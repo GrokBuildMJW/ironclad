@@ -42,7 +42,7 @@ This document is the single source of truth for **what actually works right now*
 | **Autoplan** (`/autoplan on\|off [N]`) | **wired (config-gated)** | Ported into the server's queue consumer (`_autoplan_tick`), **decoupled from autopilot** so it works in the split: server plans → client executes → server advances → server plans again. Fires only when `/autoplan on` is set **and** `paths.active_capability_backlog` is configured (no backlog → it disables itself). Logic unit-tested. |
 | Autopilot auto-launch on the server | **placeholder / by design off** | The server never launches code-agents (`_LAUNCH_CMD` is skipped); launching is the client's job (the pool). The server-side `autopilot` toggle is currently inert. |
 | Remote turn cancel (Ctrl+C in the TUI) | **wired + tested** | `POST /cancel` sets the engine cancel event; the running turn aborts at its next iteration. Ctrl+C in the TUI fires it non-blocking. |
-| Constrained-emission **hard floor** (grammar) | **parked** | Available on recent vLLM, but the engine path uses the soft validate→reask only. |
+| Constrained-emission **hard floor** (grammar) | **available — soft path active by design** | Grammar-constrained decoding (guided JSON) is **verified stable** on the reference GPU (no engine crash, schema-valid output). The ACK exposes it (`constrained_emission` / `emit_validated`) for callers wanting token-level guarantees; the **orchestration engine deliberately keeps the soft validate→reask gate** — it's backend-agnostic (any OpenAI endpoint) and already ~100% reliable, so per-emission grammar buys little. Not a TODO — a decision. |
 | **Lodestar** capability→backlog plugin | **opt-in (off)** | `lodestar.enabled=false` by default; demo in `examples/demo-vessel/`. |
 
 ## Memory
@@ -68,7 +68,7 @@ not data in the codebase:
 So the public artifact is **wired but empty** — the integration works, the content is
 the operator's.
 
-## What's next (to finish the rebuild)
+## Rebuild punch-list — done
 
 1. ~~Wire the engine to the Mem0 backend.~~ **Done** — `engine/memory.py`, off by
    default, ships empty (see Memory above).
@@ -76,7 +76,11 @@ the operator's.
    `_autoplan_tick`, decoupled from autopilot, backlog-config-gated.
 3. ~~Wire remote turn cancellation across the HTTP boundary.~~ **Done** —
    `POST /cancel` + Ctrl+C in the TUI.
-4. Decide whether to unpark the grammar hard-floor on the reference GPU.
+4. ~~Decide the grammar hard-floor.~~ **Decided** — verified stable on the reference
+   GPU; available via the ACK; the engine keeps the soft path by design (see table).
+
+The rebuild's known placeholders are now resolved. What remains is ordinary
+hardening and breadth of testing — treat `main` as a development snapshot still.
 
 ## Reference load test
 
