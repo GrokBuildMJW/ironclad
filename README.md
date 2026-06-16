@@ -60,7 +60,8 @@ python engine/gx10.py --workdir ./my-workspace
 ```
 
 - **Full walkthrough, the server/client split, and the reference vLLM launch:**
-  see **[`SETUP.md`](SETUP.md)**.
+  see **[`SETUP.md`](SETUP.md)** — including copy-paste **shell shortcuts** (so you can
+  just type `ironclad`) for **Windows PowerShell, macOS and Linux**.
 - **Let an AI coding agent set it up for you** (deterministic, verifiable runbook):
   see **[`AGENTS.md`](AGENTS.md)**.
 

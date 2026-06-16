@@ -31,6 +31,16 @@ a failed check — report the exact error and stop (fail-closed).
 
 Done-A: `import ack` works and `pytest` is green.
 
+6. **(Optional) Install shell shortcuts** so the user can type one word. Detect the
+   OS/shell and append the matching block from [§8 of `SETUP.md`](SETUP.md#8-shell-shortcuts-windows--macos--linux),
+   substituting `IRONCLAD_HOME` with the absolute clone path:
+   - **Windows / PowerShell:** ensure `$PROFILE` exists, append the `function ironclad…`
+     block, tell the user to run `. $PROFILE`.
+   - **macOS / Linux:** append the `ironclad()…` block to `~/.zshrc` (zsh) or
+     `~/.bashrc` (bash), tell the user to `source` it.
+   - Check: in a fresh shell, `ironclad-cli --help` (or the chosen command) resolves.
+   Never hard-code the path into the repo — only into the user's own profile.
+
 ## Track B — connect to a model endpoint
 
 1. **Have an OpenAI-compatible endpoint** reachable (e.g. vLLM). To stand one up on a
