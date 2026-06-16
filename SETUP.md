@@ -71,6 +71,7 @@ env vars → CLI flags**. The simplest path is env vars:
 | `GX10_WORKDIR`    | workspace (tasks/, summaries/, session)  | `.`                         |
 | `GX10_MAX_TOKENS` | output token cap                         | `8192`                      |
 | `GX10_THINKING`   | `auto` \| `first` \| `off` \| `all`      | `auto`                      |
+| `GX10_LANGUAGE`   | reply language (`en`,`de`,`fr`,…)        | `en`                        |
 
 Or drop a `gx10.config.json` next to where you run it:
 

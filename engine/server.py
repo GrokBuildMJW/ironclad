@@ -282,6 +282,7 @@ class _Handler(BaseHTTPRequestHandler):
                     "workdir": os.getcwd(),
                     "watcher": gx10._WATCHER_ENABLED,
                     "autopilot": gx10.AUTOPILOT_ENABLED,
+                    "language": gx10.LANGUAGE,
                 })
             elif self.path == "/tasks":
                 self._send(200, {"tasks": gx10._store().list()})

@@ -103,6 +103,7 @@ if [ "$WITH_ORCH" = 1 ] && [ "$ORCH_DOCKER" = 1 ]; then
   docker run -d --name "$ORCH_CONTAINER" --restart unless-stopped --network host \
     -e GX10_BASE_URL="http://localhost:${VLLM_PORT}/v1" \
     -e GX10_MODEL="$SERVED_NAME" -e GX10_SERVER_PORT="$ORCH_PORT" -e GX10_WORKDIR=/work \
+    -e GX10_LANGUAGE="${GX10_LANGUAGE:-en}" \
     -v "$REPO_ROOT/ironclad-workdir":/work "$ORCH_CONTAINER" >/dev/null
   log "orchestrator container '$ORCH_CONTAINER' on :$ORCH_PORT"
   for i in $(seq 1 30); do
@@ -119,6 +120,7 @@ elif [ "$WITH_ORCH" = 1 ]; then
   pip install --quiet -e "$REPO_ROOT[engine]" 2>/dev/null || pip install --quiet openai pydantic
   export GX10_BASE_URL="http://localhost:${VLLM_PORT}/v1"
   export GX10_MODEL="$SERVED_NAME"
+  export GX10_LANGUAGE="${GX10_LANGUAGE:-en}"
   if command -v tmux >/dev/null; then
     tmux kill-session -t ironclad 2>/dev/null || true
     tmux new-session -d -s ironclad -c "$REPO_ROOT" \

@@ -20,6 +20,8 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
+import shutil
 import sys
 import threading
 import time
@@ -36,7 +38,9 @@ if str(_HERE) not in sys.path:
 try:
     from prompt_toolkit import Application
     from prompt_toolkit.buffer import Buffer
+    from prompt_toolkit.formatted_text import ANSI
     from prompt_toolkit.key_binding import KeyBindings
+    from prompt_toolkit.keys import Keys
     from prompt_toolkit.layout import Layout
     from prompt_toolkit.layout.containers import HSplit, Window
     from prompt_toolkit.layout.controls import BufferControl, FormattedTextControl
@@ -49,9 +53,13 @@ import client
 from client import Server
 from commands import HELP_TEXT, classify
 
-import re as _re
-
-_PERF_RE = _re.compile(r"\[perf\][^\n]*")
+#: Output scrollback offset in visual rows from the bottom (0 = follow newest).
+_SCROLL: Dict[str, int] = {"rows": 0}
+#: How many trailing lines scrollback can reach (bounds per-render cost).
+_MAX_SCROLL_LINES = 3000
+#: Multi-line pastes, stored and shown compressed as "[Pasted #N +L lines]".
+_PASTES: list = []
+_PASTE_RE = re.compile(r"\[Pasted #(\d+) \+\d+ lines\]")
 
 #: Shared status for the toolbar, refreshed by the background poller + stream parse.
 _STATUS: Dict[str, Any] = {
@@ -76,8 +84,10 @@ def _toolbar():
     a_dot = "●" if _STATUS["autopilot"] else "○"
     if st["thinking"]:
         mid = f"  {frame}  {st['label']}...   Strg+C = abbrechen   "
+    elif _SCROLL["rows"] > 0:
+        mid = f"  ↑ Verlauf (+{_SCROLL['rows']})  ·  PageUp/PageDown  ·  PageDown→Ende   "
     else:
-        mid = "  Orchestrator-Client  ·  streaming   |   /help · exit   "
+        mid = "  Orchestrator-Client  ·  streaming   |   /help · exit · PageUp=Verlauf   "
     line3 = (f"     {_STATUS['model']}  ·  {_STATUS['perf'] or '—'}  ·  "
              f"tasks {_STATUS['pending']}P/{_STATUS['in_progress']}IP/{_STATUS['done']}D"
              f"  ·  {_STATUS['server']}")
@@ -218,17 +228,93 @@ def _worker(srv: Server, codedir: Path, q: "Queue[str]", app: "Application",
         _stream(payload)
 
 
+# --------------------------------------------------------------------------- #
+# Scrollable output pane (keeps ANSI colours; honours _SCROLL["rows"]).
+# --------------------------------------------------------------------------- #
+def _termsize():
+    if gx10._UI_APP is not None:
+        try:
+            sz = gx10._UI_APP.output.get_size()
+            return sz.rows, sz.columns
+        except Exception:  # noqa: BLE001
+            pass
+    s = shutil.get_terminal_size((80, 24))
+    return s.lines, s.columns
+
+
+def _page_rows() -> int:
+    rows, _ = _termsize()
+    return max(1, rows - 6)
+
+
+def _output():
+    """Like gx10._get_output but scrollable: show a window of visual rows ending
+    ``_SCROLL["rows"]`` rows above the bottom (0 = follow newest). Whole-line
+    granularity; scrollback bounded to the last _MAX_SCROLL_LINES lines."""
+    term_rows, term_cols = _termsize()
+    rows = max(1, term_rows - 6)
+    width = max(1, term_cols)
+    with gx10._UI_LOCK:
+        lines = list(gx10._UI_LINES)
+        if gx10._UI_PARTIAL:
+            lines.append(gx10._UI_PARTIAL)
+    lines = lines[-_MAX_SCROLL_LINES:]
+    heights = [gx10._visual_rows(ln, width) for ln in lines]
+    total = sum(heights)
+    max_skip = max(0, total - rows)
+    skip = min(max(0, _SCROLL["rows"]), max_skip)
+    _SCROLL["rows"] = skip                      # clamp stored value
+    end = total - skip
+    start = max(0, end - rows)
+    out, pos = [], 0
+    for ln, h in zip(lines, heights):
+        if pos + h > start and pos < end:
+            out.append(ln)
+        pos += h
+    return ANSI("\n".join(out))
+
+
+def _expand_pastes(text: str) -> str:
+    """Replace ``[Pasted #k +N lines]`` placeholders with the stored full text."""
+    def _sub(m):
+        idx = int(m.group(1)) - 1
+        return _PASTES[idx] if 0 <= idx < len(_PASTES) else m.group(0)
+    return _PASTE_RE.sub(_sub, text)
+
+
 def _build_app(q: "Queue[str]") -> "Application":
     input_buf = Buffer(name="input_buf", multiline=False)
     kb = KeyBindings()
 
     @kb.add("enter")
     def _enter(event):
-        text = input_buf.text.strip()
+        raw = input_buf.text.strip()
         input_buf.reset()
-        if text:
-            gx10._ui_print(gx10.col(f"\n[Du] > {text}", gx10.C.BOLD))
-        q.put(text)
+        _SCROLL["rows"] = 0                       # neue Eingabe → zurück ans Ende
+        if not raw:
+            q.put(""); return
+        expanded = _expand_pastes(raw)            # Platzhalter → voller Text
+        gx10._ui_print(gx10.col(f"\n[Du] > {raw}", gx10.C.BOLD))  # kompakt anzeigen
+        _PASTES.clear()
+        q.put(expanded)
+
+    @kb.add(Keys.BracketedPaste)
+    def _paste(event):
+        data = event.data
+        if "\n" in data.strip():                  # mehrzeilig → komprimiert anzeigen
+            n = data.count("\n") + 1
+            _PASTES.append(data)
+            event.current_buffer.insert_text(f"[Pasted #{len(_PASTES)} +{n} lines]")
+        else:
+            event.current_buffer.insert_text(data)
+
+    @kb.add("pageup")
+    def _pgup(event):
+        _SCROLL["rows"] += max(1, _page_rows() - 1)
+
+    @kb.add("pagedown")
+    def _pgdn(event):
+        _SCROLL["rows"] = max(0, _SCROLL["rows"] - max(1, _page_rows() - 1))
 
     @kb.add("c-c")
     def _ctrl_c(event):
@@ -242,7 +328,7 @@ def _build_app(q: "Queue[str]") -> "Application":
         q.put("\x04")
 
     layout = Layout(HSplit([
-        Window(content=FormattedTextControl(gx10._get_output, focusable=False),
+        Window(content=FormattedTextControl(_output, focusable=False),
                wrap_lines=True),
         Window(height=1, char="─"),
         Window(content=BufferControl(buffer=input_buf, focusable=True), height=1,
@@ -265,7 +351,8 @@ def run_tui(srv: Server, codedir: Path, max_agents: int) -> None:
     gx10._ui_print(gx10.col("  Ironclad Orchestrator — Vollbild-Client", gx10.C.GREEN))
     gx10._ui_print(gx10.col(f"  Server : {srv.base}", gx10.C.GRAY))
     gx10._ui_print(gx10.col(f"  Code   : {codedir}", gx10.C.GRAY))
-    gx10._ui_print(gx10.col("  Tippe frei für einen Turn · /work · /auto on|off · exit", gx10.C.GRAY))
+    gx10._ui_print(gx10.col("  Tippe frei für einen Turn · /help für Befehle · exit", gx10.C.GRAY))
+    gx10._ui_print(gx10.col("  PageUp/PageDown = im Verlauf scrollen · mehrzeiliges Einfügen wird komprimiert", gx10.C.GRAY))
 
     stop = threading.Event()
     pool = ThreadPoolExecutor(max_workers=max_agents, thread_name_prefix="codeagent")

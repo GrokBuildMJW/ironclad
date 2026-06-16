@@ -139,6 +139,7 @@ MAX_ITERATIONS   = 20
 MAX_CTX_CHARS    = 80_000        # High-Water: erst hier wird getrimmt
 TRIM_TARGET_CHARS = 48_000       # PERF-06: Low-Water nach dem Trim (60 %)
 MAX_TOKENS       = 8192          # PERF-10: vorher 4096 → Handover-Truncation
+LANGUAGE         = "en"          # Antwortsprache des Orchestrators (OSS-Default en; per GX10_LANGUAGE/Config)
 MAX_FILE_CHARS   = 24_000        # PERF-05: read_file-Cap (Head+Tail)
 LIST_DIR_HARD_CAP = 200          # HV-B: harter Cap in list_directory
 TEMPERATURE      = 0.3
@@ -1351,6 +1352,23 @@ def _resolve_platform(mode: Optional[str]) -> str:
     return "windows" if os.name == "nt" else "linux"
 
 
+_LANG_NAMES = {
+    "en": "English", "de": "German", "fr": "French", "es": "Spanish",
+    "it": "Italian", "pt": "Portuguese", "nl": "Dutch", "pl": "Polish",
+}
+
+
+def _language_guidance(lang: str) -> str:
+    """Runtime note that pins the orchestrator's reply language. Deterministic: the
+    configured language wins regardless of the input language. ``en`` is the OSS
+    default; set ``GX10_LANGUAGE`` (or generation.language) to override."""
+    code = (lang or "en").strip().lower()
+    name = _LANG_NAMES.get(code, lang)
+    return ("## Response language\n"
+            f"Always respond to the user in {name}, regardless of the language of the "
+            "input, tools, or context. Keep code identifiers and file paths unchanged.")
+
+
 def _platform_guidance(platform: str) -> str:
     """Dynamisch injizierte Laufzeit-Notiz — hält den Prompt-File neutral."""
     if platform == "windows":
@@ -1595,6 +1613,7 @@ class GX10:
 
     def _inject_platform_guidance(self):
         self._append_guidance(_platform_guidance(self.platform))
+        self._append_guidance(_language_guidance(LANGUAGE))
 
     # OPT-4: ein Completion-Call mit 1× Retry bei transientem API-Fehler
     def _make_completion(self, think: bool, stream: bool):
@@ -2821,6 +2840,7 @@ def _code_defaults() -> Dict[str, Any]:
             "thinking_mode": "auto",
             "stream":        True,
             "retry_backoff": RETRY_BACKOFF,
+            "language":      LANGUAGE,
         },
         "context": {
             "max_iterations":    MAX_ITERATIONS,
@@ -2949,6 +2969,7 @@ def _apply_env(cfg: Dict[str, Any]) -> Dict[str, Any]:
     setif("GX10_PROMPT",     "paths",      "system_prompt")
     setif("GX10_MAX_TOKENS", "generation", "max_tokens", int)
     setif("GX10_THINKING",   "generation", "thinking_mode")
+    setif("GX10_LANGUAGE",   "generation", "language")
     setif("GX10_PLATFORM",   "platform",   "mode")
     _truthy = lambda v: v.strip().lower() in ("1", "true", "yes", "on", "an")
     setif("GX10_ONBOARDING", "onboarding", "enabled", _truthy)
@@ -2984,7 +3005,7 @@ def _apply_config(cfg: Dict[str, Any]):
     global PLATFORM_MODE, PLATFORM, TASKS_DEDUP_THRESHOLD, ONBOARDING_MODE, TASK_PREFIX, _TASK_ID_RE, ACK_ENABLED, LODESTAR_ENABLED
     global AUTOPILOT_ENABLED, AUTOPILOT_CLAUDE_BIN, AUTOPILOT_EXTRA_ARGS
     global AUTOPILOT_DEFAULT_EFFORT, AUTOPILOT_LOGS_DIR, AUTOPILOT_MAX_CONCURRENT, AUTOPILOT_STREAM, AUTOPILOT_TERMINATE_ON_ADVANCE, AUTOPILOT_AUTOPLAN, AUTOPILOT_MAX_TASKS, AUTOPILOT_LOG_TERMINAL
-    global TEMPERATURE, MAX_TOKENS, RETRY_BACKOFF
+    global TEMPERATURE, MAX_TOKENS, RETRY_BACKOFF, LANGUAGE
     global MAX_ITERATIONS, MAX_CTX_CHARS, TRIM_TARGET_CHARS, MAX_FILE_CHARS, LIST_DIR_HARD_CAP
     global _PLANNING_KW, _ROUTINE_KW, WORKSPACE_DIRS, _IDLE_ACTIVE
     global WATCHER_FEEDBACK_DIR, _WATCHER_ENABLED, RECONCILER_INTERVAL
@@ -3027,6 +3048,7 @@ def _apply_config(cfg: Dict[str, Any]):
     TEMPERATURE   = float(gen["temperature"])
     MAX_TOKENS    = int(gen["max_tokens"])
     RETRY_BACKOFF = float(gen["retry_backoff"])
+    LANGUAGE      = (str(gen.get("language", "en")).strip() or "en")
 
     MAX_ITERATIONS    = int(ctx["max_iterations"])
     MAX_CTX_CHARS     = int(ctx["max_ctx_chars"])
