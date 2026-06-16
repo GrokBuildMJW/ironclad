@@ -34,6 +34,9 @@ ORCH_DOCKER=0
 ORCH_PORT="${GX10_SERVER_PORT:-8100}"
 CONTAINER="${IRONCLAD_VLLM_CONTAINER:-vllm}"
 ORCH_CONTAINER="${IRONCLAD_ORCH_CONTAINER:-ironclad-orchestrator}"
+# Workspace volume OUTSIDE the synced repo: the container writes it as root, so it
+# must not sit under core/ (a re-sync's `rm -rf core` would hit permission errors).
+ORCH_WORKDIR="${IRONCLAD_WORKDIR:-$HOME/ironclad-workdir}"
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -99,12 +102,12 @@ if [ "$WITH_ORCH" = 1 ] && [ "$ORCH_DOCKER" = 1 ]; then
   log "building orchestrator image '$ORCH_CONTAINER' from $REPO_ROOT"
   docker build -t "$ORCH_CONTAINER" "$REPO_ROOT" >/dev/null
   docker rm -f "$ORCH_CONTAINER" >/dev/null 2>&1 || true
-  mkdir -p "$REPO_ROOT/ironclad-workdir"
+  mkdir -p "$ORCH_WORKDIR"
   docker run -d --name "$ORCH_CONTAINER" --restart unless-stopped --network host \
     -e GX10_BASE_URL="http://localhost:${VLLM_PORT}/v1" \
     -e GX10_MODEL="$SERVED_NAME" -e GX10_SERVER_PORT="$ORCH_PORT" -e GX10_WORKDIR=/work \
     -e GX10_LANGUAGE="${GX10_LANGUAGE:-en}" \
-    -v "$REPO_ROOT/ironclad-workdir":/work "$ORCH_CONTAINER" >/dev/null
+    -v "$ORCH_WORKDIR":/work "$ORCH_CONTAINER" >/dev/null
   log "orchestrator container '$ORCH_CONTAINER' on :$ORCH_PORT"
   for i in $(seq 1 30); do
     curl -fs "http://localhost:${ORCH_PORT}/health" >/dev/null 2>&1 && { log "orchestrator healthy"; break; }
