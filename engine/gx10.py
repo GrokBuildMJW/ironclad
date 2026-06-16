@@ -800,7 +800,9 @@ ONBOARDING_TOOLS = [
 
 def _effective_tools() -> List[Dict[str, Any]]:
     """Tool-Liste je nach Modus — Onboarding-Tools nur, wenn aktiv."""
-    mem = [MEMORY_TOOL] if _MemoryManager is not None else []
+    # Tool nur anbieten, wenn Memory KONFIGURIERT ist (nicht bloß das Modul da ist) —
+    # sonst böte sich der Tool an, obwohl jeder Aufruf "nicht verfügbar" zurückgäbe.
+    mem = [MEMORY_TOOL] if _MEMORY is not None else []
     return TOOLS + mem + (ONBOARDING_TOOLS if ONBOARDING_MODE else [])
 
 # ─── Makro-Tool: deterministische Pipeline (HV-A) ─────────────
@@ -3062,13 +3064,19 @@ def _apply_config(cfg: Dict[str, Any]):
     WORKSPACE_DIRS = list(ws["dirs"])
     _IDLE_ACTIVE   = ws["idle_marker"]
 
-    # Memory-Config aus conf/memory/memory.json laden (optional)
+    # Memory-Config: Datei (conf/memory/memory.json) ODER Env (GX10_MEMORY_URL).
+    # Optional — ohne base_url bleibt _MEMORY_CONFIG leer → Memory aus (Hooks inert).
     _mem_cfg_path = Path("conf/memory/memory.json")
     if _mem_cfg_path.exists():
         try:
             _MEMORY_CONFIG = json.loads(_mem_cfg_path.read_text(encoding="utf-8"))
         except Exception:
             pass
+    _mem_url = os.environ.get("GX10_MEMORY_URL")
+    if _mem_url:
+        _MEMORY_CONFIG = {**(_MEMORY_CONFIG or {}), "base_url": _mem_url}
+        _MEMORY_CONFIG.setdefault("enabled", True)
+        _MEMORY_CONFIG.setdefault("agent_id", os.environ.get("GX10_MEMORY_AGENT", "ironclad"))
 
     WATCHER_FEEDBACK_DIR = wa["feedback_dir"]
     _WATCHER_ENABLED     = bool(wa["enabled"])

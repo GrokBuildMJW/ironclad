@@ -283,6 +283,8 @@ class _Handler(BaseHTTPRequestHandler):
                     "watcher": gx10._WATCHER_ENABLED,
                     "autopilot": gx10.AUTOPILOT_ENABLED,
                     "language": gx10.LANGUAGE,
+                    "memory": ("off" if gx10._MEMORY is None
+                               else ("up" if gx10._MEMORY.is_available() else "down")),
                 })
             elif self.path == "/tasks":
                 self._send(200, {"tasks": gx10._store().list()})

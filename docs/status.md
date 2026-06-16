@@ -38,7 +38,7 @@ This document is the single source of truth for **what actually works right now*
 | Reasoning-worker fan-out (`/fanout`) | **wired + tested** | Concurrency bounded by `max_num_seqs`; measured speedup. |
 | ACK contract gate at `stage_handover` | **wired + tested** | Soft path (`_ack_validate`): task_json validated against `TaskSpec`, fail-closed → reask. |
 | Orchestrator Docker image / compose | **wired + tested** | Runs as `ironclad-orchestrator` next to the model. |
-| **Memory (Mem0)** | **placeholder** | See below — hooks present, backend not shipped in core. |
+| **Memory (Mem0)** | **wired + tested** | `engine/memory.py` talks to a Mem0-style service (`GX10_MEMORY_URL`); store+search verified live. The store starts **empty** — see below. |
 | **Autoplan** (`/autoplan on\|off [N]`) | **placeholder** | Command parses and sets flags, but the "plan the next task when the pipeline empties" loop is **not** ported into the server's queue consumer; autopilot is off server-side. No effect yet. |
 | Autopilot auto-launch on the server | **placeholder / by design off** | The server never launches code-agents (`_LAUNCH_CMD` is skipped); launching is the client's job (the pool). The server-side `autopilot` toggle is currently inert. |
 | Remote turn cancel (Ctrl+C in the TUI) | **placeholder** | Not yet wired across the HTTP boundary; shows a notice. |
@@ -47,22 +47,31 @@ This document is the single source of truth for **what actually works right now*
 
 ## Memory
 
-The engine has **integration points** for long-term memory (a `remember`/query tool,
-store-on-task-completion, and stage-time context injection), but the **backend is not
-part of `core/`**: `gx10.py` imports a `memory` module inside a `try/except`, and when
-it is absent (the default in this repo) `_MemoryManager` is `None` and **every memory
-hook is inert** — no tool is registered, nothing is stored or queried.
+The engine has long-term memory **wired in**: a `query_memory` tool, store-on-task-
+completion, and stage-time context injection, backed by `engine/memory.py` — a small,
+secret-free client for a **Mem0-style HTTP service** (`POST /add`, `POST /search` with
+`graph=false`, `GET /health`). Store + search are verified live against the reference
+Mem0 stack (Qdrant + Neo4j + BGE-M3, LLM pointed at the local model).
 
-To enable it you bring your own `MemoryManager` (the reference deployment runs a
-**Mem0** stack — Qdrant + Neo4j + BGE-M3 embeddings, LLM pointed at the local model —
-as separate containers) and point the engine at it via a memory config. **Status:**
-the Mem0 stack runs in the reference deployment, but the engine↔memory wiring is **not
-yet connected in the exported code** — it is the next integration step. Until then,
-memory is a documented extension point, not a working feature here.
+**This repo ships the wiring, never any memory content.** Memory is a runtime service,
+not data in the codebase:
+
+- **Off by default.** With no `GX10_MEMORY_URL` (and no `conf/memory/memory.json`) the
+  `MemoryManager` is never constructed → all hooks stay inert and no tool is offered.
+- **Bring your own service _and_ corpus.** Point the engine at your Mem0 endpoint
+  (`GX10_MEMORY_URL=http://your-mem-host:8800`, optional `GX10_MEMORY_AGENT`). The store
+  starts **empty** — Ironclad accumulates its own memory from task completions; any
+  pre-existing corpus is yours to import, into your own namespace, and never lives here.
+- **Namespace.** Reads/writes use `agent_id` (default `ironclad`) and an optional
+  `user_id`; set them to match wherever your content lives.
+
+So the public artifact is **wired but empty** — the integration works, the content is
+the operator's.
 
 ## What's next (to finish the rebuild)
 
-1. Wire the engine to the Mem0 backend (ship/point at a `MemoryManager`).
+1. ~~Wire the engine to the Mem0 backend.~~ **Done** — `engine/memory.py`, off by
+   default, ships empty (see Memory above).
 2. Port the autoplan loop into the server's queue consumer (decide client- vs
    server-side launching).
 3. Wire remote turn cancellation across the HTTP boundary.
