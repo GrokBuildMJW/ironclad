@@ -1,0 +1,8 @@
+{
+  "type": "feature",
+  "priority": "high",
+  "title": "List todos endpoint",
+  "description": "Implement GET /todos with simple paging.",
+  "capability": "todo-list",
+  "status": "done"
+}

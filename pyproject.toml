@@ -1,0 +1,48 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ironclad"
+version = "0.0.1"
+description = "Reliability for LLM agents through enforcement, not model size — Agent-Contract-Kernel (ACK) + a fail-closed orchestration engine."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
+authors = [{ name = "MJWC-AI-LAB" }]
+keywords = [
+  "llm", "agents", "reliability", "pydantic", "tool-calling",
+  "structured-output", "orchestration", "validation",
+]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Topic :: Software Development :: Libraries",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+# The ACK library depends only on pydantic + stdlib (kernel stays standalone).
+dependencies = ["pydantic>=2"]
+
+[project.optional-dependencies]
+# The orchestration engine (engine/) additionally talks to an OpenAI-compatible
+# endpoint and renders a terminal UI.
+engine = ["openai>=1", "prompt_toolkit>=3"]
+
+[project.urls]
+Homepage = "https://github.com/GrokBuildMJW/ironclad"
+Source = "https://github.com/GrokBuildMJW/ironclad"
+Issues = "https://github.com/GrokBuildMJW/ironclad/issues"
+
+# The importable library is the Agent-Contract-Kernel. The orchestration engine in
+# engine/ currently ships as runnable scripts (run directly), not as wheel modules —
+# this will be packaged once its API stabilizes (see README: pre-release).
+[tool.setuptools]
+packages = ["ack", "ack.lodestar"]
+
+[tool.setuptools.package-data]
+# Ship the paved-road generator templates (Copier tree) as data, not as packages —
+# their directory names are template placeholders, not valid module names.
+ack = ["templates/**/*"]

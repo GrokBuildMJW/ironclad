@@ -1,0 +1,6 @@
+{
+  "_comment": "Vessel config fragment — enables the Lodestar capability/gap plugin. A real vessel merges this into its engine config; the doctor honours it via --lodestar.",
+  "lodestar": {
+    "enabled": true
+  }
+}

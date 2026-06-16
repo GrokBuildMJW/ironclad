@@ -1,0 +1,14 @@
+Ironclad
+Copyright 2026 MJWC-AI-LAB and Ironclad contributors
+
+This product includes software developed by MJWC-AI-LAB and the Ironclad
+contributors.
+
+Licensed under the Apache License, Version 2.0. See the LICENSE file.
+
+Ironclad builds on the following third-party open-source projects (each
+under its own permissive license; see their respective distributions):
+  - vLLM            (Apache-2.0)
+  - mem0ai          (Apache-2.0)
+  - Qwen models     (Apache-2.0 / Tongyi Qianwen license, per model card)
+  - pydantic        (MIT)
