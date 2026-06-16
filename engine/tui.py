@@ -18,6 +18,7 @@ server.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 import threading
@@ -46,6 +47,7 @@ except ImportError:
 import gx10  # UI primitives (openai-frei importierbar)
 import client
 from client import Server
+from commands import HELP_TEXT, classify
 
 import re as _re
 
@@ -75,13 +77,13 @@ def _toolbar():
     if st["thinking"]:
         mid = f"  {frame}  {st['label']}...   Strg+C = abbrechen   "
     else:
-        mid = "  Ironclad Thin-Client  ·  streaming  |  exit = Beenden   "
+        mid = "  Orchestrator-Client  ·  streaming   |   /help · exit   "
     line3 = (f"     {_STATUS['model']}  ·  {_STATUS['perf'] or '—'}  ·  "
              f"tasks {_STATUS['pending']}P/{_STATUS['in_progress']}IP/{_STATUS['done']}D"
              f"  ·  {_STATUS['server']}")
     return [
         ("fg:ansiblue bold", " ██ "),
-        ("bold", "GX10 CLI"),
+        ("bold", "Ironclad"),
         ("", "  powered by "),
         ("fg:ansiblue bold", "MJWC-AI-LAB"),
         ("", "\n"),
@@ -120,55 +122,100 @@ def _worker(srv: Server, codedir: Path, q: "Queue[str]", app: "Application",
             pool: ThreadPoolExecutor, claimed: set, auto: Dict[str, Any]) -> None:
     log = gx10._ui_print
 
-    def _on_text(t: str) -> None:
-        gx10._ui_print(t, end="")  # Server-Chunks tragen ihre eigenen \n
-        m = _PERF_RE.search(t)
-        if m:
-            _STATUS["perf"] = m.group(0).strip()
-
-    while True:
-        text = q.get().strip()
-        if text == "\x04":
-            app.exit(); return
-        if not text:
-            continue
-        low = text.lower()
-        if low == "exit":
-            app.exit(); return
-        if low == "/work":
-            futs = client.dispatch_pending(srv, codedir, pool, claimed, log=log)
-            log(gx10.col(f"  → {len(futs)} Handover gestartet (parallel)", gx10.C.CYAN)
-                if futs else gx10.col("  (keine neuen Handover)", gx10.C.GRAY))
-            continue
-        if low.startswith("/auto"):
-            arg = low.split()[-1] if len(low.split()) > 1 else ""
-            if arg == "on" and auto.get("stop") is None:
-                stop = threading.Event()
-                auto["stop"] = stop
-
-                def _loop(stop=stop):
-                    while not stop.wait(5.0):
-                        client.dispatch_pending(srv, codedir, pool, claimed, log=log)
-                threading.Thread(target=_loop, daemon=True).start()
-                log(gx10.col("  [AUTO] Poller AN — zieht Handover laufend, parallel", gx10.C.GREEN))
-            elif arg == "off" and auto.get("stop") is not None:
-                auto["stop"].set(); auto["stop"] = None
-                log(gx10.col("  [AUTO] Poller AUS", gx10.C.YELLOW))
-            else:
-                log(gx10.col(f"  [AUTO] {'AN' if auto.get('stop') else 'AUS'}  |  /auto on / /auto off",
-                             gx10.C.GRAY))
-            continue
-        # sonst: Turn vom Server streamen.
+    def _stream(payload: str) -> None:
         gx10._status["thinking"] = True
         gx10._status["label"] = "Qwen"
+        # Zeilenweise puffern, damit wir die [perf]-Zeile herausfiltern können: sie
+        # gehört NUR in die Toolbar (unten), nicht in den Chat-Verlauf.
+        partial = {"buf": ""}
+
+        def _emit_line(line: str) -> None:
+            clean = gx10._ANSI_LEN_RE.sub("", line)
+            idx = clean.find("[perf]")
+            if idx != -1:
+                _STATUS["perf"] = clean[idx:].strip()   # nur Toolbar
+                return
+            gx10._ui_print(line)                          # mit \n in den Pane
+
+        def _on_text(t: str) -> None:
+            partial["buf"] += t
+            while "\n" in partial["buf"]:
+                line, partial["buf"] = partial["buf"].split("\n", 1)
+                _emit_line(line)
+
         try:
-            srv.chat_stream(text, _on_text)
+            srv.chat_stream(payload, _on_text)
         except Exception as e:  # noqa: BLE001
             gx10._ui_print(gx10.col(f"  ✗ /chat/stream fehlgeschlagen: {e!r}", gx10.C.RED))
         finally:
+            if partial["buf"]:
+                _emit_line(partial["buf"])
             gx10._status["thinking"] = False
             if gx10._UI_APP is not None:
                 gx10._UI_APP.invalidate()
+
+    while True:
+        text = q.get()
+        if text == "\x04":
+            app.exit(); return
+        kind, name, payload = classify(text)
+        if kind == "empty":
+            continue
+        if kind == "local" and name in ("exit", "quit"):
+            app.exit(); return
+        if kind == "local":
+            if name == "help":
+                log(HELP_TEXT)
+            elif name == "health":
+                try:
+                    log(gx10.col("  " + json.dumps(srv.health(), ensure_ascii=False), gx10.C.GRAY))
+                except Exception as e:  # noqa: BLE001
+                    log(gx10.col(f"  ✗ {e}", gx10.C.RED))
+            elif name == "tasks":
+                try:
+                    ts = srv.tasks()
+                    if not ts:
+                        log(gx10.col("  (keine Tasks)", gx10.C.GRAY))
+                    for t in ts:
+                        log(f"  {t.get('status','?'):11} {t.get('id','?'):10} "
+                            f"{t.get('type','?'):14} {t.get('title','')}")
+                except Exception as e:  # noqa: BLE001
+                    log(gx10.col(f"  ✗ {e}", gx10.C.RED))
+            elif name == "pending":
+                try:
+                    ps = srv.pending()
+                    if not ps:
+                        log(gx10.col("  (keine offenen Handover)", gx10.C.GRAY))
+                    for it in ps:
+                        log(f"  {it.get('id'):10} {it.get('agent','?'):7} "
+                            f"{it.get('type','?'):14} {it.get('title','')}")
+                except Exception as e:  # noqa: BLE001
+                    log(gx10.col(f"  ✗ {e}", gx10.C.RED))
+            elif name == "work":
+                futs = client.dispatch_pending(srv, codedir, pool, claimed, log=log)
+                log(gx10.col(f"  → {len(futs)} Handover gestartet (parallel)", gx10.C.CYAN)
+                    if futs else gx10.col("  (keine neuen Handover)", gx10.C.GRAY))
+            elif name == "auto":
+                parts = payload.split()
+                arg = parts[1].lower() if len(parts) > 1 else ""
+                if arg == "on" and auto.get("stop") is None:
+                    stop = threading.Event()
+                    auto["stop"] = stop
+
+                    def _loop(stop=stop):
+                        while not stop.wait(5.0):
+                            client.dispatch_pending(srv, codedir, pool, claimed, log=log)
+                    threading.Thread(target=_loop, daemon=True).start()
+                    log(gx10.col("  [AUTO] Poller AN — zieht Handover laufend, parallel", gx10.C.GREEN))
+                elif arg == "off" and auto.get("stop") is not None:
+                    auto["stop"].set(); auto["stop"] = None
+                    log(gx10.col("  [AUTO] Poller AUS", gx10.C.YELLOW))
+                else:
+                    log(gx10.col(f"  [AUTO] {'AN' if auto.get('stop') else 'AUS'}  |  /auto on / /auto off",
+                                 gx10.C.GRAY))
+            continue
+        # kind in ("server", "turn") → an den Orchestrator streamen (Befehl ohne / bzw. Turn).
+        _stream(payload)
 
 
 def _build_app(q: "Queue[str]") -> "Application":

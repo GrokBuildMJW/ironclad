@@ -489,7 +489,7 @@ def _toolbar():
     if _status["thinking"]:
         return [
             ("fg:ansiblue bold", " ██ "),
-            ("bold",             "GX10 CLI"),
+            ("bold",             "Ironclad"),
             ("",                 "  powered by "),
             ("fg:ansiblue bold", "MJWC-AI-LAB"),
             ("",                 "\n"),
@@ -509,12 +509,12 @@ def _toolbar():
         ]
     return [
         ("fg:ansiblue bold", " ██ "),
-        ("bold",             "GX10 CLI"),
+        ("bold",             "Ironclad"),
         ("",                 "  powered by "),
         ("fg:ansiblue bold", "MJWC-AI-LAB"),
         ("",                 "\n"),
         ("fg:ansiblue bold", " ██ "),
-        ("",                 "  GX10 Orchestrator Engine  ·  streaming  |  exit = Beenden   "),
+        ("",                 "  Orchestrator Engine  ·  streaming  |  exit = Beenden   "),
         (w_color,            w_dot),
         ("",                 " Watcher  "),
         (a_color,            a_dot),
@@ -3136,7 +3136,7 @@ def main():
     thinking_mode = cfg["generation"]["thinking_mode"]
 
     Cy = "\033[96m"; Gy = "\033[90m"; Bo = "\033[1m"; R = "\033[0m"
-    print(f"{Cy}{Bo}  GX10 CLI v3{R}")
+    print(f"{Cy}{Bo}  Ironclad — Orchestrator CLI{R}")
     print(f"{Gy}  Modell : {model}  |  qwen3_coder{R}")
     print(f"{Gy}  URL    : {base_url}{R}")
     print(f"{Gy}  Stream : {'an' if stream else 'aus'}  |  "

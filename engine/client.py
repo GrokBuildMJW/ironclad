@@ -38,6 +38,8 @@ from concurrent.futures import Future, ThreadPoolExecutor, wait
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from commands import HELP_TEXT, classify
+
 # Default ist localhost (secret-frei); die echte Server-Adresse (z. B. der Spark im
 # LAN) kommt aus GX10_SERVER_URL / --server — privat über conf/, nie hartkodiert hier.
 DEFAULT_SERVER = os.environ.get("GX10_SERVER_URL", "http://localhost:8100")
@@ -195,17 +197,6 @@ def dispatch_pending(srv: Server, codedir: Path, pool: ThreadPoolExecutor,
 # --------------------------------------------------------------------------- #
 # REPL.
 # --------------------------------------------------------------------------- #
-_HELP = """\
-  <text>        an den Orchestrator senden (POST /chat)
-  /tasks        TaskStore-Übersicht (GET /tasks)
-  /pending      offene Handover für lokale code-agents (GET /pending)
-  /work         alle offenen Handover EINMAL lokal abarbeiten (parallel, bounded pool)
-  /auto on|off  Hintergrund-Poller: zieht Handover und arbeitet sie laufend parallel ab
-  /health       Server-Status
-  /help         diese Hilfe
-  exit          beenden"""
-
-
 def _print_tasks(tasks: List[Dict[str, Any]]) -> None:
     if not tasks:
         print("  (keine Tasks)")
@@ -223,7 +214,7 @@ def repl(srv: Server, codedir: Path, max_agents: int = DEFAULT_MAX_AGENTS) -> No
     except urllib.error.URLError as e:
         print(f"  ⚠ Server {srv.base} nicht erreichbar: {e}")
     print(f"  code-root (lokal): {codedir}  |  max parallele code-agents: {max_agents}")
-    print(_HELP)
+    print(HELP_TEXT)
 
     claimed: set = set()
     pool = ThreadPoolExecutor(max_workers=max_agents, thread_name_prefix="codeagent")
@@ -242,68 +233,71 @@ def repl(srv: Server, codedir: Path, max_agents: int = DEFAULT_MAX_AGENTS) -> No
         except (EOFError, KeyboardInterrupt):
             print()
             break
-        if not line:
+        kind, name, payload = classify(line)
+        if kind == "empty":
             continue
-        low = line.lower()
-        if low == "exit":
+        if kind == "local" and name in ("exit", "quit"):
             break
-        elif low == "/help":
-            print(_HELP)
-        elif low == "/health":
-            try:
-                print("  " + json.dumps(srv.health(), ensure_ascii=False))
-            except urllib.error.URLError as e:
-                print(f"  ✗ {e}")
-        elif low == "/tasks":
-            try:
-                _print_tasks(srv.tasks())
-            except urllib.error.URLError as e:
-                print(f"  ✗ {e}")
-        elif low == "/pending":
-            try:
-                p = srv.pending()
-                if not p:
-                    print("  (keine offenen Handover)")
-                for it in p:
-                    print(f"  {it.get('id'):10} {it.get('agent','?'):7} "
-                          f"{it.get('type','?'):14} {it.get('title','')}")
-            except urllib.error.URLError as e:
-                print(f"  ✗ {e}")
-        elif low == "/work":
-            futures = dispatch_pending(srv, codedir, pool, claimed)
-            if not futures:
-                print("  (keine neuen Handover)")
-            else:
-                print(f"  → {len(futures)} Handover gestartet (≤{max_agents} parallel), warte ...")
-                done_set, _ = wait(futures)
-                ok = sum(1 for f in done_set if f.result() is True)
-                print(f"  fertig: {ok}/{len(futures)} sauber hochgeladen")
-        elif low.startswith("/auto"):
-            arg = low.split()[-1] if len(low.split()) > 1 else ""
-            if arg == "on":
-                if auto_stop is None:
-                    auto_stop = threading.Event()
-                    threading.Thread(target=_auto_loop, args=(auto_stop,), daemon=True).start()
-                    print(f"  [AUTO] Poller AN — zieht Handover alle 5s, ≤{max_agents} parallel")
+        if kind == "local":
+            if name == "help":
+                print(HELP_TEXT)
+            elif name == "health":
+                try:
+                    print("  " + json.dumps(srv.health(), ensure_ascii=False))
+                except urllib.error.URLError as e:
+                    print(f"  ✗ {e}")
+            elif name == "tasks":
+                try:
+                    _print_tasks(srv.tasks())
+                except urllib.error.URLError as e:
+                    print(f"  ✗ {e}")
+            elif name == "pending":
+                try:
+                    p = srv.pending()
+                    if not p:
+                        print("  (keine offenen Handover)")
+                    for it in p:
+                        print(f"  {it.get('id'):10} {it.get('agent','?'):7} "
+                              f"{it.get('type','?'):14} {it.get('title','')}")
+                except urllib.error.URLError as e:
+                    print(f"  ✗ {e}")
+            elif name == "work":
+                futures = dispatch_pending(srv, codedir, pool, claimed)
+                if not futures:
+                    print("  (keine neuen Handover)")
                 else:
-                    print("  [AUTO] läuft bereits")
-            elif arg == "off":
-                if auto_stop is not None:
-                    auto_stop.set()
-                    auto_stop = None
-                    print("  [AUTO] Poller AUS")
+                    print(f"  → {len(futures)} Handover gestartet (≤{max_agents} parallel), warte ...")
+                    done_set, _ = wait(futures)
+                    ok = sum(1 for f in done_set if f.result() is True)
+                    print(f"  fertig: {ok}/{len(futures)} sauber hochgeladen")
+            elif name == "auto":
+                parts = payload.split()
+                arg = parts[1].lower() if len(parts) > 1 else ""
+                if arg == "on":
+                    if auto_stop is None:
+                        auto_stop = threading.Event()
+                        threading.Thread(target=_auto_loop, args=(auto_stop,), daemon=True).start()
+                        print(f"  [AUTO] Poller AN — zieht Handover alle 5s, ≤{max_agents} parallel")
+                    else:
+                        print("  [AUTO] läuft bereits")
+                elif arg == "off":
+                    if auto_stop is not None:
+                        auto_stop.set()
+                        auto_stop = None
+                        print("  [AUTO] Poller AUS")
+                    else:
+                        print("  [AUTO] war nicht aktiv")
                 else:
-                    print("  [AUTO] war nicht aktiv")
-            else:
-                print(f"  [AUTO] {'AN' if auto_stop else 'AUS'}  |  /auto on / /auto off")
-        else:
-            try:
-                res = srv.chat(line)
-                out = res.get("output", "")
-                if out:
-                    print(out, end="" if out.endswith("\n") else "\n")
-            except urllib.error.URLError as e:
-                print(f"  ✗ /chat fehlgeschlagen: {e}")
+                    print(f"  [AUTO] {'AN' if auto_stop else 'AUS'}  |  /auto on / /auto off")
+            continue
+        # kind in ("server", "turn") → an den Orchestrator (Server-Befehl ohne / bzw. Turn).
+        try:
+            res = srv.chat(payload)
+            out = res.get("output", "")
+            if out:
+                print(out, end="" if out.endswith("\n") else "\n")
+        except urllib.error.URLError as e:
+            print(f"  ✗ /chat fehlgeschlagen: {e}")
 
     if auto_stop is not None:
         auto_stop.set()
