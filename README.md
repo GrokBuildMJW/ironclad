@@ -150,6 +150,15 @@ Honest near-term plan (the rebuild's placeholders are now wired — see
 - Single-command compose for the whole reference stack (model + memory + orchestrator).
 - First tagged release once the APIs settle.
 
+**Sovereign AI / local deployments.** Ironclad is **model-agnostic** and **fully
+self-hostable** — it talks to any OpenAI-compatible endpoint, so it already runs
+against locally-served open models (e.g. **Falcon**, **Jais**, **K2 Think** via vLLM)
+with no cloud dependency and data kept on your own infrastructure. On the roadmap:
+verified config recipes for those models, retrieval/**RAG over local datasets** through
+the memory hook, and on-prem **agent templates for enterprise/government** use cases.
+These are integration directions the architecture already supports, not shipped
+features yet.
+
 Issues and discussions are welcome — this is an early, openly-developed project.
 
 ## License
