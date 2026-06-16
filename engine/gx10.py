@@ -532,7 +532,7 @@ def _toolbar():
 
 # ─── Spinner ─────────────────────────────────────────────────
 class Spinner:
-    def __init__(self, label: str = "Qwen denkt"):
+    def __init__(self, label: str = "Qwen thinking"):
         self._label = label
 
     def start(self):
@@ -1965,20 +1965,20 @@ class GX10:
         dt   = time.time() - turn["t0"]
         kind = outcome.get("kind", "done")
         marks = {
-            "done":  ("✓ FERTIG",        C.GREEN),
-            "abort": ("⚠ ABGEBROCHEN",   C.YELLOW),
-            "error": ("✗ FEHLER",        C.RED),
+            "done":  ("✓ DONE",          C.GREEN),
+            "abort": ("⚠ CANCELLED",     C.YELLOW),
+            "error": ("✗ ERROR",         C.RED),
             "max":   (f"⏱ MAX-ITER ({MAX_ITERATIONS})", C.YELLOW),
-            "crash": ("✗ FEHLER (intern)", C.RED),
+            "crash": ("✗ ERROR (internal)", C.RED),
         }
         label, color = marks.get(kind, marks["done"])
         detail = outcome.get("detail") or ""
         if detail:
             detail = " · " + detail.replace("\n", " ")[:80]
-        _ui_print("")   # Abstand als eigene Zeile
+        _ui_print("")   # spacing as its own line
         _ui_print(col(
-            f"  ======== {label} · bereit für Eingabe · "
-            f"{turn['gens']} Gen · {dt:.0f}s · {turn['completion']} tok{detail} ========",
+            f"  ======== {label} · ready · "
+            f"{turn['gens']} gen · {dt:.0f}s · {turn['completion']} tok{detail} ========",
             color))
 
     # ── Agent Loop ────────────────────────────────────────────
@@ -2007,7 +2007,7 @@ class GX10:
             self._trim_context()
 
             think = self._think_for(iteration)
-            label = "Qwen plant (Thinking)" if think else "Qwen führt aus"
+            label = "Qwen (planning)" if think else "Qwen (running)"
             _ui_print(col(f"  [{label}]", C.GRAY))
 
             spinner = Spinner(label)
@@ -2623,7 +2623,7 @@ def _build_app() -> Application:
         text = input_buf.text.strip()
         input_buf.reset()
         if text:
-            _ui_print(col(f"\n[Du] > {text}", C.BOLD))
+            _ui_print(col(f"\n[You] > {text}", C.BOLD))
         _INPUT_QUEUE.put(text)
 
     @kb.add("c-c")
@@ -2647,7 +2647,7 @@ def _build_app() -> Application:
             Window(
                 content=BufferControl(buffer=input_buf, focusable=True),
                 height=1,
-                get_line_prefix=lambda i, wrap_count: "│ [Du] > ",
+                get_line_prefix=lambda i, wrap_count: "│ [You] > ",
             ),
             Window(height=1, char="─"),
             Window(
@@ -3245,7 +3245,7 @@ def main():
         print(col(HELP, C.YELLOW))
         while True:
             try:
-                user_input = input("\n[Du] > ").strip()
+                user_input = input("\n[You] > ").strip()
             except KeyboardInterrupt:
                 print("  (Strg+C — tippe 'exit' zum Beenden)")
                 continue

@@ -40,13 +40,13 @@ from typing import Any, Dict, List, Optional
 
 from commands import HELP_TEXT, classify
 
-# Default ist localhost (secret-frei); die echte Server-Adresse (z. B. der Spark im
-# LAN) kommt aus GX10_SERVER_URL / --server — privat über conf/, nie hartkodiert hier.
+# Default is localhost (secret-free); the real server address (e.g. the box on the
+# LAN) comes from GX10_SERVER_URL / --server — private via conf/, never hard-coded here.
 DEFAULT_SERVER = os.environ.get("GX10_SERVER_URL", "http://localhost:8100")
 CLAUDE_BIN = os.environ.get("GX10_CLAUDE_BIN", "claude")
 DEFAULT_EFFORT = os.environ.get("GX10_CLAUDE_EFFORT", "high")
-#: Max gleichzeitig laufende lokale code-agents (claude --print). Jeder ist schwer
-#: (Opus/Sonnet) → konservativer Default; per GX10_MAX_AGENTS übersteuerbar.
+#: Max local code-agents (claude --print) running at once. Each is heavy
+#: (Opus/Sonnet) → conservative default; override with GX10_MAX_AGENTS.
 DEFAULT_MAX_AGENTS = int(os.environ.get("GX10_MAX_AGENTS", "3"))
 _MODEL_BY_AGENT = {"OPUS": "claude-opus-4-8", "SONNET": "claude-sonnet-4-6"}
 
@@ -135,25 +135,25 @@ def _run_handover(item: Dict[str, Any], codedir: Path, log=print) -> Optional[st
     if str(model).startswith("kimi"):
         model = _MODEL_BY_AGENT.get(agent, "claude-opus-4-8")
     effort = item.get("effort") or DEFAULT_EFFORT
-    prompt = (f"Lies und bearbeite autonom den Handover {ho_name} in "
-              f"summaries/handovers/. Folge den Anweisungen in .claude/CLAUDE.md.")
+    prompt = (f"Autonomously read and work the handover {ho_name} in "
+              f"summaries/handovers/. Follow the instructions in .claude/CLAUDE.md.")
 
     argv = [CLAUDE_BIN, "--model", str(model), "--effort", str(effort), "--print", prompt]
-    log(f"  → claude lokal: {tid} ({agent}, {model}, effort={effort})  cwd={codedir}")
+    log(f"  → claude (local): {tid} ({agent}, {model}, effort={effort})  cwd={codedir}")
     env = {**os.environ, "PYTHONIOENCODING": "utf-8"}
     try:
         proc = subprocess.run(argv, cwd=str(codedir), env=env,
                               stdin=subprocess.DEVNULL, text=True)
     except FileNotFoundError:
-        log(f"  ✗ claude-Binary '{CLAUDE_BIN}' nicht gefunden "
-            f"(GX10_CLAUDE_BIN setzen) — Handover {tid} übersprungen")
+        log(f"  ✗ claude binary '{CLAUDE_BIN}' not found "
+            f"(set GX10_CLAUDE_BIN) — handover {tid} skipped")
         return None
     rc = proc.returncode
 
     fb_path = codedir / "summaries" / "feedback" / f"{tid}_{agent}-feedback.md"
     if fb_path.exists():
         return fb_path.read_text(encoding="utf-8")
-    log(f"  ⚠ claude beendet (exit {rc}) ohne Feedback-Datei {fb_path.name}")
+    log(f"  ⚠ claude exited (exit {rc}) without a feedback file {fb_path.name}")
     return None
 
 
@@ -167,13 +167,13 @@ def _process_one(srv: Server, codedir: Path, item: Dict[str, Any], claimed: set,
         fb = _run_handover(item, codedir, log=log)
         if fb:
             res = srv.feedback(tid, agent, fb)
-            log(f"  ✓ Feedback hochgeladen: {tid} → {res.get('feedback_file')}")
+            log(f"  ✓ feedback uploaded: {tid} → {res.get('feedback_file')}")
             return True
-        log(f"  ⚠ {tid}: kein Feedback erzeugt — wird beim nächsten Poll erneut versucht")
+        log(f"  ⚠ {tid}: no feedback produced — will retry on the next poll")
     except urllib.error.URLError as e:
-        log(f"  ✗ {tid}: Upload/Netz fehlgeschlagen: {e}")
+        log(f"  ✗ {tid}: upload/network failed: {e}")
     except Exception as e:  # noqa: BLE001
-        log(f"  ✗ {tid}: code-agent fehlgeschlagen: {e!r}")
+        log(f"  ✗ {tid}: code-agent failed: {e!r}")
     claimed.discard(tid)
     return False
 
@@ -186,7 +186,7 @@ def dispatch_pending(srv: Server, codedir: Path, pool: ThreadPoolExecutor,
     try:
         pending = srv.pending()
     except urllib.error.URLError as e:
-        log(f"  ✗ /pending nicht erreichbar: {e}")
+        log(f"  ✗ /pending unreachable: {e}")
         return []
     futures: List[Future] = []
     for item in pending:
@@ -203,7 +203,7 @@ def dispatch_pending(srv: Server, codedir: Path, pool: ThreadPoolExecutor,
 # --------------------------------------------------------------------------- #
 def _print_tasks(tasks: List[Dict[str, Any]]) -> None:
     if not tasks:
-        print("  (keine Tasks)")
+        print("  (no tasks)")
         return
     for t in tasks:
         print(f"  {t.get('status','?'):11} {t.get('id','?'):10} "
@@ -213,11 +213,11 @@ def _print_tasks(tasks: List[Dict[str, Any]]) -> None:
 def repl(srv: Server, codedir: Path, max_agents: int = DEFAULT_MAX_AGENTS) -> None:
     try:
         h = srv.health()
-        print(f"  verbunden: {srv.base}  |  Modell {h.get('model')}  |  "
+        print(f"  connected: {srv.base}  |  model {h.get('model')}  |  "
               f"vLLM {h.get('base_url')}")
     except urllib.error.URLError as e:
-        print(f"  ⚠ Server {srv.base} nicht erreichbar: {e}")
-    print(f"  code-root (lokal): {codedir}  |  max parallele code-agents: {max_agents}")
+        print(f"  ⚠ server {srv.base} unreachable: {e}")
+    print(f"  code root (local): {codedir}  |  max parallel code-agents: {max_agents}")
     print(HELP_TEXT)
 
     claimed: set = set()
@@ -259,7 +259,7 @@ def repl(srv: Server, codedir: Path, max_agents: int = DEFAULT_MAX_AGENTS) -> No
                 try:
                     p = srv.pending()
                     if not p:
-                        print("  (keine offenen Handover)")
+                        print("  (no open handovers)")
                     for it in p:
                         print(f"  {it.get('id'):10} {it.get('agent','?'):7} "
                               f"{it.get('type','?'):14} {it.get('title','')}")
@@ -268,12 +268,12 @@ def repl(srv: Server, codedir: Path, max_agents: int = DEFAULT_MAX_AGENTS) -> No
             elif name == "work":
                 futures = dispatch_pending(srv, codedir, pool, claimed)
                 if not futures:
-                    print("  (keine neuen Handover)")
+                    print("  (no new handovers)")
                 else:
-                    print(f"  → {len(futures)} Handover gestartet (≤{max_agents} parallel), warte ...")
+                    print(f"  → {len(futures)} handover(s) started (≤{max_agents} parallel), waiting ...")
                     done_set, _ = wait(futures)
                     ok = sum(1 for f in done_set if f.result() is True)
-                    print(f"  fertig: {ok}/{len(futures)} sauber hochgeladen")
+                    print(f"  done: {ok}/{len(futures)} cleanly uploaded")
             elif name == "auto":
                 parts = payload.split()
                 arg = parts[1].lower() if len(parts) > 1 else ""
@@ -281,16 +281,16 @@ def repl(srv: Server, codedir: Path, max_agents: int = DEFAULT_MAX_AGENTS) -> No
                     if auto_stop is None:
                         auto_stop = threading.Event()
                         threading.Thread(target=_auto_loop, args=(auto_stop,), daemon=True).start()
-                        print(f"  [AUTO] Poller AN — zieht Handover alle 5s, ≤{max_agents} parallel")
+                        print(f"  [AUTO] poller ON — pulls handovers every 5s, ≤{max_agents} parallel")
                     else:
-                        print("  [AUTO] läuft bereits")
+                        print("  [AUTO] already running")
                 elif arg == "off":
                     if auto_stop is not None:
                         auto_stop.set()
                         auto_stop = None
-                        print("  [AUTO] Poller AUS")
+                        print("  [AUTO] poller OFF")
                     else:
-                        print("  [AUTO] war nicht aktiv")
+                        print("  [AUTO] was not active")
                 else:
                     print(f"  [AUTO] {'AN' if auto_stop else 'AUS'}  |  /auto on / /auto off")
             continue
@@ -301,7 +301,7 @@ def repl(srv: Server, codedir: Path, max_agents: int = DEFAULT_MAX_AGENTS) -> No
             if out:
                 print(out, end="" if out.endswith("\n") else "\n")
         except urllib.error.URLError as e:
-            print(f"  ✗ /chat fehlgeschlagen: {e}")
+            print(f"  ✗ /chat failed: {e}")
 
     if auto_stop is not None:
         auto_stop.set()
@@ -311,11 +311,11 @@ def repl(srv: Server, codedir: Path, max_agents: int = DEFAULT_MAX_AGENTS) -> No
 def main() -> None:
     p = argparse.ArgumentParser(description="Ironclad thin orchestrator client")
     p.add_argument("--server", default=DEFAULT_SERVER,
-                   help=f"Orchestrator-Server-URL (Default {DEFAULT_SERVER})")
+                   help=f"Orchestrator server URL (default {DEFAULT_SERVER})")
     p.add_argument("--codedir", default=".",
-                   help="Lokales Code-Root (cwd für claude --print; enthält .claude/CLAUDE.md)")
+                   help="Local code root (cwd for claude --print; contains .claude/CLAUDE.md)")
     p.add_argument("--max-agents", type=int, default=DEFAULT_MAX_AGENTS,
-                   help=f"Max parallele lokale code-agents (Default {DEFAULT_MAX_AGENTS})")
+                   help=f"Max parallel local code-agents (default {DEFAULT_MAX_AGENTS})")
     args = p.parse_args()
     if os.name == "nt":
         os.system("")

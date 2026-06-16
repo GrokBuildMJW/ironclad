@@ -31,27 +31,27 @@ SERVER_COMMANDS = {
 }
 
 HELP_TEXT = """\
-Befehle (mit / prefix) — freier Text ohne / geht als Turn an den Orchestrator:
+Commands (with a / prefix) — plain text without / is sent to the orchestrator as a turn:
 
-  lokal (Client):
-    /help              diese Hilfe
-    /tasks             TaskStore-Übersicht
-    /pending           offene Handover für lokale code-agents
-    /work              offene Handover EINMAL lokal abarbeiten (parallel)
-    /auto on|off       Hintergrund-Poller für Handover
-    /health            Server-Status
-    exit               beenden
+  local (client):
+    /help              this help
+    /tasks             TaskStore overview
+    /pending           staged handovers for local code-agents
+    /work              run all open handovers ONCE locally (in parallel)
+    /auto on|off       background poller for handovers
+    /health            server status
+    exit               quit
 
-  Orchestrator (Server):
-    /status            Status (Modell, Perf, Tasks, Tools)
-    /config            aktive Konfiguration
-    /clear             Kontext des Orchestrators leeren
-    /read <pfad>       Datei im Server-Workdir lesen
-    /ls [pfad]         Verzeichnis im Server-Workdir
-    /watcher on|off    Auto-Advance (Reconciler)
-    /autopilot on|off  Autopilot
+  orchestrator (server):
+    /status            status (model, perf, tasks, tools)
+    /config            active configuration
+    /clear             clear the orchestrator's context
+    /read <path>       read a file in the server workdir
+    /ls [path]         list a directory in the server workdir
+    /watcher on|off    auto-advance (reconciler)
+    /autopilot on|off  autopilot
     /autoplan on|off [N]
-    (weitere: /write, /cat, /log-terminal)"""
+    (more: /write, /cat, /log-terminal)"""
 
 
 def classify(line: str) -> Tuple[str, str, str]:

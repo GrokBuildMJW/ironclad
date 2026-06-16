@@ -61,17 +61,27 @@ toolbar shows live status (model · throughput · tasks · watcher). Illustrativ
 transcript from a real session:
 
 ```text
-[Du] > was ist 17 mal 23?
-  [Qwen plant (Thinking)]
-  17 mal 23 ergibt 391.
+[You] > what is 17 times 23?
+  [Qwen (planning)]
+  17 times 23 is 391.
   [perf] TTFT 0.5s · 183 tok/2.9s = 64 tok/s · prompt 1739
-  ======== ✓ FERTIG · bereit für Eingabe · 1 Gen · 3s · 183 tok ========
+  ======== ✓ DONE · ready · 1 gen · 3s · 183 tok ========
 ──────────────────────────────────────────────────────────────────────
-│ [Du] >
+│ [You] >
 ──────────────────────────────────────────────────────────────────────
  ██ Ironclad  powered by MJWC-AI-LAB
- ██  Orchestrator-Client · streaming   |   /help · exit
+ ██  Orchestrator client · streaming   |   /help · exit · PageUp=history
      qwen3.6-35b · 64 tok/s · tasks 0P/0IP/0D · http://<server>:8100
+```
+
+**Reply language is a setting** (`GX10_LANGUAGE` — `en` default, `ar`, `fr`, …). The
+model answers in the configured language regardless of the input language. Real output
+with `GX10_LANGUAGE=ar`, same question:
+
+```text
+[You] > what is 17 times 23?
+  حاصل ضرب 17 في 23 هو 391.
+  ======== ✓ DONE · ready · 1 gen · 2s ========
 ```
 
 `/command` routing (local + forwarded), scrollback (PageUp/PageDown) and compressed

@@ -48,7 +48,7 @@ try:
 except ImportError:
     HAS_PT = False
 
-import gx10  # UI primitives (openai-frei importierbar)
+import gx10  # UI primitives (importable without openai)
 import client
 from client import Server
 from commands import HELP_TEXT, classify
@@ -83,11 +83,11 @@ def _toolbar():
     w_dot = "●" if _STATUS["watcher"] else "○"
     a_dot = "●" if _STATUS["autopilot"] else "○"
     if st["thinking"]:
-        mid = f"  {frame}  {st['label']}...   Strg+C = abbrechen   "
+        mid = f"  {frame}  {st['label']}...   Ctrl+C = cancel   "
     elif _SCROLL["rows"] > 0:
-        mid = f"  ↑ Verlauf (+{_SCROLL['rows']})  ·  PageUp/PageDown  ·  PageDown→Ende   "
+        mid = f"  ↑ history (+{_SCROLL['rows']})  ·  PageUp/PageDown  ·  PageDown→bottom   "
     else:
-        mid = "  Orchestrator-Client  ·  streaming   |   /help · exit · PageUp=Verlauf   "
+        mid = "  Orchestrator client  ·  streaming   |   /help · exit · PageUp=history   "
     line3 = (f"     {_STATUS['model']}  ·  {_STATUS['perf'] or '—'}  ·  "
              f"tasks {_STATUS['pending']}P/{_STATUS['in_progress']}IP/{_STATUS['done']}D"
              f"  ·  {_STATUS['server']}")
@@ -119,7 +119,7 @@ def _poller(srv: Server, stop: threading.Event) -> None:
             _STATUS.update(pending=counts.get("pending", 0),
                            in_progress=counts.get("in_progress", 0),
                            done=counts.get("done", 0))
-        except Exception:  # noqa: BLE001 — Netz weg → rot, weiter pollen
+        except Exception:  # noqa: BLE001 — network gone -> red, keep polling
             _STATUS["connected"] = False
         if gx10._UI_APP is not None:
             gx10._UI_APP.invalidate()
@@ -135,17 +135,17 @@ def _worker(srv: Server, codedir: Path, q: "Queue[str]", app: "Application",
     def _stream(payload: str) -> None:
         gx10._status["thinking"] = True
         gx10._status["label"] = "Qwen"
-        # Zeilenweise puffern, damit wir die [perf]-Zeile herausfiltern können: sie
-        # gehört NUR in die Toolbar (unten), nicht in den Chat-Verlauf.
+        # Buffer line by line so we can filter out the [perf] line: it belongs ONLY
+        # in the toolbar (bottom), not in the chat history.
         partial = {"buf": ""}
 
         def _emit_line(line: str) -> None:
             clean = gx10._ANSI_LEN_RE.sub("", line)
             idx = clean.find("[perf]")
             if idx != -1:
-                _STATUS["perf"] = clean[idx:].strip()   # nur Toolbar
+                _STATUS["perf"] = clean[idx:].strip()   # toolbar only
                 return
-            gx10._ui_print(line)                          # mit \n in den Pane
+            gx10._ui_print(line)                          # with newline into the pane
 
         def _on_text(t: str) -> None:
             partial["buf"] += t
@@ -156,7 +156,7 @@ def _worker(srv: Server, codedir: Path, q: "Queue[str]", app: "Application",
         try:
             srv.chat_stream(payload, _on_text)
         except Exception as e:  # noqa: BLE001
-            gx10._ui_print(gx10.col(f"  ✗ /chat/stream fehlgeschlagen: {e!r}", gx10.C.RED))
+            gx10._ui_print(gx10.col(f"  ✗ /chat/stream failed: {e!r}", gx10.C.RED))
         finally:
             if partial["buf"]:
                 _emit_line(partial["buf"])
@@ -185,7 +185,7 @@ def _worker(srv: Server, codedir: Path, q: "Queue[str]", app: "Application",
                 try:
                     ts = srv.tasks()
                     if not ts:
-                        log(gx10.col("  (keine Tasks)", gx10.C.GRAY))
+                        log(gx10.col("  (no tasks)", gx10.C.GRAY))
                     for t in ts:
                         log(f"  {t.get('status','?'):11} {t.get('id','?'):10} "
                             f"{t.get('type','?'):14} {t.get('title','')}")
@@ -195,7 +195,7 @@ def _worker(srv: Server, codedir: Path, q: "Queue[str]", app: "Application",
                 try:
                     ps = srv.pending()
                     if not ps:
-                        log(gx10.col("  (keine offenen Handover)", gx10.C.GRAY))
+                        log(gx10.col("  (no open handovers)", gx10.C.GRAY))
                     for it in ps:
                         log(f"  {it.get('id'):10} {it.get('agent','?'):7} "
                             f"{it.get('type','?'):14} {it.get('title','')}")
@@ -203,8 +203,8 @@ def _worker(srv: Server, codedir: Path, q: "Queue[str]", app: "Application",
                     log(gx10.col(f"  ✗ {e}", gx10.C.RED))
             elif name == "work":
                 futs = client.dispatch_pending(srv, codedir, pool, claimed, log=log)
-                log(gx10.col(f"  → {len(futs)} Handover gestartet (parallel)", gx10.C.CYAN)
-                    if futs else gx10.col("  (keine neuen Handover)", gx10.C.GRAY))
+                log(gx10.col(f"  → {len(futs)} handover(s) started (parallel)", gx10.C.CYAN)
+                    if futs else gx10.col("  (no new handovers)", gx10.C.GRAY))
             elif name == "auto":
                 parts = payload.split()
                 arg = parts[1].lower() if len(parts) > 1 else ""
@@ -216,10 +216,10 @@ def _worker(srv: Server, codedir: Path, q: "Queue[str]", app: "Application",
                         while not stop.wait(5.0):
                             client.dispatch_pending(srv, codedir, pool, claimed, log=log)
                     threading.Thread(target=_loop, daemon=True).start()
-                    log(gx10.col("  [AUTO] Poller AN — zieht Handover laufend, parallel", gx10.C.GREEN))
+                    log(gx10.col("  [AUTO] poller ON — pulls handovers continuously, in parallel", gx10.C.GREEN))
                 elif arg == "off" and auto.get("stop") is not None:
                     auto["stop"].set(); auto["stop"] = None
-                    log(gx10.col("  [AUTO] Poller AUS", gx10.C.YELLOW))
+                    log(gx10.col("  [AUTO] poller OFF", gx10.C.YELLOW))
                 else:
                     log(gx10.col(f"  [AUTO] {'AN' if auto.get('stop') else 'AUS'}  |  /auto on / /auto off",
                                  gx10.C.GRAY))
@@ -290,24 +290,24 @@ def _build_app(q: "Queue[str]", srv: Server) -> "Application":
         try:
             srv.cancel()
         except Exception as e:  # noqa: BLE001
-            gx10._ui_print(gx10.col(f"  ✗ Abbruch fehlgeschlagen: {e!r}", gx10.C.RED))
+            gx10._ui_print(gx10.col(f"  ✗ cancel failed: {e!r}", gx10.C.RED))
 
     @kb.add("enter")
     def _enter(event):
         raw = input_buf.text.strip()
         input_buf.reset()
-        _SCROLL["rows"] = 0                       # neue Eingabe → zurück ans Ende
+        _SCROLL["rows"] = 0                       # new input -> jump back to the bottom
         if not raw:
             q.put(""); return
-        expanded = _expand_pastes(raw)            # Platzhalter → voller Text
-        gx10._ui_print(gx10.col(f"\n[Du] > {raw}", gx10.C.BOLD))  # kompakt anzeigen
+        expanded = _expand_pastes(raw)            # placeholders -> full text
+        gx10._ui_print(gx10.col(f"\n[Du] > {raw}", gx10.C.BOLD))  # show compact
         _PASTES.clear()
         q.put(expanded)
 
     @kb.add(Keys.BracketedPaste)
     def _paste(event):
         data = event.data
-        if "\n" in data.strip():                  # mehrzeilig → komprimiert anzeigen
+        if "\n" in data.strip():                  # multi-line -> show compressed
             n = data.count("\n") + 1
             _PASTES.append(data)
             event.current_buffer.insert_text(f"[Pasted #{len(_PASTES)} +{n} lines]")
@@ -325,8 +325,8 @@ def _build_app(q: "Queue[str]", srv: Server) -> "Application":
     @kb.add("c-c")
     def _ctrl_c(event):
         if gx10._status["thinking"]:
-            gx10._ui_print(gx10.col("  ⨯ Abbruch angefordert …", gx10.C.YELLOW))
-            # nicht-blockierend: den laufenden Server-Turn abbrechen
+            gx10._ui_print(gx10.col("  ⨯ cancel requested …", gx10.C.YELLOW))
+            # non-blocking: cancel the running server turn
             threading.Thread(target=_cancel_fn, daemon=True).start()
         # sonst: ignorieren (exit zum Beenden)
 
@@ -353,13 +353,13 @@ def run_tui(srv: Server, codedir: Path, max_agents: int) -> None:
 
     q: "Queue[str]" = Queue()
     app = _build_app(q, srv)
-    gx10._UI_APP = app  # _ui_print routet ab jetzt in den Output-Pane
+    gx10._UI_APP = app  # _ui_print now routes into the output pane
 
-    gx10._ui_print(gx10.col("  Ironclad Orchestrator — Vollbild-Client", gx10.C.GREEN))
+    gx10._ui_print(gx10.col("  Ironclad Orchestrator — full-screen client", gx10.C.GREEN))
     gx10._ui_print(gx10.col(f"  Server : {srv.base}", gx10.C.GRAY))
     gx10._ui_print(gx10.col(f"  Code   : {codedir}", gx10.C.GRAY))
-    gx10._ui_print(gx10.col("  Tippe frei für einen Turn · /help für Befehle · exit", gx10.C.GRAY))
-    gx10._ui_print(gx10.col("  PageUp/PageDown = im Verlauf scrollen · mehrzeiliges Einfügen wird komprimiert", gx10.C.GRAY))
+    gx10._ui_print(gx10.col("  Type freely for a turn · /help for commands · exit", gx10.C.GRAY))
+    gx10._ui_print(gx10.col("  PageUp/PageDown = scroll history · multi-line paste is compressed", gx10.C.GRAY))
 
     stop = threading.Event()
     pool = ThreadPoolExecutor(max_workers=max_agents, thread_name_prefix="codeagent")
@@ -390,8 +390,8 @@ def main() -> None:
     srv = Server(args.server)
     codedir = Path(args.codedir).expanduser().resolve()
     if not HAS_PT:
-        print("  [WARN] prompt_toolkit fehlt — pip install prompt_toolkit für das TUI.")
-        print("         Falle auf die einfache Zeilen-REPL zurück.\n")
+        print("  [WARN] prompt_toolkit missing — pip install prompt_toolkit for the TUI.")
+        print("         Falling back to the plain line REPL.\n")
         client.repl(srv, codedir, max_agents=args.max_agents)
         return
     run_tui(srv, codedir, args.max_agents)
