@@ -44,9 +44,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
-# Die Engine wird als Standalone-Script-Verzeichnis geführt (gx10.py legt core/ auf
-# sys.path, nicht als Paket). Wir spiegeln das: dieses Verzeichnis (core/engine) auf
-# den Pfad, dann gx10 absolut importieren — funktioniert als Script UND als Modul.
+# The engine is run as a standalone script directory (gx10.py puts core/ on
+# sys.path, not as a package). We mirror that: put this dir (core/engine) on the
+# path, then import gx10 absolutely — works both as a script AND as a module.
 _HERE = Path(__file__).resolve().parent
 if str(_HERE) not in sys.path:
     sys.path.insert(0, str(_HERE))
@@ -125,7 +125,7 @@ def bootstrap(config_path: Optional[str] = None) -> Tuple[gx10.GX10, Dict[str, A
     gx10._EFFECTIVE_CFG = cfg
     gx10._CFG_SOURCE = cfg_path
 
-    # Prompt vor dem chdir absolut auflösen (relativ → SCRIPT_DIR), wie in main().
+    # Resolve the prompt absolutely before chdir (relative → SCRIPT_DIR), like main().
     prompt_cfg = cfg["paths"]["system_prompt"]
     prompt_abs = ""
     if prompt_cfg:
@@ -154,8 +154,8 @@ def bootstrap(config_path: Optional[str] = None) -> Tuple[gx10.GX10, Dict[str, A
         except Exception:
             pass
 
-    # Server-Politik: NIE selbst claude starten (das ist Client-Sache); aber den
-    # Feedback-Reconciler aktiv halten, damit gepostetes Feedback Tasks vorrückt.
+    # Server policy: never launch claude itself (that's the client's job), but keep
+    # the feedback reconciler running so posted feedback advances tasks.
     gx10.AUTOPILOT_ENABLED = False
     gx10._WATCHER_ENABLED = True
     return agent, cfg, cfg_path, workdir
@@ -176,7 +176,7 @@ def _queue_consumer(agent: gx10.GX10, stop: threading.Event) -> None:
         if not item:
             continue
         if item.startswith(gx10._LAUNCH_CMD):
-            # Launch ist Client-Sache — der Server startet keine code-agents.
+            # Launching is the client's job — the server starts no code-agents.
             continue
         if item.startswith(gx10._ADVANCE_CMD):
             parts = item.split("\x00")  # ['', 'advance', tid, agent]
@@ -190,7 +190,7 @@ def _queue_consumer(agent: gx10.GX10, stop: threading.Event) -> None:
                 print(f"[ADVANCE] {tid} ({agent_adv}): {res.splitlines()[0] if res else res}",
                       flush=True)
                 # Autoplan (entkoppelt von Autopilot — Launch ist Client-Sache): bei
-                # leerer Pipeline den nächsten Plan-Turn einreihen. Greift nur, wenn
+                # empty pipeline, enqueue the next planning turn. Only fires when
                 # `/autoplan on` gesetzt ist und ein Backlog konfiguriert ist.
                 if res and res.startswith("OK"):
                     gx10._autoplan_tick(tid, lambda p: gx10._INPUT_QUEUE.put(p))
@@ -248,7 +248,7 @@ def _write_feedback(task_id: str, agent: str, content: str) -> str:
 class _Handler(BaseHTTPRequestHandler):
     server_version = "Ironclad-Orchestrator/0"
 
-    # Der GX10-Agent + Config + Reasoning-Worker werden vom Server injiziert.
+    # The GX10 agent + config + reasoning workers are injected by the server.
     agent: gx10.GX10
     cfg: Dict[str, Any]
     workers: ReasoningWorkers
@@ -331,15 +331,15 @@ class _Handler(BaseHTTPRequestHandler):
                         self.wfile.write(text.encode("utf-8", "replace"))
                         self.wfile.flush()
                     except (BrokenPipeError, ConnectionResetError, OSError):
-                        pass  # Client weg → Turn läuft serverseitig zu Ende
+                        pass  # client gone → the turn finishes server-side
                 with _Streamed(_write):
                     with _AGENT_LOCK:
                         gx10._dispatch(self.agent, message)
             elif self.path == "/cancel":
                 # Bricht den gerade laufenden Turn ab: das Engine-_CANCEL_EVENT wird
-                # gesetzt; run() prüft es pro Iteration/Generation und beendet sauber.
-                # Kein Agent-Lock nötig — das Event ist thread-safe und der laufende
-                # Turn-Thread pollt es. Der nächste Turn löscht es beim Start.
+                # set; run() checks it per iteration/generation and stops cleanly.
+                # No agent lock needed — the event is thread-safe and the running
+                # turn thread polls it. The next turn clears it on start.
                 gx10._CANCEL_EVENT.set()
                 self._send(200, {"ok": True, "cancelled": True})
             elif self.path == "/feedback":
@@ -405,7 +405,7 @@ def serve(host: str = "0.0.0.0", port: int = 8100,
     httpd = ThreadingHTTPServer((host, port), _Handler)
 
     print(f"  Ironclad Orchestrator-Server", flush=True)
-    print(f"  Modell : {agent.model}  |  vLLM {cfg['connection']['base_url']}", flush=True)
+    print(f"  Model  : {agent.model}  |  vLLM {cfg['connection']['base_url']}", flush=True)
     print(f"  WORKDIR: {workdir}", flush=True)
     print(f"  Config : {cfg_path or '— (Code-Defaults)'}", flush=True)
     print(f"  Listen : http://{host}:{port}  "

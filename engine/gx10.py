@@ -1660,7 +1660,7 @@ class GX10:
 
     def _load_prompt(self, path_str: str):
         if not path_str:
-            _ui_print(col("[INFO] Ohne System-Prompt gestartet.", C.GRAY))
+            _ui_print(col("[INFO] started without a system prompt.", C.GRAY))
             return
         p = Path(path_str)
         if p.exists():
@@ -1668,7 +1668,7 @@ class GX10:
             self.messages.append({"role": "system", "content": content})
             _ui_print(col(f"[OK] Prompt: {p} ({len(content)} Zeichen)", C.GREEN))
         else:
-            _ui_print(col(f"[WARN] Nicht gefunden: {p}", C.YELLOW))
+            _ui_print(col(f"[WARN] not found: {p}", C.YELLOW))
 
     def save_session(self):
         try:
@@ -1676,9 +1676,9 @@ class GX10:
                 json.dumps({"messages": self.messages}, ensure_ascii=False, indent=2),
                 encoding="utf-8"
             )
-            _ui_print(col(f"[OK] Session gespeichert: {SESSION_FILE}", C.GRAY))
+            _ui_print(col(f"[OK] session saved: {SESSION_FILE}", C.GRAY))
         except Exception as e:
-            _ui_print(col(f"[WARN] Session nicht gespeichert: {e}", C.YELLOW))
+            _ui_print(col(f"[WARN] session not saved: {e}", C.YELLOW))
 
     @staticmethod
     def _sanitize_messages(msgs: List[Dict]) -> List[Dict]:
@@ -1735,7 +1735,7 @@ class GX10:
             self.messages = ([system] if system else []) + loaded
             return len(loaded)
         except Exception as e:
-            _ui_print(col(f"[WARN] Session nicht ladbar: {e}", C.YELLOW))
+            _ui_print(col(f"[WARN] session not loadable: {e}", C.YELLOW))
             return 0
 
     def _trim_context(self):
@@ -2104,7 +2104,7 @@ class GX10:
             "role":    "user",
             "content": f"DATEIINHALT {path}:\n```\n{result}\n```"
         })
-        return col(f"[OK] {path} in Kontext geladen", C.GREEN)
+        return col(f"[OK] {path} loaded into the context", C.GREEN)
 
     def manual_write(self, path: str) -> str:
         if not self.last_response:
@@ -2123,7 +2123,7 @@ class GX10:
         system = next((m for m in self.messages if m["role"] == "system"), None)
         self.messages      = [system] if system else []
         self.last_response = ""
-        return col("[OK] Kontext zurückgesetzt (System-Prompt bleibt).", C.YELLOW)
+        return col("[OK] context reset (the system prompt stays).", C.YELLOW)
 
     def status(self) -> str:
         chars     = sum(len(str(m.get("content") or "")) for m in self.messages)
@@ -2131,17 +2131,17 @@ class GX10:
         p         = self._perf
         avg_tps   = (p["completion"] / p["wall"]) if p["wall"] > 0 else 0.0
         return "\n".join([
-            col(f"  Modell       : {self.model}",                C.GRAY),
+            col(f"  Model        : {self.model}",                C.GRAY),
             col(f"  Streaming    : {'an' if self.stream else 'aus'}", C.GRAY),
-            col(f"  Plattform    : {self.platform}",              C.GRAY),
-            col(f"  Onboarding   : {'an' if self.onboarding else 'aus'}", C.GRAY),
-            col(f"  Autopilot    : {('an (max=' + str(AUTOPILOT_MAX_CONCURRENT) + (', stream' if AUTOPILOT_STREAM else '') + (', replan' if AUTOPILOT_AUTOPLAN else '') + ')') if AUTOPILOT_ENABLED else 'aus'}", C.GRAY),
+            col(f"  Platform     : {self.platform}",              C.GRAY),
+            col(f"  Onboarding   : {'on' if self.onboarding else 'off'}", C.GRAY),
+            col(f"  Autopilot    : {('on (max=' + str(AUTOPILOT_MAX_CONCURRENT) + (', stream' if AUTOPILOT_STREAM else '') + (', replan' if AUTOPILOT_AUTOPLAN else '') + ')') if AUTOPILOT_ENABLED else 'off'}", C.GRAY),
             col(f"  Thinking     : {self.thinking_mode}",         C.GRAY),
             col(f"  max_tokens   : {self.max_tokens}",            C.GRAY),
             col(f"  Nachrichten  : {len(self.messages)}",         C.GRAY),
             col(f"  Zeichen      : {chars}",                      C.GRAY),
             col(f"  Tool Results : {tool_msgs}",                  C.GRAY),
-            col(f"  Tools aktiv  : {len(_effective_tools())}",    C.GRAY),
+            col(f"  Tools active : {len(_effective_tools())}",    C.GRAY),
             col(f"  Perf         : {p['gens']} Gens · prompt {p['prompt']} · "
                 f"completion {p['completion']} tok · ⌀ {avg_tps:.0f} tok/s", C.GRAY),
             col(f"  Letzte Gen   : {p['last'] or '—'}",            C.GRAY),
@@ -2150,23 +2150,23 @@ class GX10:
 
 # ─── Hilfe ────────────────────────────────────────────────────
 HELP = """
-  Manuelle Befehle:
-    read <datei>     Datei in Kontext laden
-    write <pfad>     Letzte Antwort speichern
-    cat <pfad>       Datei anzeigen
-    ls [ordner]      Verzeichnis auflisten
-    clear            Kontext löschen (Prompt bleibt)
-    status           Kontext-Info (inkl. Streaming/Thinking/max_tokens)
-    config           Effektiv geladene CLI-Konfiguration + Quelle
-    reload           gx10.py neu laden (Session bleibt)
-    watcher on|off        Feedback-Watcher aktivieren / deaktivieren
-    autopilot on|off      Autopilot (Auto-Start von Claude) schalten
-    autoplan on [N]       Autonomes Planen (optional: max N Tasks, dann Stopp)
-    autoplan off          Autoplan stoppen + Zähler reset
-    log-terminal on|off   Live-Log-Fenster bei jedem Autopilot-Start öffnen
+  Manual commands:
+    read <file>      load a file into the context
+    write <path>     save the last reply
+    cat <path>       show a file
+    ls [dir]         list a directory
+    clear            clear the context (the prompt stays)
+    status           context info (incl. streaming/thinking/max_tokens)
+    config           the effectively-loaded CLI config + source
+    reload           reload gx10.py (the session stays)
+    watcher on|off        enable / disable the feedback watcher
+    autopilot on|off      toggle autopilot (auto-launch of Claude)
+    autoplan on [N]       autonomous planning (optional: max N tasks, then stop)
+    autoplan off          stop autoplan + reset the counter
+    log-terminal on|off   open a live-log window on every autopilot start
     help / exit
 
-  Alles andere → Agent Loop
+  Everything else → agent loop
 """
 
 # ─── `config`-Befehl: autoritative, effektiv geladene Konfiguration ──
@@ -2181,7 +2181,7 @@ def _render_config() -> str:
     key_env = conn.get("api_key_env", "GX10_API_KEY")
     key_state = "gesetzt" if os.environ.get(key_env) else "nicht gesetzt"
     return "\n".join([
-        col(f"  Quelle        : {_CFG_SOURCE if _CFG_SOURCE else '— (Code-Defaults)'}", C.GREEN),
+        col(f"  Quelle        : {_CFG_SOURCE if _CFG_SOURCE else '— (code defaults)'}", C.GREEN),
         col(f"  connection    : {conn['base_url']} · {conn['model']}", C.GRAY),
         col(f"  api-key       : aus Env {key_env} ({key_state})", C.GRAY),
         col(f"  platform      : {PLATFORM} (mode={pl['mode']})", C.GRAY),
@@ -2195,7 +2195,7 @@ def _render_config() -> str:
         col(f"  thinking_auto : {len(ta['planning_keywords'])} planning / {len(ta['routine_keywords'])} routine keywords", C.GRAY),
         col(f"  workspace     : {len(ws['dirs'])} dirs", C.GRAY),
         col(f"  ui            : max_lines={ui['max_lines']} · refresh={ui['refresh_interval']}s", C.GRAY),
-        col(f"  Precedence    : Code-Defaults < Datei/conf < Env < CLI", C.GRAY),
+        col(f"  Precedence    : code-defaults < file/conf < env < CLI", C.GRAY),
     ])
 
 
@@ -2224,14 +2224,14 @@ def _dispatch(agent: GX10, user_input: str):
         if arg == "on":
             _WATCHER_ENABLED = True
             if _EFFECTIVE_CFG: _EFFECTIVE_CFG["watcher"]["enabled"] = True
-            _ui_print(col("[RECONCILER] Auto-Advance AN — Feedback wird automatisch abgeschlossen", C.GREEN))
+            _ui_print(col("[RECONCILER] auto-advance ON — feedback is completed automatically", C.GREEN))
         elif arg == "off":
             _WATCHER_ENABLED = False
             if _EFFECTIVE_CFG: _EFFECTIVE_CFG["watcher"]["enabled"] = False
-            _ui_print(col("[RECONCILER] Auto-Advance AUS — Abschluss manuell auslösen", C.YELLOW))
+            _ui_print(col("[RECONCILER] auto-advance OFF — complete manually", C.YELLOW))
         else:
             state = col("AN", C.GREEN) if _WATCHER_ENABLED else col("AUS", C.YELLOW)
-            _ui_print(f"  Auto-Advance (Reconciler): {state}  |  watcher on / watcher off")
+            _ui_print(f"  auto-advance (reconciler): {state}  |  watcher on / watcher off")
     elif cmd.startswith("autopilot"):
         global AUTOPILOT_ENABLED
         arg = cmd.split()[-1] if len(cmd.split()) > 1 else ""
@@ -2246,10 +2246,10 @@ def _dispatch(agent: GX10, user_input: str):
         elif arg == "off":
             AUTOPILOT_ENABLED = False
             if _EFFECTIVE_CFG: _EFFECTIVE_CFG["autopilot"]["enabled"] = False
-            _ui_print(col("[AUTOPILOT] AUS — keine neuen Auto-Starts (laufende Sessions bleiben)", C.YELLOW))
+            _ui_print(col("[AUTOPILOT] OFF — no new auto-starts (running sessions remain)", C.YELLOW))
         else:
             state = col("AN", C.GREEN) if AUTOPILOT_ENABLED else col("AUS", C.YELLOW)
-            _ui_print(f"  Autopilot: {state}  |  autopilot on / autopilot off")
+            _ui_print(f"  autopilot: {state}  |  autopilot on / autopilot off")
     elif cmd.startswith("autoplan"):
         global AUTOPILOT_AUTOPLAN, AUTOPILOT_MAX_TASKS, _AUTOPLAN_DONE
         parts = cmd.split()
@@ -2262,7 +2262,7 @@ def _dispatch(agent: GX10, user_input: str):
                     AUTOPILOT_MAX_TASKS = int(n_arg)
                     if _EFFECTIVE_CFG: _EFFECTIVE_CFG["autopilot"]["autoplan_max_tasks"] = AUTOPILOT_MAX_TASKS
                 except ValueError:
-                    _ui_print(col(f"[AUTOPLAN] Ungültige Zahl: {n_arg!r}", C.RED))
+                    _ui_print(col(f"[AUTOPLAN] invalid number: {n_arg!r}", C.RED))
                     return  # type: ignore
             _AUTOPLAN_DONE     = 0   # Zähler immer auf null beim Aktivieren
             AUTOPILOT_AUTOPLAN = True
@@ -2285,7 +2285,7 @@ def _dispatch(agent: GX10, user_input: str):
             AUTOPILOT_AUTOPLAN = False
             _AUTOPLAN_DONE     = 0
             if _EFFECTIVE_CFG: _EFFECTIVE_CFG["autopilot"]["autoplan"] = False
-            _ui_print(col("[AUTOPLAN] AUS — Pipeline stoppt wenn Queue leer. Zähler reset.", C.YELLOW))
+            _ui_print(col("[AUTOPLAN] OFF — pipeline stops when the queue is empty. Counter reset.", C.YELLOW))
         else:
             state     = col("AN", C.GREEN) if AUTOPILOT_AUTOPLAN else col("AUS", C.YELLOW)
             limit_str = f"  max={AUTOPILOT_MAX_TASKS}" if AUTOPILOT_MAX_TASKS > 0 else "  unbegrenzt"
@@ -2297,7 +2297,7 @@ def _dispatch(agent: GX10, user_input: str):
         if arg == "on":
             AUTOPILOT_LOG_TERMINAL = True
             if _EFFECTIVE_CFG: _EFFECTIVE_CFG["autopilot"]["log_terminal"] = True
-            _ui_print(col("[LOG-TERMINAL] AN — nächster Autopilot-Start öffnet Live-Fenster (wt / PowerShell)", C.GREEN))
+            _ui_print(col("[LOG-TERMINAL] ON — the next autopilot start opens a live window (wt / PowerShell)", C.GREEN))
         elif arg == "off":
             AUTOPILOT_LOG_TERMINAL = False
             if _EFFECTIVE_CFG: _EFFECTIVE_CFG["autopilot"]["log_terminal"] = False
@@ -2345,7 +2345,7 @@ def _terminate_autopilot(task_id: str):
                 proc.kill()
         _ui_print(col(f"  [AUTO] Session zu {task_id} beendet (PID {proc.pid}) — Task ist done", C.GRAY))
     except Exception as e:
-        _ui_print(col(f"  [AUTO] Session zu {task_id} nicht beendbar: {e!r}", C.YELLOW))
+        _ui_print(col(f"  [AUTO] could not terminate the session for {task_id}: {e!r}", C.YELLOW))
 
 def _find_handover(task_id: str) -> Optional[Path]:
     d = Path("summaries/handovers")
@@ -2399,7 +2399,7 @@ def _do_launch(task_id: str, agent: str):
     ho = _find_handover(task_id)
     if not ho:
         _autopilot_release()
-        _ui_print(col(f"  [AUTO] Handover für {task_id} verschwunden — Launch verworfen", C.YELLOW))
+        _ui_print(col(f"  [AUTO] handover for {task_id} vanished — launch discarded", C.YELLOW))
         return
     model, effort = _parse_handover_meta(ho)
     effort = effort or AUTOPILOT_DEFAULT_EFFORT
@@ -2441,8 +2441,8 @@ def _do_launch(task_id: str, agent: str):
         _store().transition(task_id, "in_progress")
     except KeyError:
         pass
-    _ui_print(col(f"  → [AUTO] claude gestartet: "
-                  f"{task_id} ({agent}, {model}, effort={effort}) · PID {proc.pid} · Log {logfile}",
+    _ui_print(col(f"  → [AUTO] claude launched: "
+                  f"{task_id} ({agent}, {model}, effort={effort}) · PID {proc.pid} · log {logfile}",
                   C.MAGENTA))
 
     # Log-Terminal: neues Konsolenfenster mit Get-Content -Wait öffnen (nur Windows).
@@ -2471,9 +2471,9 @@ def _do_launch(task_id: str, agent: str):
                 )
                 _opened = True
             except Exception as _te:
-                _ui_print(col(f"  [AUTO] Log-Terminal nicht geöffnet: {_te!r}", C.YELLOW))
+                _ui_print(col(f"  [AUTO] log terminal not opened: {_te!r}", C.YELLOW))
         if _opened:
-            _ui_print(col(f"  [AUTO] Log-Terminal geöffnet für {task_id}", C.CYAN))
+            _ui_print(col(f"  [AUTO] log terminal opened for {task_id}", C.CYAN))
 
     def _wait():
         try:
@@ -2596,11 +2596,11 @@ def _reconciler_loop(stop_event: threading.Event, interval: float):
     launched: set = set()
 
     def enqueue(tid, agent, fname):
-        _ui_print(col(f"\n[AUTO] Feedback erkannt: {fname} → advance {tid} ({agent})", C.GREEN))
+        _ui_print(col(f"\n[AUTO] feedback detected: {fname} → advance {tid} ({agent})", C.GREEN))
         _INPUT_QUEUE.put(f"{_ADVANCE_CMD}{tid}\x00{agent}")
 
     def launch_enqueue(tid, agent):
-        _ui_print(col(f"\n[AUTO] Handover {tid} ({agent}) → starte Claude", C.GREEN))
+        _ui_print(col(f"\n[AUTO] handover {tid} ({agent}) → launching Claude", C.GREEN))
         _INPUT_QUEUE.put(f"{_LAUNCH_CMD}{tid}\x00{agent}")
 
     while not stop_event.wait(interval):
@@ -2610,7 +2610,7 @@ def _reconciler_loop(stop_event: threading.Event, interval: float):
             _reconcile_once(_store(), enqueue, seen_mtime, enqueued,
                             launch_enqueue, launched)
         except Exception as e:
-            _ui_print(col(f"[WARN] Reconciler-Tick fehlgeschlagen: {e}", C.YELLOW))
+            _ui_print(col(f"[WARN] reconciler tick failed: {e}", C.YELLOW))
 
 
 # ─── Application UI ───────────────────────────────────────────
@@ -2675,20 +2675,19 @@ def _autoplan_prompt(tid: str) -> Optional[str]:
     if not backlog:
         return None
     return (
-        f"[AUTOPLAN] Task {tid} abgeschlossen, Pipeline ist leer. "
-        f"Plane den nächsten Schritt: lies den aktiven Capability-Backlog {backlog} und "
-        f"nimm den OBERSTEN Eintrag (Rang #1 — ob 🟡 partial oder 🔴 not-started; partial "
-        f"heißt OFFEN, nicht überspringen). Übernimm den Handover-Seed (type, effort, "
-        f"assignee, Scope, anchors) und lege via stage_handover an — mit capability:'<key>' "
-        f"im task_json (Pflicht — driftfreier Status-Join). Codebase-Pfade NUR aus dem "
-        f"anchors-Feld oder per search_files verifiziert — NICHT raten. Kein Duplikat — der "
-        f"Store prüft automatisch. PLAN-ÄNDERUNGS-PFLICHT: Lies zuerst das Feedback des "
-        f"abgeschlossenen Tasks. Hat es unter ## Issues Punkte mit Plan-Relevanz "
-        f"(Effort-Änderung, neue Abhängigkeit, Pfad-Korrektur, Architektur-Erkenntnis)? → "
-        f"Dann ZUERST das gap-tracking/Mapping anpassen, DANN stage_handover. "
-        f"AUTONOM-PFLICHT: Rufe stage_handover JETZT direkt auf — KEINE Rückfragen. "
-        f"Ist der Backlog leer (keine offenen Gaps) oder nur DEFER/out-of-scope: melde das, "
-        f"lege KEINEN Task an, und stoppe (Pipeline-Ziel erreicht)."
+        f"[AUTOPLAN] Task {tid} is complete, the pipeline is empty. "
+        f"Plan the next step: read the active capability backlog {backlog} and take the "
+        f"TOP entry (rank #1 — whether 🟡 partial or 🔴 not-started; partial means OPEN, "
+        f"do not skip). Adopt the handover seed (type, effort, assignee, scope, anchors) "
+        f"and create it via stage_handover — with capability:'<key>' in the task_json "
+        f"(required — drift-free status join). Codebase paths ONLY from the anchors field "
+        f"or verified via search_files — do NOT guess. No duplicate — the store checks "
+        f"automatically. PLAN-CHANGE DUTY: first read the completed task's feedback. Does it "
+        f"have items under ## Issues with plan relevance (effort change, new dependency, path "
+        f"correction, architecture insight)? → Then FIRST adjust the gap-tracking/mapping, "
+        f"THEN stage_handover. AUTONOMY DUTY: call stage_handover NOW, directly — NO "
+        f"questions. If the backlog is empty (no open gaps) or only DEFER/out-of-scope: "
+        f"report it, create NO task, and stop (pipeline goal reached)."
     )
 
 
@@ -2709,22 +2708,22 @@ def _autoplan_tick(tid: str, enqueue) -> None:
         AUTOPILOT_AUTOPLAN = False
         if _EFFECTIVE_CFG:
             _EFFECTIVE_CFG["autopilot"]["autoplan"] = False
-        _ui_print(col(f"\n  ✓ [AUTOPLAN] Limit erreicht ({_AUTOPLAN_DONE}/"
-                      f"{AUTOPILOT_MAX_TASKS}) — Autoplan gestoppt.", C.GREEN))
+        _ui_print(col(f"\n  ✓ [AUTOPLAN] limit reached ({_AUTOPLAN_DONE}/"
+                      f"{AUTOPILOT_MAX_TASKS}) — autoplan stopped.", C.GREEN))
         return
     s = _store()
     if s.list("pending") or s.list("in_progress"):
-        return                       # Pipeline nicht leer → nichts zu planen
+        return                       # pipeline not empty → nothing to plan
     prompt = _autoplan_prompt(tid)
     if prompt is None:
-        AUTOPILOT_AUTOPLAN = False   # kein Backlog → Autoplan hat keine Quelle
+        AUTOPILOT_AUTOPLAN = False   # no backlog → autoplan has no source
         if _EFFECTIVE_CFG:
             _EFFECTIVE_CFG["autopilot"]["autoplan"] = False
-        _ui_print(col("  [AUTOPLAN] kein Backlog konfiguriert "
-                      "(paths.active_capability_backlog) — Autoplan aus.", C.YELLOW))
+        _ui_print(col("  [AUTOPLAN] no backlog configured "
+                      "(paths.active_capability_backlog) — autoplan off.", C.YELLOW))
         return
     enqueue(prompt)
-    _ui_print(col(f"\n  → [AUTOPLAN] Queue leer nach {tid} — plane nächsten Task", C.CYAN))
+    _ui_print(col(f"\n  → [AUTOPLAN] queue empty after {tid} — planning the next task", C.CYAN))
 
 
 def _agent_thread(agent: GX10, app: Application):
@@ -2780,7 +2779,7 @@ def _agent_thread(agent: GX10, app: Application):
             global _RELOAD_FLAG
             _RELOAD_FLAG = True
             agent.save_session()
-            _ui_print(col("[OK] Neustart — Session gespeichert.", C.GREEN))
+            _ui_print(col("[OK] restart — session saved.", C.GREEN))
             app.exit()
             return
 
@@ -2901,7 +2900,7 @@ def _resolve_config_source(cli_config: Optional[str]) -> Optional[Path]:
             p = Path(c).expanduser()
             if p.exists():
                 return p
-            print(col(f"  [WARN] Config nicht gefunden: {p}", C.YELLOW))
+            print(col(f"  [WARN] config not found: {p}", C.YELLOW))
             return None
     for p in (Path.cwd() / "conf", Path.cwd() / "gx10.config.json",
               SCRIPT_DIR / "conf", SCRIPT_DIR / "gx10.config.json"):
@@ -2915,7 +2914,7 @@ def _read_json_dict(p: Path) -> Dict[str, Any]:
         data = json.loads(p.read_text(encoding="utf-8"))
         return data if isinstance(data, dict) else {}
     except Exception as e:
-        print(col(f"  [WARN] Config nicht ladbar ({p}): {e} — übersprungen.", C.YELLOW))
+        print(col(f"  [WARN] config not loadable ({p}): {e} — skipped.", C.YELLOW))
         return {}
 
 
@@ -2957,7 +2956,7 @@ def _load_config_tree(source: Optional[Path], _seen: Optional[set] = None) -> Di
         # eigene Inline-Blöcke übersteuern die Includes
         return _deep_merge(merged, data)
 
-    print(col(f"  [WARN] Config-Quelle weder Datei noch Verzeichnis: {p}", C.YELLOW))
+    print(col(f"  [WARN] config source is neither a file nor a directory: {p}", C.YELLOW))
     return {}
 
 
@@ -2972,7 +2971,7 @@ def _apply_env(cfg: Dict[str, Any]) -> Dict[str, Any]:
             try:
                 cfg[section][key] = transform(v)
             except Exception:
-                print(col(f"  [WARN] Env {name}={v!r} ignoriert (ungültig)", C.YELLOW))
+                print(col(f"  [WARN] env {name}={v!r} ignored (invalid)", C.YELLOW))
     setif("GX10_BASE_URL",   "connection", "base_url")
     setif("GX10_MODEL",      "connection", "model")
     setif("GX10_WORKDIR",    "paths",      "workdir")
@@ -3103,37 +3102,37 @@ def main():
     parser = argparse.ArgumentParser(
         description="GX10 Orchestrator v3 (Performance-Fixes, konfigurierbar)")
     parser.add_argument("--config",     default=None,
-                        help="JSON-Config-Pfad (sonst Env GX10_CONFIG / "
+                        help="JSON config path (else env GX10_CONFIG / "
                              "./gx10.config.json / <SCRIPT_DIR>/gx10.config.json)")
     parser.add_argument("--workdir",    default=None,
-                        help="Arbeitsverzeichnis (tasks/, summaries/, vault/, Session); Default '.'")
+                        help="working directory (tasks/, summaries/, vault/, session); default '.'")
     parser.add_argument("--base-url",   default=None)
     parser.add_argument("--api-key",    default=None,
-                        help="API-Key ad-hoc übersteuern (sonst aus Env GX10_API_KEY)")
+                        help="override the API key ad-hoc (else from env GX10_API_KEY)")
     parser.add_argument("--model",      default=None)
     parser.add_argument("--prompt",     default=None)
     parser.add_argument("--no-prompt",  action="store_true")
     parser.add_argument("--fresh",      action="store_true",
-                        help="Gespeicherte Session ignorieren")
+                        help="ignore the saved session")
     parser.add_argument("--no-stream",  action="store_true",
-                        help="Streaming deaktivieren (Vergleich gegen v1-Verhalten)")
+                        help="disable streaming (compare against v1 behaviour)")
     parser.add_argument("--max-tokens", type=int, default=None,
-                        help=f"Output-Token-Limit (Default {MAX_TOKENS})")
+                        help=f"output token limit (default {MAX_TOKENS})")
     parser.add_argument("--thinking",   choices=["auto", "first", "off", "all"], default=None,
-                        help="Thinking-Modus: auto=selbst entscheiden (Default, denkt nur "
-                             "bei Planung, im Zweifel ja), first=immer Planungs-Runde, "
-                             "off=nie, all=immer")
+                        help="thinking mode: auto=decide per turn (default, thinks only "
+                             "when planning, yes if in doubt), first=always a planning round, "
+                             "off=never, all=always")
     parser.add_argument("--platform",   choices=["auto", "windows", "linux"], default=None,
-                        help="Shell-/Syntax-Modus für execute_command "
-                             "(Default auto = beim Start erkennen)")
+                        help="shell/syntax mode for execute_command "
+                             "(default auto = detect at startup)")
     parser.add_argument("--onboarding",    dest="onboarding", action="store_const", const=True,
-                        default=None, help="Onboarding-Modus AN (Duplikat-Vorprüfung vor Handover)")
+                        default=None, help="onboarding mode ON (duplicate pre-check before handover)")
     parser.add_argument("--no-onboarding", dest="onboarding", action="store_const", const=False,
-                        help="Onboarding-Modus AUS")
+                        help="onboarding mode OFF")
     parser.add_argument("--autopilot",     dest="autopilot", action="store_const", const=True,
-                        default=None, help="Autopilot AN (startet Claude für Handovers autonom)")
+                        default=None, help="autopilot ON (launches Claude for handovers autonomously)")
     parser.add_argument("--no-autopilot",  dest="autopilot", action="store_const", const=False,
-                        help="Autopilot AUS")
+                        help="autopilot OFF")
     args = parser.parse_args()
 
     if os.name == "nt":
@@ -3175,25 +3174,25 @@ def main():
 
     Cy = "\033[96m"; Gy = "\033[90m"; Bo = "\033[1m"; R = "\033[0m"
     print(f"{Cy}{Bo}  Ironclad — Orchestrator CLI{R}")
-    print(f"{Gy}  Modell : {model}  |  qwen3_coder{R}")
+    print(f"{Gy}  Model  : {model}  |  qwen3_coder{R}")
     print(f"{Gy}  URL    : {base_url}{R}")
-    print(f"{Gy}  Stream : {'an' if stream else 'aus'}  |  "
+    print(f"{Gy}  Stream : {'on' if stream else 'off'}  |  "
           f"thinking={thinking_mode}  |  max_tokens={max_tokens}{R}")
-    print(f"{Gy}  Plattf.: {PLATFORM}"
+    print(f"{Gy}  Platf.: {PLATFORM}"
           + (f" (aus '{PLATFORM_MODE}' erkannt)" if PLATFORM_MODE == 'auto' else "")
           + (f"  |  Onboarding: AN" if ONBOARDING_MODE else "")
           + f"{R}")
     if AUTOPILOT_ENABLED:
-        print(f"\033[93m  Autopilot: AN — startet Claude autonom "
+        print(f"\033[93m  autopilot: ON — launches Claude autonomously "
               f"(max_concurrent={AUTOPILOT_MAX_CONCURRENT}, {' '.join(AUTOPILOT_EXTRA_ARGS)}){R}")
     if AUTOPILOT_ENABLED and AUTOPILOT_AUTOPLAN:
-        limit_str = f", max_tasks={AUTOPILOT_MAX_TASKS}" if AUTOPILOT_MAX_TASKS > 0 else ", unbegrenzt"
-        print(f"\033[93m  Autoplan: AN{limit_str}{R}")
-        print(f"\033[91m  ⚠ WARNUNG: Autoplan NIEMALS mit bezahltem API-Abo verwenden! "
-              f"Nur für lokale vLLM-Instanzen.{R}")
-    print(f"{Gy}  Prompt : {prompt_abs or '— (ohne)'}{R}")
+        limit_str = f", max_tasks={AUTOPILOT_MAX_TASKS}" if AUTOPILOT_MAX_TASKS > 0 else ", unlimited"
+        print(f"\033[93m  autoplan: ON{limit_str}{R}")
+        print(f"\033[91m  ⚠ WARNING: never use autoplan with a paid API plan! "
+              f"Local vLLM instances only.{R}")
+    print(f"{Gy}  Prompt : {prompt_abs or '— (none)'}{R}")
     print(f"{Gy}  WORKDIR: {workdir}{R}")
-    print(f"{Gy}  Config : {cfg_path or '— (Code-Defaults)'}{R}")
+    print(f"{Gy}  Config : {cfg_path or '— (code defaults)'}{R}")
     print()
     if not HAS_PT:
         print("\033[93m  [WARN] pip install prompt_toolkit\033[0m")
@@ -3214,8 +3213,8 @@ def main():
     if not args.fresh and Path(SESSION_FILE).exists():
         n = agent.load_session()
         if n > 0:
-            print(f"[OK] Session resumed — {n} Nachrichten geladen")
-            print("     (--fresh für neue Session)")
+            print(f"[OK] session resumed — {n} messages loaded")
+            print("     (--fresh for a new session)")
 
     if HAS_PT:
         global _UI_APP
@@ -3232,7 +3231,7 @@ def main():
         rt.start()
         state = "aktiv" if _WATCHER_ENABLED else "deaktiviert"
         col_  = C.GREEN if _WATCHER_ENABLED else C.YELLOW
-        _ui_print(col(f"[OK] Feedback-Reconciler bereit ({state}, Polling alle "
+        _ui_print(col(f"[OK] feedback reconciler ready ({state}, polling every "
                       f"{RECONCILER_INTERVAL:.0f}s — 'watcher on/off')", col_))
 
         app.run()
@@ -3247,7 +3246,7 @@ def main():
             try:
                 user_input = input("\n[You] > ").strip()
             except KeyboardInterrupt:
-                print("  (Strg+C — tippe 'exit' zum Beenden)")
+                print("  (Ctrl+C — type 'exit' to quit)")
                 continue
             except EOFError:
                 agent.save_session()

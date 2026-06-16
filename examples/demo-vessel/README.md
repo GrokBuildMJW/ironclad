@@ -1,4 +1,4 @@
-# Demo-Vessel (öffentlich, runnable)
+# Demo vessel (public, runnable)
 
 A minimal, self-contained **vessel** (a use-case docking on Ironclad) that exercises
 the Lodestar capability/gap plugin end-to-end — no real data, no secrets. Use it to
