@@ -1,21 +1,69 @@
-# Ironclad orchestrator as a service. Sits next to your model server (vLLM) on the
-# same box. Uses host networking so it can reach the model on localhost and expose
-# :8100 on the host — same trust model as the model port (home LAN).
+# Ironclad reference stack — one `docker compose up` for the model + orchestrator.
 #
+#   # orchestrator only (connect to a model you already run):
 #   GX10_BASE_URL=http://localhost:8000/v1 GX10_MODEL=qwen3.6-35b docker compose up -d
 #
-# Secret-free: connection comes from env (with sensible defaults), nothing baked in.
+#   # model + orchestrator together (needs a GPU + the NVIDIA container runtime):
+#   IRONCLAD_MODEL_DIR=~/models/RedHatAI-Qwen3.6-35B-A3B-NVFP4 \
+#     docker compose --profile model up -d
+#
+# Host networking so the orchestrator reaches the model on localhost and binds :8100
+# on the host (same trust model as the model port — home LAN). Secret-free: hosts,
+# model dir and language come from env (with sensible defaults), nothing baked in.
+#
+# Long-term memory (Mem0) is optional and external — point the orchestrator at it with
+# GX10_MEMORY_URL=http://<mem-host>:8800; it is not bundled here (bring your own).
 services:
+  # Model server (vLLM). Only started with `--profile model`; otherwise bring your own
+  # OpenAI-compatible endpoint and run just the orchestrator.
+  vllm:
+    profiles: ["model"]
+    image: ${IRONCLAD_VLLM_IMAGE:-vllm/vllm-openai:cu130-nightly}
+    container_name: vllm
+    network_mode: host
+    ipc: host
+    restart: unless-stopped
+    volumes:
+      - ${IRONCLAD_MODEL_DIR:-./models}:/model:ro
+    command: >
+      /model
+      --served-model-name ${GX10_MODEL:-qwen3.6-35b}
+      --quantization compressed-tensors --kv-cache-dtype fp8
+      --attention-backend flashinfer --moe-backend flashinfer_cutlass
+      --tensor-parallel-size 1 --gpu-memory-utilization ${IRONCLAD_GPU_MEM_UTIL:-0.6}
+      --max-model-len ${IRONCLAD_MAX_MODEL_LEN:-32768} --max-num-seqs ${IRONCLAD_MAX_SEQS:-8}
+      --enable-chunked-prefill --enable-prefix-caching
+      --reasoning-parser qwen3 --enable-auto-tool-choice --tool-call-parser qwen3_coder
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-fs", "http://localhost:8000/v1/models"]
+      interval: 10s
+      timeout: 5s
+      retries: 60          # cold start loads weights into VRAM — can take minutes
+      start_period: 30s
+
   orchestrator:
     build: .
     image: ironclad-orchestrator
     container_name: ironclad-orchestrator
     network_mode: host          # reach vLLM on localhost:8000, bind 8100 on the host
     restart: unless-stopped
+    depends_on:
+      vllm:
+        condition: service_healthy
+        required: false         # only waited on when the `model` profile is active
     environment:
       GX10_BASE_URL: ${GX10_BASE_URL:-http://localhost:8000/v1}
       GX10_MODEL: ${GX10_MODEL:-qwen3.6-35b}
       GX10_SERVER_PORT: ${GX10_SERVER_PORT:-8100}
+      GX10_LANGUAGE: ${GX10_LANGUAGE:-en}
+      GX10_MEMORY_URL: ${GX10_MEMORY_URL:-}
       GX10_WORKDIR: /work
     volumes:
       - ./ironclad-workdir:/work   # tasks/, summaries/, session persist on the host

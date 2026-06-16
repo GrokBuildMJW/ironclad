@@ -70,9 +70,20 @@ bash scripts/spark-bootstrap.sh --model-dir <weights> --served-name qwen3.6-35b 
      --with-orchestrator --docker
 ```
 
-Equivalently, with the model already up: `GX10_MODEL=qwen3.6-35b docker compose up -d`
-(see [`docker-compose.yml`](../docker-compose.yml)). Uses host networking so it reaches
-vLLM on `localhost:8000` and binds `:8100`; the workspace persists in `ironclad-workdir/`.
+**One compose for the whole stack.** [`docker-compose.yml`](../docker-compose.yml) can
+bring up the model **and** the orchestrator together:
+
+```bash
+# model + orchestrator (needs a GPU + the NVIDIA container runtime):
+IRONCLAD_MODEL_DIR=~/models/RedHatAI-Qwen3.6-35B-A3B-NVFP4 docker compose --profile model up -d
+
+# orchestrator only (you already run a model):
+GX10_MODEL=qwen3.6-35b docker compose up -d
+```
+
+The orchestrator waits for vLLM's healthcheck before starting; host networking lets it
+reach vLLM on `localhost:8000` and bind `:8100`; the workspace persists in
+`ironclad-workdir/`. Long-term memory (Mem0) stays external — set `GX10_MEMORY_URL`.
 
 Then, from your workstation:
 

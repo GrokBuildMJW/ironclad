@@ -163,7 +163,8 @@ Honest near-term plan (the rebuild's placeholders are now wired — see
 [`docs/status.md`](docs/status.md) for the full per-component status):
 
 - Broaden test coverage and harden the new server/client paths.
-- Single-command compose for the whole reference stack (model + memory + orchestrator).
+- One-command compose for **model + orchestrator** ships now
+  (`docker compose --profile model up`); bundling memory is next.
 - First tagged release once the APIs settle.
 
 **Sovereign AI / local deployments.** Ironclad is **model-agnostic** and **fully
