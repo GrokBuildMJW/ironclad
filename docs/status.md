@@ -39,7 +39,7 @@ This document is the single source of truth for **what actually works right now*
 | ACK contract gate at `stage_handover` | **wired + tested** | Soft path (`_ack_validate`): task_json validated against `TaskSpec`, fail-closed → reask. |
 | Orchestrator Docker image / compose | **wired + tested** | Runs as `ironclad-orchestrator` next to the model. |
 | **Memory (Mem0)** | **wired + tested** | `engine/memory.py` talks to a Mem0-style service (`GX10_MEMORY_URL`); store+search verified live. The store starts **empty** — see below. |
-| **Autoplan** (`/autoplan on\|off [N]`) | **placeholder** | Command parses and sets flags, but the "plan the next task when the pipeline empties" loop is **not** ported into the server's queue consumer; autopilot is off server-side. No effect yet. |
+| **Autoplan** (`/autoplan on\|off [N]`) | **wired (config-gated)** | Ported into the server's queue consumer (`_autoplan_tick`), **decoupled from autopilot** so it works in the split: server plans → client executes → server advances → server plans again. Fires only when `/autoplan on` is set **and** `paths.active_capability_backlog` is configured (no backlog → it disables itself). Logic unit-tested. |
 | Autopilot auto-launch on the server | **placeholder / by design off** | The server never launches code-agents (`_LAUNCH_CMD` is skipped); launching is the client's job (the pool). The server-side `autopilot` toggle is currently inert. |
 | Remote turn cancel (Ctrl+C in the TUI) | **placeholder** | Not yet wired across the HTTP boundary; shows a notice. |
 | Constrained-emission **hard floor** (grammar) | **parked** | Available on recent vLLM, but the engine path uses the soft validate→reask only. |
@@ -72,8 +72,8 @@ the operator's.
 
 1. ~~Wire the engine to the Mem0 backend.~~ **Done** — `engine/memory.py`, off by
    default, ships empty (see Memory above).
-2. Port the autoplan loop into the server's queue consumer (decide client- vs
-   server-side launching).
+2. ~~Port the autoplan loop into the server's queue consumer.~~ **Done** —
+   `_autoplan_tick`, decoupled from autopilot, backlog-config-gated.
 3. Wire remote turn cancellation across the HTTP boundary.
 4. Decide whether to unpark the grammar hard-floor on the reference GPU.
 

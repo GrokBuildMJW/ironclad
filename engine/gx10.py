@@ -2666,6 +2666,67 @@ def _build_app() -> Application:
     )
 
 
+def _autoplan_prompt(tid: str) -> Optional[str]:
+    """Build the 'plan the next task' prompt for autoplan from the configured
+    capability backlog (``paths.active_capability_backlog``). Returns None when no
+    backlog is configured — autoplan then has no source to plan from and stays idle
+    (generic-safe: no vessel-specific default is assumed)."""
+    backlog = (_EFFECTIVE_CFG or {}).get("paths", {}).get("active_capability_backlog")
+    if not backlog:
+        return None
+    return (
+        f"[AUTOPLAN] Task {tid} abgeschlossen, Pipeline ist leer. "
+        f"Plane den nächsten Schritt: lies den aktiven Capability-Backlog {backlog} und "
+        f"nimm den OBERSTEN Eintrag (Rang #1 — ob 🟡 partial oder 🔴 not-started; partial "
+        f"heißt OFFEN, nicht überspringen). Übernimm den Handover-Seed (type, effort, "
+        f"assignee, Scope, anchors) und lege via stage_handover an — mit capability:'<key>' "
+        f"im task_json (Pflicht — driftfreier Status-Join). Codebase-Pfade NUR aus dem "
+        f"anchors-Feld oder per search_files verifiziert — NICHT raten. Kein Duplikat — der "
+        f"Store prüft automatisch. PLAN-ÄNDERUNGS-PFLICHT: Lies zuerst das Feedback des "
+        f"abgeschlossenen Tasks. Hat es unter ## Issues Punkte mit Plan-Relevanz "
+        f"(Effort-Änderung, neue Abhängigkeit, Pfad-Korrektur, Architektur-Erkenntnis)? → "
+        f"Dann ZUERST das gap-tracking/Mapping anpassen, DANN stage_handover. "
+        f"AUTONOM-PFLICHT: Rufe stage_handover JETZT direkt auf — KEINE Rückfragen. "
+        f"Ist der Backlog leer (keine offenen Gaps) oder nur DEFER/out-of-scope: melde das, "
+        f"lege KEINEN Task an, und stoppe (Pipeline-Ziel erreicht)."
+    )
+
+
+def _autoplan_tick(tid: str, enqueue) -> None:
+    """After a successful advance: count it, enforce the max-tasks limit, and when the
+    pipeline is empty enqueue the next planning turn. ``enqueue(prompt:str)`` puts the
+    turn on the input queue. Gated on ``AUTOPILOT_AUTOPLAN`` only — independent of
+    autopilot's *launch* side, so it works in the server/client split (server plans,
+    client executes, server advances, server plans again)."""
+    global _AUTOPLAN_DONE, AUTOPILOT_AUTOPLAN
+    if not AUTOPILOT_AUTOPLAN:
+        return
+    _AUTOPLAN_DONE += 1
+    _ui_print(col(f"  [AUTOPLAN] {_AUTOPLAN_DONE}"
+                  + (f"/{AUTOPILOT_MAX_TASKS}" if AUTOPILOT_MAX_TASKS > 0 else "")
+                  + " Tasks abgeschlossen", C.CYAN))
+    if AUTOPILOT_MAX_TASKS > 0 and _AUTOPLAN_DONE >= AUTOPILOT_MAX_TASKS:
+        AUTOPILOT_AUTOPLAN = False
+        if _EFFECTIVE_CFG:
+            _EFFECTIVE_CFG["autopilot"]["autoplan"] = False
+        _ui_print(col(f"\n  ✓ [AUTOPLAN] Limit erreicht ({_AUTOPLAN_DONE}/"
+                      f"{AUTOPILOT_MAX_TASKS}) — Autoplan gestoppt.", C.GREEN))
+        return
+    s = _store()
+    if s.list("pending") or s.list("in_progress"):
+        return                       # Pipeline nicht leer → nichts zu planen
+    prompt = _autoplan_prompt(tid)
+    if prompt is None:
+        AUTOPILOT_AUTOPLAN = False   # kein Backlog → Autoplan hat keine Quelle
+        if _EFFECTIVE_CFG:
+            _EFFECTIVE_CFG["autopilot"]["autoplan"] = False
+        _ui_print(col("  [AUTOPLAN] kein Backlog konfiguriert "
+                      "(paths.active_capability_backlog) — Autoplan aus.", C.YELLOW))
+        return
+    enqueue(prompt)
+    _ui_print(col(f"\n  → [AUTOPLAN] Queue leer nach {tid} — plane nächsten Task", C.CYAN))
+
+
 def _agent_thread(agent: GX10, app: Application):
     """Agent-Loop läuft im Hintergrund-Thread."""
     global _AUTOPLAN_DONE, AUTOPILOT_AUTOPLAN, _RELOAD_FLAG
@@ -2694,64 +2755,11 @@ def _agent_thread(agent: GX10, app: Application):
                 ok = res.startswith("OK")
                 _ui_print(col(f"  {'✓' if ok else '✗'} {res.splitlines()[0]}",
                               C.GREEN if ok else C.RED))
-                # Autoplan: nach erfolgreichem Advance bei leerer Queue GX10 beauftragen,
-                # den nächsten Task zu planen. Nur wenn Autopilot + Autoplan aktiv.
-                # WICHTIG: max_tasks-Limit wird VOR der Planung geprüft — niemals danach.
-                if ok and AUTOPILOT_ENABLED and AUTOPILOT_AUTOPLAN:
-                    _AUTOPLAN_DONE += 1
-                    _ui_print(col(
-                        f"  [AUTOPLAN] {_AUTOPLAN_DONE}"
-                        + (f"/{AUTOPILOT_MAX_TASKS}" if AUTOPILOT_MAX_TASKS > 0 else "")
-                        + f" Tasks abgeschlossen", C.CYAN))
-                    # Limit-Check: Autoplan abschalten wenn max_tasks erreicht
-                    if AUTOPILOT_MAX_TASKS > 0 and _AUTOPLAN_DONE >= AUTOPILOT_MAX_TASKS:
-                        AUTOPILOT_AUTOPLAN = False
-                        if _EFFECTIVE_CFG:
-                            _EFFECTIVE_CFG["autopilot"]["autoplan"] = False
-                        _ui_print(col(
-                            f"\n  ✓ [AUTOPLAN] Limit erreicht ({_AUTOPLAN_DONE}/{AUTOPILOT_MAX_TASKS}) "
-                            f"— Autoplan gestoppt. Pipeline läuft noch bis Queue leer.\n"
-                            f"  ✓ Feedback archiviert unter: vault/_Workflow/feedback/",
-                            C.GREEN))
-                    else:
-                        s = _store()
-                        if not s.list("pending") and not s.list("in_progress"):
-                            # Aktiver Capability-Backlog aus Config (Capability-Engine v2):
-                            # zeigt auf den AKTUELL bearbeiteten Backlog (z. B. Frontend),
-                            # NICHT mehr hartcodiert auf n8n-Parity. Themenwechsel = nur
-                            # paths.active_capability_backlog umstellen.
-                            _active_bl = ((_EFFECTIVE_CFG or {}).get("paths", {}).get(
-                                "active_capability_backlog")
-                                or "vault/Research/n8n-Parity/n8n-parity-backlog.md")
-                            autoplan_prompt = (
-                                f"[AUTOPLAN] Task {tid} abgeschlossen, Pipeline ist leer. "
-                                f"Plane den nächsten Schritt: lies den aktiven Capability-Backlog "
-                                f"{_active_bl} und nimm den OBERSTEN "
-                                f"Eintrag (Rang #1 — ob 🟡 partial oder 🔴 not-started; partial heißt OFFEN, "
-                                f"nicht überspringen). Übernimm den Handover-Seed (type, effort, assignee, "
-                                f"Scope, anchors) und lege via stage_handover an — mit capability:'<key>' "
-                                f"im task_json (Pflicht — driftfreier Status-Join). Codebase-Pfade NUR aus dem "
-                                f"anchors-Feld oder per search_files verifiziert — NICHT raten. "
-                                f"Kein Duplikat — der Store prüft automatisch. "
-                                f"PLAN-ÄNDERUNGS-PFLICHT: Lies zuerst das Feedback des abgeschlossenen Tasks "
-                                f"(vault/_Workflow/feedback/{tid}_OPUS-feedback.md o.ä.). Hat es unter ## Issues "
-                                f"Punkte mit Plan-Relevanz (Effort-Änderung, neue Abhängigkeit, Pfad-Korrektur, "
-                                f"Architektur-Erkenntnis)? → Dann ZUERST MAPPING + gap-tracking anpassen, "
-                                f"update_capability_tracking.py ausführen, DANN stage_handover. "
-                                f"Kein Silent-Continue wenn Issues Plan-Eingriff erfordern. "
-                                f"AUTONOM-PFLICHT: Rufe stage_handover JETZT direkt auf — "
-                                f"KEINE Rückfragen, KEIN 'Soll ich?', KEIN 'Empfehlung:'. "
-                                f"Ist der Backlog leer (keine offenen Gaps) oder enthält er NUR Einträge mit "
-                                f"DEFER/out-of-scope in den Notes: melde das, lege KEINEN Task an, und stoppe "
-                                f"den Autoplan (Pipeline-Ziel erreicht). DEFER-Features mit explizitem DEFER-Hinweis "
-                                f"in den Notes sind KEIN Task — ignoriere sie auch wenn sie formal noch als Backlog-Eintrag erscheinen. "
-                                f"Analyse-Notizen IMMER nach vault/_Workflow/analysis/ — NIEMALS nach "
-                                f"summaries/feedback/ (dort nur {{task_id}}_{{agent}}-feedback.md)."
-                            )
-                            _INPUT_QUEUE.put(autoplan_prompt)
-                            _ui_print(col(
-                                f"\n  → [AUTOPLAN] Queue leer nach {tid} — GX10 plant nächsten Task",
-                                C.CYAN))
+                # Autoplan: nach erfolgreichem Advance bei leerer Queue den nächsten
+                # Task planen lassen. Monolith-Politik: nur wenn Autopilot AN (Launch
+                # lokal). Logik geteilt mit dem Server über _autoplan_tick.
+                if ok and AUTOPILOT_ENABLED:
+                    _autoplan_tick(tid, lambda p: _INPUT_QUEUE.put(p))
             continue
 
         # Autopilot-Launch: startet claude für einen Handover (detached).

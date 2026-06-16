@@ -189,6 +189,11 @@ def _queue_consumer(agent: gx10.GX10, stop: threading.Event) -> None:
                         res = f"ERROR: {e!r}"
                 print(f"[ADVANCE] {tid} ({agent_adv}): {res.splitlines()[0] if res else res}",
                       flush=True)
+                # Autoplan (entkoppelt von Autopilot — Launch ist Client-Sache): bei
+                # leerer Pipeline den nächsten Plan-Turn einreihen. Greift nur, wenn
+                # `/autoplan on` gesetzt ist und ein Backlog konfiguriert ist.
+                if res and res.startswith("OK"):
+                    gx10._autoplan_tick(tid, lambda p: gx10._INPUT_QUEUE.put(p))
             continue
         # Plain prompt (e.g. autoplan) → normaler Turn.
         with _AGENT_LOCK:
