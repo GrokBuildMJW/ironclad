@@ -14,7 +14,11 @@
 #
 # Usage:
 #   bash scripts/spark-bootstrap.sh --model-dir ~/models/RedHatAI-Qwen3.6-35B-A3B-NVFP4 \
-#                                   --served-name qwen3.6-35b [--with-orchestrator]
+#                                   --served-name qwen3.6-35b [--with-orchestrator] [--docker]
+#
+#   --with-orchestrator   also start the Ironclad orchestrator server (port 8100)
+#   --docker              run the orchestrator as a container (build core/Dockerfile)
+#                         instead of a venv+tmux process; requires --with-orchestrator
 set -euo pipefail
 
 # ── defaults (override via flags or GX10_* env) ───────────────────────────────
@@ -26,8 +30,10 @@ GPU_MEM_UTIL="${IRONCLAD_GPU_MEM_UTIL:-0.6}"
 MAX_MODEL_LEN="${IRONCLAD_MAX_MODEL_LEN:-32768}"
 MAX_SEQS="${IRONCLAD_MAX_SEQS:-8}"
 WITH_ORCH=0
+ORCH_DOCKER=0
 ORCH_PORT="${GX10_SERVER_PORT:-8100}"
 CONTAINER="${IRONCLAD_VLLM_CONTAINER:-vllm}"
+ORCH_CONTAINER="${IRONCLAD_ORCH_CONTAINER:-ironclad-orchestrator}"
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -37,6 +43,7 @@ while [ $# -gt 0 ]; do
     --port)              VLLM_PORT="$2"; shift 2;;
     --gpu-mem-util)      GPU_MEM_UTIL="$2"; shift 2;;
     --with-orchestrator) WITH_ORCH=1; shift;;
+    --docker)            ORCH_DOCKER=1; shift;;
     --orchestrator-port) ORCH_PORT="$2"; shift 2;;
     -h|--help)
       sed -n '2,20p' "$0"; exit 0;;
@@ -56,7 +63,9 @@ docker info --format '{{json .Runtimes}}' 2>/dev/null | grep -q nvidia \
   || log "warn: NVIDIA docker runtime not detected — '--gpus all' may fail"
 
 # ── 1) vLLM ──────────────────────────────────────────────────────────────────
-if [ "$(docker ps -q -f name="^${CONTAINER}$")" ]; then
+if curl -fs "http://localhost:${VLLM_PORT}/v1/models" >/dev/null 2>&1; then
+  log "an OpenAI endpoint already responds on :${VLLM_PORT} — leaving the model server as is"
+elif [ "$(docker ps -q -f name="^${CONTAINER}$")" ]; then
   log "vLLM container '${CONTAINER}' already running — leaving as is"
 else
   docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
@@ -84,7 +93,24 @@ for i in $(seq 1 120); do
 done
 
 # ── 2) orchestrator (optional) ───────────────────────────────────────────────
-if [ "$WITH_ORCH" = 1 ]; then
+if [ "$WITH_ORCH" = 1 ] && [ "$ORCH_DOCKER" = 1 ]; then
+  # Containerisiert: Image bauen + als Service neben vLLM laufen lassen (host-net,
+  # damit localhost:VLLM_PORT erreichbar ist und :ORCH_PORT auf dem Host bindet).
+  log "building orchestrator image '$ORCH_CONTAINER' from $REPO_ROOT"
+  docker build -t "$ORCH_CONTAINER" "$REPO_ROOT" >/dev/null
+  docker rm -f "$ORCH_CONTAINER" >/dev/null 2>&1 || true
+  mkdir -p "$REPO_ROOT/ironclad-workdir"
+  docker run -d --name "$ORCH_CONTAINER" --restart unless-stopped --network host \
+    -e GX10_BASE_URL="http://localhost:${VLLM_PORT}/v1" \
+    -e GX10_MODEL="$SERVED_NAME" -e GX10_SERVER_PORT="$ORCH_PORT" -e GX10_WORKDIR=/work \
+    -v "$REPO_ROOT/ironclad-workdir":/work "$ORCH_CONTAINER" >/dev/null
+  log "orchestrator container '$ORCH_CONTAINER' on :$ORCH_PORT"
+  for i in $(seq 1 30); do
+    curl -fs "http://localhost:${ORCH_PORT}/health" >/dev/null 2>&1 && { log "orchestrator healthy"; break; }
+    [ "$i" = 30 ] && fail "orchestrator container not healthy — check: docker logs $ORCH_CONTAINER"
+    sleep 1
+  done
+elif [ "$WITH_ORCH" = 1 ]; then
   VENV="$REPO_ROOT/.venv"
   [ -d "$VENV" ] || python3 -m venv "$VENV"
   # shellcheck disable=SC1091

@@ -1,0 +1,21 @@
+# Ironclad orchestrator as a service. Sits next to your model server (vLLM) on the
+# same box. Uses host networking so it can reach the model on localhost and expose
+# :8100 on the host — same trust model as the model port (home LAN).
+#
+#   GX10_BASE_URL=http://localhost:8000/v1 GX10_MODEL=qwen3.6-35b docker compose up -d
+#
+# Secret-free: connection comes from env (with sensible defaults), nothing baked in.
+services:
+  orchestrator:
+    build: .
+    image: ironclad-orchestrator
+    container_name: ironclad-orchestrator
+    network_mode: host          # reach vLLM on localhost:8000, bind 8100 on the host
+    restart: unless-stopped
+    environment:
+      GX10_BASE_URL: ${GX10_BASE_URL:-http://localhost:8000/v1}
+      GX10_MODEL: ${GX10_MODEL:-qwen3.6-35b}
+      GX10_SERVER_PORT: ${GX10_SERVER_PORT:-8100}
+      GX10_WORKDIR: /work
+    volumes:
+      - ./ironclad-workdir:/work   # tasks/, summaries/, session persist on the host

@@ -46,9 +46,9 @@ The **model**: `RedHatAI/Qwen3.6-35B-A3B-NVFP4` served as `qwen3.6-35b`, on
 On the Spark, from a checkout of this repo:
 
 ```bash
-# 1) (once) get the weights, e.g.
-#    huggingface-cli download RedHatAI/Qwen3.6-35B-A3B-NVFP4 \
-#      --local-dir ~/models/RedHatAI-Qwen3.6-35B-A3B-NVFP4
+# 1) (once) get the weights with the Hugging Face CLI (`pip install -U huggingface_hub`):
+#    hf download RedHatAI/Qwen3.6-35B-A3B-NVFP4 \
+#       --local-dir ~/models/RedHatAI-Qwen3.6-35B-A3B-NVFP4
 
 # 2) one-shot: vLLM + orchestrator
 bash scripts/spark-bootstrap.sh \
@@ -60,6 +60,19 @@ bash scripts/spark-bootstrap.sh \
 The script is **idempotent** (re-run safe), parameterized (no host/IP baked in), and
 waits for `/v1/models` (and `/health` if `--with-orchestrator`) before returning. See
 `bash scripts/spark-bootstrap.sh --help` for all flags.
+
+**Orchestrator as a container.** Add `--docker` to run the orchestrator as a service
+(built from [`Dockerfile`](../Dockerfile)) instead of a venv+tmux process — it joins
+vLLM (and the memory stack) as a managed container:
+
+```bash
+bash scripts/spark-bootstrap.sh --model-dir <weights> --served-name qwen3.6-35b \
+     --with-orchestrator --docker
+```
+
+Equivalently, with the model already up: `GX10_MODEL=qwen3.6-35b docker compose up -d`
+(see [`docker-compose.yml`](../docker-compose.yml)). Uses host networking so it reaches
+vLLM on `localhost:8000` and binds `:8100`; the workspace persists in `ironclad-workdir/`.
 
 Then, from your workstation:
 
