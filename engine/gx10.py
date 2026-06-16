@@ -1,68 +1,26 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-GX10 Orchestrator V3 — Pipeline-Beschleunigung (Testbuild)
-==========================================================
-Paralleler Testbuild zu gx10.py (Produktion bleibt unangetastet).
-Enthält ALLE Performance-Fixes der Produktion plus die Maßnahmen gegen
-die langsame Task-Wechsel-/„done"-Transition:
+Ironclad orchestration engine — agent loop, deterministic TaskStore, fail-closed
+macros (advance_pipeline / stage_handover), config-tree loader, and the interactive
+CLI. Runs against any OpenAI-compatible endpoint; every model-emitted task_json is
+validated against the ACK contract at the stage_handover boundary.
 
-  HV-A  Makro-Tool `advance_pipeline` — schaltet die komplette
-        deterministische Pipeline (active.md archivieren, Feedback ins
-        Vault, Task-JSON → done, Handover löschen, nächsten Task
-        aktivieren) in EINEM Tool-Call durch. Statt ~12 LLM-Round-Trips
-        nur noch ~2. Größter Hebel gegen „ewig bis zum nächsten Task".
-  HV-B  list_directory mit sort='time' + limit + Hard-Cap (200) →
-        keine 438-Einträge-Bombe aus tasks/done mehr im Kontext.
-  HV-C  Prompt-v3 weist an, auf „done" das Makro-Tool EINMAL zu rufen
-        statt der Einzelschritte (kein Schritt-für-Schritt-Geplänkel).
+Key design points:
+  - Macro tools collapse multi-step workflows into a single deterministic call
+    (advance_pipeline for completion, stage_handover for creation) — far fewer
+    LLM round-trips than step-by-step file ops.
+  - Streaming + incremental output; hysteresis context-trimming (prefix-cache
+    friendly); per-generation perf instrumentation (TTFT, tokens/s).
+  - Thinking is decided per turn (planning thinks; routine lookups don't); the ACK
+    emitter turns it off per-request for reliable structured output.
 
-In-place-Optimierungen (kein neuer Build, weiter in v3 getestet):
-  OPT-2 Makro `stage_handover` — veröffentlicht einen NEUEN Handover in
-        EINEM Call (Handover-MD + optional Task-JSON + active.md). Pendant
-        zu advance_pipeline für die Task-Erstellung: ~3 Round-Trips → 1.
-  OPT-3 Instrumentierung — TTFT, Tokens/s und prompt/completion-Tokens
-        pro Generierung (graue [perf]-Zeile + Summe in `status`). Nutzt
-        stream_options.include_usage. Macht Tuning messbar statt gefühlt.
-  OPT-4 Transient-Retry — 1× Wiederholung mit Backoff bei API-Fehler
-        statt sofortigem Turn-Abbruch.
-  OPT-5 advance_pipeline aktiviert den nächsten Task zusätzlich als
-        in_progress (pending→in_progress), hält das Task-Board konsistent.
-  OPT-6 Thinking-Auto (Default): pro Turn wird bei Iteration 0 entschieden,
-        ob gedacht wird — sicherer Fehlermodus (im Zweifel denken), kein
-        Extra-Round-Trip. Routine (Status/Lookup/done) läuft ohne Thinking.
-  OPT-7 Live-Tool-Call-Indikator: füllt die „tote Zeit" bei Tool-Call-
-        Generierungen (kein gestreamter Text) mit einem Hinweis → der
-        schnelle Off-Pfad fühlt sich nicht mehr langsam an.
+Default system prompt: prompts/GX10_Orchestrator_SystemPrompt.md.
 
-Geerbte Performance-Fixes aus der Produktion:
-  PERF-01  Streaming aktiviert (stream=True) → Antwort erscheint
-           inkrementell statt erst nach voller Generierung. Größter
-           Hebel für die GEFÜHLTE Latenz.
-  PERF-02  <think>…</think> wird VOR dem Persistieren entfernt
-           (clean() auf gespeicherten assistant.content). Stoppt das
-           Anwachsen der History durch totes Reasoning → jeder
-           Folge-Prefill bleibt schlank.
-  PERF-03  Thinking-Modus per CLI steuerbar (--thinking first|off|all),
-           damit man verifizieren kann, ob der enable_thinking-Schalter
-           serverseitig überhaupt greift.
-  PERF-05  read_file kappt sehr große Dateien (Head+Tail mit Marker)
-           statt ungekappt in den Kontext zu laden.
-  PERF-06  Cache-freundliches Hysterese-Trimming: unter dem High-Water
-           bleibt die History unverändert (stabiler Prefix → vLLM
-           Prefix-Cache greift); erst beim Überschreiten wird in einem
-           Rutsch bis aufs Low-Water gekürzt statt jede Runde ein wenig.
-  PERF-10  max_tokens default 8192 (statt 4096) + per CLI tunebar →
-           Handovers werden nicht mehr mitten im write_file-Argument
-           abgeschnitten.
-
-Default-Prompt = prompts/GX10_Orchestrator_SystemPrompt.md.
-
-Flags:
-    python gx10_v3.py
-    python gx10_v3.py --thinking off   # maximal schnell
-    python gx10_v3.py --prompt prompts/GX10_Orchestrator_SystemPrompt.md
-                                       # gegen den Produktions-Prompt testen
+Examples:
+    python gx10.py
+    python gx10.py --thinking off   # fastest
+    python gx10.py --prompt prompts/GX10_Orchestrator_SystemPrompt.md
 """
 
 import os
