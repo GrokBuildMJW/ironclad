@@ -12,11 +12,18 @@ The guiding principle: a small fast model with hard schema/validation
 enforcement beats a large model you "trust" to format its output. Hermes-grade
 tool-calling reliability **without** depending on any specific model or parser.
 
-## 🚧 Status: in active development (pre-release)
+## 🚧 Status: proven core, mid-redesign (pre-release)
 
-Ironclad is **work in progress.** There is no tagged release yet; APIs, layout and
-config may change without notice. It is generated from a private monorepo — treat
-`main` as a development snapshot, not a stable artifact.
+Ironclad's engine comes from a **proven, in-production orchestrator**, but it is
+currently undergoing a **complete redesign** (single process → headless server + thin
+client, containerized, reasoning-worker fan-out, full-screen TUI). **Not everything is
+re-wired or re-tested yet**, and some features are still **placeholders** while the
+rebuild finishes (notably memory and autoplan). There is no tagged release; APIs,
+layout and config may change. Treat `main` as a development snapshot.
+
+👉 **[`docs/status.md`](docs/status.md)** is the honest, per-component **wiring status**
+(proven / wired+tested / placeholder / opt-in), the module reference, the memory
+situation, and the latest load-test results. Read it before relying on anything.
 
 **Reference environment.** Ironclad is developed and exercised on an **NVIDIA DGX
 Spark** (GB10, Blackwell `sm_121`, 128 GB unified memory) running a local **vLLM**

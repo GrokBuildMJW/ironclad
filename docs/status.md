@@ -1,0 +1,97 @@
+# Project status & wiring
+
+> ## ⚠️ Read this first
+>
+> Ironclad's engine grew out of a **proven, in-production orchestrator** (years of
+> daily use). It is currently undergoing a **complete redesign**: the original
+> single-process CLI is being split into a headless **server** + thin **client**,
+> containerized, and given a reasoning-worker fan-out and a full-screen TUI.
+>
+> **Not everything is re-wired or re-tested yet.** The pieces below are marked
+> honestly: *proven* (inherited, battle-tested), *wired + tested* (rebuilt and
+> verified in the new architecture), *placeholder* (hook exists, backend/logic not
+> yet ported), or *opt-in* (off by default). Treat `main` as a development snapshot.
+
+This document is the single source of truth for **what actually works right now**.
+
+## Module reference
+
+| File | What it does |
+|------|--------------|
+| `engine/gx10.py` | The orchestrator engine **and** the original monolithic CLI. Agent loop, tool execution, deterministic `TaskStore`, fail-closed macros (`stage_handover` / `advance_pipeline`), config-tree loader, platform detection, context trimming. This is the *proven* core. |
+| `engine/server.py` | **Headless server** (new). Drives the engine with no UI, exposes plain-HTTP endpoints, serializes agent access, runs the feedback-side reconciler. |
+| `engine/client.py` | **Thin client** (new). Line REPL + the local code-agent pool (`claude --print`) that keeps project code on your machine. |
+| `engine/tui.py` | **Full-screen client** (new). prompt_toolkit UI, live streaming, status toolbar, scrollback, compressed multi-line paste. |
+| `engine/commands.py` | Shared command router for REPL + TUI (`/command` → local or forwarded to the server). |
+| `engine/workers.py` | **Reasoning-worker fan-out** (new). Independent prompts run concurrently against the model (`POST /fanout`). |
+| `ack/` | **Agent-Contract-Kernel**: schema-as-SSOT (`case_spec`), bounded validate→reask (`validated_emit`), constrained emission (`constrained_emission`), registry, doctor, generator, and the opt-in `lodestar` plugin. |
+
+## Wiring status
+
+| Component | Status | Notes |
+|-----------|--------|-------|
+| Agent loop, tools, TaskStore, macros | **proven** | Inherited from the in-production orchestrator. |
+| Config tree + `GX10_*` env + language setting | **wired + tested** | `language` (reply language) default `en`. |
+| Server/client split (`/chat`, `/chat/stream`, `/tasks`, `/pending`, `/feedback`) | **wired + tested** | Verified PC→LAN→Spark; headless capture; streaming. |
+| Thin client + parallel code-agent pool | **wired + tested** | Bounded pool; claim-once; unclaim-on-failure. |
+| Full-screen TUI (stream, toolbar, scroll, paste) | **wired + tested** | Render/scroll/paste unit-checked; runs in a real terminal. |
+| Reasoning-worker fan-out (`/fanout`) | **wired + tested** | Concurrency bounded by `max_num_seqs`; measured speedup. |
+| ACK contract gate at `stage_handover` | **wired + tested** | Soft path (`_ack_validate`): task_json validated against `TaskSpec`, fail-closed → reask. |
+| Orchestrator Docker image / compose | **wired + tested** | Runs as `ironclad-orchestrator` next to the model. |
+| **Memory (Mem0)** | **placeholder** | See below — hooks present, backend not shipped in core. |
+| **Autoplan** (`/autoplan on\|off [N]`) | **placeholder** | Command parses and sets flags, but the "plan the next task when the pipeline empties" loop is **not** ported into the server's queue consumer; autopilot is off server-side. No effect yet. |
+| Autopilot auto-launch on the server | **placeholder / by design off** | The server never launches code-agents (`_LAUNCH_CMD` is skipped); launching is the client's job (the pool). The server-side `autopilot` toggle is currently inert. |
+| Remote turn cancel (Ctrl+C in the TUI) | **placeholder** | Not yet wired across the HTTP boundary; shows a notice. |
+| Constrained-emission **hard floor** (grammar) | **parked** | Available on recent vLLM, but the engine path uses the soft validate→reask only. |
+| **Lodestar** capability→backlog plugin | **opt-in (off)** | `lodestar.enabled=false` by default; demo in `examples/demo-vessel/`. |
+
+## Memory
+
+The engine has **integration points** for long-term memory (a `remember`/query tool,
+store-on-task-completion, and stage-time context injection), but the **backend is not
+part of `core/`**: `gx10.py` imports a `memory` module inside a `try/except`, and when
+it is absent (the default in this repo) `_MemoryManager` is `None` and **every memory
+hook is inert** — no tool is registered, nothing is stored or queried.
+
+To enable it you bring your own `MemoryManager` (the reference deployment runs a
+**Mem0** stack — Qdrant + Neo4j + BGE-M3 embeddings, LLM pointed at the local model —
+as separate containers) and point the engine at it via a memory config. **Status:**
+the Mem0 stack runs in the reference deployment, but the engine↔memory wiring is **not
+yet connected in the exported code** — it is the next integration step. Until then,
+memory is a documented extension point, not a working feature here.
+
+## What's next (to finish the rebuild)
+
+1. Wire the engine to the Mem0 backend (ship/point at a `MemoryManager`).
+2. Port the autoplan loop into the server's queue consumer (decide client- vs
+   server-side launching).
+3. Wire remote turn cancellation across the HTTP boundary.
+4. Decide whether to unpark the grammar hard-floor on the reference GPU.
+
+## Reference load test
+
+Run against the full reference stack on the DGX Spark (2026-06-17): all five
+containers up — `vllm-35b`, `mem-api`, `mem-qdrant`, `mem-neo4j`,
+`ironclad-orchestrator` (all healthy) — driven from a workstation over the LAN.
+
+**Fan-out (8 independent reasoning prompts, concurrent):**
+
+| metric | value |
+|--------|-------|
+| success | 8 / 8 |
+| wall-clock | 1.2 s |
+| Σ per-prompt latency | 7.1 s |
+| **speedup vs serial** | **5.8×** |
+| aggregate throughput | ~118 tok/s |
+
+**Chat (3 sequential turns, single agent — serialized by design):**
+
+| metric | value |
+|--------|-------|
+| mean turn latency | 2.1 s |
+| decode rate | ~55–68 tok/s |
+| answers | all correct, in the configured language (German) |
+
+Interpretation: the parallel reasoning path scales near-linearly to the model's batch
+width (`max_num_seqs=8`); the conversational path is intentionally one-turn-at-a-time
+behind the agent lock. Both are healthy on a single GB10.
