@@ -95,6 +95,10 @@ class Server:
         if tail:
             on_text(tail)
 
+    def cancel(self) -> Dict[str, Any]:
+        """Abort the turn currently running on the server (sets its cancel event)."""
+        return self._req("POST", "/cancel", {})
+
     def tasks(self) -> List[Dict[str, Any]]:
         return self._req("GET", "/tasks").get("tasks", [])
 

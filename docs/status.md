@@ -41,7 +41,7 @@ This document is the single source of truth for **what actually works right now*
 | **Memory (Mem0)** | **wired + tested** | `engine/memory.py` talks to a Mem0-style service (`GX10_MEMORY_URL`); store+search verified live. The store starts **empty** — see below. |
 | **Autoplan** (`/autoplan on\|off [N]`) | **wired (config-gated)** | Ported into the server's queue consumer (`_autoplan_tick`), **decoupled from autopilot** so it works in the split: server plans → client executes → server advances → server plans again. Fires only when `/autoplan on` is set **and** `paths.active_capability_backlog` is configured (no backlog → it disables itself). Logic unit-tested. |
 | Autopilot auto-launch on the server | **placeholder / by design off** | The server never launches code-agents (`_LAUNCH_CMD` is skipped); launching is the client's job (the pool). The server-side `autopilot` toggle is currently inert. |
-| Remote turn cancel (Ctrl+C in the TUI) | **placeholder** | Not yet wired across the HTTP boundary; shows a notice. |
+| Remote turn cancel (Ctrl+C in the TUI) | **wired + tested** | `POST /cancel` sets the engine cancel event; the running turn aborts at its next iteration. Ctrl+C in the TUI fires it non-blocking. |
 | Constrained-emission **hard floor** (grammar) | **parked** | Available on recent vLLM, but the engine path uses the soft validate→reask only. |
 | **Lodestar** capability→backlog plugin | **opt-in (off)** | `lodestar.enabled=false` by default; demo in `examples/demo-vessel/`. |
 
@@ -74,7 +74,8 @@ the operator's.
    default, ships empty (see Memory above).
 2. ~~Port the autoplan loop into the server's queue consumer.~~ **Done** —
    `_autoplan_tick`, decoupled from autopilot, backlog-config-gated.
-3. Wire remote turn cancellation across the HTTP boundary.
+3. ~~Wire remote turn cancellation across the HTTP boundary.~~ **Done** —
+   `POST /cancel` + Ctrl+C in the TUI.
 4. Decide whether to unpark the grammar hard-floor on the reference GPU.
 
 ## Reference load test

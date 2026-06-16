@@ -282,9 +282,15 @@ def _expand_pastes(text: str) -> str:
     return _PASTE_RE.sub(_sub, text)
 
 
-def _build_app(q: "Queue[str]") -> "Application":
+def _build_app(q: "Queue[str]", srv: Server) -> "Application":
     input_buf = Buffer(name="input_buf", multiline=False)
     kb = KeyBindings()
+
+    def _cancel_fn():
+        try:
+            srv.cancel()
+        except Exception as e:  # noqa: BLE001
+            gx10._ui_print(gx10.col(f"  ✗ Abbruch fehlgeschlagen: {e!r}", gx10.C.RED))
 
     @kb.add("enter")
     def _enter(event):
@@ -319,8 +325,9 @@ def _build_app(q: "Queue[str]") -> "Application":
     @kb.add("c-c")
     def _ctrl_c(event):
         if gx10._status["thinking"]:
-            gx10._ui_print(gx10.col("  (Remote-Turn läuft — Abbrechen noch nicht verdrahtet)",
-                                    gx10.C.GRAY))
+            gx10._ui_print(gx10.col("  ⨯ Abbruch angefordert …", gx10.C.YELLOW))
+            # nicht-blockierend: den laufenden Server-Turn abbrechen
+            threading.Thread(target=_cancel_fn, daemon=True).start()
         # sonst: ignorieren (exit zum Beenden)
 
     @kb.add("c-d")
@@ -345,7 +352,7 @@ def run_tui(srv: Server, codedir: Path, max_agents: int) -> None:
     _STATUS["codedir"] = str(codedir)
 
     q: "Queue[str]" = Queue()
-    app = _build_app(q)
+    app = _build_app(q, srv)
     gx10._UI_APP = app  # _ui_print routet ab jetzt in den Output-Pane
 
     gx10._ui_print(gx10.col("  Ironclad Orchestrator — Vollbild-Client", gx10.C.GREEN))

@@ -335,6 +335,13 @@ class _Handler(BaseHTTPRequestHandler):
                 with _Streamed(_write):
                     with _AGENT_LOCK:
                         gx10._dispatch(self.agent, message)
+            elif self.path == "/cancel":
+                # Bricht den gerade laufenden Turn ab: das Engine-_CANCEL_EVENT wird
+                # gesetzt; run() prüft es pro Iteration/Generation und beendet sauber.
+                # Kein Agent-Lock nötig — das Event ist thread-safe und der laufende
+                # Turn-Thread pollt es. Der nächste Turn löscht es beim Start.
+                gx10._CANCEL_EVENT.set()
+                self._send(200, {"ok": True, "cancelled": True})
             elif self.path == "/feedback":
                 data = self._read_json()
                 tid = (data.get("task_id") or "").strip()
@@ -402,7 +409,7 @@ def serve(host: str = "0.0.0.0", port: int = 8100,
     print(f"  WORKDIR: {workdir}", flush=True)
     print(f"  Config : {cfg_path or '— (Code-Defaults)'}", flush=True)
     print(f"  Listen : http://{host}:{port}  "
-          f"(GET /health /tasks /pending · POST /chat /chat/stream /feedback /fanout)",
+          f"(GET /health /tasks /pending · POST /chat /chat/stream /cancel /feedback /fanout)",
           flush=True)
     try:
         httpd.serve_forever()

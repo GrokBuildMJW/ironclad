@@ -191,6 +191,18 @@ def test_http_chat_stream(tmp_path, monkeypatch):
         httpd.shutdown()
 
 
+def test_http_cancel_sets_event(tmp_path, monkeypatch):
+    httpd, port = _start_server(monkeypatch, tmp_path)
+    try:
+        gx10._CANCEL_EVENT.clear()
+        res = _post(port, "/cancel", {})
+        assert res["ok"] and res["cancelled"] is True
+        assert gx10._CANCEL_EVENT.is_set()      # running turn would see this and abort
+    finally:
+        gx10._CANCEL_EVENT.clear()
+        httpd.shutdown()
+
+
 def test_http_chat_requires_message(tmp_path, monkeypatch):
     httpd, port = _start_server(monkeypatch, tmp_path)
     try:
