@@ -1,0 +1,99 @@
+# Reference deployment — NVIDIA DGX Spark
+
+Ironclad is developed and exercised on a single **NVIDIA DGX Spark**. This is the
+reference stack: what runs, why, and how to bring it up in one shot. Nothing here is
+required by Ironclad — any OpenAI-compatible endpoint works — but reproducing this box
+gives you the same behaviour the project is tuned against.
+
+> **Pre-release.** Versions/flags below reflect what currently works on this hardware
+> and may change.
+
+## The hardware
+
+- **NVIDIA DGX Spark** — GB10 Grace-Blackwell, compute `sm_121`, **128 GB unified
+  memory** (CPU+GPU share one pool).
+- Practical consequence: the box is **decode-bandwidth-limited**. A **Mixture-of-
+  Experts** model in **NVFP4** (4-bit, runs natively on Blackwell) decodes far faster
+  than a dense model of similar quality, and fits comfortably in unified memory. That
+  is why the reference model is an **MoE NVFP4**, not a large dense model.
+
+## What runs on the box
+
+| Component        | What it is                                   | Port  | Required for Ironclad |
+|------------------|----------------------------------------------|-------|-----------------------|
+| **vLLM**         | OpenAI-compatible server, the orchestrator + worker model | 8000  | **Yes** |
+| **Orchestrator** | Ironclad server (`engine/server.py`), headless | 8100  | for the server/client split |
+| Memory (opt.)    | Mem0 + Qdrant + Neo4j + BGE-M3 long-term memory | 8800 | optional |
+
+The **model**: `RedHatAI/Qwen3.6-35B-A3B-NVFP4` served as `qwen3.6-35b`, on
+`vllm/vllm-openai:cu130-nightly`. Key flags and why:
+
+- `--quantization compressed-tensors --kv-cache-dtype fp8` — NVFP4 weights + fp8 KV
+  cache to stay within bandwidth/memory.
+- `--moe-backend flashinfer_cutlass --attention-backend flashinfer` — the MoE/attn
+  kernels that work on `sm_121` (the marlin MoE backend rejects this unquantized path).
+- `--gpu-memory-utilization 0.6` — leaves headroom in unified memory for the other
+  services (memory stack, orchestrator).
+- `--reasoning-parser qwen3 --enable-auto-tool-choice --tool-call-parser qwen3_coder`
+  — Qwen3 thinking + native tool calling. Ironclad's ACK emitter turns **thinking off
+  per-request** for structured emission (that is what makes it ~100 % reliable);
+  ordinary chat keeps thinking on.
+- **CUDA 13 nightly image matters:** grammar/constrained decoding (XGrammar) crashed
+  the engine on older images on this GPU; it works on `cu130-nightly`.
+
+## One-shot setup
+
+On the Spark, from a checkout of this repo:
+
+```bash
+# 1) (once) get the weights, e.g.
+#    huggingface-cli download RedHatAI/Qwen3.6-35B-A3B-NVFP4 \
+#      --local-dir ~/models/RedHatAI-Qwen3.6-35B-A3B-NVFP4
+
+# 2) one-shot: vLLM + orchestrator
+bash scripts/spark-bootstrap.sh \
+     --model-dir ~/models/RedHatAI-Qwen3.6-35B-A3B-NVFP4 \
+     --served-name qwen3.6-35b \
+     --with-orchestrator
+```
+
+The script is **idempotent** (re-run safe), parameterized (no host/IP baked in), and
+waits for `/v1/models` (and `/health` if `--with-orchestrator`) before returning. See
+`bash scripts/spark-bootstrap.sh --help` for all flags.
+
+Then, from your workstation:
+
+```bash
+GX10_SERVER_URL=http://<spark-host>:8100 python engine/tui.py --codedir .
+```
+
+## Optional: long-term memory stack
+
+Ironclad runs fine without it. If you want persistent agent memory, run a **Mem0**
+service (vector + graph) alongside vLLM:
+
+- **Qdrant** (vectors) + **Neo4j** (graph) + **BGE-M3** embeddings, with Mem0's LLM
+  pointed back at the local vLLM (`qwen3.6-35b`).
+- Pin `mem0ai==0.1.118` with the `[graph]` extra (later 2.x dropped the OSS graph
+  store). Read path is vector-only by default; enable graph only for relational
+  queries (the graph path is slower).
+- Expose it on `:8800` and point the engine's memory layer at it.
+
+This stack is deployment glue rather than framework code, so it is documented here
+rather than scripted in `spark-bootstrap.sh`.
+
+## Verify
+
+```bash
+curl -s http://localhost:8000/v1/models          # model listed
+curl -s http://localhost:8100/health             # {"ok": true, "model": "qwen3.6-35b", ...}
+```
+
+## Notes / gotchas observed on this hardware
+
+- **Cold start** loads weights into VRAM up front — the first `/v1/models` can take a
+  few minutes.
+- **Concurrency:** vLLM batches `--max-num-seqs` (8) concurrent sequences — Ironclad's
+  `/fanout` exploits this for parallel reasoning (measured ~5× over serial).
+- **One model at a time:** with 128 GB unified, run a single NVFP4 MoE plus the small
+  services; don't try to co-host a second large model.

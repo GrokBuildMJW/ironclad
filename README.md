@@ -12,9 +12,20 @@ The guiding principle: a small fast model with hard schema/validation
 enforcement beats a large model you "trust" to format its output. Hermes-grade
 tool-calling reliability **without** depending on any specific model or parser.
 
-> Status: **early / pre-release.** This README is the public entry point; the
-> framework is being consolidated from a working internal codebase. APIs will
-> stabilize before the first tagged release.
+## 🚧 Status: in active development (pre-release)
+
+Ironclad is **work in progress.** There is no tagged release yet; APIs, layout and
+config may change without notice. It is generated from a private monorepo — treat
+`main` as a development snapshot, not a stable artifact.
+
+**Reference environment.** Ironclad is developed and exercised on an **NVIDIA DGX
+Spark** (GB10, Blackwell `sm_121`, 128 GB unified memory) running a local **vLLM**
+server with **Qwen3.6-35B-A3B-NVFP4**. Nothing is hard-wired to that box — any
+OpenAI-compatible endpoint works — but the defaults (`localhost:8000`,
+`qwen3.6-35b`), the throughput numbers and the constrained-decoding findings (NVFP4,
+XGrammar on the CUDA 13 nightly) reflect that hardware. See
+[`docs/dgx-spark.md`](docs/dgx-spark.md) for the full reference stack and a **one-shot
+bootstrap** (`scripts/spark-bootstrap.sh`).
 
 ## Why
 
@@ -29,18 +40,29 @@ tool-calling reliability **without** depending on any specific model or parser.
 - **Standalone.** No hidden dependency on any private deployment. Bring your
   own OpenAI-compatible endpoint (vLLM, etc.).
 
-## Quickstart
+## Setup
+
+Requires **Python 3.10+** and an **OpenAI-compatible endpoint** (e.g. vLLM).
 
 ```bash
-pip install -r requirements.txt        # (coming with the first release)
+git clone https://github.com/GrokBuildMJW/ironclad.git
+cd ironclad
+python -m venv .venv && . .venv/bin/activate     # Windows: .venv\Scripts\Activate.ps1
+pip install -e ".[engine]"                         # ACK + engine (openai, prompt_toolkit)
 
-# Point at any OpenAI-compatible endpoint:
-export IRONCLAD_BASE_URL=http://localhost:8000/v1
-export IRONCLAD_MODEL=your-served-model-name
-export IRONCLAD_API_KEY=...            # if your endpoint needs one
+# Point at your model endpoint (defaults: http://localhost:8000/v1, qwen3.6-35b):
+export GX10_BASE_URL=http://localhost:8000/v1
+export GX10_MODEL=your-served-model-name
+export GX10_API_KEY=...                             # only if your endpoint needs one
 
-python -m ironclad --workdir ./my-workspace
+# Monolithic full-screen CLI (one process):
+python engine/gx10.py --workdir ./my-workspace
 ```
+
+- **Full walkthrough, the server/client split, and the reference vLLM launch:**
+  see **[`SETUP.md`](SETUP.md)**.
+- **Let an AI coding agent set it up for you** (deterministic, verifiable runbook):
+  see **[`AGENTS.md`](AGENTS.md)**.
 
 A runnable **demo vessel** lives in [`examples/demo-vessel/`](examples/demo-vessel/)
 — a minimal, self-contained workspace showing a contract spec, a pipeline, and
