@@ -16,8 +16,9 @@ lean **orchestration engine** that turns multi-step agent workflows into
 deterministic, fail-closed pipelines.
 
 The guiding principle: a small fast model with hard schema/validation
-enforcement beats a large model you "trust" to format its output. Hermes-grade
-tool-calling reliability **without** depending on any specific model or parser.
+enforcement beats a large model you "trust" to format its output. You get
+**production-grade tool-calling reliability without depending on any specific
+model or parser** — the kernel enforces the contract, not the weights.
 
 ## 🚧 Status: proven core, mid-redesign (pre-release)
 

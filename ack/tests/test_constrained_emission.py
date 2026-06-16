@@ -3,7 +3,7 @@
 The hard-floor guarantee, proven without a running model: the constrained request
 carries the closed schema + a forcing tool_choice, and the runtime validator
 REJECTS any reply that omits a required field — on both the native-tool-call path
-(vLLM/Qwen3-hermes) and the content-JSON fallback path (our live Ollama runtime).
+(vLLM/Qwen3-Coder) and the content-JSON fallback path.
 
     python -m pytest core/ack/tests/test_constrained_emission.py -v
 """
@@ -196,13 +196,9 @@ def test_no_tool_calls_and_no_content_raises():
 # --------------------------------------------------------------------------- #
 
 
-def test_qwen3_uses_hermes_parser():
-    flags = recommended_vllm_server_flags("qwen3")
-    assert flags == ["--enable-auto-tool-choice", "--tool-call-parser", "hermes"]
-
-
-def test_qwen3_coder_uses_xml_parser():
-    assert recommended_vllm_server_flags("qwen3-coder")[-1] == "qwen3_xml"
+def test_qwen3_coder_parser():
+    flags = recommended_vllm_server_flags("qwen3-coder")
+    assert flags == ["--enable-auto-tool-choice", "--tool-call-parser", "qwen3_coder"]
 
 
 def test_unknown_model_family_raises():

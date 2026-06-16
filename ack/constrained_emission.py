@@ -290,13 +290,12 @@ def emit_constrained(
 # Ops helper — recommended vLLM server launch flags (documentation/grounding)
 # --------------------------------------------------------------------------- #
 
-#: Tool-call parser per model family (verified against vLLM tool-calling docs).
-#: Qwen3 (non-coder) + Hermes use ``hermes``; Qwen3-Coder uses ``qwen3_xml``.
+#: Tool-call parser per model family (per vLLM's tool-calling docs). This framework
+#: targets Qwen3-Coder; for other families, pick the matching value from vLLM's
+#: ``--tool-call-parser`` options.
 _TOOL_CALL_PARSER: dict[str, str] = {
-    "qwen3": "hermes",
-    "hermes": "hermes",
-    "qwen2.5": "hermes",
-    "qwen3-coder": "qwen3_xml",
+    "qwen3-coder": "qwen3_coder",
+    "qwen3_coder": "qwen3_coder",
 }
 
 
@@ -304,8 +303,8 @@ def recommended_vllm_server_flags(model_family: str) -> list[str]:
     """Return the vLLM server flags that make *model_family* emit grammar-constrained
     tool-calls. Use to ground an ops runbook / a future vLLM service definition.
 
-    Example: ``recommended_vllm_server_flags("qwen3")`` →
-    ``["--enable-auto-tool-choice", "--tool-call-parser", "hermes"]``.
+    Example: ``recommended_vllm_server_flags("qwen3-coder")`` →
+    ``["--enable-auto-tool-choice", "--tool-call-parser", "qwen3_coder"]``.
     """
     parser = _TOOL_CALL_PARSER.get(model_family.strip().lower())
     if parser is None:

@@ -330,16 +330,6 @@ def _build_app(q: "Queue[str]", srv: Server) -> "Application":
         _SCROLL["rows"] = max(0, _SCROLL["rows"] - max(1, _page_rows() - 1))
         event.app.invalidate()
 
-    # Mouse wheel (needs mouse_support=True): scroll the history a few lines per notch.
-    @kb.add(Keys.ScrollUp)
-    def _wheel_up(event):
-        _SCROLL["rows"] += 3
-        event.app.invalidate()
-
-    @kb.add(Keys.ScrollDown)
-    def _wheel_down(event):
-        _SCROLL["rows"] = max(0, _SCROLL["rows"] - 3)
-        event.app.invalidate()
 
     @kb.add("c-c")
     def _ctrl_c(event):
@@ -363,7 +353,7 @@ def _build_app(q: "Queue[str]", srv: Server) -> "Application":
         Window(content=FormattedTextControl(_toolbar, focusable=False), height=3),
     ]))
     return Application(layout=layout, key_bindings=kb, full_screen=True,
-                       refresh_interval=gx10.UI_REFRESH_INTERVAL, mouse_support=True)
+                       refresh_interval=gx10.UI_REFRESH_INTERVAL, mouse_support=False)
 
 
 def run_tui(srv: Server, codedir: Path, max_agents: int) -> None:
