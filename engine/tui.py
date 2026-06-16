@@ -109,20 +109,25 @@ def _toolbar():
 # --------------------------------------------------------------------------- #
 # Background: poll the server for toolbar status.
 # --------------------------------------------------------------------------- #
+def _poll_once(srv: Server) -> None:
+    try:
+        h = srv.health()
+        _STATUS.update(connected=True, model=h.get("model", "?"),
+                       watcher=h.get("watcher"), autopilot=h.get("autopilot"))
+        counts = Counter(t.get("status") for t in srv.tasks())
+        _STATUS.update(pending=counts.get("pending", 0),
+                       in_progress=counts.get("in_progress", 0),
+                       done=counts.get("done", 0))
+    except Exception:  # noqa: BLE001 — network gone -> red, keep polling
+        _STATUS["connected"] = False
+    if gx10._UI_APP is not None:
+        gx10._UI_APP.invalidate()
+
+
 def _poller(srv: Server, stop: threading.Event) -> None:
+    _poll_once(srv)                 # immediate first poll → model info shows at once
     while not stop.wait(3.0):
-        try:
-            h = srv.health()
-            _STATUS.update(connected=True, model=h.get("model", "?"),
-                           watcher=h.get("watcher"), autopilot=h.get("autopilot"))
-            counts = Counter(t.get("status") for t in srv.tasks())
-            _STATUS.update(pending=counts.get("pending", 0),
-                           in_progress=counts.get("in_progress", 0),
-                           done=counts.get("done", 0))
-        except Exception:  # noqa: BLE001 — network gone -> red, keep polling
-            _STATUS["connected"] = False
-        if gx10._UI_APP is not None:
-            gx10._UI_APP.invalidate()
+        _poll_once(srv)
 
 
 # --------------------------------------------------------------------------- #
@@ -300,7 +305,7 @@ def _build_app(q: "Queue[str]", srv: Server) -> "Application":
         if not raw:
             q.put(""); return
         expanded = _expand_pastes(raw)            # placeholders -> full text
-        gx10._ui_print(gx10.col(f"\n[Du] > {raw}", gx10.C.BOLD))  # show compact
+        gx10._ui_print(gx10.col(f"\n[You] > {raw}", gx10.C.BOLD))  # show compact
         _PASTES.clear()
         q.put(expanded)
 
@@ -314,13 +319,27 @@ def _build_app(q: "Queue[str]", srv: Server) -> "Application":
         else:
             event.current_buffer.insert_text(data)
 
-    @kb.add("pageup")
+    # eager=True so the page keys win over the focused input buffer's defaults.
+    @kb.add(Keys.PageUp, eager=True)
     def _pgup(event):
         _SCROLL["rows"] += max(1, _page_rows() - 1)
+        event.app.invalidate()
 
-    @kb.add("pagedown")
+    @kb.add(Keys.PageDown, eager=True)
     def _pgdn(event):
         _SCROLL["rows"] = max(0, _SCROLL["rows"] - max(1, _page_rows() - 1))
+        event.app.invalidate()
+
+    # Mouse wheel (needs mouse_support=True): scroll the history a few lines per notch.
+    @kb.add(Keys.ScrollUp)
+    def _wheel_up(event):
+        _SCROLL["rows"] += 3
+        event.app.invalidate()
+
+    @kb.add(Keys.ScrollDown)
+    def _wheel_down(event):
+        _SCROLL["rows"] = max(0, _SCROLL["rows"] - 3)
+        event.app.invalidate()
 
     @kb.add("c-c")
     def _ctrl_c(event):
@@ -339,12 +358,12 @@ def _build_app(q: "Queue[str]", srv: Server) -> "Application":
                wrap_lines=True),
         Window(height=1, char="─"),
         Window(content=BufferControl(buffer=input_buf, focusable=True), height=1,
-               get_line_prefix=lambda i, wrap_count: "│ [Du] > "),
+               get_line_prefix=lambda i, wrap_count: "│ [You] > "),
         Window(height=1, char="─"),
         Window(content=FormattedTextControl(_toolbar, focusable=False), height=3),
     ]))
     return Application(layout=layout, key_bindings=kb, full_screen=True,
-                       refresh_interval=gx10.UI_REFRESH_INTERVAL, mouse_support=False)
+                       refresh_interval=gx10.UI_REFRESH_INTERVAL, mouse_support=True)
 
 
 def run_tui(srv: Server, codedir: Path, max_agents: int) -> None:
