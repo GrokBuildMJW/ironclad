@@ -102,6 +102,22 @@ Measured on the reference stack — a single **NVIDIA DGX Spark** (GB10) serving
 Reproduce with your own endpoint; numbers scale with the model and GPU. Full method
 and the per-component **wiring status** live in [`docs/status.md`](docs/status.md).
 
+## A starting point to build on
+
+Ironclad is a **foundation, not a finished product** — a generic agentic core meant
+to be extended. Concrete use cases dock onto it as **vessels** (see
+[`examples/demo-vessel/`](examples/demo-vessel/); a generator scaffolds new ones), so a
+broad audience can build their own domain agents on a reliable, self-hosted base
+rather than starting from scratch. Realistic directions the architecture supports today:
+
+- **Edge & energy efficiency** — a small, enforced model on local/edge hardware
+  instead of a large cloud one. That efficiency bet is the whole premise of the project.
+- **Education · healthcare · logistics** — build a vessel for your domain: reliable
+  tool-using agents and retrieval/RAG assistants over your own data, kept on-prem.
+
+The repo's job is to give you a working starting point, not to ship every vertical —
+the verticals are yours to build.
+
 ## Setup
 
 Requires **Python 3.10+** and an **OpenAI-compatible endpoint** (e.g. vLLM).

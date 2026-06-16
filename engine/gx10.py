@@ -594,7 +594,7 @@ TOOLS = [
                 "properties": {
                     "path":  {"type": "string", "default": "."},
                     "sort":  {"type": "string", "enum": ["name", "time"], "default": "name"},
-                    "limit": {"type": "integer", "description": "Max. Anzahl Einträge (neueste zuerst bei sort='time')"}
+                    "limit": {"type": "integer", "description": "max number of entries (newest first when sort='time')"}
                 },
                 "required": []
             }
@@ -670,9 +670,9 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "search_files",
-            "description": ("Durchsucht Dateien mit einem REGEX (case-insensitive; "
-                            "z. B. 'vLLM|rate.limit'). Ungültiges Muster fällt auf "
-                            "literalen Substring zurück. Für Task-JSONs file_pattern='*.json' setzen."),
+            "description": ("Search files with a REGEX (case-insensitive; e.g. "
+                            "'vLLM|rate.limit'). An invalid pattern falls back to a literal "
+                            "substring. For task JSONs set file_pattern='*.json'."),
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -701,22 +701,21 @@ TOOLS = [
         "function": {
             "name": "advance_pipeline",
             "description": (
-                "Schaltet die Workflow-Pipeline für EINEN abgeschlossenen Task "
-                "in einem einzigen deterministischen Schritt weiter: archiviert "
-                "vault/_Workflow/active.md → handovers/, kopiert das Feedback ins "
-                "Vault, setzt das Task-JSON auf status=done und verschiebt es nach "
-                "tasks/done/, löscht den Handover in summaries/handovers/ und "
-                "aktiviert optional den nächsten Task. "
-                "Bei 'done' IMMER dieses Tool verwenden statt einzelner "
-                "move_file/copy_file/delete_file-Aufrufe. Fail-closed: bricht ab, "
-                "wenn die Feedback-Datei fehlt. Rührt code/ und Audit-Chain nie an."
+                "Advance the workflow pipeline for ONE completed task in a single "
+                "deterministic step: archive vault/_Workflow/active.md → handovers/, "
+                "copy the feedback into the vault, set the task JSON to status=done and "
+                "move it to tasks/done/, delete the handover in summaries/handovers/, and "
+                "optionally activate the next task. "
+                "On 'done' ALWAYS use this tool instead of individual "
+                "move_file/copy_file/delete_file calls. Fail-closed: aborts if the "
+                "feedback file is missing. Never touches code/ or the audit chain."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "task_id":      {"type": "string", "description": "z. B. KGC-315"},
+                    "task_id":      {"type": "string", "description": "e.g. KGC-315"},
                     "agent":        {"type": "string", "enum": ["OPUS", "SONNET"]},
-                    "next_task_id": {"type": "string", "description": "optional — nächster zu aktivierender Task"}
+                    "next_task_id": {"type": "string", "description": "optional — the next task to activate"}
                 },
                 "required": ["task_id", "agent"]
             }
@@ -727,23 +726,22 @@ TOOLS = [
         "function": {
             "name": "stage_handover",
             "description": (
-                "Legt einen NEUEN Task+Handover in EINEM Schritt an. Das System "
-                "(TaskStore) vergibt die ID, stempelt created_at und prüft "
-                "deterministisch auf THEMEN-DUPLIKATE — gib daher KEINE id und "
-                "KEIN created_at selbst an (werden ignoriert/überschrieben). "
-                "Existiert bereits ein Task zum gleichen Thema, wird NICHTS "
-                "angelegt und der bestehende Task genannt — dann diesen nutzen, "
-                "keinen neuen erzwingen. Beim Anlegen/Übergeben IMMER dieses Tool."
+                "Create a NEW task+handover in ONE step. The system (TaskStore) assigns "
+                "the ID, stamps created_at and deterministically checks for TOPIC "
+                "DUPLICATES — so do NOT pass an id or a created_at yourself (they are "
+                "ignored/overwritten). If a task on the same topic already exists, NOTHING "
+                "is created and the existing task is named — then use that one, do not "
+                "force a new one. When creating/handing off ALWAYS use this tool."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "agent":       {"type": "string", "enum": ["OPUS", "SONNET"]},
-                    "handover_md": {"type": "string", "description": "Vollständiger Handover-Markdown"},
-                    "task_json":   {"type": "string", "description": "Task-JSON als String (title, description, type, priority Pflicht; id/created_at weglassen — vergibt der Store)"},
-                    "task_id":     {"type": "string", "description": "optional — nur für reinen Handover OHNE task_json"},
+                    "handover_md": {"type": "string", "description": "the full handover markdown"},
+                    "task_json":   {"type": "string", "description": "task JSON as a string (title, description, type, priority required; omit id/created_at — the store assigns them)"},
+                    "task_id":     {"type": "string", "description": "optional — only for a pure handover WITHOUT task_json"},
                     "set_active":  {"type": "boolean", "description": "optional, default true"},
-                    "force":       {"type": "boolean", "description": "optional — Dedup übersteuern (NUR auf ausdrückliche Operator-Anweisung)"}
+                    "force":       {"type": "boolean", "description": "optional — override dedup (ONLY on an explicit operator instruction)"}
                 },
                 "required": ["agent", "handover_md"]
             }
@@ -758,16 +756,16 @@ MEMORY_TOOL = {
     "function": {
         "name": "query_memory",
         "description": (
-            "Sucht im persistenten Agenten-Gedächtnis nach relevantem Kontext: "
-            "vergangene Task-Patterns, Architektur-Entscheidungen, bekannte Gotchas "
-            "und Lösungsansätze. Vor stage_handover für komplexe Tasks aufrufen, um "
-            "relevante Past-Decisions zu finden. Auch für Research nutzbar."
+            "Search the persistent agent memory for relevant context: past task "
+            "patterns, architecture decisions, known gotchas and solution approaches. "
+            "Call before stage_handover for complex tasks to find relevant past "
+            "decisions. Also useful for research."
         ),
         "parameters": {
             "type": "object",
             "properties": {
-                "query": {"type": "string", "description": "Suchanfrage (Deutsch oder Englisch, natural language)"},
-                "limit": {"type": "integer", "description": "Max. Anzahl Ergebnisse (default 8)"}
+                "query": {"type": "string", "description": "search query (natural language)"},
+                "limit": {"type": "integer", "description": "max number of results (default 8)"}
             },
             "required": ["query"]
         }
@@ -780,17 +778,16 @@ ONBOARDING_TOOLS = [
         "function": {
             "name": "check_task_exists",
             "description": (
-                "Prüft VOR dem Schreiben eines Handovers billig, ob bereits ein "
-                "Task zum gleichen Thema existiert (gleiche Logik wie das "
-                "stage_handover-Dedup-Gate). Liefert 'EXISTS: KGC-XXX' oder 'NONE'. "
-                "Im Onboarding-Modus IMMER zuerst aufrufen, um teure Handover-"
-                "Generierung für Duplikate zu vermeiden."
+                "Cheaply check BEFORE writing a handover whether a task on the same "
+                "topic already exists (same logic as the stage_handover dedup gate). "
+                "Returns 'EXISTS: KGC-XXX' or 'NONE'. In onboarding mode ALWAYS call this "
+                "first to avoid expensive handover generation for duplicates."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "title":       {"type": "string"},
-                    "description": {"type": "string", "description": "optional — schärft die Ähnlichkeitsprüfung"}
+                    "description": {"type": "string", "description": "optional — sharpens the similarity check"}
                 },
                 "required": ["title"]
             }
@@ -845,14 +842,14 @@ def _advance_pipeline(task_id: str, agent: str, next_task_id: Optional[str] = No
     active.md wird projiziert. Fail-closed: ohne Feedback-Datei kein
     Abschluss. Rührt weder code/ noch die Audit-Chain an."""
     if not task_id or not _TASK_ID_RE.match(task_id):
-        return f"ERROR: Ungültige task_id: {task_id!r} (erwartet z. B. KGC-315)"
+        return f"ERROR: invalid task_id: {task_id!r} (expected e.g. KGC-315)"
     agent = (agent or "").upper()
     if agent == "KIMI":
         agent = "SONNET"                      # Kimi → Sonnet (Legacy-Alias, 2026-06-15)
     if agent not in ("OPUS", "SONNET"):
-        return f"ERROR: agent muss OPUS oder SONNET sein (war: {agent!r})"
+        return f"ERROR: agent must be OPUS or SONNET (was: {agent!r})"
     if next_task_id and not _TASK_ID_RE.match(next_task_id):
-        return f"ERROR: Ungültige next_task_id: {next_task_id!r}"
+        return f"ERROR: invalid next_task_id: {next_task_id!r}"
 
     store = _store()
     log: List[str] = []
@@ -860,7 +857,7 @@ def _advance_pipeline(task_id: str, agent: str, next_task_id: Optional[str] = No
     # Idempotenz-Gate: Task bereits done → kein erneutes Advance nötig
     existing = store.get(task_id)
     if existing and existing.get("status") == "done":
-        return (f"OK: Task {task_id} ist bereits done — kein erneutes Advance nötig. "
+        return (f"OK: task {task_id} is already done — no re-advance needed. "
                 f"Feedback liegt in vault/_Workflow/feedback/{task_id}_{agent}-feedback.md")
 
     # 0. Fail-closed-Gate: Feedback MUSS existieren
@@ -876,7 +873,7 @@ def _advance_pipeline(task_id: str, agent: str, next_task_id: Optional[str] = No
             return (f"ERROR: Feedback fehlt: summaries/feedback/{task_id}_{agent}-feedback.md "
                     f"und vault/_Workflow/feedback/{task_id}_{agent}-feedback.md "
                     f"— Task gilt als NICHT abgeschlossen. Pipeline nicht weitergeschaltet.")
-    log.append(f"feedback gefunden: {fb}")
+    log.append(f"feedback found: {fb}")
 
     try:
         # 1. aktuellen active.md-Handover archivieren (vor dem Umschalten)
@@ -887,7 +884,7 @@ def _advance_pipeline(task_id: str, agent: str, next_task_id: Optional[str] = No
             shutil.copy2(str(active), str(archive))
             log.append(f"active.md archiviert → {archive}")
         else:
-            log.append("active.md nicht vorhanden (skip Archiv)")
+            log.append("active.md not present (skip archive)")
 
         # 2. Feedback ins Vault archivieren UND Original entfernen — sonst
         #    sammeln sich Alt-Feedbacks in summaries/feedback/ und matchen bei
@@ -903,14 +900,14 @@ def _advance_pipeline(task_id: str, agent: str, next_task_id: Optional[str] = No
             except OSError:
                 log.append(f"feedback → {vfb}")
         else:
-            log.append(f"feedback bereits in Vault: {vfb} (kein Copy nötig)")
+            log.append(f"feedback already in vault: {vfb} (no copy needed)")
 
         # 3. Status-Übergang → done (über den Store)
         try:
             store.transition(task_id, "done")
             log.append(f"task {task_id} → tasks/done (status=done)")
         except KeyError:
-            log.append("task-json nicht gefunden (skip)")
+            log.append("task-json not found (skip)")
 
         # 3a. Memory: Task-Abschluss als Episode speichern (fail-soft)
         if _MEMORY is not None and _MEMORY.is_available():
@@ -926,19 +923,19 @@ def _advance_pipeline(task_id: str, agent: str, next_task_id: Optional[str] = No
                      Path(f"summaries/handovers/{task_id}_{agent.capitalize()}.md")):
             if cand.exists():
                 cand.unlink()
-                log.append(f"handover gelöscht: {cand}")
+                log.append(f"handover deleted: {cand}")
                 deleted = True
                 break
         if not deleted:
-            log.append("kein Handover in summaries/handovers (skip)")
+            log.append("no handover in summaries/handovers (skip)")
 
         # 5. nächsten Task aktivieren (Store) — active.md folgt aus Projektion
         if next_task_id:
             try:
                 store.transition(next_task_id, "in_progress")
-                log.append(f"nächster Task {next_task_id} → in_progress")
+                log.append(f"next task {next_task_id} → in_progress")
             except KeyError:
-                log.append(f"WARN: nächster Task {next_task_id} nicht gefunden")
+                log.append(f"WARN: next task {next_task_id} not found")
 
         # 6. active.md projizieren (neuester nicht-done Handover bzw. idle)
         store.project_active()
@@ -968,9 +965,9 @@ def _advance_pipeline(task_id: str, agent: str, next_task_id: Optional[str] = No
                 log.append(f"regen {_script}: WARN {_e!r}")
 
     except Exception as e:
-        return f"ERROR: Pipeline-Schritt fehlgeschlagen: {e}\nBisher:\n" + "\n".join(f"  - {l}" for l in log)
+        return f"ERROR: pipeline step failed: {e}\nso far:\n" + "\n".join(f"  - {l}" for l in log)
 
-    return f"OK: Pipeline für {task_id} ({agent}) weitergeschaltet\n" + "\n".join(f"  - {l}" for l in log)
+    return f"OK: pipeline advanced for {task_id} ({agent})\n" + "\n".join(f"  - {l}" for l in log)
 
 
 # ─── Pfad-Guard: erfundene Codebase-Pfade im Handover erkennen ───
@@ -1033,9 +1030,9 @@ def _stage_handover(task_id: Optional[str], agent: str, handover_md: str,
     if agent == "KIMI":
         agent = "SONNET"                      # Kimi → Sonnet (Legacy-Alias, 2026-06-15)
     if agent not in ("OPUS", "SONNET"):
-        return f"ERROR: agent muss OPUS oder SONNET sein (war: {agent!r})"
+        return f"ERROR: agent must be OPUS or SONNET (was: {agent!r})"
     if not handover_md or not handover_md.strip():
-        return "ERROR: handover_md ist leer — vollständiger Handover-Text erforderlich."
+        return "ERROR: handover_md is empty — the full handover text is required."
 
     store = _store()
     log: List[str] = []
@@ -1049,9 +1046,9 @@ def _stage_handover(task_id: Optional[str], agent: str, handover_md: str,
                 try:
                     fields = json.loads(task_json)
                 except json.JSONDecodeError as e:
-                    return f"ERROR: task_json kein gültiges JSON: {e} — nichts angelegt."
+                    return f"ERROR: task_json is not valid JSON: {e} — nothing created."
                 if not isinstance(fields, dict):
-                    return "ERROR: task_json muss ein JSON-Objekt sein — nichts angelegt."
+                    return "ERROR: task_json must be a JSON object — nothing created."
             task_type = str(fields.get("type", "")).lower()
             # ACK-Soft-Pfad-Gate: validiere das task_json gegen den Vertrag, BEVOR
             # der Store etwas mutiert. Bei Verletzung fail-closed mit exaktem Fehler
@@ -1064,13 +1061,13 @@ def _stage_handover(task_id: Optional[str], agent: str, handover_md: str,
             try:
                 task = store.create(fields, force=bool(force))
             except DuplicateTaskError as e:
-                return (f"ERROR: Duplikat — gleiches Thema existiert bereits als "
+                return (f"ERROR: duplicate — a task on the same topic already exists as "
                         f"{e.existing_id}. KEIN neuer Task angelegt. Bestehenden Task "
                         f"nutzen oder (nur auf Anweisung) force=true setzen.")
             except ValueError as e:
-                return f"ERROR: {e} — kein Task angelegt."
+                return f"ERROR: {e} — no task created."
             tid = task["id"]
-            log.append(f"task angelegt: {tid} (pending, created_at={task['created_at']})")
+            log.append(f"task created: {tid} (pending, created_at={task['created_at']})")
             ho_md = _normalize_handover_id(handover_md, tid)
             # Memory-Kontext aus Vergangenheits-Patterns anhängen (fail-soft)
             if _MEMORY is not None and _MEMORY.is_available():
@@ -1090,7 +1087,7 @@ def _stage_handover(task_id: Optional[str], agent: str, handover_md: str,
         else:
             # Reiner Handover ohne Task-JSON — verlangt eine gültige task_id.
             if not task_id or not _TASK_ID_RE.match(task_id):
-                return f"ERROR: ohne task_json eine gültige task_id nötig (war: {task_id!r})"
+                return f"ERROR: without task_json a valid task_id is required (was: {task_id!r})"
             tid = task_id
             ho = Path(f"summaries/handovers/{tid}_{agent}.md")
             _atomic_write(ho, handover_md)
@@ -1098,7 +1095,7 @@ def _stage_handover(task_id: Optional[str], agent: str, handover_md: str,
 
         if set_active:
             store.project_active()
-            log.append("active.md projiziert (= neuester nicht-done Handover)")
+            log.append("active.md projected (= newest non-done handover)")
 
     except Exception as e:
         return f"ERROR: stage_handover fehlgeschlagen: {e}\nBisher:\n" + "\n".join(f"  - {l}" for l in log)
@@ -1232,7 +1229,7 @@ class TaskStore:
     def _validate(self, fields: Dict[str, Any]):
         missing = [k for k in self.REQUIRED if not str(fields.get(k, "")).strip()]
         if missing:
-            raise ValueError(f"Pflichtfelder fehlen: {', '.join(missing)}")
+            raise ValueError(f"required fields missing: {', '.join(missing)}")
 
     # ── Lesen ────────────────────────────────────────────────
     def get(self, task_id: str) -> Optional[Dict[str, Any]]:
@@ -1294,11 +1291,11 @@ class TaskStore:
         """Verschiebt das Task-JSON zwischen Status-Ordnern (atomar), zieht
         das status-Feld nach und projiziert active.md neu."""
         if to_status not in self.STATUSES:
-            raise ValueError(f"Ungültiger Status: {to_status!r}")
+            raise ValueError(f"invalid status: {to_status!r}")
         with self._lock:
             p, s = self._find(task_id)
             if not p:
-                raise KeyError(f"Task nicht gefunden: {task_id}")
+                raise KeyError(f"task not found: {task_id}")
             data = json.loads(p.read_text(encoding="utf-8"))
             if not isinstance(data, dict):
                 data = {"id": task_id}
@@ -1375,27 +1372,27 @@ def _platform_guidance(platform: str) -> str:
     """Dynamisch injizierte Laufzeit-Notiz — hält den Prompt-File neutral."""
     if platform == "windows":
         return (
-            "## Laufzeitumgebung\n"
-            "Betriebssystem: **Windows**. Für `execute_command` PowerShell-Syntax "
-            "verwenden (z. B. `Get-Date`, `Get-ChildItem`, `Get-Content`, "
-            "`Select-String`) — KEINE Unix-Befehle wie `date`, `ls`, `cat`, `grep`."
+            "## Runtime environment\n"
+            "Operating system: **Windows**. For `execute_command` use PowerShell syntax "
+            "(e.g. `Get-Date`, `Get-ChildItem`, `Get-Content`, `Select-String`) — NO Unix "
+            "commands like `date`, `ls`, `cat`, `grep`."
         )
     return (
-        "## Laufzeitumgebung\n"
-        "Betriebssystem: **Linux**. Für `execute_command` POSIX/bash-Syntax "
-        "verwenden (z. B. `date`, `ls`, `cat`, `grep`)."
+        "## Runtime environment\n"
+        "Operating system: **Linux**. For `execute_command` use POSIX/bash syntax "
+        "(e.g. `date`, `ls`, `cat`, `grep`)."
     )
 
 
 def _onboarding_guidance() -> str:
-    """Wird nur im Onboarding-Modus in den Kontext injiziert."""
+    """Injected into the context only in onboarding mode."""
     return (
-        "## Onboarding-Modus (aktiv)\n"
-        "Vor JEDEM `stage_handover` für einen NEUEN Task zuerst "
-        "`check_task_exists(title=…, description=…)` aufrufen. Liefert es "
-        "`EXISTS: KGC-XXX`, KEINEN Handover generieren — den bestehenden Task "
-        "nennen. Nur bei `NONE` den Handover schreiben und `stage_handover` "
-        "rufen. Das spart teure Generierung für Duplikate."
+        "## Onboarding mode (active)\n"
+        "Before EVERY `stage_handover` for a NEW task, first call "
+        "`check_task_exists(title=…, description=…)`. If it returns "
+        "`EXISTS: KGC-XXX`, do NOT generate a handover — name the existing task. "
+        "Only on `NONE` write the handover and call `stage_handover`. This avoids "
+        "expensive generation for duplicates."
     )
 
 
@@ -1414,9 +1411,9 @@ def run_tool(name: str, args: Dict[str, Any]) -> str:
                 omitted = len(text) - head_n - tail_n
                 return (
                     text[:head_n]
-                    + f"\n\n... [GX10v3: {omitted} Zeichen ausgelassen — Datei {len(text)} "
-                      f"Zeichen, gekappt auf {MAX_FILE_CHARS}. Für gezielte Ausschnitte "
-                      f"execute_command nutzen, z. B. findstr/Select-String.] ...\n\n"
+                    + f"\n\n... [Ironclad: {omitted} chars omitted — file {len(text)} "
+                      f"chars, capped at {MAX_FILE_CHARS}. For targeted excerpts use "
+                      f"execute_command, e.g. findstr/Select-String.] ...\n\n"
                     + text[-tail_n:]
                 )
             return text
@@ -1555,13 +1552,13 @@ def run_tool(name: str, args: Dict[str, Any]) -> str:
         elif name == "check_task_exists":
             title = args.get("title", "")
             if not title.strip():
-                return "ERROR: title erforderlich"
+                return "ERROR: title required"
             existing = _store().find_duplicate(title, args.get("description", ""))
             return f"EXISTS: {existing}" if existing else "NONE"
 
         elif name == "query_memory":
             if _MEMORY is None or not _MEMORY.is_available():
-                return "[Memory] nicht verfügbar — läuft der memory-stack? `docker compose -f memory-stack/docker-compose.yml up -d`"
+                return "[Memory] unavailable — is the memory stack running? `docker compose -f memory-stack/docker-compose.yml up -d`"
             return _MEMORY.query(
                 args.get("query", ""),
                 int(args.get("limit", 8)),
