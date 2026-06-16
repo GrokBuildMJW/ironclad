@@ -102,6 +102,16 @@ Measured on the reference stack — a single **NVIDIA DGX Spark** (GB10) serving
 Reproduce with your own endpoint; numbers scale with the model and GPU. Full method
 and the per-component **wiring status** live in [`docs/status.md`](docs/status.md).
 
+## A reliability layer, not another model
+
+Ironclad doesn't compete with the open models — it makes them **dependable to build
+on**. It's **model-agnostic by design**: reliability comes from the contract kernel
+(schema → validate → reask), not the weights. So it's a natural **agent/reliability
+layer for regional open models** like Falcon, Jais and K2 Think — point it at any of
+them ([running on other models](docs/models/)) and get fail-closed pipelines,
+structured tool-calls and a thin local client, **without forking or retraining
+anything**.
+
 ## A starting point to build on
 
 Ironclad is a **foundation, not a finished product** — a generic agentic core meant
