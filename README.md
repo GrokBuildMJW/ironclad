@@ -179,23 +179,29 @@ core/
 
 ## Roadmap
 
-Honest near-term plan (the rebuild's placeholders are now wired — see
-[`docs/status.md`](docs/status.md) for the full per-component status):
+Honest split of **what works today** vs **what is planned** lives in
+**[`docs/roadmap.md`](docs/roadmap.md)**; the per-component wiring status of shipped
+features is in **[`docs/status.md`](docs/status.md)**. In short:
 
-- Broaden test coverage and harden the new server/client paths.
-- One-command compose for **model + orchestrator + optional memory** ships now
-  (`docker compose --profile model --profile memory up`).
-- First tagged release once the APIs settle.
+- **Today — single-tenant, home-LAN trust.** One operator, one principal, no
+  authentication on the server (it trusts its network like the model port). Code stays
+  on the client by construction.
+- **In progress (Phase d) — secure, session-gated channel,** still single-operator:
+  selectable trust profiles (`open` / `token` / `sealed`), a client-managed tunnel
+  option, and an explicit session that **seals on disconnect**. The token is a
+  *deployment secret*, not a user login.
+- **Planned (Phase g) — Identity & Authorization (multi-tenant):** per-principal scope
+  through tasks, memory namespaces, and data-source entitlements, with org/group
+  RBAC via OIDC/SAML. **This does not exist yet** — until it lands, treat
+  enterprise/government use as single-tenant on trusted infrastructure.
+- Also: broader tests, verified recipes for more local open models, **RAG over local
+  datasets** through the memory hook, and a first tagged release.
 
 **Sovereign AI / local deployments.** Ironclad is **model-agnostic** and **fully
 self-hostable** — it talks to any OpenAI-compatible endpoint, so it already runs
 against locally-served open models (e.g. **Falcon**, **Jais**, **K2 Think** via vLLM —
 see **[running on other models](docs/models/)**) with no cloud dependency and data kept
-on your own infrastructure. On the roadmap:
-verified config recipes for those models, retrieval/**RAG over local datasets** through
-the memory hook, and on-prem **agent templates for enterprise/government** use cases.
-These are integration directions the architecture already supports, not shipped
-features yet.
+on your own infrastructure.
 
 Issues and discussions are welcome — this is an early, openly-developed project.
 

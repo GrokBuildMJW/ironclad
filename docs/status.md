@@ -44,6 +44,7 @@ This document is the single source of truth for **what actually works right now*
 | Remote turn cancel (Ctrl+C in the TUI) | **wired + tested** | `POST /cancel` sets the engine cancel event; the running turn aborts at its next iteration. Ctrl+C in the TUI fires it non-blocking. |
 | Constrained-emission **hard floor** (grammar) | **available — soft path active by design** | Grammar-constrained decoding (guided JSON) is **verified stable** on the reference GPU (no engine crash, schema-valid output). The ACK exposes it (`constrained_emission` / `emit_validated`) for callers wanting token-level guarantees; the **orchestration engine deliberately keeps the soft validate→reask gate** — it's backend-agnostic (any OpenAI endpoint) and already ~100% reliable, so per-emission grammar buys little. Not a TODO — a decision. |
 | **Lodestar** capability→backlog plugin | **opt-in (off)** | `lodestar.enabled=false` by default; demo in `examples/demo-vessel/`. |
+| **Security / trust model** | **home-LAN trust (single-tenant)** | Today the server trusts its network like the model port — **no authentication**, one operator, one principal. A selectable, session-gated, authenticated channel (still single-operator) is **in progress** (Phase d). **No multi-user identity/authorization** exists — see the [roadmap](roadmap.md). |
 
 ## Memory
 
