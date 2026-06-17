@@ -58,6 +58,10 @@ pip install -e ".[engine]"           # ACK (pydantic) + engine extras (openai, p
 `pip install -e .` (without the extra) installs just the **ACK library** (`import ack`)
 — pydantic-only, for embedding the contract kernel in your own app.
 
+> Once published to PyPI the distribution name is **`ironclad-ai`**
+> (`pip install ironclad-ai`); the import package stays `ack`. (`ironclad` was already
+> taken on PyPI by an unrelated project.)
+
 ## 3. Configure the model endpoint
 
 Configuration precedence (low → high): **code defaults → config file/dir → `GX10_*`

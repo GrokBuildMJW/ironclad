@@ -3,7 +3,7 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "ironclad"
+name = "ironclad-ai"
 version = "0.0.1"
 description = "Reliability for LLM agents through enforcement, not model size — Agent-Contract-Kernel (ACK) + a fail-closed orchestration engine."
 readme = "README.md"
