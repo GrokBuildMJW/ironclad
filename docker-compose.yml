@@ -11,8 +11,10 @@
 # on the host (same trust model as the model port — home LAN). Secret-free: hosts,
 # model dir and language come from env (with sensible defaults), nothing baked in.
 #
-# Long-term memory (Mem0) is optional and external — point the orchestrator at it with
-# GX10_MEMORY_URL=http://<mem-host>:8800; it is not bundled here (bring your own).
+# Long-term memory (Mem0) ships under the `memory` profile (Qdrant + Neo4j + a Mem0
+# API). Bring it up and point the orchestrator at it:
+#   NEO4J_PASSWORD=change-me GX10_MEMORY_URL=http://localhost:8800 \
+#     docker compose --profile model --profile memory up -d
 services:
   # Model server (vLLM). Only started with `--profile model`; otherwise bring your own
   # OpenAI-compatible endpoint and run just the orchestrator.
@@ -67,3 +69,63 @@ services:
       GX10_WORKDIR: /work
     volumes:
       - ./ironclad-workdir:/work   # tasks/, summaries/, session persist on the host
+
+  # --- Long-term memory (Mem0) — started with `--profile memory` -------------
+  # Then also set GX10_MEMORY_URL=http://localhost:8800 so the orchestrator uses it.
+  qdrant:
+    profiles: ["memory"]
+    image: qdrant/qdrant:latest
+    container_name: mem-qdrant
+    restart: unless-stopped
+    volumes:
+      - qdrant-data:/qdrant/storage
+
+  neo4j:
+    profiles: ["memory"]
+    image: neo4j:5.26.4
+    container_name: mem-neo4j
+    restart: unless-stopped
+    environment:
+      NEO4J_AUTH: neo4j/${NEO4J_PASSWORD:-ironclad-memory}
+      NEO4J_PLUGINS: '["apoc"]'        # Mem0 graph memory needs APOC
+      NEO4J_dbms_security_procedures_unrestricted: apoc.*
+    volumes:
+      - neo4j-data:/data
+      - neo4j-logs:/logs
+
+  memory-api:
+    profiles: ["memory"]
+    build: ./memory-service
+    image: ironclad-memory-api
+    container_name: mem-api
+    restart: unless-stopped
+    ports:
+      - "8800:8000"                    # orchestrator reaches it at localhost:8800
+    extra_hosts:
+      - "host.docker.internal:host-gateway"   # reach the host-network vLLM from this bridge container
+    environment:
+      # memory-api runs on the bridge network → reach the host's model via host-gateway,
+      # not localhost. Override with MEM0_LLM_BASE_URL if your endpoint is elsewhere.
+      MEM0_LLM_BASE_URL: ${MEM0_LLM_BASE_URL:-http://host.docker.internal:8000/v1}
+      MEM0_LLM_MODEL: ${GX10_MODEL:-qwen3.6-35b}
+      NEO4J_PASSWORD: ${NEO4J_PASSWORD:-ironclad-memory}
+      NEO4J_URL: bolt://neo4j:7687
+      QDRANT_HOST: qdrant
+      HF_HOME: /hf-cache               # cache BGE-M3 weights
+    volumes:
+      - hf-cache:/hf-cache
+    depends_on:
+      - qdrant
+      - neo4j
+    healthcheck:
+      test: ["CMD", "curl", "-fs", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 60
+      start_period: 60s                # first boot downloads BGE-M3
+
+volumes:
+  qdrant-data:
+  neo4j-data:
+  neo4j-logs:
+  hf-cache:

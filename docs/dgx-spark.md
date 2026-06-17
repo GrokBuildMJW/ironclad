@@ -93,18 +93,23 @@ GX10_SERVER_URL=http://<spark-host>:8100 python engine/tui.py --codedir .
 
 ## Optional: long-term memory stack
 
-Ironclad runs fine without it. If you want persistent agent memory, run a **Mem0**
-service (vector + graph) alongside vLLM:
+Ironclad runs fine without it. If you want persistent agent memory, the compose ships
+a **Mem0** service (vector + graph) under the `memory` profile:
 
-- **Qdrant** (vectors) + **Neo4j** (graph) + **BGE-M3** embeddings, with Mem0's LLM
-  pointed back at the local vLLM (`qwen3.6-35b`).
-- Pin `mem0ai==0.1.118` with the `[graph]` extra (later 2.x dropped the OSS graph
-  store). Read path is vector-only by default; enable graph only for relational
-  queries (the graph path is slower).
-- Expose it on `:8800` and point the engine's memory layer at it.
+```bash
+NEO4J_PASSWORD=change-me GX10_MEMORY_URL=http://localhost:8800 \
+  docker compose --profile model --profile memory up -d
+```
 
-This stack is deployment glue rather than framework code, so it is documented here
-rather than scripted in `spark-bootstrap.sh`.
+This brings up **Qdrant** (vectors) + **Neo4j** (graph) + a **Mem0 API** with **BGE-M3**
+embeddings (built from [`memory-service/`](../memory-service/)), with Mem0's LLM pointed
+back at the local model. Setting `GX10_MEMORY_URL` makes the orchestrator use it
+(`/health` then reports `memory: up`).
+
+Notes: `mem0ai==0.1.118` is pinned with the `[graph]` extra (later 2.x dropped the OSS
+graph store); the read path is vector-only by default (`graph=false`) — enable graph
+only for relational queries, it's slower. The store starts **empty**; it accumulates
+from task completions (any pre-existing corpus is yours to import).
 
 ## Verify
 
