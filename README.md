@@ -1,6 +1,7 @@
 # Ironclad
 
 [![CI](https://github.com/GrokBuildMJW/ironclad/actions/workflows/ci.yml/badge.svg)](https://github.com/GrokBuildMJW/ironclad/actions/workflows/ci.yml)
+[![PyPI](https://img.shields.io/pypi/v/ironclad-ai)](https://pypi.org/project/ironclad-ai/)
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 ![Python](https://img.shields.io/badge/python-3.10%2B-blue)
 ![Status](https://img.shields.io/badge/status-pre--release-orange)
@@ -131,6 +132,15 @@ the verticals are yours to build.
 ## Setup
 
 Requires **Python 3.10+** and an **OpenAI-compatible endpoint** (e.g. vLLM).
+
+**Install the library from PyPI:**
+
+```bash
+pip install ironclad-ai          # the ACK library (import ack)
+pip install "ironclad-ai[engine]"  # + the orchestration engine deps
+```
+
+**Or clone for the full engine + CLI/TUI** (recommended while pre-release):
 
 ```bash
 git clone https://github.com/GrokBuildMJW/ironclad.git

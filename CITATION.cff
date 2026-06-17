@@ -1,0 +1,23 @@
+cff-version: 1.2.0
+title: Ironclad
+message: "If you use Ironclad in your work, please cite it."
+type: software
+authors:
+  - name: "MJWC-AI-LAB"
+repository-code: "https://github.com/GrokBuildMJW/ironclad"
+url: "https://pypi.org/project/ironclad-ai/"
+abstract: >-
+  Reliability for LLM agents through enforcement, not model size — an
+  Agent-Contract-Kernel (schema-as-single-source-of-truth, validate→reask→retry)
+  paired with a fail-closed orchestration engine. Model-agnostic: runs against any
+  OpenAI-compatible endpoint.
+license: Apache-2.0
+version: 0.0.1
+keywords:
+  - llm
+  - agents
+  - reliability
+  - tool-calling
+  - structured-outputs
+  - pydantic
+  - orchestration
