@@ -112,13 +112,13 @@ that does **not** hinge on model latency — the client stays snappy while the b
   SETUP. The Python line REPL (`engine/client.py`) and full-screen TUI (`engine/tui.py`)
   remain as **legacy** zero-dependency fallbacks.
 
-## Planned — scalable-context memory (context extension + short-term memory)
+## Scalable-context memory (built)
 
-Today's memory hook is deliberately minimal: it stores *completed tasks* and injects a
-flat top-K recall at stage time, while the live turn is kept inside the model window by
-char-based trimming that simply **drops** the oldest rounds. The planned extension turns
-that into a proper **multi-tier context system**, so the *total addressable* context far
-exceeds the bounded model window — without making decode any slower.
+The earlier memory hook was deliberately minimal: it stored *completed tasks* and injected
+a flat top-K recall at stage time, while the live turn was kept inside the model window by
+char-based trimming that simply **dropped** the oldest rounds. That is now a proper
+**multi-tier context system**, so the *total addressable* context far exceeds the bounded
+model window — without making decode any slower.
 
 **The key insight — two layers, and only one is cheap to grow.** The model's context
 **window** is a hard per-request budget bounded by VRAM and memory bandwidth; growing it
@@ -131,19 +131,20 @@ freely on disk. The window stays a small *working set*; the scaling lives in mem
 - **Hot — the model window (working set).** Recent verbatim rounds + the active task
   spec. Stays bounded so decode stays fast. Raised (if at all) only as a hardware-gated
   last step, after the retrieval layer has proven it carries the load.
-- **Warm — short-term memory (new).** A fast in-memory tier holding the **rolling
+- **Warm — short-term memory (built).** A fast in-memory tier holding the **rolling
   conversation summary**, recent-turn state, and a short-TTL **retrieval cache** in front
   of the long-term store. Unlike the window it **survives a server restart** and is
   **shared across the parallel reasoning workers** (which today share no history at all).
   Reads are cache-aside under a hard time budget — a miss just falls through to today's
   path, never a stall. (Built on a BSD-licensed in-memory store, so it stays OSS-clean.)
 - **Cold — long-term memory (exists today, gets richer).** The vector(+graph) store that
-  already ships. Planned: it also receives the **summarized + chunked** evicted context
+  already ships. It also receives the **summarized + chunked** evicted context
   (lossless — the raw text is archived even where the summary is lossy), so nothing the
   agent has seen is ever truly discarded.
 
-**Planned mechanisms — all additive, flag-gated, and fail-soft; the hot read path stays
-vector-only and off the timeout-prone graph path:**
+**Mechanisms — all additive, individually flag-gated (default-on where a memory/warm
+service is configured), and fail-soft; the hot read path stays vector-only and off the
+timeout-prone graph path:**
 
 1. **Rolling / hierarchical summarization on eviction.** When a round would be trimmed, it
    is first summarized into a compact running block kept just below the system prompt and
@@ -161,11 +162,16 @@ vector-only and off the timeout-prone graph path:**
    same shared summary + per-item retrieval on **read**, and a single-writer reducer
    consolidates their outputs into one de-duplicated **write** — so the workers contribute
    to and draw on memory like the main loop, without a write race.
+6. **On-demand relational recall.** A `deep_query_memory` tool reaches the vector+**graph**
+   path explicitly when a relational question needs it, kept off the latency-sensitive hot
+   path (which stays vector-only).
 
-Flag-off is byte-identical to today, and with the warm/cold tiers down a turn still
-completes (fail-soft); the model stays the only thing that can block a turn. None of this
-needs the client — "more context" is entirely server-side: same HTTP contract, no new
-endpoint, no version coupling.
+Each mechanism can be disabled individually, and with the warm/cold tiers down a turn still
+completes (fail-soft) — the model stays the only thing that can block a turn. None of this
+needs the client: "more context" is entirely server-side — same HTTP contract, no new
+endpoint, no version coupling. The one hardware-gated piece is raising the **window** itself
+(the hot working set) — done last, and only after the retrieval layer proves it carries the
+load.
 
 ## Also planned
 

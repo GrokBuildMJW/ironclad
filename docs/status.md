@@ -20,7 +20,7 @@ This document is the single source of truth for **what actually works right now*
 |------|--------------|
 | `engine/gx10.py` | The orchestrator **engine library** (the *proven* core). Agent loop, tool execution, deterministic `TaskStore`, fail-closed macros (`stage_handover` / `advance_pipeline`), config-tree loader, platform detection, context trimming. The server imports it; the standalone monolithic CLI was **removed** (one way: server + client). |
 | `engine/server.py` | **Headless server** (new). Drives the engine with no UI, exposes plain-HTTP endpoints, serializes agent access, runs the feedback-side reconciler. |
-| `clients/ink/` | **Recommended terminal client** (new, TypeScript). Purpose-built renderer (own React reconciler + flexbox + packed cell buffer + cell-level diff) → **ghost-free resize**, smooth streaming, native scrollback/selection/copy, find-in-buffer (Ctrl+F). Same HTTP/tool-bridge contract; build-from-source (Node ≥ 22). |
+| `clients/ink/` | **Recommended terminal client** (new, TypeScript). Purpose-built renderer (own React reconciler + flexbox + packed cell buffer + cell-level diff) → **ghost-free resize**, smooth streaming, native scrollback/selection/copy. Slash-command autocomplete, local `!cmd` shell, in-CLI `/update`, per-project session. Same HTTP/tool-bridge contract; build-from-source (Node ≥ 22). |
 | `engine/client.py` | **Thin client (legacy)**. Line REPL + the local code-agent pool (`claude --print`) that keeps project code on your machine. Zero-dependency fallback. |
 | `engine/tui.py` | **Full-screen client (legacy)**. prompt_toolkit UI, live streaming, status toolbar, scrollback, compressed multi-line paste. |
 | `engine/commands.py` | Shared command router for REPL + TUI (`/command` → local or forwarded to the server). |
@@ -35,14 +35,14 @@ This document is the single source of truth for **what actually works right now*
 | Config tree + `GX10_*` env + language setting | **wired + tested** | `language` (reply language) default `en`. |
 | Server/client split (`/chat`, `/chat/stream`, `/tasks`, `/pending`, `/feedback`) | **wired + tested** | Verified PC→LAN→Spark; headless capture; streaming. |
 | Thin client + parallel code-agent pool | **wired + tested** | Bounded pool; claim-once; unclaim-on-failure (in both the TypeScript and Python clients). |
-| **TypeScript terminal client** (`clients/ink/`) | **wired + tested** | Purpose-built renderer (React reconciler + Yoga flexbox + packed cell buffer + cell-level diff). **272** `node:test` cases across renderer/UI/net/tools; ghost-free resize, native scrollback/selection/copy, live-streaming markdown, Ctrl+F search; adversarially verified. Build-from-source / global install (Node ≥ 22). |
+| **TypeScript terminal client** (`clients/ink/`) | **wired + tested** | Purpose-built renderer (React reconciler + Yoga flexbox + packed cell buffer + cell-level diff). **327** `node:test` cases across renderer/UI/net/tools; ghost-free resize, native scrollback/selection/copy, live-streaming markdown with preserved + syntax-highlighted code, slash-command autocomplete, `!cmd`, in-CLI `/update`, per-project session; adversarially verified. Build-from-source / global install (Node ≥ 22). |
 | Full-screen Python TUI (stream, toolbar, scroll, paste) — **legacy** | **wired + tested** | Render/scroll/paste unit-checked; runs in a real terminal. Superseded by the TypeScript client. |
 | Reasoning-worker fan-out (`/fanout`) + `parallel_reason` tool | **wired + tested** | Stateless concurrent reasoning, **GPU-safety-governed**: a config-driven concurrency cap **and** a token-budget envelope (`concurrency × max_tokens ≤ max_batch_tokens`) so a large `max_tokens` lowers parallelism instead of over-subscribing the box — overflow just queues. Core ships conservative defaults (concurrency 4); the deploy pins model-matched values (8 = our model's `max_num_seqs`). Now also exposed **in-engine** as the `parallel_reason` tool, so the orchestrator itself batches independent items. Live-verified: governed `/fanout` 8/8 at ~5.8× speedup on the reference GPU. |
 | ACK contract gate at `stage_handover` | **wired + tested** | Soft path (`_ack_validate`): task_json validated against `TaskSpec`, fail-closed → reask. |
 | Function-calling robustness (every tool boundary) | **wired + tested** | Validate→reask on **all** tool arguments, not just task_json: malformed JSON or a schema violation (required + types) is returned to the model as the tool result so it re-emits — never silently degraded to empty args. Live-verified end to end (native tool turn against the reference model). |
 | Model-agnostic tool-call recovery | **wired + tested** | When an OpenAI-compatible endpoint returns no native `tool_calls`, calls the model emitted as **text** (`<tool_call>` tags, fenced json, or a bare object) are recovered — gated to known tool names so a legitimate JSON answer is never hijacked. Removes the hard dependency on a server-side tool parser. |
 | Orchestrator Docker image / compose | **wired + tested** | Runs as `ironclad-orchestrator` next to the model. |
-| **Memory (Mem0)** | **wired + tested** | `engine/memory.py` talks to a Mem0-style service (`GX10_MEMORY_URL`); store+search verified live. The store starts **empty** — see below. |
+| **Memory — multi-tier** (Mem0 cold + warm tier + per-turn context pipeline) | **wired + tested** | Cold: `engine/memory.py` → Mem0-style service (`GX10_MEMORY_URL`). Warm: `engine/warm.py` → a BSD in-memory store (`GX10_WARM_URL`, fail-soft). Plus rolling summarization, per-turn RAG (with warm cache-aside), token-accurate budgeting, chunking + recency, the `deep_query_memory` (graph) tool, and worker memory (shared summary on read + single-writer reduce). Default-on where a memory/warm service is configured; store starts **empty** — see below. |
 | **Autoplan** (`/autoplan on\|off [N]`) | **wired (config-gated)** | Ported into the server's queue consumer (`_autoplan_tick`), **decoupled from autopilot** so it works in the split: server plans → client executes → server advances → server plans again. Fires only when `/autoplan on` is set **and** `paths.active_capability_backlog` is configured (no backlog → it disables itself). Logic unit-tested. |
 | Autopilot auto-launch on the server | **placeholder / by design off** | The server never launches code-agents (`_LAUNCH_CMD` is skipped); launching is the client's job (the pool). The server-side `autopilot` toggle is currently inert. |
 | Remote turn cancel (Esc / Ctrl+C) | **wired + tested** | `POST /cancel` sets the engine cancel event; the running turn aborts at its next iteration. In the recommended TypeScript client **Esc or Ctrl+C** cancels — it aborts the stream locally (instant return to idle) and POSTs `/cancel`; the legacy Python TUI fires it via Ctrl+C non-blocking. |
@@ -61,6 +61,20 @@ completion, and stage-time context injection, backed by `engine/memory.py` — a
 secret-free client for a **Mem0-style HTTP service** (`POST /add`, `POST /search` with
 `graph=false`, `GET /health`). Store + search are verified live against the reference
 Mem0 stack (Qdrant + Neo4j + BGE-M3, LLM pointed at the local model).
+
+**Three tiers (all server-side, fail-soft).** *Hot* = the model window (a bounded working
+set, char/token-budget trimmed). *Warm* = `engine/warm.py`, a BSD-licensed in-memory store
+(`GX10_WARM_URL`, e.g. Valkey) holding the rolling conversation summary, recent-turn state,
+and a short-TTL retrieval cache that **survives a restart** and is **shared across the
+reasoning workers**. *Cold* = the Mem0 vector(+graph) store below. On top of the tiers:
+rolling/hierarchical summarization on eviction (raw archived to cold, prefix-stable),
+per-turn RAG assembly (warm cache-aside), token-accurate budgeting that scales the working
+set to the model window, chunked + recency-ranked long-artifact storage, an on-demand
+`deep_query_memory` graph tool, and worker memory (workers read the shared summary +
+per-item retrieval, a single-writer reducer consolidates their writes). Each piece is
+individually flag-gated (default-on where a memory/warm service is configured); with the
+warm/cold tiers down a turn still completes. The hot read path stays vector-only and off the
+timeout-prone graph path.
 
 **This repo ships the wiring, never any memory content.** Memory is a runtime service,
 not data in the codebase:
@@ -120,6 +134,8 @@ releases* is partly manual and being formalized.
 Run against the full reference stack on the DGX Spark (2026-06-17): all five
 containers up — `vllm-35b`, `mem-api`, `mem-qdrant`, `mem-neo4j`,
 `ironclad-orchestrator` (all healthy) — driven from a workstation over the LAN.
+*(The warm tier `mem-valkey` was added after this run — the current `--profile memory`
+stack is six containers.)*
 
 **Fan-out (8 independent reasoning prompts, concurrent):**
 

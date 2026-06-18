@@ -1,13 +1,22 @@
 /**
  * Status poller — fetches /health + /tasks every ~2s into state for the footer. Returns
  * [status, setPerf] so the stream turn can push the latest [perf] line into the footer.
+ *
+ * §3b resilience:
+ *  - **Coalescing:** a failed/missed poll keeps the last-known model/memory/tasks and only flips
+ *    `connected:false` (the footer greys out instead of flickering/resetting). `pollStatus`
+ *    returns `null` on any error to signal "keep previous state".
+ *  - **Reconnect flush:** on a disconnected→connected transition, drain the tool-result retry
+ *    buffer (a result dropped during a blip is delivered once the channel is back).
  */
-import {useEffect, useState} from 'react';
+import {useEffect, useRef, useState} from 'react';
+import {flushToolResults} from '../tools/bridge.js';
 import type {Server} from '../net/server.js';
 
 export interface StatusState {
   model: string;
   connected: boolean;
+  memory: string; // /health.memory: 'up' (reachable) · 'down' (configured, unreachable) · 'off' (none)
   watcher: boolean;
   autopilot: boolean;
   pending: number;
@@ -19,6 +28,7 @@ export interface StatusState {
 export const EMPTY_STATUS: StatusState = {
   model: '—',
   connected: false,
+  memory: 'off',
   watcher: false,
   autopilot: false,
   pending: 0,
@@ -27,32 +37,54 @@ export const EMPTY_STATUS: StatusState = {
   perf: '',
 };
 
+/** The status fields derived from one /health + /tasks fetch (perf is pushed separately). */
+export type StatusFields = Omit<StatusState, 'perf'>;
+
+/** One poll: map /health + /tasks into status fields, or `null` on ANY error (→ caller keeps the
+ *  previous state and only marks it disconnected — the coalescing guarantee). Never throws. */
+export async function pollStatus(srv: Server): Promise<StatusFields | null> {
+  try {
+    const h = await srv.health();
+    const tasks = await srv.tasks();
+    const c = (s: string): number => tasks.filter((t) => t['status'] === s).length;
+    return {
+      connected: Boolean(h['ok']),
+      model: String(h['model'] ?? '—'),
+      memory: String(h['memory'] ?? 'off'),
+      watcher: Boolean(h['watcher']),
+      autopilot: Boolean(h['autopilot']),
+      pending: c('pending'),
+      inProgress: c('in_progress'),
+      done: c('done'),
+    };
+  } catch {
+    return null;
+  }
+}
+
+/** Resolve the next connected flag + whether this poll is a reconnect (disconnected→connected),
+ *  which is the signal to flush the tool-result buffer. `null` upd = a failed poll → disconnected. */
+export function nextConnState(prev: boolean, upd: StatusFields | null): {connected: boolean; reconnected: boolean} {
+  const now = upd === null ? false : Boolean(upd.connected);
+  return {connected: now, reconnected: now && !prev};
+}
+
 export function useStatusPoller(srv: Server, intervalMs = 2000): [StatusState, (perf: string) => void] {
   const [st, setSt] = useState<StatusState>(EMPTY_STATUS);
+  const wasConnected = useRef(false);
   const setPerf = (perf: string): void => setSt((s) => ({...s, perf}));
 
   useEffect(() => {
     let live = true;
+    wasConnected.current = false;
     const poll = async (): Promise<void> => {
-      try {
-        const h = await srv.health();
-        const tasks = await srv.tasks();
-        const c = (s: string): number => tasks.filter((t) => t['status'] === s).length;
-        if (live) {
-          setSt((s) => ({
-            ...s,
-            connected: Boolean(h['ok']),
-            model: String(h['model'] ?? '—'),
-            watcher: Boolean(h['watcher']),
-            autopilot: Boolean(h['autopilot']),
-            pending: c('pending'),
-            inProgress: c('in_progress'),
-            done: c('done'),
-          }));
-        }
-      } catch {
-        if (live) setSt((s) => ({...s, connected: false}));
-      }
+      const upd = await pollStatus(srv);
+      if (!live) return;
+      const {connected, reconnected} = nextConnState(wasConnected.current, upd);
+      wasConnected.current = connected;
+      // coalesce: on a failed poll keep model/memory/tasks, just drop `connected`.
+      setSt((s) => (upd === null ? {...s, connected: false} : {...s, ...upd}));
+      if (reconnected) void flushToolResults(srv).catch(() => {}); // channel back → resend buffered results
     };
     void poll();
     const id = setInterval(() => void poll(), intervalMs);

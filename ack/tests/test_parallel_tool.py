@@ -25,8 +25,8 @@ class _StubWorkers:
     def __init__(self):
         self.calls = []
 
-    def fanout(self, items, *, system=None, max_tokens=None, think=True):
-        self.calls.append({"items": list(items), "system": system,
+    def fanout(self, items, *, system=None, contexts=None, max_tokens=None, think=True):
+        self.calls.append({"items": list(items), "system": system, "contexts": contexts,
                            "max_tokens": max_tokens, "think": think})
         out = []
         for it in items:
@@ -70,6 +70,7 @@ def test_routes_to_fanout_and_formats():
     # forwarded correctly
     assert w.calls[0]["items"] == ["x", "y", "z"]
     assert w.calls[0]["system"] == "summarise"
+    assert w.calls[0]["contexts"] is None        # §3c MAP off by default → stateless fan-out
     assert w.calls[0]["max_tokens"] == 512
     assert w.calls[0]["think"] is True
     # rendered in order, with the ok-count header

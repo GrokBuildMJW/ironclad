@@ -111,6 +111,7 @@ if [ "$WITH_ORCH" = 1 ] && [ "$ORCH_DOCKER" = 1 ]; then
     -e GX10_MODEL="$SERVED_NAME" -e GX10_SERVER_PORT="$ORCH_PORT" -e GX10_WORKDIR=/work \
     -e GX10_LANGUAGE="${GX10_LANGUAGE:-en}" \
     -e GX10_MEMORY_URL="${GX10_MEMORY_URL:-}" \
+    -e GX10_WARM_URL="${GX10_WARM_URL:-}" \
     -e GX10_PROFILE="${GX10_PROFILE:-}" \
     -e GX10_SERVER_TOKEN="${GX10_SERVER_TOKEN:-}" \
     -e GX10_FANOUT_CONCURRENCY="${GX10_FANOUT_CONCURRENCY:-}" \
@@ -129,11 +130,12 @@ elif [ "$WITH_ORCH" = 1 ]; then
   # shellcheck disable=SC1091
   . "$VENV/bin/activate"
   pip install --quiet --upgrade pip
-  pip install --quiet -e "$REPO_ROOT[engine]" 2>/dev/null || pip install --quiet openai pydantic
+  pip install --quiet -e "$REPO_ROOT[engine,memory]" 2>/dev/null || pip install --quiet openai pydantic redis
   export GX10_BASE_URL="http://localhost:${VLLM_PORT}/v1"
   export GX10_MODEL="$SERVED_NAME"
   export GX10_LANGUAGE="${GX10_LANGUAGE:-en}"
   export GX10_MEMORY_URL="${GX10_MEMORY_URL:-}"
+  export GX10_WARM_URL="${GX10_WARM_URL:-}"
   # Forward-if-set (trust profile + fan-out governor); inherited by tmux/nohup below.
   export GX10_PROFILE="${GX10_PROFILE:-}"
   export GX10_SERVER_TOKEN="${GX10_SERVER_TOKEN:-}"

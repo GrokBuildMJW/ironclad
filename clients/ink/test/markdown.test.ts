@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {renderMarkdown, StreamMarkdown} from '../src/markdown.js';
+import {renderMarkdown, StreamMarkdown, splitBlocks} from '../src/markdown.js';
 
 const strip = (s: string): string => s.replace(/\x1b\[[0-9;]*m/g, '');
 
@@ -53,3 +53,49 @@ test('StreamMarkdown keeps earlier blocks stable as the tail grows', () => {
   const r2 = sm.render('para one\n\npara two');
   assert.ok(r1.startsWith('para one') && r2.startsWith('para one'), 'first block unchanged across updates');
 })
+
+// ── MEM-20: code display keeps its formatting ───────────────────────────────────────────────────
+
+test('MEM-20: a long code line is NOT reflowed/wrapped, indentation preserved', () => {
+  const longTail = 'x'.repeat(60);
+  const md = '```python\ndef f():\n        return "' + longTail + '"\n```';
+  const lines = strip(renderMarkdown(md, 40)).split('\n');
+  const ret = lines.find((l) => l.includes('return'));
+  const def = lines.find((l) => /def f/.test(l));
+  assert.ok(ret && def, 'both code lines present');
+  assert.ok(ret!.includes(longTail), 'the long code line stays on one line (no width wrap)');
+  const lead = (l: string): number => l.length - l.trimStart().length;
+  assert.ok(lead(ret!) > lead(def!), 'relative indentation preserved (return deeper than def)');
+});
+
+test('MEM-20: a fenced code block is styled (carries ANSI, visually distinct)', () => {
+  const out = renderMarkdown('```js\nconst x = 1;\n```', 80);
+  assert.match(out, /\x1b\[[0-9;]*m/, 'code block carries ANSI styling');
+});
+
+test('MEM-20: splitBlocks keeps a fenced block with a blank line as ONE block', () => {
+  const body = 'intro\n\n```js\nconst a = 1;\n\nconst b = 2;\n```\n\nafter';
+  assert.deepEqual(splitBlocks(body), [
+    'intro',
+    '```js\nconst a = 1;\n\nconst b = 2;\n```',
+    'after',
+  ]);
+});
+
+test('MEM-20: splitBlocks treats an unterminated fence as the open tail', () => {
+  const body = 'note\n\n```js\nconst a = 1;\n\nstill typing';
+  assert.deepEqual(splitBlocks(body), ['note', '```js\nconst a = 1;\n\nstill typing']);
+});
+
+test('MEM-20: prose without fences splits exactly as before (no regression)', () => {
+  assert.deepEqual(splitBlocks('a\n\nb\n\nc'), ['a', 'b', 'c']);
+});
+
+test('MEM-20: StreamMarkdown renders both code lines across a blank line in the fence', () => {
+  const sm = new StreamMarkdown(80);
+  const out = strip(sm.render('intro\n\n```js\nconst a = 1;\n\nconst b = 2;\n```'));
+  assert.match(out, /const a = 1;/);
+  assert.match(out, /const b = 2;/);
+  // the fenced block is one cached/non-tail block (intro complete, code block is the tail)
+  assert.equal(sm.cachedBlocks, 1, 'intro cached; the whole fence is the single open tail');
+});

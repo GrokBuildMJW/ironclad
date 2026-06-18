@@ -23,6 +23,7 @@ export interface Config {
   claudePermissionMode: string;
   agentCmd: string;
   maxAgents: number;
+  srcDir: string | null; // MEM-17: repo root for /update (rebuild+reinstall); null = unknown
 }
 
 /** Shape of the optional JSON config file (every field optional). */
@@ -35,6 +36,7 @@ interface FileConfig {
   claudePermissionMode?: string;
   agentCmd?: string;
   maxAgents?: number;
+  srcDir?: string | null;
 }
 
 /** Resolve the config-file path: `$GX10_CONFIG`, else the OS user-config dir. */
@@ -83,6 +85,7 @@ export function loadConfig(): Config {
       '{bin} --model {model} --effort {effort} --permission-mode {permission} --print {prompt}',
     ),
     maxAgents: parseInt(process.env['GX10_MAX_AGENTS'] ?? '', 10) || f.maxAgents || 3,
+    srcDir: opt('GX10_SRC', f.srcDir),
   };
 }
 
@@ -90,16 +93,32 @@ export interface Args {
   server: string;
   codedir: string;
   maxAgents: number;
+  resume: boolean; // MEM-14: opt into resuming the persisted session (default = fresh start)
 }
 
-/** argparse parity: --server (default GX10_SERVER_URL), --codedir (default .), --max-agents. */
+const _truthy = (v: string | undefined): boolean =>
+  (v ?? '').trim().toLowerCase() === '1' ||
+  (v ?? '').trim().toLowerCase() === 'true' ||
+  (v ?? '').trim().toLowerCase() === 'yes' ||
+  (v ?? '').trim().toLowerCase() === 'on';
+
+/** argparse parity: --server (default GX10_SERVER_URL), --codedir (default .), --max-agents.
+ *  MEM-14: resume is OPT-IN — default is a fresh start. `--resume` / env `GX10_RESUME` turn it on;
+ *  `--fresh` / `--no-resume` / `GX10_NO_RESUME` force it off (GX10_NO_RESUME wins over GX10_RESUME). */
 export function parseArgs(argv: string[], cfg: Config): Args {
-  const a: Args = {server: cfg.serverUrl, codedir: '.', maxAgents: cfg.maxAgents};
+  const a: Args = {
+    server: cfg.serverUrl,
+    codedir: '.',
+    maxAgents: cfg.maxAgents,
+    resume: _truthy(process.env['GX10_RESUME']) && !_truthy(process.env['GX10_NO_RESUME']),
+  };
   for (let i = 0; i < argv.length; i++) {
     const t = argv[i];
     if (t === '--server') a.server = argv[++i] ?? a.server;
     else if (t === '--codedir') a.codedir = argv[++i] ?? a.codedir;
     else if (t === '--max-agents') a.maxAgents = parseInt(argv[++i] ?? '', 10) || a.maxAgents;
+    else if (t === '--resume') a.resume = true;
+    else if (t === '--fresh' || t === '--no-resume') a.resume = false;
     else if (t?.startsWith('--server=')) a.server = t.slice('--server='.length);
     else if (t?.startsWith('--codedir=')) a.codedir = t.slice('--codedir='.length);
     else if (t?.startsWith('--max-agents=')) a.maxAgents = parseInt(t.slice('--max-agents='.length), 10) || a.maxAgents;

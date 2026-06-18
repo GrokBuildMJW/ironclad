@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ironclad-ai"
-version = "0.0.2"
+version = "0.0.3"
 description = "Reliability for LLM agents through enforcement, not model size — Agent-Contract-Kernel (ACK) + a fail-closed orchestration engine."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -30,6 +30,10 @@ dependencies = ["pydantic>=2"]
 # The orchestration engine (engine/) additionally talks to an OpenAI-compatible
 # endpoint and renders a terminal UI.
 engine = ["openai>=1", "prompt_toolkit>=3", "textual>=0.80", "rich>=13"]
+# Optional warm tier (Valkey) for short-term session state + a retrieval cache. The MIT `redis`
+# client speaks the Valkey wire protocol; the tier is lazily imported and fail-soft, so this stays
+# optional (no warm tier configured → never imported).
+memory = ["redis>=5"]
 
 [project.urls]
 Homepage = "https://github.com/GrokBuildMJW/ironclad"

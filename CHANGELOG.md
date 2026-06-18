@@ -1,15 +1,31 @@
 # Changelog
 
 All notable changes to Ironclad are recorded here. The format follows
-[Keep a Changelog](https://keepachangelog.com/); the project is **pre-release**, so there
-is no tagged version yet — everything sits under *Unreleased* until the first release.
+[Keep a Changelog](https://keepachangelog.com/); the project is **pre-release** (0.0.x).
+Released versions are listed below; upcoming work accumulates under *Unreleased*.
 
 > Docs are code: a change does not ship without a Changelog entry (the promote gate
 > enforces a non-empty *Unreleased* section).
 
 ## [Unreleased]
 
+## [0.0.3] - 2026-06-19
+
 ### Added
+- **Scalable-context memory** (multi-tier, default-on when a memory/warm service is configured):
+  a **warm tier** (BSD-licensed in-memory store) holding the rolling conversation summary,
+  recent-turn state, and a short-TTL retrieval cache that survives a server restart and is shared
+  across the reasoning workers; **rolling/hierarchical summarization** on eviction (raw archived
+  to long-term, prefix-stable); **per-turn retrieval (RAG)** assembly; **token-accurate budgeting**
+  that scales the working set to the model window; **chunked, lossless** long-artifact store with
+  recency tie-breaking; a **`deep_query_memory`** tool for the relational (graph) path; and
+  **parallel workers as memory citizens** (shared summary + per-item retrieval on read, single-writer
+  reducer on write). All additive and fail-soft — with the warm/cold tiers down, a turn still
+  completes. Server-side only (same HTTP contract, no new client coupling).
+- **Recommended TypeScript terminal client** (`clients/ink/`) on a purpose-built renderer:
+  slash-command autocomplete, local shell via `!cmd`, in-CLI `/update` (rebuild + reinstall),
+  `/reset` + opt-in `/resume`, per-project session storage (`<codedir>/.ironclad-cli/`), and
+  preserved + syntax-highlighted code display (`/cat` fences with the language from the extension).
 - **Secure, session-gated channel** (single-tenant): selectable trust profiles
   `open` / `token` / `sealed`, a client-managed tunnel option, and an explicit session
   that seals on disconnect. The token is a deployment secret, not a user login.

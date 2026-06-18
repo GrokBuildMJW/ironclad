@@ -14,7 +14,9 @@ model-emitted `task_json` is validated against the ACK contract at the
 > `tui.py`, `cli.py` — are **legacy**: kept as zero-dependency references and headless
 > fallbacks, still maintained but no longer the primary UI.
 
-- `gx10.py` — the engine + the interactive CLI (`python gx10.py`).
+- `gx10.py` — the orchestration **engine library** (agent loop, tool execution, deterministic
+  TaskStore, fail-closed macros, config-tree loader, context trimming). Imported by the server;
+  the standalone monolithic CLI was **removed** (one way: server + client).
 - `server.py` — **headless** orchestrator server. Drives `gx10` with no UI and
   exposes a plain-HTTP API. Holds the reasoning + state (turn loop, TaskStore,
   `stage_handover`/`advance_pipeline`, feedback-side reconciler). Run on the box that
@@ -46,9 +48,12 @@ PC (client.py)                         Spark (server.py + vLLM)
 ```
 
 The server never reaches into the client; the client initiates every exchange, so
-session-gating and code-locality are structural. Trust model = home LAN (no auth on
-the port, same as the vLLM port). Pass the server address via `--server` /
-`GX10_SERVER_URL`, never hard-code it.
+session-gating and code-locality are structural. **The trust model is selectable (Phase d):**
+`open` (default — no auth, LAN bind, like the vLLM port), `token` (deployment secret over the
+LAN), or `sealed` (loopback bind behind a client-managed tunnel + secret + session heartbeat).
+The token is a deployment secret, not a user login. Pass the server address via `--server` /
+`GX10_SERVER_URL`, never hard-code it. The local code-agent is pluggable via `GX10_AGENT_CMD`
+(not locked to `claude --print`).
 
 ```bash
 # on the model box:

@@ -124,8 +124,27 @@ services:
       retries: 60
       start_period: 60s                # first boot downloads BGE-M3
 
+  # --- Warm tier (Valkey) — short-term session state + retrieval cache (B0) ----
+  # Valkey (BSD-3, Linux-Foundation fork of Redis 7.2) — NOT the Redis server (RSALv2/SSPL).
+  valkey:
+    profiles: ["memory"]
+    image: valkey/valkey:8-alpine
+    container_name: mem-valkey
+    restart: unless-stopped
+    command: ["valkey-server", "--appendonly", "yes", "--save", "60", "1000"]
+    ports:
+      - "127.0.0.1:6379:6379"          # loopback only — the host orchestrator reaches it, never the LAN
+    volumes:
+      - valkey-data:/data
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 30
+
 volumes:
   qdrant-data:
   neo4j-data:
   neo4j-logs:
+  valkey-data:
   hf-cache:

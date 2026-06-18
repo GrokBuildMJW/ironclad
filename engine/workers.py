@@ -67,12 +67,15 @@ class ReasoningWorkers:
         budget_cap = max(1, self.max_batch_tokens // max(1, int(max_tokens)))
         return max(1, min(self.max_concurrency, n, budget_cap))
 
-    def _one(self, prompt: str, system: Optional[str], max_tokens: int,
-             temperature: float, think: bool) -> Dict[str, Any]:
+    def _one(self, prompt: str, system: Optional[str], context: Optional[str],
+             max_tokens: int, temperature: float, think: bool) -> Dict[str, Any]:
         messages: List[Dict[str, str]] = []
         if system:
             messages.append({"role": "system", "content": system})
-        messages.append({"role": "user", "content": prompt})
+        # §3c MAP: optional per-item context (the worker's own retrieved foreground) goes
+        # right before the item, at the tail — None ⇒ the prompt is sent verbatim (today).
+        user = (context + "\n\n" + prompt) if context else prompt
+        messages.append({"role": "user", "content": user})
         t0 = time.monotonic()
         try:
             resp = self.client.chat.completions.create(
@@ -102,6 +105,7 @@ class ReasoningWorkers:
             }
 
     def fanout(self, prompts: Sequence[str], *, system: Optional[str] = None,
+               contexts: Optional[Sequence[Optional[str]]] = None,
                max_tokens: Optional[int] = None, temperature: float = 0.7,
                think: bool = True) -> List[Dict[str, Any]]:
         """Run every prompt concurrently (bounded) and return results IN INPUT ORDER.
@@ -110,11 +114,19 @@ class ReasoningWorkers:
         model's thinking stays on (unlike the ACK structured-emission path, which
         forces it off). Never raises for a model/transport error on a single prompt;
         that prompt's result carries ``ok=False`` + ``error``.
+
+        ``contexts`` (§3c MAP): optional per-item context strings (same length as
+        ``prompts``) — each is prepended to its item so a fan-out worker gets its own
+        retrieved foreground. ``None`` (or a length mismatch) ⇒ today's stateless
+        behaviour (prompts sent verbatim), so the default path is byte-identical.
         """
         n = len(prompts)
         if n == 0:
             return []
         mt = max_tokens or self.default_max_tokens
+        ctxs = list(contexts) if contexts is not None else None
+        if ctxs is not None and len(ctxs) != n:
+            ctxs = None  # length mismatch → fail safe to the stateless path, never misalign
         results: List[Optional[Dict[str, Any]]] = [None] * n
         # Safety governor: cap parallelism by the token-budget envelope, not just the
         # request size — a large max_tokens lowers concurrency so the box is never
@@ -122,7 +134,8 @@ class ReasoningWorkers:
         workers = self._plan_concurrency(n, mt)
         with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="reason") as pool:
             futs = {
-                pool.submit(self._one, p, system, mt, temperature, think): i
+                pool.submit(self._one, p, system, (ctxs[i] if ctxs else None),
+                            mt, temperature, think): i
                 for i, p in enumerate(prompts)
             }
             for f in as_completed(futs):

@@ -59,7 +59,7 @@ git clone https://github.com/GrokBuildMJW/ironclad.git
 cd ironclad
 python -m venv .venv
 . .venv/bin/activate                 # Windows PowerShell: .venv\Scripts\Activate.ps1
-pip install -e ".[engine]"           # ACK (pydantic) + engine extras (openai, prompt_toolkit)
+pip install -e ".[engine]"           # ACK (pydantic) + engine extras (openai + TUI: prompt_toolkit, textual, rich)
 ```
 
 `pip install -e .` (without the extra) installs just the **ACK library** (`import ack`)
@@ -125,7 +125,7 @@ the server is identical. The Python `tui.py`/`client.py` stay as legacy fallback
 `engine/gx10.py` is now the **engine library** (imported by the server), not a CLI.
 
 Server endpoints: `GET /health /tasks /pending /doctor` · `POST /chat /chat/stream
-/tool-result /feedback /fanout /session/*`. The client pulls staged handovers from
+/tool-result /feedback /fanout /cancel /session/*`. The client pulls staged handovers from
 `/pending`, runs code-agents locally, and posts results to `/feedback`. `--max-agents`
 bounds how many run in parallel.
 

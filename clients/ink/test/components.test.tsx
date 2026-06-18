@@ -5,15 +5,18 @@ import {renderToString} from '../src/render/ink-compat.js';
 import {Footer} from '../src/ui/Footer.js';
 import {WorkingLine} from '../src/ui/WorkingLine.js';
 import {InputBox} from '../src/ui/InputBox.js';
+import {CommandMenu} from '../src/ui/CommandMenu.js';
+import {completions} from '../src/commands.js';
 import type {StatusState} from '../src/ui/useStatusPoller.js';
 
 // Rendered on OUR renderer via ink-compat (the components are unchanged; only their Box/Text/hooks
 // now resolve to the custom renderer instead of Stock Ink).
 
-test('Footer — model · conn · tasks · perf', () => {
+test('Footer — model · conn · mem · tasks · perf', () => {
   const st: StatusState = {
     model: 'qwen3.6-35b',
     connected: true,
+    memory: 'up',
     watcher: true,
     autopilot: false,
     pending: 1,
@@ -26,9 +29,23 @@ test('Footer — model · conn · tasks · perf', () => {
   assert.match(f, /Ironclad/);
   assert.match(f, /qwen3\.6-35b/);
   assert.match(f, /conn/);
+  assert.match(f, /mem up/, 'shows memory status'); // MEM-7
   assert.match(f, /1P\/0IP\/4D/);
   assert.match(f, /TTFT 0\.5s/);
   unmount();
+});
+
+test('Footer — memory off/down render their state', () => {
+  const base: StatusState = {
+    model: 'm', connected: true, memory: 'off', watcher: false, autopilot: false,
+    pending: 0, inProgress: 0, done: 0, perf: '',
+  };
+  const off = renderToString(<Footer st={base} />, 100, 3);
+  assert.match(off.frame(), /mem off/);
+  off.unmount();
+  const down = renderToString(<Footer st={{...base, memory: 'down'}} />, 100, 3);
+  assert.match(down.frame(), /mem down/);
+  down.unmount();
 });
 
 test('WorkingLine — verb + elapsed + tokens + interrupt hint', () => {
@@ -52,5 +69,22 @@ test('InputBox — ruled prompt with buffer + caret', () => {
 test('InputBox — empty shows hint', () => {
   const {frame, unmount} = renderToString(<InputBox buffer="" caret={false} hint="Frag etwas …" />, 80, 4);
   assert.match(frame(), /Frag etwas …/);
+  unmount();
+});
+
+test('CommandMenu — lists matches and marks the selected row (MEM-16(2))', () => {
+  const items = completions('re'); // [reset, resume]
+  const {frame, unmount} = renderToString(<CommandMenu items={items} sel={1} />, 100, 6);
+  const f = frame();
+  assert.match(f, /\/reset/);
+  assert.match(f, /\/resume/);
+  assert.match(f, /›/, 'has a selection marker');
+  assert.match(f, /Tab vervollständigen/, 'shows the key hint');
+  unmount();
+});
+
+test('CommandMenu — empty list renders nothing', () => {
+  const {frame, unmount} = renderToString(<CommandMenu items={[]} sel={0} />, 100, 3);
+  assert.equal(frame().trim(), '');
   unmount();
 });

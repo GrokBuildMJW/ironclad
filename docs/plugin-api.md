@@ -53,12 +53,15 @@ plugins live outside it.
 
 ## Scaffold one (don't hand-write it)
 
-The generator lays down a complete, correctly-shaped plugin (skill + spec + test +
-registration) from a template:
+The generator lays down a complete, correctly-shaped case/domain skeleton from a template —
+a skill stub, its `CASE` spec, a backlog + gap-tracking doc, a test, and the registration:
 
 ```bash
-python ack/generator.py --help     # scaffold a new case/skill
+python -m ack.generator --domain <domain-key> --case <case-key> --description "what it does"
+python -m ack.generator --help      # all options (--phase, --tier, --dry-run, …)
 ```
+
+`--domain`, `--case` and `--description` are required; everything else has sensible defaults.
 
 ## Notes
 

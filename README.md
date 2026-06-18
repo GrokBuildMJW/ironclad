@@ -57,8 +57,8 @@ long-term **memory**, autoplan, and **function-calling robustness** (validate→
 every tool call + recovery for models without native tool-calls). On top, the **extension
 surface** is shipped: an **open plugin API** (drop in a tool, no core fork), a **bring-your-
 own code-agent CLI**, a **dev container** that runs the whole suite as a build+test gate,
-and a beginner **self-maintenance** guide. Verified by **236 Python tests** (227 offline + 9
-live) plus **272 TypeScript client tests**, and a **full end-to-end run with a real code-agent**.
+and a beginner **self-maintenance** guide. Verified by **318 Python tests** (309 offline + 9
+live) plus **327 TypeScript client tests**, and a **full end-to-end run with a real code-agent**.
 
 It is still **pre-release**: single-tenant by design (no multi-user auth yet), no tagged
 release, and APIs/layout/config may change. The DEV → Prod → Public **promote pipeline** that
@@ -103,7 +103,7 @@ watcher · connection). Illustrative frame from a real session:
 ```text
  █▀▄▀█ Ironclad · Orchestrator Client
    Ironclad CLI 0.1.0 · code . · ≤3 agents
-  /help · exit · mouse selects/copies natively
+  /help · exit
 
  > what is 17 times 23?
 
@@ -200,7 +200,7 @@ pip install "ironclad-ai[engine]"  # + the orchestration engine deps
 git clone https://github.com/GrokBuildMJW/ironclad.git
 cd ironclad
 python -m venv .venv && . .venv/bin/activate     # Windows: .venv\Scripts\Activate.ps1
-pip install -e ".[engine]"                         # ACK + engine (openai, prompt_toolkit)
+pip install -e ".[engine]"                         # ACK + engine (openai + TUI deps: prompt_toolkit, textual, rich)
 
 # Point at your model endpoint (defaults: http://localhost:8000/v1, qwen3.6-35b):
 export GX10_BASE_URL=http://localhost:8000/v1

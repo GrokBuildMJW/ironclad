@@ -6,11 +6,41 @@
  * never has to wrap a line mid-ANSI-escape (which is what corrupts colours/layout).
  * A fresh Marked instance per call avoids the extension-stacking that marked.use() causes.
  */
+import './forceColor.js'; // MEM-20: must run before marked-terminal so chalk inits with colour on
 import {Marked} from 'marked';
 import {markedTerminal} from 'marked-terminal';
 
 /** Markdown syntax probe — if a block matches none of this, it renders verbatim (the fast path). */
 const HAS_MARKDOWN = /[*_`~#]|\[[^\]]*\]\(|^\s{0,3}([-+*]|\d+\.)\s|^\s{0,3}>|^\s{0,3}#{1,6}\s|```/m;
+
+/** Count fence lines (``` possibly indented) in a chunk — an odd count toggles the fence open/closed. */
+function fenceCount(s: string): number {
+  return (s.match(/^[ \t]*```/gm) ?? []).length;
+}
+
+/**
+ * Split a body into blank-line-separated blocks for incremental rendering — but NEVER split inside
+ * an open ``` fence (MEM-20). A fenced code block that contains a blank line would otherwise be cut
+ * across blocks, breaking the fence so each half parses on its own and the live preview garbles the
+ * code. While a fence is open, following chunks are merged until it closes; an unterminated fence
+ * stays as the still-growing tail.
+ */
+export function splitBlocks(body: string): string[] {
+  const parts = body.split(/\n{2,}/);
+  const blocks: string[] = [];
+  let buf: string[] = [];
+  let open = false;
+  for (const p of parts) {
+    buf.push(p);
+    if (fenceCount(p) % 2 === 1) open = !open;
+    if (!open) {
+      blocks.push(buf.join('\n\n'));
+      buf = [];
+    }
+  }
+  if (buf.length) blocks.push(buf.join('\n\n')); // unterminated fence → the open tail
+  return blocks;
+}
 
 /**
  * Streaming markdown renderer (concept §9). For a live token stream, re-parsing the whole answer on
@@ -36,7 +66,7 @@ export class StreamMarkdown {
   }
 
   render(body: string): string {
-    const blocks = body.split(/\n{2,}/);
+    const blocks = splitBlocks(body); // MEM-20: fence-aware so code blocks aren't cut at blank lines
     const out: string[] = [];
     for (let i = 0; i < blocks.length; i++) {
       const text = blocks[i] ?? '';

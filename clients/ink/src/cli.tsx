@@ -15,6 +15,7 @@ import {execSync} from 'node:child_process';
 import {render} from './render/ink-compat.js';
 import {App} from './ui/App.js';
 import {loadConfig, parseArgs} from './config.js';
+import {load as loadSession, exitMessage, statePath} from './state/persist.js';
 import {Server} from './net/server.js';
 
 // The Windows console defaults to a non-UTF-8 OEM code page, which renders our UTF-8 output
@@ -37,4 +38,12 @@ const workdir = resolve(args.codedir);
 chdir(workdir);
 const srv = new Server(args.server, {token: cfg.serverToken});
 
-render(<App srv={srv} codedir={workdir} maxAgents={args.maxAgents} />);
+const app = render(<App srv={srv} codedir={workdir} maxAgents={args.maxAgents} resume={args.resume} />);
+
+// MEM-18: on exit (after the TUI tears down), tell the user the session is saved + how to resume —
+// like other code CLIs. Only when there's a non-empty saved session. MEM-19: read this project's
+// per-directory state file (<codedir>/.ironclad-cli/session.json).
+void app.waitUntilExit().then(() => {
+  const msg = exitMessage(loadSession(statePath(workdir)));
+  if (msg) process.stdout.write(`\n${msg}\n`);
+});

@@ -5,9 +5,11 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
-# Runtime deps only: the server talks to vLLM (openai) and validates with pydantic.
+# Runtime deps: the server talks to vLLM (openai), validates with pydantic, and the optional
+# warm tier (B0) uses the MIT `redis` client (Valkey wire protocol; lazily imported, fail-soft —
+# installed so the warm cache/session-state actually works when GX10_WARM_URL is set).
 # prompt_toolkit is NOT needed server-side (that's the client/TUI).
-RUN pip install --no-cache-dir "openai>=1" "pydantic>=2"
+RUN pip install --no-cache-dir "openai>=1" "pydantic>=2" "redis>=5"
 
 # Source (engine + the ACK package it imports). gx10.py puts /app on sys.path so
 # `import ack` resolves; server.py adds engine/ for `import gx10`.

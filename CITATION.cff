@@ -12,7 +12,8 @@ abstract: >-
   paired with a fail-closed orchestration engine. Model-agnostic: runs against any
   OpenAI-compatible endpoint.
 license: Apache-2.0
-version: 0.0.2
+version: 0.0.3
+date-released: 2026-06-19
 keywords:
   - llm
   - agents

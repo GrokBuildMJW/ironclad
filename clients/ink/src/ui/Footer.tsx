@@ -1,6 +1,6 @@
 /**
- * Pinned status footer — model · conn · watch · auto · tasks · perf. Mirrors cli.py's
- * _footer() content with the same palette.
+ * Pinned status footer — model · conn · mem · watch · auto · tasks · perf. Mirrors cli.py's
+ * _footer() content with the same palette. `mem` reflects /health.memory (up/down/off).
  */
 import React from 'react';
 import {Box, Text} from '../render/ink-compat.js';
@@ -16,6 +16,8 @@ function Sep(): React.ReactElement {
 }
 
 export function Footer({st}: {st: StatusState}): React.ReactElement {
+  // memory tri-state: up = reachable (green), down = configured-but-unreachable (red), off = none (dim)
+  const memColor = st.memory === 'up' ? SUCCESS : st.memory === 'down' ? ERROR : DIM;
   return (
     <Box>
       <Text bold color={ACCENT}>
@@ -27,6 +29,10 @@ export function Footer({st}: {st: StatusState}): React.ReactElement {
       <Sep />
       <Text color={st.connected ? SUCCESS : ERROR}>{st.connected ? '●' : '○'}</Text>
       <Text color={DIM}> conn</Text>
+      <Sep />
+      <Text color={memColor}>{st.memory === 'off' ? '○' : '●'}</Text>
+      <Text color={DIM}> mem </Text>
+      <Text color={memColor}>{st.memory}</Text>
       <Sep />
       <Dot on={st.watcher} />
       <Text color={DIM}> watch </Text>

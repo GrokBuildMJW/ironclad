@@ -55,6 +55,11 @@ except ImportError:
     _MemoryManager = None
 
 try:
+    from warm import WarmTier as _WarmTier
+except ImportError:
+    _WarmTier = None
+
+try:
     from prompt_toolkit import Application
     from prompt_toolkit.buffer import Buffer
     from prompt_toolkit.layout import Layout
@@ -95,9 +100,32 @@ CODE_ROOT        = ""            # optionaler Code-Root für den Handover-Pfad-G
                                  # (vessel-spezifisch, z. B. ein Service-Unterordner
                                  # im Repo); leer = nur Repo-Root prüfen. Via paths.code_root.
 MAX_ITERATIONS   = 20
-MAX_CTX_CHARS    = 80_000        # High-Water: erst hier wird getrimmt
+MAX_CTX_CHARS    = 80_000        # High-Water: erst hier wird getrimmt (char-basiert; bei TOKEN_BUDGET aus MAX_MODEL_LEN abgeleitet)
 TRIM_TARGET_CHARS = 48_000       # PERF-06: Low-Water nach dem Trim (60 %)
 MAX_TOKENS       = 8192          # PERF-10: vorher 4096 → Handover-Truncation
+# MEM-9 / §3-Mechanismus 3 — token-genaues Budgeting: den Trim-Working-Set ans MODELLFENSTER
+# koppeln statt an feste Zeichen. Bei TOKEN_BUDGET=True leitet _apply_config MAX_CTX_CHARS/
+# TRIM_TARGET_CHARS aus MAX_MODEL_LEN ab (minus Reserve für Output+RAG+Summary, chars/4-Schätzung,
+# 10 % Headroom) → der Working-Set skaliert mit dem Fenster, überläuft es aber nie. AUS = feste
+# Zeichen-Schwellen wie heute (dann greifen context.max_ctx_chars / GX10_MAX_CTX_CHARS).
+MAX_MODEL_LEN    = 32768         # hartes Per-Request-Token-Fenster (vLLM --max-model-len); GX10_MAX_MODEL_LEN/IRONCLAD_MAX_MODEL_LEN
+TOKEN_BUDGET     = True          # Default AN (06-18); aus via context.token_budget=false / GX10_TOKEN_BUDGET=0
+CHARS_PER_TOKEN  = 4             # grobe Token-Schätzung (chars/token)
+# B1 — Rolling summarization: beim Trim die evict'eten Runden in einen kompakten
+# Summary-Block direkt UNTER dem System-Prompt rollen UND den Rohtext verlustfrei
+# nach Mem0 (/add_bulk, vektor-only) archivieren. Flag-gated, fail-soft, off-critical-
+# path; FLAG-AUS = byte-identisch zum heutigen Trim (kein Modell-Call, kein Block).
+SUMMARIZE_EVICTED  = True        # B1-Schalter (Default AN, 06-18 Entscheidung); aus via context.summarize_evicted=false / GX10_CONTEXT_SUMMARY=0
+SUMMARY_MAX_TOKENS = 512         # gedeckelte Ausgabe des Eviction-Summaries
+_SUMMARY_MARKER    = "## Conversation so far (rolling summary)"   # stabiler Block-Marker (find-and-update statt duplizieren)
+# B2 — Auto-Retrieval-Assembly: pro User-Turn EINE vektor-only Suche (graph=false) auf die
+# User-Message, dedup gegen das Fenster, token-budgetierter Context-Block VOR die User-Message
+# (am Tail → Prefix-Cache bleibt). Warm-Cache (B0) davor (cache-aside). Flag-gated, fail-soft;
+# FLAG-AUS = User-Message verbatim angehängt → byte-identisch zum heutigen Verhalten.
+RAG_ENABLED     = True            # B2-Schalter (Default AN, 06-18 Entscheidung); aus via context.rag_enabled=false / GX10_CONTEXT_RAG=0
+RAG_TOP_K       = 5               # Treffer pro Retrieval
+RAG_MAX_TOKENS  = 1024            # Token-Budget des injizierten Blocks (chars/4-Schätzung)
+_RAG_MARKER     = "## Relevant context (retrieved)"
 LANGUAGE         = "en"          # Antwortsprache des Orchestrators (OSS-Default en; per GX10_LANGUAGE/Config)
 MAX_FILE_CHARS   = 24_000        # PERF-05: read_file-Cap (Head+Tail)
 LIST_DIR_HARD_CAP = 200          # HV-B: harter Cap in list_directory
@@ -177,9 +205,28 @@ WORKSPACE_DIRS = [
 # Memory-Layer — module-level Singleton, initialisiert in GX10.__init__()
 _MEMORY_CONFIG: Dict[str, Any] = {}
 _MEMORY: Optional[Any] = None
+# Warm-Tier (Valkey, B0) — optionaler cache-aside-Layer vor dem Cold-Vektor-Store (B2-Retrieval)
+# + Session-State. Singleton, initialisiert in GX10.__init__(); ohne url bleibt es None (no-op).
+_WARM_CONFIG: Dict[str, Any] = {}
+_WARM: Optional[Any] = None
 #: Phase-e reasoning fan-out (engine/workers.py). Set by the server; stays None in the
 #: monolithic CLI, so the parallel tool is offered only where the governed workers exist.
 _WORKERS: Optional[Any] = None
+#: §3c MAP — when True, each fan-out worker gets its own per-item retrieved context (memory
+#: read-citizen) PLUS the shared rolling-summary floor. Default ON (06-18); set False /
+#: GX10_WORKER_MEMORY=0 for the stateless fan-out. Config workers.memory_read.
+WORKER_MEMORY = True
+#: §3c REDUCE — when True, the OK fan-out outputs are consolidated by a SINGLE writer (the main
+#: loop) into ONE cold write (no parallel /add races / duplicates). Default ON (06-18); set
+#: False / GX10_WORKER_WRITE=0 to stop persisting fan-out outputs. Config workers.memory_write.
+WORKER_WRITE = True
+#: Write strategy: "reducer" (default, single-writer consolidation — the only mode for the
+#: stateless reasoning fan-out) | "direct" (reserved for long-lived autonomous agents that write
+#: idempotently themselves; the reducer steps back). Config workers.write_mode / GX10_WORKER_WRITE_MODE.
+WORKER_WRITE_MODE = "reducer"
+#: Warm-tier session key for the shared rolling summary + worker scratch (single-tenant default).
+#: Config GX10_SESSION_ID. ``session:{id}:summary`` survives restart and is read by the workers.
+WARM_SESSION_ID = "main"
 #: Tools that operate on the *code* — they run where the code is. When a client is driving
 #: a turn and has offered local execution, the server routes these THROUGH the client (it
 #: runs them on the local filesystem and returns the result). Set by the server per turn.
@@ -796,6 +843,29 @@ MEMORY_TOOL = {
     }
 }
 
+# §3-Mechanismus 5 / MEM-10: opt-in RELATIONAL memory query over the graph. Slower, off the hot
+# path; offered only when memory is configured. The hot read (query_memory) stays vector-only.
+DEEP_MEMORY_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "deep_query_memory",
+        "description": (
+            "RELATIONAL / multi-hop memory query over the knowledge graph (e.g. 'what depends on "
+            "task X', 'how are A and B connected'). Slower than query_memory and off the hot path "
+            "— use it only when a plain query_memory (vector) isn't enough for a connection or "
+            "dependency question, NOT for routine lookups."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "relational query (natural language)"},
+                "limit": {"type": "integer", "description": "max number of results (default 5)"}
+            },
+            "required": ["query"]
+        }
+    }
+}
+
 # Phase-e: server-side parallel reasoning. Offered only when the governed fan-out
 # workers are present (i.e. running under the server). The model uses it to process
 # many INDEPENDENT items in one concurrent batch instead of a serial tool loop.
@@ -857,7 +927,7 @@ def _effective_tools() -> List[Dict[str, Any]]:
     """Tool-Liste je nach Modus — Onboarding-Tools nur, wenn aktiv."""
     # Tool nur anbieten, wenn Memory KONFIGURIERT ist (nicht bloß das Modul da ist) —
     # sonst böte sich der Tool an, obwohl jeder Aufruf "nicht verfügbar" zurückgäbe.
-    mem = [MEMORY_TOOL] if _MEMORY is not None else []
+    mem = [MEMORY_TOOL, DEEP_MEMORY_TOOL] if _MEMORY is not None else []
     par = [PARALLEL_TOOL] if _WORKERS is not None else []
     plug = [t["schema"] for t in _PLUGIN_TOOLS.values()]
     return TOOLS + mem + par + plug + (ONBOARDING_TOOLS if ONBOARDING_MODE else [])
@@ -1417,6 +1487,30 @@ _LANG_NAMES = {
 }
 
 
+# MEM-20: map a file extension to a fenced-code language tag, so `/cat` output renders as preserved,
+# syntax-highlighted code in markdown clients instead of being reflowed as prose. Unknown → "".
+_EXT_LANG = {
+    ".py": "python", ".pyi": "python", ".ts": "typescript", ".tsx": "tsx",
+    ".js": "javascript", ".jsx": "jsx", ".mjs": "javascript", ".cjs": "javascript",
+    ".json": "json", ".md": "markdown", ".sh": "bash", ".bash": "bash", ".zsh": "bash",
+    ".ps1": "powershell", ".yml": "yaml", ".yaml": "yaml", ".toml": "toml", ".ini": "ini",
+    ".cfg": "ini", ".rs": "rust", ".go": "go", ".java": "java", ".kt": "kotlin",
+    ".c": "c", ".h": "c", ".cpp": "cpp", ".cc": "cpp", ".hpp": "cpp", ".cs": "csharp",
+    ".css": "css", ".scss": "scss", ".html": "html", ".xml": "xml", ".sql": "sql",
+    ".rb": "ruby", ".php": "php", ".swift": "swift", ".lua": "lua", ".r": "r",
+    ".dockerfile": "dockerfile", ".tf": "hcl", ".proto": "proto", ".graphql": "graphql",
+    ".vue": "vue", ".svelte": "svelte", ".dart": "dart", ".scala": "scala",
+}
+
+
+def _lang_for_path(path: str) -> str:
+    """Fenced-code language for a path's extension (MEM-20); "" when unknown."""
+    base = os.path.basename(path).lower()
+    if base in ("dockerfile", "makefile"):
+        return "dockerfile" if base == "dockerfile" else "makefile"
+    return _EXT_LANG.get(os.path.splitext(base)[1], "")
+
+
 def _language_guidance(lang: str) -> str:
     """Runtime note that pins the orchestrator's reply language. Deterministic: the
     configured language wins regardless of the input language. ``en`` is the OSS
@@ -1622,6 +1716,157 @@ def _format_parallel(results: List[Dict[str, Any]]) -> str:
     return f"[parallel_reason] {ok}/{len(results)} ok\n\n" + "\n\n".join(lines)
 
 
+# ── retrieval helpers (shared by the per-turn RAG (B2) and the fan-out worker read (§3c)) ──
+def _retrieve_hits(query: str, top_k: int) -> List[str]:
+    """Cache-aside hit list for *query*: the optional warm tier (B0) in front of the cold vector
+    store. Fail-soft → ``[]``. Assumes the caller already gated on ``_MEMORY`` availability."""
+    if _MEMORY is None or not (query or "").strip():
+        return []
+    hits: Optional[List[str]] = None
+    warm = _WARM
+    if warm is not None:
+        try:
+            hits = warm.cache_get(query)
+        except Exception:  # noqa: BLE001
+            hits = None
+    if hits is None:
+        try:
+            hits = _MEMORY.search(query, top_k)
+        except Exception:  # noqa: BLE001
+            return []
+        if warm is not None and hits:
+            try:
+                warm.cache_set(query, hits)
+            except Exception:  # noqa: BLE001
+                pass
+    return list(hits or [])
+
+
+def _rag_block(hits: List[str], budget_tokens: int, in_window: str = "") -> str:
+    """Format hits into a token-budgeted, deduped ``## Relevant context (retrieved)`` block (or
+    ""). Dedups within the block and against *in_window* (already-visible context; "" ⇒ skip)."""
+    budget_chars = max(0, budget_tokens) * 4   # grobe chars/4-Token-Schätzung
+    lines: List[str] = []
+    seen: set = set()
+    used = 0
+    for h in hits:
+        h = str(h).strip()
+        if not h:
+            continue
+        key = " ".join(h.split())[:200].lower()
+        if key in seen or (in_window and h in in_window):
+            continue
+        line = f"- {h}"
+        if used + len(line) + 1 > budget_chars:
+            break
+        lines.append(line)
+        seen.add(key)
+        used += len(line) + 1
+    if not lines:
+        return ""
+    return _RAG_MARKER + "\n" + "\n".join(lines)
+
+
+def _worker_contexts(items: List[str]) -> Optional[List[Optional[str]]]:
+    """§3c MAP: per-item vector retrieval so each fan-out worker gets its OWN focused foreground
+    (not just the shared instruction). Returns a per-item list (a block or None per item), or
+    ``None`` for the whole batch when disabled / memory unavailable → ``fanout`` stays
+    byte-identical to today. Fail-soft; respects the same token budget as the per-turn RAG."""
+    if not WORKER_MEMORY or _MEMORY is None:
+        return None
+    try:
+        if not _MEMORY.is_available():
+            return None
+    except Exception:  # noqa: BLE001
+        return None
+    out: List[Optional[str]] = []
+    any_ctx = False
+    for it in items:
+        try:
+            hits = _retrieve_hits(it, RAG_TOP_K)
+            block = _rag_block(hits, RAG_MAX_TOKENS) if hits else ""
+        except Exception:  # noqa: BLE001 — one item's retrieval never sinks the batch
+            block = ""
+        out.append(block or None)
+        if block:
+            any_ctx = True
+    return out if any_ctx else None
+
+
+def _worker_shared_floor() -> str:
+    """§3c MAP floor: the shared rolling summary (from the warm tier) that every fan-out worker
+    gets on top of its per-item context — the common ground the main loop has. "" when disabled /
+    warm not configured / no summary yet. Fail-soft."""
+    if not WORKER_MEMORY or _WARM is None:
+        return ""
+    try:
+        s = _WARM.get_session(WARM_SESSION_ID, "summary")
+    except Exception:  # noqa: BLE001
+        return ""
+    s = (s or "").strip()
+    return (_SUMMARY_MARKER + "\n" + s) if s else ""
+
+
+def _reduce_worker_results(results: List[Dict[str, Any]], topic: str = "") -> int:
+    """§3c REDUCE: consolidate the OK fan-out outputs into ONE cold write via a SINGLE writer —
+    workers never write Mem0 directly (parallel /add ⇒ duplicates + the slow LLM path on the hot
+    fan-out). Dedups, then one ``add_bulk`` (or ``chunk_and_store`` when large). Flag-gated
+    (WORKER_WRITE, ``reducer`` mode), fail-soft, off-critical-path (the writes are themselves
+    fire-and-forget). Returns the number of consolidated items written (0 when disabled/empty).
+
+    ``direct`` mode is reserved for long-lived autonomous agents that write idempotently on their
+    own; for the stateless reasoning fan-out the reducer steps back (returns 0)."""
+    if not WORKER_WRITE or WORKER_WRITE_MODE != "reducer" or _MEMORY is None:
+        return 0
+    try:
+        if not _MEMORY.is_available():
+            return 0
+    except Exception:  # noqa: BLE001
+        return 0
+    seen: set = set()
+    parts: List[str] = []
+    for i, r in enumerate(results, 1):
+        if not r.get("ok"):
+            continue
+        c = (r.get("content") or "").strip()
+        if not c:
+            continue
+        key = " ".join(c.split())[:200].lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        parts.append(f"[{i}] {c}")
+    if not parts:
+        return 0
+    blob = (f"Parallel reasoning on: {topic}\n\n" if topic else "") + "\n\n".join(parts)
+    md: Dict[str, Any] = {"source": "worker_reduce"}
+    if topic:
+        md["topic"] = topic[:200]
+    try:
+        # one consolidated write; chunk if it exceeds the artifact cap (B3), else a single add_bulk
+        if len(blob) > getattr(_MEMORY, "chunk_size", 6000):
+            _MEMORY.chunk_and_store(blob, md, source="worker_reduce")
+        else:
+            _MEMORY.add_bulk(blob, md)
+    except Exception:  # noqa: BLE001 — best effort, never break the turn
+        return 0
+    return len(parts)
+
+
+def _derive_ctx_budget(max_model_len: int, max_tokens: int, rag_tokens: int,
+                       summary_tokens: int, chars_per_token: int = CHARS_PER_TOKEN) -> tuple:
+    """MEM-9 / §3-Mechanismus 3: trim watermark (in CHARS, since _trim_context measures chars)
+    derived from the model window minus the reserves it must leave free — output (``max_tokens``)
+    + the RAG block + the summary block — via the chars/token estimate with 10% headroom. Returns
+    ``(high_chars, low_chars)`` with low = 60% of high (mirrors the legacy 80k→48k hysteresis).
+    Scales the working set with ``max_model_len`` while never overflowing it; floored so a tiny
+    window can't yield ≤0."""
+    reserve = max(0, int(max_tokens) + int(rag_tokens) + int(summary_tokens))
+    budget_tok = max(2048, int((int(max_model_len) - reserve) * 0.9))
+    high = budget_tok * max(1, int(chars_per_token))
+    return high, int(high * 0.6)
+
+
 def run_tool(name: str, args: Dict[str, Any]) -> str:
     try:
         # Pass code-tools THROUGH to the driving client (runs them on the local fs) when a
@@ -1792,10 +2037,19 @@ def run_tool(name: str, args: Dict[str, Any]) -> str:
 
         elif name == "query_memory":
             if _MEMORY is None or not _MEMORY.is_available():
-                return "[Memory] unavailable — is the memory stack running? `docker compose -f memory-stack/docker-compose.yml up -d`"
+                return "[Memory] unavailable — is the memory stack running? `docker compose --profile memory up -d` (in core/)"
             return _MEMORY.query(
                 args.get("query", ""),
                 int(args.get("limit", 8)),
+            )
+
+        elif name == "deep_query_memory":
+            # §3-Mechanismus 5: relational/multi-hop (graph=true), off the hot path. Re-gated.
+            if _MEMORY is None or not _MEMORY.is_available():
+                return "[Memory] unavailable — is the memory stack running? `docker compose --profile memory up -d` (in core/)"
+            return _MEMORY.deep_query(
+                args.get("query", ""),
+                int(args.get("limit", 5)),
             )
 
         elif name == "parallel_reason":
@@ -1807,12 +2061,23 @@ def run_tool(name: str, args: Dict[str, Any]) -> str:
                     or not all(isinstance(x, str) for x in items)):
                 return "ERROR: 'items' must be a non-empty list of strings"
             mt = args.get("max_tokens")
+            instruction = args.get("instruction") or None
+            # §3c MAP: each worker becomes a memory READ-citizen — shared rolling-summary floor
+            # (fold into the system instruction) + per-item retrieved foreground. All flag-gated,
+            # fail-soft; with the flag off floor="" and contexts=None ⇒ today's stateless fan-out.
+            floor = _worker_shared_floor()
+            system = ((instruction + "\n\n" + floor) if instruction else floor) if floor else instruction
+            contexts = _worker_contexts(items)
             results = _WORKERS.fanout(
                 items,
-                system=(args.get("instruction") or None),
+                system=system,
+                contexts=contexts,
                 max_tokens=int(mt) if mt else None,
                 think=True,
             )
+            # §3c REDUCE: single-writer consolidation of the OK outputs into ONE cold write
+            # (flag-gated, fail-soft, fire-and-forget) — no parallel-write races. Off ⇒ no-op.
+            _reduce_worker_results(results, topic=(instruction or ""))
             return _format_parallel(results)
 
         elif name in _PLUGIN_TOOLS:
@@ -1857,9 +2122,12 @@ class GX10:
             self._append_guidance(_onboarding_guidance())
         self._ensure_dirs()
         # Memory-Layer initialisieren (fail-soft, einmalig pro Prozess)
-        global _MEMORY
+        global _MEMORY, _WARM
         if _MemoryManager is not None and _MEMORY_CONFIG and _MEMORY is None:
             _MEMORY = _MemoryManager(_MEMORY_CONFIG)
+        # Warm-Tier (B0) initialisieren — optional; ohne url bleibt der Tier no-op (fail-soft).
+        if _WarmTier is not None and _WARM_CONFIG and _WARM is None:
+            _WARM = _WarmTier(_WARM_CONFIG)
 
     def _append_guidance(self, note: str):
         """Hängt eine Laufzeit-Notiz an den System-Prompt (oder legt eine
@@ -2014,6 +2282,11 @@ class GX10:
         system = [m for m in self.messages if m.get("role") == "system"]
         others = [m for m in self.messages if m.get("role") != "system"]
 
+        # B1: nur wenn der Schalter an ist, die entfernten Runden mitschneiden,
+        # um sie zu summarizen + zu archivieren. AUS = leerer Pfad, kein Overhead.
+        track = SUMMARIZE_EVICTED
+        evicted: List[Dict] = []
+
         # In ganzen "Runden" kürzen, damit assistant.tool_calls und die
         # zugehörigen tool-Antworten zusammenbleiben (API-Invariante).
         while total_len(others) > TRIM_TARGET_CHARS and len(others) > 1:
@@ -2026,9 +2299,130 @@ class GX10:
             # wenn nur ein User-Turn im Kontext liegt aber viele Tool-Results).
             if cut >= len(others):
                 break
+            if track:
+                evicted.extend(others[:cut])
             del others[:cut]
 
+        # B1: evict'ete Runden in den Summary-Block rollen + nach Cold archivieren.
+        # _roll_summary mutiert `system` in place (Summary-Message direkt unter dem
+        # Prompt) — AUS oder ohne Eviction bleibt `system` unberührt → die Reassign
+        # unten ist dann byte-identisch zum heutigen Trim. Fail-soft: jeder Fehler
+        # degradiert auf den reinen Drop (Runden sind oben bereits entfernt).
+        if track and evicted:
+            self._roll_summary(system, evicted)
+
         self.messages = system + others
+
+    # ── B1: rolling summarization on eviction (flag-gated, fail-soft) ──
+    @staticmethod
+    def _find_summary(system: List[Dict]) -> Optional[Dict]:
+        """Die bestehende Summary-Message in der System-Partition (oder None)."""
+        for m in system:
+            if str(m.get("content") or "").startswith(_SUMMARY_MARKER):
+                return m
+        return None
+
+    @staticmethod
+    def _render_rounds(msgs: List[Dict]) -> str:
+        """Evict'ete Nachrichten kompakt als Transkript rendern (Rohtext fürs Summary +
+        die verlustfreie Cold-Archivierung). Tool-Calls ohne Content werden benannt."""
+        parts: List[str] = []
+        for m in msgs:
+            role = m.get("role", "?")
+            content = str(m.get("content") or "")
+            if not content and m.get("tool_calls"):
+                names = ", ".join(
+                    str((c.get("function") or {}).get("name", "?"))
+                    for c in (m.get("tool_calls") or [])
+                )
+                content = f"(tool calls: {names})"
+            parts.append(f"[{role}] {content}")
+        return "\n\n".join(parts)
+
+    def _summarize(self, prev_summary: str, raw: str) -> str:
+        """Ein gedeckelter, nicht-denkender Completion-Call, der das vorige Summary mit dem
+        neuen Transkript zu EINEM konsolidierten Summary verschmilzt (hierarchisch — das neue
+        subsumiert das alte, der Block bleibt beschränkt). Wirft bei Fehler → Caller fällt
+        auf den reinen Drop zurück. Ohne Tools, off der normalen Generierung."""
+        instr = (
+            "You maintain a running summary of an ongoing agent session so older turns can be "
+            "dropped from the context window without losing essential state. Merge the PREVIOUS "
+            "SUMMARY with the NEW TRANSCRIPT into a single concise summary. Preserve: decisions "
+            "made, facts established, file paths, task ids, open threads — anything needed to "
+            "continue the work. Be terse and factual. Output only the summary text."
+        )
+        user = ""
+        prev_body = ""
+        if prev_summary.strip():
+            # die Marker-Zeile vor dem Re-Feed entfernen (nur der Inhalt zählt)
+            prev_body = prev_summary.split("\n", 1)[1].strip() if "\n" in prev_summary else ""
+        if prev_body:
+            user += "PREVIOUS SUMMARY:\n" + prev_body + "\n\n"
+        user += "NEW TRANSCRIPT:\n" + raw
+        resp = self.client.chat.completions.create(
+            model=self.model,
+            messages=[{"role": "system", "content": instr},
+                      {"role": "user", "content": user}],
+            max_tokens=SUMMARY_MAX_TOKENS,
+            temperature=0.2,
+            stream=False,
+        )
+        return (resp.choices[0].message.content or "").strip()
+
+    def _roll_summary(self, system: List[Dict], evicted: List[Dict]) -> None:
+        """Evict'ete Runden in den Summary-Block (direkt unter dem System-Prompt) rollen und
+        den Rohtext verlustfrei nach Cold archivieren. Fail-soft: jeder Fehler lässt `system`
+        unverändert → es bleibt beim heutigen reinen Drop (die Runden sind bereits entfernt)."""
+        raw = self._render_rounds(evicted)
+        # 1) Verlustfreies Cold-Archiv (fire-and-forget, vektor-only) — nichts geht verloren.
+        if _MEMORY is not None:
+            try:
+                if _MEMORY.is_available():
+                    _MEMORY.add_bulk(raw, {"source": "context_eviction"})
+            except Exception:  # noqa: BLE001 — Archiv ist best effort
+                pass
+        # 2) In-Window Rolling Summary (synchroner, gedeckelter Modell-Call, fail-soft).
+        prev = self._find_summary(system)
+        try:
+            new_summary = self._summarize(prev["content"] if prev else "", raw)
+        except Exception as e:  # noqa: BLE001 — Summary scheitern darf den Turn nicht kippen
+            _ui_print(col(f"[WARN] context summary skipped: {e}", C.YELLOW))
+            return
+        if not new_summary.strip():
+            return
+        content = _SUMMARY_MARKER + "\n" + new_summary.strip()
+        if prev is not None:
+            prev["content"] = content          # find-and-update (kein Duplikat)
+        else:
+            system.append({"role": "system", "content": content})   # direkt unter dem Prompt
+        # §3c: den Rolling-Summary auch in den Warm-Tier spiegeln — überlebt Orchestrator-Restart
+        # und ist von den Fan-out-Workern als shared Floor lesbar. Fail-soft; no-op ohne Warm-Tier.
+        if _WARM is not None:
+            try:
+                _WARM.set_session(WARM_SESSION_ID, "summary", new_summary.strip())
+            except Exception:  # noqa: BLE001 — Warm-Spiegel ist best effort
+                pass
+
+    # ── B2: per-turn retrieval assembly (flag-gated, fail-soft, cache-aside) ──
+    def _retrieve_context(self, query: str) -> str:
+        """Eine vektor-only Retrieval auf *query*, dedupliziert gegen das Live-Fenster und
+        token-budgetiert, als ``## Relevant context (retrieved)``-Block (oder "" bei Miss /
+        unavailable / Flag-AUS). Cache-aside über den optionalen Warm-Tier; fail-soft
+        end-to-end — jeder Fehler → "". FLAG-AUS gibt sofort "" zurück (kein Memory-Touch,
+        kein Netz) → die User-Message wird verbatim angehängt = byte-identisch zu heute."""
+        if not RAG_ENABLED or not (query or "").strip() or _MEMORY is None:
+            return ""
+        try:
+            if not _MEMORY.is_available():
+                return ""
+        except Exception:  # noqa: BLE001
+            return ""
+        hits = _retrieve_hits(query, RAG_TOP_K)
+        if not hits:
+            return ""
+        # gegen das, was das Modell ohnehin schon sieht, deduplizieren (nicht doppelt injizieren)
+        in_window = "\n".join(str(m.get("content") or "") for m in self.messages)
+        return _rag_block(hits, RAG_MAX_TOKENS, in_window)
 
     def _ensure_dirs(self):
         for d in WORKSPACE_DIRS:
@@ -2245,7 +2639,11 @@ class GX10:
     def run(self, user_input: str):
         global _TURN_DID_ADVANCE
         _CANCEL_EVENT.clear()
-        self.messages.append({"role": "user", "content": user_input})
+        # B2: per-Turn-Retrieval VOR dem Append (Query = User-Message, dedup gegen das bisherige
+        # Fenster). FLAG-AUS → "" → die User-Message wird verbatim angehängt (byte-identisch).
+        rag = self._retrieve_context(user_input)
+        self.messages.append({"role": "user",
+                              "content": (rag + "\n\n" + user_input) if rag else user_input})
         # Neuer Operator-Turn → Auto-Plan-Guard zurücksetzen. Ein advance_pipeline
         # in DIESEM Turn setzt ihn wieder; ein darauffolgendes stage_handover im
         # selben Turn wird dann blockiert (solange autoplan aus).
@@ -2394,16 +2792,49 @@ class GX10:
 
     def manual_cat(self, path: str) -> str:
         r = run_tool("read_file", {"path": path})
-        return r if not r.startswith("ERROR") else col(r, C.RED)
+        if r.startswith("ERROR"):
+            return col(r, C.RED)
+        # MEM-20: fence the content (with the language from the extension) so markdown clients show it
+        # as preserved, highlighted code instead of reflowing it as prose.
+        return f"```{_lang_for_path(path)}\n{r}\n```"
 
     def manual_ls(self, path: str = ".") -> str:
         return run_tool("list_directory", {"path": path})
 
     def clear_context(self) -> str:
         system = next((m for m in self.messages if m["role"] == "system"), None)
-        self.messages      = [system] if system else []
+        self.messages      = [system] if system else []   # drops the B1 summary block (a 2nd system msg)
         self.last_response = ""
+        # MEM-12: also drop the warm rolling summary so /clear and /reset truly start clean
+        # (otherwise a stale/contradictory summary resurrects). Fail-soft; Cold/Mem0 untouched.
+        if _WARM is not None:
+            try:
+                _WARM.del_session(WARM_SESSION_ID, "summary")
+            except Exception:  # noqa: BLE001
+                pass
         return col("[OK] context reset (the system prompt stays).", C.YELLOW)
+
+    def context_report(self) -> str:
+        """MEM-13: read-only diagnosis of what context is currently injected — the rolling summary
+        block (B1) and the last per-turn retrieved block (B2) — so you can tell whether a wrong
+        answer comes from a stale summary vs bad retrieval. Plus the recovery hints."""
+        lines = [col("  Injected context (diagnosis):", C.GRAY)]
+        summ = next((m for m in self.messages if m.get("role") == "system"
+                     and str(m.get("content") or "").startswith(_SUMMARY_MARKER)), None)
+        if summ:
+            body = str(summ["content"]).split("\n", 1)[1] if "\n" in str(summ["content"]) else ""
+            lines.append(col(f"  - rolling summary ({len(body)} chars): {body[:400]}", C.GRAY))
+        else:
+            lines.append(col("  - rolling summary: (none)", C.GRAY))
+        last_user = next((m for m in reversed(self.messages) if m.get("role") == "user"), None)
+        rag = ""
+        cu = str(last_user.get("content") or "") if last_user else ""
+        if _RAG_MARKER in cu:
+            rag = cu[cu.index(_RAG_MARKER):].split("\n\n", 1)[0]
+        lines.append(col(f"  - last retrieved block: {rag[:400] if rag else '(none)'}", C.GRAY))
+        lines.append(col("  Tip: 'clear'/'reset' clears window+summary (keeps long-term memory) · "
+                         "'rag off' disables retrieval · purge a wrong fact point-level only (never blind).", C.GRAY))
+        return "\n".join(lines)
 
     def status(self) -> str:
         chars     = sum(len(str(m.get("content") or "")) for m in self.messages)
@@ -2585,6 +3016,24 @@ def _dispatch(agent: GX10, user_input: str):
         else:
             state = col("AN", C.GREEN) if AUTOPILOT_LOG_TERMINAL else col("AUS", C.YELLOW)
             _ui_print(f"  Log-Terminal: {state}  |  log-terminal on / log-terminal off")
+    elif cmd == "rag" or cmd.startswith("rag "):
+        # MEM-13: session toggle for per-turn retrieval — turn it OFF when the retrieval itself
+        # looks like the source of inconsistent answers (answers then use only the live window).
+        global RAG_ENABLED
+        arg = cmd.split()[-1] if len(cmd.split()) > 1 else ""
+        if arg == "on":
+            RAG_ENABLED = True
+            if _EFFECTIVE_CFG: _EFFECTIVE_CFG["context"]["rag_enabled"] = True
+            _ui_print(col("[RAG] per-turn retrieval ON", C.GREEN))
+        elif arg == "off":
+            RAG_ENABLED = False
+            if _EFFECTIVE_CFG: _EFFECTIVE_CFG["context"]["rag_enabled"] = False
+            _ui_print(col("[RAG] per-turn retrieval OFF — answers use only the live window", C.YELLOW))
+        else:
+            state = col("AN", C.GREEN) if RAG_ENABLED else col("AUS", C.YELLOW)
+            _ui_print(f"  per-turn retrieval (RAG): {state}  |  rag on / rag off")
+    elif cmd == "context":
+        _ui_print(agent.context_report())
     else:
         agent.run(user_input)
 
@@ -2993,6 +3442,9 @@ def _code_defaults() -> Dict[str, Any]:
             "concurrency":      4,
             "max_tokens":       1024,
             "max_batch_tokens": 8192,
+            "memory_read":      WORKER_MEMORY,      # §3c MAP: per-item RAG + shared floor (Default AUS)
+            "memory_write":     WORKER_WRITE,       # §3c REDUCE: single-writer cold consolidation (Default AUS)
+            "write_mode":       WORKER_WRITE_MODE,  # "reducer" (Default) | "direct" (autonome Agenten)
         },
         "onboarding": {
             "enabled": ONBOARDING_MODE,
@@ -3028,11 +3480,18 @@ def _code_defaults() -> Dict[str, Any]:
             "language":      LANGUAGE,
         },
         "context": {
-            "max_iterations":    MAX_ITERATIONS,
-            "max_ctx_chars":     MAX_CTX_CHARS,
-            "trim_target_chars": TRIM_TARGET_CHARS,
-            "max_file_chars":    MAX_FILE_CHARS,
-            "list_dir_hard_cap": LIST_DIR_HARD_CAP,
+            "max_iterations":     MAX_ITERATIONS,
+            "max_ctx_chars":      MAX_CTX_CHARS,
+            "trim_target_chars":  TRIM_TARGET_CHARS,
+            "max_model_len":      MAX_MODEL_LEN,    # MEM-9: hartes Token-Fenster (Budget-Quelle)
+            "token_budget":       TOKEN_BUDGET,     # MEM-9: Trim ans Fenster koppeln (Default AN)
+            "max_file_chars":     MAX_FILE_CHARS,
+            "list_dir_hard_cap":  LIST_DIR_HARD_CAP,
+            "summarize_evicted":  SUMMARIZE_EVICTED,   # B1: Default AUS → byte-identischer Trim
+            "summary_max_tokens": SUMMARY_MAX_TOKENS,
+            "rag_enabled":        RAG_ENABLED,         # B2: Default AUS → User-Message verbatim
+            "rag_top_k":          RAG_TOP_K,
+            "rag_max_tokens":     RAG_MAX_TOKENS,
         },
         "thinking_auto": {
             "planning_keywords": list(_PLANNING_KW),
@@ -3172,6 +3631,23 @@ def _apply_env(cfg: Dict[str, Any]) -> Dict[str, Any]:
     setif("GX10_WORKERS_MAX_BATCH_TOKENS","workers", "max_batch_tokens", int)
     _truthy = lambda v: v.strip().lower() in ("1", "true", "yes", "on", "an")
     setif("GX10_ONBOARDING", "onboarding", "enabled", _truthy)
+    setif("GX10_CONTEXT_SUMMARY",    "context", "summarize_evicted",  _truthy)   # B1-Schalter
+    setif("GX10_SUMMARY_MAX_TOKENS", "context", "summary_max_tokens", int)
+    setif("GX10_CONTEXT_RAG",        "context", "rag_enabled",        _truthy)   # B2-Schalter
+    setif("GX10_RAG_TOP_K",          "context", "rag_top_k",          int)
+    setif("GX10_RAG_MAX_TOKENS",     "context", "rag_max_tokens",     int)
+    setif("GX10_WORKER_MEMORY",      "workers", "memory_read",        _truthy)   # §3c MAP-Schalter
+    setif("GX10_WORKER_WRITE",       "workers", "memory_write",       _truthy)   # §3c REDUCE-Schalter
+    setif("GX10_WORKER_WRITE_MODE",  "workers", "write_mode")                    # reducer | direct
+    # B4: Trimm-Working-Set per Env retunebar (proportional zu einem angehobenen Modellfenster
+    # IRONCLAD_MAX_MODEL_LEN), ohne Config-Datei-Edit auf dem Spark. Unset → heutige Werte.
+    setif("GX10_MAX_CTX_CHARS",      "context", "max_ctx_chars",      int)
+    setif("GX10_TRIM_TARGET_CHARS",  "context", "trim_target_chars",  int)
+    # MEM-9: Modellfenster als Budget-Quelle. IRONCLAD_MAX_MODEL_LEN (Deploy/vLLM-Var) zuerst,
+    # GX10_MAX_MODEL_LEN überschreibt (spezifischer). GX10_TOKEN_BUDGET=0 → feste char-Schwellen.
+    setif("IRONCLAD_MAX_MODEL_LEN",  "context", "max_model_len",      int)
+    setif("GX10_MAX_MODEL_LEN",      "context", "max_model_len",      int)
+    setif("GX10_TOKEN_BUDGET",       "context", "token_budget",       _truthy)
     setif("GX10_AUTOPILOT",  "autopilot",  "enabled", _truthy)
     setif("GX10_AUTOPILOT_STREAM",    "autopilot", "stream",          _truthy)
     setif("GX10_AUTOPILOT_TERMINATE", "autopilot", "terminate_on_advance", _truthy)
@@ -3206,10 +3682,13 @@ def _apply_config(cfg: Dict[str, Any]):
     global AUTOPILOT_DEFAULT_EFFORT, AUTOPILOT_LOGS_DIR, AUTOPILOT_MAX_CONCURRENT, AUTOPILOT_STREAM, AUTOPILOT_TERMINATE_ON_ADVANCE, AUTOPILOT_AUTOPLAN, AUTOPILOT_MAX_TASKS, AUTOPILOT_LOG_TERMINAL
     global TEMPERATURE, MAX_TOKENS, RETRY_BACKOFF, LANGUAGE
     global MAX_ITERATIONS, MAX_CTX_CHARS, TRIM_TARGET_CHARS, MAX_FILE_CHARS, LIST_DIR_HARD_CAP
+    global SUMMARIZE_EVICTED, SUMMARY_MAX_TOKENS, RAG_ENABLED, RAG_TOP_K, RAG_MAX_TOKENS
+    global MAX_MODEL_LEN, TOKEN_BUDGET
+    global WORKER_MEMORY, WORKER_WRITE, WORKER_WRITE_MODE, WARM_SESSION_ID
     global _PLANNING_KW, _ROUTINE_KW, WORKSPACE_DIRS, _IDLE_ACTIVE
     global WATCHER_FEEDBACK_DIR, _WATCHER_ENABLED, RECONCILER_INTERVAL
     global SPINNER_FRAMES, UI_REFRESH_INTERVAL, _UI_MAX_LINES, _UI_LINES
-    global _MEMORY_CONFIG
+    global _MEMORY_CONFIG, _WARM_CONFIG
 
     conn, paths, gen = cfg["connection"], cfg["paths"], cfg["generation"]
     ctx, ta, ws       = cfg["context"], cfg["thinking_auto"], cfg["workspace"]
@@ -3254,6 +3733,24 @@ def _apply_config(cfg: Dict[str, Any]):
     TRIM_TARGET_CHARS = int(ctx["trim_target_chars"])
     MAX_FILE_CHARS    = int(ctx["max_file_chars"])
     LIST_DIR_HARD_CAP = int(ctx["list_dir_hard_cap"])
+    SUMMARIZE_EVICTED  = bool(ctx.get("summarize_evicted", True))    # B1: Default AN (06-18)
+    SUMMARY_MAX_TOKENS = int(ctx.get("summary_max_tokens", SUMMARY_MAX_TOKENS))
+    RAG_ENABLED        = bool(ctx.get("rag_enabled", True))          # B2: Default AN (06-18)
+    RAG_TOP_K          = int(ctx.get("rag_top_k", RAG_TOP_K))
+    RAG_MAX_TOKENS     = int(ctx.get("rag_max_tokens", RAG_MAX_TOKENS))
+    # MEM-9: Trim-Working-Set ans Modellfenster koppeln (nach Output/RAG/Summary-Reserve). AN →
+    # MAX_CTX_CHARS/TRIM_TARGET_CHARS aus MAX_MODEL_LEN ableiten (überschreibt die char-Defaults);
+    # AUS → die char-Schwellen oben bleiben (heutiges Verhalten, GX10_MAX_CTX_CHARS greift).
+    MAX_MODEL_LEN      = int(ctx.get("max_model_len", MAX_MODEL_LEN))
+    TOKEN_BUDGET       = bool(ctx.get("token_budget", True))
+    if TOKEN_BUDGET:
+        MAX_CTX_CHARS, TRIM_TARGET_CHARS = _derive_ctx_budget(
+            MAX_MODEL_LEN, MAX_TOKENS, RAG_MAX_TOKENS, SUMMARY_MAX_TOKENS, CHARS_PER_TOKEN)
+    _wcfg = cfg.get("workers", {})
+    WORKER_MEMORY      = bool(_wcfg.get("memory_read", True))    # §3c MAP: Default AN (06-18)
+    WORKER_WRITE       = bool(_wcfg.get("memory_write", True))   # §3c REDUCE: Default AN (06-18)
+    WORKER_WRITE_MODE  = (str(_wcfg.get("write_mode", "reducer")).strip().lower() or "reducer")
+    WARM_SESSION_ID    = (os.environ.get("GX10_SESSION_ID", "").strip() or WARM_SESSION_ID)
 
     _PLANNING_KW = tuple(ta["planning_keywords"])
     _ROUTINE_KW  = tuple(ta["routine_keywords"])
@@ -3274,6 +3771,28 @@ def _apply_config(cfg: Dict[str, Any]):
         _MEMORY_CONFIG = {**(_MEMORY_CONFIG or {}), "base_url": _mem_url}
         _MEMORY_CONFIG.setdefault("enabled", True)
         _MEMORY_CONFIG.setdefault("agent_id", os.environ.get("GX10_MEMORY_AGENT", "ironclad"))
+    # B3-Schalter (optional; greifen nur mit konfiguriertem Memory): langes Feedback verlustfrei
+    # chunken statt truncaten + Recency-Tiebreak im Retrieval. Default AUS → heutiges Verhalten.
+    _mem_bool = lambda v: str(v).strip().lower() in ("1", "true", "yes", "on", "an")
+    _mem_chunk = os.environ.get("GX10_MEMORY_CHUNKING")
+    if _mem_chunk not in (None, ""):
+        _MEMORY_CONFIG = {**(_MEMORY_CONFIG or {}), "chunk_long_artifacts": _mem_bool(_mem_chunk)}
+    _mem_rec = os.environ.get("GX10_MEMORY_RECENCY")
+    if _mem_rec not in (None, ""):
+        _MEMORY_CONFIG = {**(_MEMORY_CONFIG or {}), "recency_tiebreak": _mem_bool(_mem_rec)}
+
+    # Warm-Tier-Config (B0): Datei (conf/warm/warm.json) ODER Env (GX10_WARM_URL).
+    # Optional — ohne url bleibt _WARM_CONFIG leer → Warm-Tier aus (no-op, fail-soft).
+    _warm_cfg_path = Path("conf/warm/warm.json")
+    if _warm_cfg_path.exists():
+        try:
+            _WARM_CONFIG = json.loads(_warm_cfg_path.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    _warm_url = os.environ.get("GX10_WARM_URL")
+    if _warm_url:
+        _WARM_CONFIG = {**(_WARM_CONFIG or {}), "url": _warm_url}
+        _WARM_CONFIG.setdefault("enabled", True)
 
     WATCHER_FEEDBACK_DIR = wa["feedback_dir"]
     _WATCHER_ENABLED     = bool(wa["enabled"])
