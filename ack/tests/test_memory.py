@@ -1,4 +1,4 @@
-"""Optional memory backend (core/engine/memory.py).
+"""Optional memory backend (engine/memory.py).
 
 Validates the MemoryManager contract against a stubbed HTTP service: health/availability,
 vector-only search (graph=false), result formatting, fire-and-forget store, and the

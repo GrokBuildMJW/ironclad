@@ -31,14 +31,21 @@ a failed check — report the exact error and stop (fail-closed).
 
 Done-A: `import ack` works and `pytest` is green.
 
-6. **(Optional) Install shell shortcuts** so the user can type one word. Detect the
-   OS/shell and append the matching block from [§8 of `SETUP.md`](SETUP.md#8-shell-shortcuts-windows--macos--linux),
-   substituting `IRONCLAD_HOME` with the absolute clone path:
+6. **(Optional) Install the recommended client globally.** If **Node ≥ 22** is available and
+   the user wants the TypeScript terminal client: `( cd clients/ink && npm install && npm install -g . )`
+   → a global `ironclad` command (like claude / kimi), installed in the npm prefix, not the clone.
+   - Check: `command -v ironclad` (POSIX) / `Get-Command ironclad` (PowerShell) resolves.
+   Skip on no Node — the Python clients below work without it.
+7. **(Optional) Install shell shortcuts** for the legacy clients. Detect the OS/shell and
+   append the matching block from [§8 of `SETUP.md`](SETUP.md#8-shell-shortcuts-windows--macos--linux),
+   substituting `IRONCLAD_HOME` with the absolute clone path (the `ironclad` command is the
+   global bin from step 6; `ironclad-tui`/`ironclad-repl` are the legacy Python clients):
    - **Windows / PowerShell:** ensure `$PROFILE` exists, append the `function ironclad…`
      block, tell the user to run `. $PROFILE`.
    - **macOS / Linux:** append the `ironclad()…` block to `~/.zshrc` (zsh) or
      `~/.bashrc` (bash), tell the user to `source` it.
-   - Check: in a fresh shell, `ironclad-cli --help` (or the chosen command) resolves.
+   - Check: in a fresh shell, the `ironclad` command resolves (`Get-Command ironclad` /
+     `type ironclad`).
    Never hard-code the path into the repo — only into the user's own profile.
 
 ## Track B — connect to a model endpoint
@@ -52,10 +59,12 @@ Done-A: `import ack` works and `pytest` is green.
    export GX10_API_KEY=...          # only if the endpoint needs one
    ```
    - Check: `curl -s "$GX10_BASE_URL/models"` lists your model.
-3. **Smoke a turn** (non-interactive is hard with the full-screen CLI; use a short
-   prompt and `--thinking off`):
-   `python engine/gx10.py --workdir ./ws --thinking off` then type a question.
-   - Check: a coherent answer + a `✓ FERTIG` line. Stop if the call errors.
+3. **Smoke a turn.** Start the orchestrator, then drive it with the client:
+   `python engine/server.py --port 8100 &` then
+   `GX10_SERVER_URL=http://localhost:8100 python engine/client.py --codedir .` and type a
+   short question. (Or, if you installed it in A.6, the recommended client:
+   `GX10_SERVER_URL=http://localhost:8100 ironclad`.)
+   - Check: a coherent answer + a `✓ FERTIG`/`DONE` line. Stop if the call errors.
 
 Done-B: a real model turn returns through the engine.
 

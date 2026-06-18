@@ -1,0 +1,50 @@
+{
+  "name": "ironclad-ink-client",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Ironclad CLI — Node/Ink front-end over the orchestrator HTTP API. Core stays Python on the Spark; this talks HTTP only.",
+  "license": "Apache-2.0",
+  "bin": {
+    "ironclad": "dist/cli.js"
+  },
+  "files": [
+    "dist",
+    "src",
+    "tsconfig.json",
+    "tsconfig.build.json",
+    "README.md",
+    "LICENSE",
+    "NOTICE",
+    "THIRD_PARTY.md"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "dev": "tsx src/cli.tsx",
+    "build": "tsc -p tsconfig.build.json",
+    "prepare": "npm run build",
+    "start": "node dist/cli.js",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "tsx --test src/**/*.test.ts* test/**/*.test.ts*",
+    "licenses": "license-checker --production --onlyAllow 'MIT;Apache-2.0;BSD-2-Clause;BSD-3-Clause;ISC;0BSD;Unlicense;CC0-1.0' --excludePrivatePackages"
+  },
+  "dependencies": {
+    "ink": "^7.1.0",
+    "marked": "^15.0.0",
+    "marked-terminal": "^7.3.0",
+    "react": "^19.2.0",
+    "react-reconciler": "^0.33.0",
+    "yoga-layout": "^3.2.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/react": "^19.0.0",
+    "@types/react-reconciler": "^0.33.0",
+    "ink-testing-library": "^4.0.0",
+    "license-checker": "^25.0.1",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0"
+  }
+}

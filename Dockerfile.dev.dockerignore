@@ -1,0 +1,12 @@
+# Build-context ignore for the DEV/test image (BuildKit uses <Dockerfile>.dockerignore
+# in preference to .dockerignore). Unlike the runtime image, this KEEPS ack/tests/ so the
+# in-container test gate can run the suite.
+__pycache__/
+*.py[cod]
+*.egg-info/
+.export/
+.venv/
+ironclad-workdir/
+dev-workdir/
+dev-artifacts/
+**/__pycache__/

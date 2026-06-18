@@ -27,6 +27,7 @@ import os
 import re
 import sys
 import json
+import inspect
 import time
 import shutil
 import subprocess
@@ -176,6 +177,24 @@ WORKSPACE_DIRS = [
 # Memory-Layer — module-level Singleton, initialisiert in GX10.__init__()
 _MEMORY_CONFIG: Dict[str, Any] = {}
 _MEMORY: Optional[Any] = None
+#: Phase-e reasoning fan-out (engine/workers.py). Set by the server; stays None in the
+#: monolithic CLI, so the parallel tool is offered only where the governed workers exist.
+_WORKERS: Optional[Any] = None
+#: Tools that operate on the *code* — they run where the code is. When a client is driving
+#: a turn and has offered local execution, the server routes these THROUGH the client (it
+#: runs them on the local filesystem and returns the result). Set by the server per turn.
+LOCAL_TOOL_NAMES = frozenset({
+    "read_file", "write_file", "list_directory", "execute_command", "search_files",
+    "move_file", "delete_file", "copy_file", "create_directory",
+})
+#: The active client-tool bridge (callable ``(name, args) -> str``) or None. When set, the
+#: tools in LOCAL_TOOL_NAMES are delegated to it instead of running server-side.
+_LOCAL_TOOL_BRIDGE: Optional[Any] = None
+#: Plugins discovered from the configured plugins dir (name → {"schema", "handler"}).
+#: The OPEN extension surface: a skill (a ``.py`` under a ``skills/`` dir with a module
+#: ``CASE`` dict + a ``run(...)`` function) becomes an agent tool — no core change. Empty
+#: unless ``paths.plugins_dir`` / ``GX10_PLUGINS_DIR`` is set. See docs/plugin-api.md.
+_PLUGIN_TOOLS: Dict[str, Dict[str, Any]] = {}
 
 # ─── Farben ──────────────────────────────────────────────────
 class C:
@@ -188,8 +207,45 @@ class C:
     BOLD    = "\033[1m"
     RESET   = "\033[0m"
 
+#: Whether ANSI color is appropriate for the current sink. Finalized by
+#: ``_setup_output()`` at startup; default True so interactive use is colored, but the
+#: headless server (non-TTY) drops to plain so escape codes never leak into the HTTP API.
+_COLOR_ENABLED = True
+
+
 def col(text: str, c: str) -> str:
-    return f"{c}{text}{C.RESET}"
+    return f"{c}{text}{C.RESET}" if _COLOR_ENABLED else text
+
+
+def _color_supported() -> bool:
+    """Runtime decision: emit ANSI only where it renders. NO_COLOR disables, FORCE_COLOR
+    forces, a dumb/absent TTY disables (so piped/captured output stays clean)."""
+    if os.environ.get("NO_COLOR") is not None:
+        return False
+    if os.environ.get("FORCE_COLOR"):
+        return True
+    if os.environ.get("TERM") == "dumb":
+        return False
+    try:
+        return bool(sys.stdout.isatty())
+    except Exception:  # noqa: BLE001 — no usable stdout → no color
+        return False
+
+
+def _setup_output() -> None:
+    """Make output robust across runtimes (call once at startup):
+    force UTF-8 on stdout/stderr so non-ASCII never raises (the Windows cp1252
+    ``UnicodeEncodeError`` class), enable ANSI on Windows consoles, and decide whether
+    color is appropriate for this sink. Idempotent and failure-tolerant."""
+    global _COLOR_ENABLED
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")  # py3.7+ text streams
+        except (AttributeError, ValueError):
+            pass
+    if os.name == "nt":
+        os.system("")  # turn on ANSI/VT processing in legacy Windows consoles
+    _COLOR_ENABLED = _color_supported()
 
 THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
 
@@ -213,6 +269,16 @@ _ROUTINE_KW = (
     # damit diagnostisches "woran liegt das?" weiterhin denkt):
     "etwas zu tun", "zu tun", "steht an", "todo", "to-do", "idle",
     "anything to do", "was liegt an", "liegt was an",
+)
+#: Smalltalk / identity / greetings — short conversational turns that need NO planning
+#: round. Front-stops the "auto = think on doubt" default so trivial questions answer
+#: in ~1s instead of running the reasoner up to the token cap. Length-gated so a long
+#: task that merely contains a greeting word still thinks.
+_SMALLTALK_KW = (
+    "wer bist du", "wer bis du", "wie heißt du", "wie heisst du", "was bist du",
+    "who are you", "what are you", "stell dich vor", "stell dich kurz vor",
+    "hallo", "hi ", "hey", "moin", "servus", "guten morgen", "guten tag",
+    "guten abend", "danke", "thanks", "thank you", "wie geht", "alles klar",
 )
 
 
@@ -340,7 +406,7 @@ _UI_PARTIAL: str              = ""
 _UI_LOCK                      = threading.Lock()
 _UI_APP: Optional[Application] = None
 
-# Headless-Capture-Hook: wird vom Server-Modus (core/engine/server.py) gesetzt,
+# Headless-Capture-Hook: wird vom Server-Modus (engine/server.py) gesetzt,
 # wenn KEINE prompt_toolkit-UI läuft (_UI_APP is None). Ein Callable(text:str)->None,
 # das die Ausgabe abgreift (z. B. in einen Thread-lokalen Request-Buffer) statt auf
 # stdout zu drucken. Bleibt None im normalen CLI-/REPL-Betrieb → Verhalten unverändert.
@@ -730,6 +796,40 @@ MEMORY_TOOL = {
     }
 }
 
+# Phase-e: server-side parallel reasoning. Offered only when the governed fan-out
+# workers are present (i.e. running under the server). The model uses it to process
+# many INDEPENDENT items in one concurrent batch instead of a serial tool loop.
+PARALLEL_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "parallel_reason",
+        "description": (
+            "Reason over several INDEPENDENT items at once — they run concurrently "
+            "against the local model and come back together, far faster than one at a "
+            "time. Use for batch analysis / classification / review of many items, or a "
+            "multi-candidate planning panel. NOT for steps that depend on each other "
+            "(there is no shared state between items). Concurrency is governed for GPU "
+            "safety, so passing many items is fine — overflow just queues."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "items": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "the independent units to reason over — one model call each",
+                },
+                "instruction": {
+                    "type": "string",
+                    "description": "shared instruction applied to every item (e.g. 'Classify the sentiment as pos/neg/neutral')",
+                },
+                "max_tokens": {"type": "integer", "description": "optional per-item token cap"},
+            },
+            "required": ["items"],
+        },
+    },
+}
+
 ONBOARDING_TOOLS = [
     {
         "type": "function",
@@ -758,7 +858,9 @@ def _effective_tools() -> List[Dict[str, Any]]:
     # Tool nur anbieten, wenn Memory KONFIGURIERT ist (nicht bloß das Modul da ist) —
     # sonst böte sich der Tool an, obwohl jeder Aufruf "nicht verfügbar" zurückgäbe.
     mem = [MEMORY_TOOL] if _MEMORY is not None else []
-    return TOOLS + mem + (ONBOARDING_TOOLS if ONBOARDING_MODE else [])
+    par = [PARALLEL_TOOL] if _WORKERS is not None else []
+    plug = [t["schema"] for t in _PLUGIN_TOOLS.values()]
+    return TOOLS + mem + par + plug + (ONBOARDING_TOOLS if ONBOARDING_MODE else [])
 
 # ─── Makro-Tool: deterministische Pipeline (HV-A) ─────────────
 _TASK_ID_RE = re.compile(rf"^{re.escape(TASK_PREFIX)}-[A-Za-z0-9_]+$")
@@ -1355,13 +1457,183 @@ def _onboarding_guidance() -> str:
 
 
 # ─── Tool Ausführung ──────────────────────────────────────────
+def _tool_param_schema(name: str) -> Optional[Dict[str, Any]]:
+    """The JSON-schema ``parameters`` block for a tool by name (or None if unknown)."""
+    for t in _effective_tools():
+        fn = t.get("function") or {}
+        if fn.get("name") == name:
+            return fn.get("parameters") or {}
+    return None
+
+
+_JSON_TYPES = {
+    "string": str, "integer": int, "number": (int, float),
+    "boolean": bool, "array": list, "object": dict,
+}
+
+
+def _validate_tool_args(args: Dict[str, Any], schema: Optional[Dict[str, Any]]) -> Optional[str]:
+    """Lightweight schema check against a tool's ``parameters``: required presence +
+    top-level types. Returns an error string or None. Deliberately lenient (no deep
+    nesting) — enough to drive a reask, not a full JSON-Schema validator."""
+    if not isinstance(schema, dict):
+        return None
+    props = schema.get("properties") or {}
+    missing = [r for r in (schema.get("required") or []) if r not in args]
+    if missing:
+        return f"missing required argument(s): {', '.join(missing)}"
+    for k, v in args.items():
+        spec = props.get(k)
+        if not isinstance(spec, dict):
+            continue
+        t = spec.get("type")
+        py = _JSON_TYPES.get(t)
+        # bool is a subclass of int → reject it where a number/integer is expected.
+        if t in ("integer", "number") and isinstance(v, bool):
+            return f"argument '{k}' must be {t}, got boolean"
+        if py and not isinstance(v, py):
+            return f"argument '{k}' must be {t}, got {type(v).__name__}"
+    return None
+
+
+def _parse_tool_args(name: str, raw: Optional[str]) -> "tuple[Optional[Dict[str, Any]], Optional[str]]":
+    """Parse a tool call's raw arguments and validate against its schema. Returns
+    ``(args, None)`` on success, or ``(None, error)`` — the error is fed back as the tool
+    result so the model RE-EMITS the call instead of us silently swallowing it (the
+    Validate→Reask contract, applied at the tool boundary, not just at stage_handover)."""
+    try:
+        args = json.loads(raw) if raw else {}
+    except json.JSONDecodeError as e:
+        return None, (f"malformed JSON arguments for '{name}': {e}. "
+                      f"Re-emit the tool call with valid JSON.")
+    if not isinstance(args, dict):
+        return None, f"arguments for '{name}' must be a JSON object, got {type(args).__name__}."
+    schema_err = _validate_tool_args(args, _tool_param_schema(name))
+    if schema_err:
+        return None, f"invalid arguments for '{name}': {schema_err}. Re-emit with corrected arguments."
+    return args, None
+
+
+_TOOLCALL_TAG_RE = re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.DOTALL)
+_FENCED_JSON_RE = re.compile(r"```(?:json|tool_call)?\s*(\{.*?\})\s*```", re.DOTALL)
+
+
+def _coerce_extracted(obj: Any, tool_names: set) -> Optional[Dict[str, Any]]:
+    """A parsed JSON object → a native-shaped tool_call dict, but ONLY if it names a known
+    tool (so a legitimate JSON answer is never mistaken for a call). ``arguments`` may be
+    given as ``arguments`` or ``parameters``; normalised to a JSON string."""
+    if not isinstance(obj, dict):
+        return None
+    name = obj.get("name") or (obj.get("function") or {}).get("name")
+    if not name or name not in tool_names:
+        return None
+    raw_args = obj.get("arguments")
+    if raw_args is None:
+        raw_args = obj.get("parameters")
+    if raw_args is None and isinstance(obj.get("function"), dict):
+        raw_args = obj["function"].get("arguments")
+    if isinstance(raw_args, str):
+        arguments = raw_args
+    elif raw_args is None:
+        arguments = "{}"
+    else:
+        arguments = json.dumps(raw_args, ensure_ascii=False)
+    return {"id": "", "name": name, "arguments": arguments}
+
+
+def _extract_tool_calls_from_text(content: str, tool_names: set) -> List[Dict[str, Any]]:
+    """Recover tool calls a model emitted as TEXT (no native ``tool_calls``) — the model-
+    agnostic fallback for OpenAI-compatible endpoints without a server-side tool parser.
+
+    Recognised, in priority order (first that matches wins, to avoid double extraction):
+      1. ``<tool_call>{…}</tool_call>`` blocks (Qwen/Nous style)
+      2. fenced ```json/```tool_call blocks containing a call object
+
+    **Only EXPLICIT markers count.** A bare top-level JSON object is deliberately NOT
+    treated as a call: a legitimate answer that happens to be JSON (e.g. the model was
+    asked to emit a tool *spec* or a data record with a ``name``/``arguments`` shape)
+    must never be silently re-interpreted into a destructive tool call. A model invoking
+    a tool without native support signals it with the tag/fence; data does not.
+    Each candidate is additionally gated to a known tool name. Returns [] otherwise."""
+    if not content or not tool_names:
+        return []
+    for pat in (_TOOLCALL_TAG_RE, _FENCED_JSON_RE):
+        found: List[Dict[str, Any]] = []
+        for m in pat.finditer(content):
+            try:
+                obj = json.loads(m.group(1))
+            except json.JSONDecodeError:
+                continue
+            call = _coerce_extracted(obj, tool_names)
+            if call:
+                found.append(call)
+        if found:
+            return found
+    return []
+
+
+def _load_plugins(plugins_dir: Optional[str]) -> int:
+    """Discover plugins under *plugins_dir* and expose each as an agent tool — the open
+    extension surface. A plugin is a ``.py`` in a ``skills/`` directory with a module-level
+    ``CASE`` dict (carrying ``name``/``description``/``capability``) and a ``run(...)``
+    function (the stable contract; see docs/plugin-api.md). Fail-soft: a broken plugin is
+    skipped, never aborts startup. Returns the number of tools loaded."""
+    _PLUGIN_TOOLS.clear()
+    if not plugins_dir:
+        return 0
+    try:
+        from ack.registry import Registry, derive_tool_schema
+    except Exception as e:  # noqa: BLE001 — no registry → no plugins, never fatal
+        _ui_print(col(f"  [plugins] registry unavailable: {e!r}", C.YELLOW))
+        return 0
+    try:
+        added = Registry().discover_skills(plugins_dir)
+    except Exception as e:  # noqa: BLE001
+        _ui_print(col(f"  [plugins] discovery failed in {plugins_dir!r}: {e!r}", C.YELLOW))
+        return 0
+    for r in added:
+        if r.handler is None:
+            continue
+        name = str(r.name)
+        _PLUGIN_TOOLS[name] = {
+            "schema": {"type": "function", "function": {
+                "name": name,
+                "description": str(r.description or f"plugin skill {name}"),
+                "parameters": derive_tool_schema(r.handler),
+            }},
+            "handler": r.handler,
+        }
+    if _PLUGIN_TOOLS:
+        _ui_print(col(f"  [plugins] {len(_PLUGIN_TOOLS)} tool(s) from {plugins_dir}: "
+                      f"{', '.join(sorted(_PLUGIN_TOOLS))}", C.GRAY))
+    return len(_PLUGIN_TOOLS)
+
+
+def _format_parallel(results: List[Dict[str, Any]]) -> str:
+    """Render governed fan-out results back into the turn — numbered, in input order,
+    failures isolated so a single bad item never sinks the batch."""
+    ok = sum(1 for r in results if r.get("ok"))
+    lines: List[str] = []
+    for i, r in enumerate(results, 1):
+        if r.get("ok"):
+            lines.append(f"[{i}] {(r.get('content') or '').strip()}")
+        else:
+            lines.append(f"[{i}] ERROR: {r.get('error')}")
+    return f"[parallel_reason] {ok}/{len(results)} ok\n\n" + "\n\n".join(lines)
+
+
 def run_tool(name: str, args: Dict[str, Any]) -> str:
     try:
+        # Pass code-tools THROUGH to the driving client (runs them on the local fs) when a
+        # bridge is active; otherwise they fall through and run server-side as before.
+        if _LOCAL_TOOL_BRIDGE is not None and name in LOCAL_TOOL_NAMES:
+            return _LOCAL_TOOL_BRIDGE(name, args)
         if name == "read_file":
             p = Path(args["path"])
             if not p.exists():
                 return f"ERROR: Not found: {args['path']}"
-            text = p.read_text(encoding="utf-8")
+            # errors="replace": a non-UTF-8 file is read lossily, never crashes the read.
+            text = p.read_text(encoding="utf-8", errors="replace")
             # PERF-05: sehr große Dateien nicht ungekappt in den Kontext laden
             if len(text) > MAX_FILE_CHARS:
                 head_n = MAX_FILE_CHARS * 2 // 3
@@ -1425,17 +1697,21 @@ def run_tool(name: str, args: Dict[str, Any]) -> str:
             # Syntax-Guidance, die dem Modell injiziert wird.
             # stdin=DEVNULL: interaktive Befehle (z. B. cmd-`date` ohne Arg)
             # bekommen sofort EOF statt die volle Timeout-Zeit zu blockieren.
+            # encoding/errors explicit: decode command output as UTF-8 lossily, so a
+            # non-locale byte (cp1252 on Windows) never raises decoding the result.
             if PLATFORM == "windows":
                 argv = ["powershell", "-NoProfile", "-NonInteractive",
                         "-Command", command]
                 r = subprocess.run(
                     argv, stdin=subprocess.DEVNULL,
-                    capture_output=True, text=True, timeout=timeout
+                    capture_output=True, text=True, encoding="utf-8", errors="replace",
+                    timeout=timeout
                 )
             else:
                 r = subprocess.run(
                     command, shell=True, stdin=subprocess.DEVNULL,
-                    capture_output=True, text=True, timeout=timeout
+                    capture_output=True, text=True, encoding="utf-8", errors="replace",
+                    timeout=timeout
                 )
             out = (r.stdout + r.stderr).strip()
             return out or f"(exit {r.returncode}, no output)"
@@ -1478,7 +1754,7 @@ def run_tool(name: str, args: Dict[str, Any]) -> str:
                 if fp.is_file():
                     try:
                         for i, line in enumerate(
-                            fp.read_text(encoding="utf-8").splitlines(), 1
+                            fp.read_text(encoding="utf-8", errors="replace").splitlines(), 1
                         ):
                             if _hit(line):
                                 hits.append(f"{fp}:{i}: {line.strip()}")
@@ -1521,6 +1797,33 @@ def run_tool(name: str, args: Dict[str, Any]) -> str:
                 args.get("query", ""),
                 int(args.get("limit", 8)),
             )
+
+        elif name == "parallel_reason":
+            if _WORKERS is None:
+                return ("[parallel_reason] unavailable — this tool runs only under the "
+                        "server (the governed fan-out workers live there).")
+            items = args.get("items")
+            if (not isinstance(items, list) or not items
+                    or not all(isinstance(x, str) for x in items)):
+                return "ERROR: 'items' must be a non-empty list of strings"
+            mt = args.get("max_tokens")
+            results = _WORKERS.fanout(
+                items,
+                system=(args.get("instruction") or None),
+                max_tokens=int(mt) if mt else None,
+                think=True,
+            )
+            return _format_parallel(results)
+
+        elif name in _PLUGIN_TOOLS:
+            # Open extension surface: dispatch to a discovered plugin skill's run().
+            handler = _PLUGIN_TOOLS[name]["handler"]
+            result = handler(**args)
+            if inspect.iscoroutine(result):
+                result.close()
+                return (f"ERROR: plugin '{name}' is async; the engine tool path needs a "
+                        f"synchronous run() (see docs/plugin-api.md).")
+            return str(result)
 
         else:
             return f"ERROR: Unknown tool: {name}"
@@ -1754,6 +2057,8 @@ class GX10:
             return True                      # Planung erkannt → denken
         if t == "done" or any(k in t for k in _ROUTINE_KW):
             return False                     # klare Routine → kein Thinking
+        if len(t.split()) <= 8 and any(k in t for k in _SMALLTALK_KW):
+            return False                     # kurzer Smalltalk/Identität → kein Thinking
         return True                          # Zweifel → denken
 
     # ── Generierung: Streaming (PERF-01) ──────────────────────
@@ -1977,6 +2282,16 @@ class GX10:
                 outcome = {"kind": "error", "detail": f"API: {err}"}
                 return
 
+            # Model-agnostic fallback: if the endpoint returned no native tool_calls,
+            # try to recover any the model emitted as text (no server-side tool parser).
+            recovered_from_text = False
+            if not tool_calls and content:
+                recovered = _extract_tool_calls_from_text(
+                    content, {t["function"]["name"] for t in _effective_tools()})
+                if recovered:
+                    tool_calls = recovered
+                    recovered_from_text = True
+
             # OPT-3: Perf-Zeile + Kumulierung (Session + dieser Turn)
             if metrics:
                 self._perf["gens"]       += 1
@@ -1989,8 +2304,10 @@ class GX10:
                 turn["completion"] += metrics.get("completion_tokens") or 0
                 _ui_print(col("  " + self._perf["last"], C.GRAY))
 
-            # PERF-02: NUR den bereinigten Inhalt persistieren (kein <think>)
-            cleaned = clean(content)
+            # PERF-02: NUR den bereinigten Inhalt persistieren (kein <think>). Wenn der
+            # Tool-Call aus dem Text geborgen wurde, ist `content` die Call-Markierung
+            # selbst — nicht als assistant.content doppeln (verwirrt manche Templates).
+            cleaned = "" if recovered_from_text else clean(content)
             msg_dict: Dict[str, Any] = {"role": "assistant", "content": cleaned or None}
             if tool_calls:
                 msg_dict["tool_calls"] = [
@@ -2015,10 +2332,18 @@ class GX10:
             for i, t in enumerate(tool_calls):
                 name = t["name"] or ""
                 tcid = t["id"] or f"call_{iteration}_{i}"
-                try:
-                    args = json.loads(t["arguments"]) if t["arguments"] else {}
-                except json.JSONDecodeError:
-                    args = {}
+                # Validate→Reask at the tool boundary: malformed JSON or a schema
+                # violation is fed back as the tool result so the model re-emits,
+                # instead of silently degrading to empty args.
+                args, arg_err = _parse_tool_args(name, t["arguments"])
+                if arg_err:
+                    _ui_print(col(f"  → {name}", C.MAGENTA) +
+                              col(f"  ✗ {arg_err[:80]}", C.RED))
+                    self.messages.append({
+                        "role": "tool", "tool_call_id": tcid,
+                        "content": f"ERROR: {arg_err}",
+                    })
+                    continue
 
                 args_disp = ", ".join(
                     f"{k}={repr(str(v))[:50]}" for k, v in args.items()
@@ -2569,58 +2894,6 @@ def _reconciler_loop(stop_event: threading.Event, interval: float):
 
 
 # ─── Application UI ───────────────────────────────────────────
-def _build_app() -> Application:
-    input_buf = Buffer(name="input_buf", multiline=False)
-    kb        = KeyBindings()
-
-    @kb.add("enter")
-    def _enter(event):
-        text = input_buf.text.strip()
-        input_buf.reset()
-        if text:
-            _ui_print(col(f"\n[You] > {text}", C.BOLD))
-        _INPUT_QUEUE.put(text)
-
-    @kb.add("c-c")
-    def _ctrl_c(event):
-        if _status["thinking"]:
-            _CANCEL_EVENT.set()
-        else:
-            _INPUT_QUEUE.put("\x03")
-
-    @kb.add("c-d")
-    def _ctrl_d(event):
-        _INPUT_QUEUE.put("\x04")
-
-    layout = Layout(
-        HSplit([
-            Window(
-                content=FormattedTextControl(_get_output, focusable=False),
-                wrap_lines=True,
-            ),
-            Window(height=1, char="─"),
-            Window(
-                content=BufferControl(buffer=input_buf, focusable=True),
-                height=1,
-                get_line_prefix=lambda i, wrap_count: "│ [You] > ",
-            ),
-            Window(height=1, char="─"),
-            Window(
-                content=FormattedTextControl(_toolbar, focusable=False),
-                height=3,
-            ),
-        ])
-    )
-
-    return Application(
-        layout=layout,
-        key_bindings=kb,
-        full_screen=True,
-        refresh_interval=UI_REFRESH_INTERVAL,
-        mouse_support=False,
-    )
-
-
 def _autoplan_prompt(tid: str) -> Optional[str]:
     """Build the 'plan the next task' prompt for autoplan from the configured
     capability backlog (``paths.active_capability_backlog``). Returns None when no
@@ -2681,80 +2954,6 @@ def _autoplan_tick(tid: str, enqueue) -> None:
     _ui_print(col(f"\n  → [AUTOPLAN] queue empty after {tid} — planning the next task", C.CYAN))
 
 
-def _agent_thread(agent: GX10, app: Application):
-    """Agent-Loop läuft im Hintergrund-Thread."""
-    global _AUTOPLAN_DONE, AUTOPILOT_AUTOPLAN, _RELOAD_FLAG
-    while True:
-        user_input = _INPUT_QUEUE.get().strip()
-
-        if user_input == "\x04":            # Ctrl+D
-            agent.save_session()
-            app.exit()
-            return
-
-        if user_input == "\x03":            # Ctrl+C ohne aktiven Call
-            _ui_print(col("  (tippe 'exit' zum Beenden)", C.GRAY))
-            continue
-
-        # Strukturierter Reconciler-Befehl: deterministischer Abschluss, KEIN LLM.
-        if user_input.startswith(_ADVANCE_CMD):
-            parts = user_input.split("\x00")   # ['', 'advance', tid, agent]
-            if len(parts) >= 4:
-                tid, agent_adv = parts[2], parts[3]
-                _ui_print(col(f"  → advance_pipeline({tid}, {agent_adv}) [auto]", C.MAGENTA))
-                try:
-                    res = _advance_pipeline(tid, agent_adv)
-                except Exception as e:
-                    res = f"ERROR: {e!r}"
-                ok = res.startswith("OK")
-                _ui_print(col(f"  {'✓' if ok else '✗'} {res.splitlines()[0]}",
-                              C.GREEN if ok else C.RED))
-                # Autoplan: nach erfolgreichem Advance bei leerer Queue den nächsten
-                # Task planen lassen. Monolith-Politik: nur wenn Autopilot AN (Launch
-                # lokal). Logik geteilt mit dem Server über _autoplan_tick.
-                if ok and AUTOPILOT_ENABLED:
-                    _autoplan_tick(tid, lambda p: _INPUT_QUEUE.put(p))
-            continue
-
-        # Autopilot-Launch: startet claude für einen Handover (detached).
-        if user_input.startswith(_LAUNCH_CMD):
-            parts = user_input.split("\x00")   # ['', 'launch', tid, agent]
-            if len(parts) >= 4:
-                try:
-                    _do_launch(parts[2], parts[3])
-                except Exception as e:
-                    _autopilot_release()
-                    _ui_print(col(f"  ✗ [AUTO] Launch-Fehler: {e!r}", C.RED))
-            continue
-
-        if not user_input:
-            continue
-
-        if user_input.lower() == "reload":
-            global _RELOAD_FLAG
-            _RELOAD_FLAG = True
-            agent.save_session()
-            _ui_print(col("[OK] restart — session saved.", C.GREEN))
-            app.exit()
-            return
-
-        if user_input.lower() == "exit":
-            agent.save_session()
-            app.exit()
-            return
-
-        # Absicherung: eine unerwartete Exception in der Verarbeitung darf den
-        # Worker-Thread NICHT stillschweigend killen (sonst wirkt die CLI
-        # „bereit", verarbeitet aber keine Eingaben mehr).
-        try:
-            _dispatch(agent, user_input)
-        except Exception as e:
-            _status["thinking"] = False
-            _ui_print(col(f"\n  ✗ FEHLER (Verarbeitung): {e!r}", C.RED))
-
-# ─── Konfiguration: Laden, Mergen, Precedence ────────────────
-# Wert-Precedence (schwach → stark): Code-Defaults < Config-Datei < Env < CLI.
-
 def _code_defaults() -> Dict[str, Any]:
     """Schnappschuss der Modul-Konstanten als unterste Precedence-Stufe."""
     return {
@@ -2775,6 +2974,25 @@ def _code_defaults() -> Dict[str, Any]:
         },
         "lodestar": {
             "enabled": LODESTAR_ENABLED,
+        },
+        "security": {
+            # Phase-d trust profile (single-tenant): open | token | sealed.
+            # The server (engine/security.py) reads this block; the token VALUE comes
+            # from the env named here, never from config. See docs/roadmap.md.
+            "profile":             "open",
+            "token_env":           "GX10_SERVER_TOKEN",
+            "session_heartbeat_s": 30,
+            "code_locality":       "mount",   # sealed forces "local"
+        },
+        "workers": {
+            # Phase-e reasoning fan-out governor (engine/workers.py). CONSERVATIVE,
+            # model-agnostic defaults — safe for an unknown endpoint, NOT tuned. The
+            # private deploy pins the model-matched values in conf/ (our reference model
+            # qwen3.6-35b: concurrency 8 = max_num_seqs). Envelope: concurrency × max_tokens
+            # ≤ max_batch_tokens, so a large max_tokens lowers parallelism (never crashes).
+            "concurrency":      4,
+            "max_tokens":       1024,
+            "max_batch_tokens": 8192,
         },
         "onboarding": {
             "enabled": ONBOARDING_MODE,
@@ -2797,6 +3015,9 @@ def _code_defaults() -> Dict[str, Any]:
             "workdir":       DEFAULT_WORKDIR,
             "session_file":  SESSION_FILE,
             "code_root":     CODE_ROOT,
+            # Open plugin surface: a dir scanned for `skills/*.py` plugins at startup
+            # (GX10_PLUGINS_DIR). Empty = no plugins. See docs/plugin-api.md.
+            "plugins_dir":   "",
         },
         "generation": {
             "temperature":   TEMPERATURE,
@@ -2877,7 +3098,9 @@ def _load_config_tree(source: Optional[Path], _seen: Optional[set] = None) -> Di
     """Lädt eine Config aus Datei ODER Verzeichnis und merged Includes
     rekursiv. Regeln:
       • Verzeichnis mit `gx10.config.json` → diese Index-Datei laden.
-      • Verzeichnis ohne Index → alle `*.json` (sortiert) deep-mergen.
+      • Verzeichnis ohne Index → alle `*.json` (sortiert) deep-mergen, DANN in
+        Unterverzeichnisse absteigen (jedes wieder als Tree; Subdirs übersteuern
+        die Top-Level-Dateien). So lädt z. B. `conf/connection/connection.json`.
       • Datei mit `include: [...]` → Einträge (relativ zur Datei) zuerst
         mergen, danach die eigenen Inline-Blöcke (Inline gewinnt).
     Liefert denselben flachen cfg-Baum wie eine Einzeldatei."""
@@ -2897,6 +3120,11 @@ def _load_config_tree(source: Optional[Path], _seen: Optional[set] = None) -> Di
         merged: Dict[str, Any] = {}
         for f in sorted(p.glob("*.json")):
             merged = _deep_merge(merged, _load_config_tree(f, _seen))
+        # Descend into subdirectories — the config is a TREE (e.g. conf/connection/).
+        # Skip hidden/dotted dirs (.git, .vscode, …) so they are never slurped in.
+        for d in sorted(x for x in p.iterdir()
+                        if x.is_dir() and not x.name.startswith(".")):
+            merged = _deep_merge(merged, _load_config_tree(d, _seen))
         return merged
 
     if p.is_file():
@@ -2935,6 +3163,13 @@ def _apply_env(cfg: Dict[str, Any]) -> Dict[str, Any]:
     setif("GX10_THINKING",   "generation", "thinking_mode")
     setif("GX10_LANGUAGE",   "generation", "language")
     setif("GX10_PLATFORM",   "platform",   "mode")
+    setif("GX10_PROFILE",          "security", "profile")
+    setif("GX10_SESSION_HEARTBEAT","security", "session_heartbeat_s", int)
+    setif("GX10_CODE_LOCALITY",    "security", "code_locality")
+    setif("GX10_PLUGINS_DIR",            "paths",    "plugins_dir")
+    setif("GX10_FANOUT_CONCURRENCY",     "workers", "concurrency",      int)
+    setif("GX10_WORKERS_MAX_TOKENS",     "workers", "max_tokens",       int)
+    setif("GX10_WORKERS_MAX_BATCH_TOKENS","workers", "max_batch_tokens", int)
     _truthy = lambda v: v.strip().lower() in ("1", "true", "yes", "on", "an")
     setif("GX10_ONBOARDING", "onboarding", "enabled", _truthy)
     setif("GX10_AUTOPILOT",  "autopilot",  "enabled", _truthy)
@@ -3053,165 +3288,18 @@ def _apply_config(cfg: Dict[str, Any]):
 
 
 # ─── Main ─────────────────────────────────────────────────────
-def main():
-    parser = argparse.ArgumentParser(
-        description="GX10 Orchestrator v3 (Performance-Fixes, konfigurierbar)")
-    parser.add_argument("--config",     default=None,
-                        help="JSON config path (else env GX10_CONFIG / "
-                             "./gx10.config.json / <SCRIPT_DIR>/gx10.config.json)")
-    parser.add_argument("--workdir",    default=None,
-                        help="working directory (tasks/, summaries/, vault/, session); default '.'")
-    parser.add_argument("--base-url",   default=None)
-    parser.add_argument("--api-key",    default=None,
-                        help="override the API key ad-hoc (else from env GX10_API_KEY)")
-    parser.add_argument("--model",      default=None)
-    parser.add_argument("--prompt",     default=None)
-    parser.add_argument("--no-prompt",  action="store_true")
-    parser.add_argument("--fresh",      action="store_true",
-                        help="ignore the saved session")
-    parser.add_argument("--no-stream",  action="store_true",
-                        help="disable streaming (compare against v1 behaviour)")
-    parser.add_argument("--max-tokens", type=int, default=None,
-                        help=f"output token limit (default {MAX_TOKENS})")
-    parser.add_argument("--thinking",   choices=["auto", "first", "off", "all"], default=None,
-                        help="thinking mode: auto=decide per turn (default, thinks only "
-                             "when planning, yes if in doubt), first=always a planning round, "
-                             "off=never, all=always")
-    parser.add_argument("--platform",   choices=["auto", "windows", "linux"], default=None,
-                        help="shell/syntax mode for execute_command "
-                             "(default auto = detect at startup)")
-    parser.add_argument("--onboarding",    dest="onboarding", action="store_const", const=True,
-                        default=None, help="onboarding mode ON (duplicate pre-check before handover)")
-    parser.add_argument("--no-onboarding", dest="onboarding", action="store_const", const=False,
-                        help="onboarding mode OFF")
-    parser.add_argument("--autopilot",     dest="autopilot", action="store_const", const=True,
-                        default=None, help="autopilot ON (launches Claude for handovers autonomously)")
-    parser.add_argument("--no-autopilot",  dest="autopilot", action="store_const", const=False,
-                        help="autopilot OFF")
-    args = parser.parse_args()
+# Engine library — the standalone monolith CLI was removed (one way: server + client).
+_REMOVED_MSG = (
+    "The monolithic gx10 CLI has been removed - gx10 is now the engine library. "
+    "Run the server (engine/server.py) and connect with the client (engine/client.py "
+    "or engine/tui.py). See docs/SETUP.md."
+)
 
-    if os.name == "nt":
-        os.system("")
 
-    # ── Config laden & Precedence anwenden (Code < Datei/conf < Env < CLI) ──
-    cfg      = _code_defaults()
-    cfg_path = _resolve_config_source(args.config)
-    cfg      = _deep_merge(cfg, _load_config_tree(cfg_path))
-    cfg      = _apply_env(cfg)
-    cfg      = _apply_cli(cfg, args)
-    _apply_config(cfg)
-    global _EFFECTIVE_CFG, _CFG_SOURCE
-    _EFFECTIVE_CFG, _CFG_SOURCE = cfg, cfg_path   # für den `config`-Befehl
-
-    # ── Prompt VOR dem chdir absolut auflösen (relativ → SCRIPT_DIR) ──
-    prompt_cfg = "" if args.no_prompt else cfg["paths"]["system_prompt"]
-    prompt_abs = ""
-    if prompt_cfg:
-        pp = Path(prompt_cfg).expanduser()
-        prompt_abs = str(pp if pp.is_absolute() else (SCRIPT_DIR / pp))
-
-    # ── WORKDIR bestimmen und hineinwechseln (relative tasks/… bleiben gültig) ──
-    workdir = Path(cfg["paths"]["workdir"]).expanduser().resolve()
-    try:
-        workdir.mkdir(parents=True, exist_ok=True)
-        os.chdir(workdir)
-    except Exception as e:
-        print(col(f"  [FEHLER] WORKDIR {workdir}: {e}", C.RED))
-        sys.exit(1)
-
-    # ── API-Key: nur aus Env (api_key_env) bzw. --api-key (ad-hoc) ──
-    api_key       = args.api_key or os.environ.get(cfg["connection"]["api_key_env"]) or DEFAULT_API_KEY
-    base_url      = cfg["connection"]["base_url"]
-    model         = cfg["connection"]["model"]
-    stream        = bool(cfg["generation"]["stream"])
-    max_tokens    = int(cfg["generation"]["max_tokens"])
-    thinking_mode = cfg["generation"]["thinking_mode"]
-
-    Cy = "\033[96m"; Gy = "\033[90m"; Bo = "\033[1m"; R = "\033[0m"
-    print(f"{Cy}{Bo}  Ironclad — Orchestrator CLI{R}")
-    print(f"{Gy}  Model  : {model}  |  qwen3_coder{R}")
-    print(f"{Gy}  URL    : {base_url}{R}")
-    print(f"{Gy}  Stream : {'on' if stream else 'off'}  |  "
-          f"thinking={thinking_mode}  |  max_tokens={max_tokens}{R}")
-    print(f"{Gy}  Platf.: {PLATFORM}"
-          + (f" (aus '{PLATFORM_MODE}' erkannt)" if PLATFORM_MODE == 'auto' else "")
-          + (f"  |  Onboarding: AN" if ONBOARDING_MODE else "")
-          + f"{R}")
-    if AUTOPILOT_ENABLED:
-        print(f"\033[93m  autopilot: ON — launches Claude autonomously "
-              f"(max_concurrent={AUTOPILOT_MAX_CONCURRENT}, {' '.join(AUTOPILOT_EXTRA_ARGS)}){R}")
-    if AUTOPILOT_ENABLED and AUTOPILOT_AUTOPLAN:
-        limit_str = f", max_tasks={AUTOPILOT_MAX_TASKS}" if AUTOPILOT_MAX_TASKS > 0 else ", unlimited"
-        print(f"\033[93m  autoplan: ON{limit_str}{R}")
-        print(f"\033[91m  ⚠ WARNING: never use autoplan with a paid API plan! "
-              f"Local vLLM instances only.{R}")
-    print(f"{Gy}  Prompt : {prompt_abs or '— (none)'}{R}")
-    print(f"{Gy}  WORKDIR: {workdir}{R}")
-    print(f"{Gy}  Config : {cfg_path or '— (code defaults)'}{R}")
-    print()
-    if not HAS_PT:
-        print("\033[93m  [WARN] pip install prompt_toolkit\033[0m")
-        print()
-
-    agent = GX10(
-        base_url=base_url,
-        api_key=api_key,
-        model=model,
-        prompt_path=prompt_abs,
-        stream=stream,
-        max_tokens=max_tokens,
-        thinking_mode=thinking_mode,
-        platform=PLATFORM,
-        onboarding=ONBOARDING_MODE,
-    )
-
-    if not args.fresh and Path(SESSION_FILE).exists():
-        n = agent.load_session()
-        if n > 0:
-            print(f"[OK] session resumed — {n} messages loaded")
-            print("     (--fresh for a new session)")
-
-    if HAS_PT:
-        global _UI_APP
-        app     = _build_app()
-        _UI_APP = app
-
-        t = threading.Thread(target=_agent_thread, args=(agent, app), daemon=True)
-        t.start()
-
-        Path(WATCHER_FEEDBACK_DIR).mkdir(parents=True, exist_ok=True)
-        recon_stop = threading.Event()
-        rt = threading.Thread(target=_reconciler_loop,
-                              args=(recon_stop, RECONCILER_INTERVAL), daemon=True)
-        rt.start()
-        state = "aktiv" if _WATCHER_ENABLED else "deaktiviert"
-        col_  = C.GREEN if _WATCHER_ENABLED else C.YELLOW
-        _ui_print(col(f"[OK] feedback reconciler ready ({state}, polling every "
-                      f"{RECONCILER_INTERVAL:.0f}s — 'watcher on/off')", col_))
-
-        app.run()
-        recon_stop.set()
-
-        if _RELOAD_FLAG:
-            os.execv(sys.executable, [sys.executable] + sys.argv)
-
-    else:
-        print(col(HELP, C.YELLOW))
-        while True:
-            try:
-                user_input = input("\n[You] > ").strip()
-            except KeyboardInterrupt:
-                print("  (Ctrl+C — type 'exit' to quit)")
-                continue
-            except EOFError:
-                agent.save_session()
-                break
-            if not user_input:
-                continue
-            if user_input.lower() == "exit":
-                agent.save_session()
-                break
-            _dispatch(agent, user_input)
+def main() -> None:
+    """Removed: gx10 is the engine library; use the server + client instead."""
+    print(_REMOVED_MSG, file=sys.stderr)
+    raise SystemExit(2)
 
 
 if __name__ == "__main__":

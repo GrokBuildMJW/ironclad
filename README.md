@@ -4,11 +4,37 @@
 [![PyPI](https://img.shields.io/pypi/v/ironclad-ai)](https://pypi.org/project/ironclad-ai/)
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 ![Python](https://img.shields.io/badge/python-3.10%2B-blue)
+![TypeScript](https://img.shields.io/badge/TypeScript-5-3178c6?logo=typescript&logoColor=white)
+![Node](https://img.shields.io/badge/Node-%E2%89%A522-3c873a?logo=node.js&logoColor=white)
 ![Status](https://img.shields.io/badge/status-pre--release-orange)
 [![Stars](https://img.shields.io/github/stars/GrokBuildMJW/ironclad?style=social)](https://github.com/GrokBuildMJW/ironclad/stargazers)
 
 **Reliability for LLM agents through enforcement, not model size.**
 🇦🇪 Built in the UAE by MJWC-AI-LAB.
+
+## Try it — describe an idea, let the agents build it
+
+```bash
+git clone https://github.com/GrokBuildMJW/ironclad.git && cd ironclad
+pip install -e ".[engine]"
+export GX10_BASE_URL=http://localhost:8000/v1 GX10_MODEL=your-model   # your model endpoint
+
+python engine/server.py &              # 1) the orchestrator (the agent + state)
+python engine/client.py --codedir .    # 2) the client — drives it; type what you want
+#   Read README.md and summarise it.   /   Build add(a,b) in calc.py with a pytest test, and run it.
+```
+
+The **orchestrator** (`engine/server.py`) runs the agent and holds state; the **client**
+drives it from your machine. The recommended client is the **TypeScript terminal client**
+in [`clients/ink/`](clients/ink/) — a purpose-built renderer (ghost-free resize, native
+scrollback/selection/copy, smooth streaming). `engine/client.py` shown above is the
+zero-dependency Python line REPL (the legacy `engine/tui.py` is a full-screen alternative).
+Code stays on your machine: the orchestrator's file/command tools are **passed through to
+the client and run on YOUR local files**. The agents **plan it, write the code, write the
+test, and run it** — you describe, they build. No prior coding needed. Full walkthrough:
+**[`docs/self-maintenance.md`](docs/self-maintenance.md)**.
+
+---
 
 Ironclad is a generic, model-agnostic framework for building reliable agentic
 systems. It pairs an **Agent-Contract-Kernel (ACK)** — schema-as-single-source-
@@ -21,18 +47,30 @@ enforcement beats a large model you "trust" to format its output. You get
 **production-grade tool-calling reliability without depending on any specific
 model or parser** — the kernel enforces the contract, not the weights.
 
-## 🚧 Status: proven core, mid-redesign (pre-release)
+## 🚧 Status: proven core, redesign landed (pre-release)
 
-Ironclad's engine comes from a **proven, in-production orchestrator**, but it is
-currently undergoing a **complete redesign** (single process → headless server + thin
-client, containerized, reasoning-worker fan-out, full-screen TUI). **Not everything is
-re-wired or re-tested yet**, and some features are still **placeholders** while the
-rebuild finishes (notably memory and autoplan). There is no tagged release; APIs,
-layout and config may change. Treat `main` as a development snapshot.
+Ironclad's engine comes from a **proven, in-production orchestrator** and has now been
+**rebuilt**: single process → headless **server + thin client**, containerized, with a
+**reasoning-worker fan-out** and a purpose-built **TypeScript terminal client**. The rebuild's pieces are wired **and
+tested** — server/client split, a session-gated **secure channel**, governed parallelism,
+long-term **memory**, autoplan, and **function-calling robustness** (validate→reask on
+every tool call + recovery for models without native tool-calls). On top, the **extension
+surface** is shipped: an **open plugin API** (drop in a tool, no core fork), a **bring-your-
+own code-agent CLI**, a **dev container** that runs the whole suite as a build+test gate,
+and a beginner **self-maintenance** guide. Verified by **236 Python tests** (227 offline + 9
+live) plus **272 TypeScript client tests**, and a **full end-to-end run with a real code-agent**.
 
-👉 **[`docs/status.md`](docs/status.md)** is the honest, per-component **wiring status**
-(proven / wired+tested / placeholder / opt-in), the module reference, the memory
-situation, and the latest load-test results. Read it before relying on anything.
+It is still **pre-release**: single-tenant by design (no multi-user auth yet), no tagged
+release, and APIs/layout/config may change. The DEV → Prod → Public **promote pipeline** that
+hardens our own releases is **in development** (today it's a manual gated path). The
+**TypeScript terminal client** is now **bundled in the repo** (`clients/ink/`,
+build-from-source) and is the recommended client. Treat `main` as a development snapshot.
+
+👉 Read these before relying on anything:
+- **[`docs/status.md`](docs/status.md)** — honest per-component **wiring status** + load tests.
+- **[`docs/test-report.md`](docs/test-report.md)** — what was tested, results, and the
+  issues found **and fixed** during the campaign (maximum transparency).
+- **[`docs/roadmap.md`](docs/roadmap.md)** — what works today vs what's planned.
 
 **Reference environment.** Ironclad is developed and exercised on an **NVIDIA DGX
 Spark** (GB10, Blackwell `sm_121`, 128 GB unified memory) running a local **vLLM**
@@ -58,22 +96,23 @@ bootstrap** (`scripts/spark-bootstrap.sh`).
 
 ## Demo
 
-The full-screen client over the server/client split — a turn streams live, the
-toolbar shows live status (model · throughput · tasks · watcher). Illustrative
-transcript from a real session:
+The recommended TypeScript client over the server/client split — a turn streams live into
+the terminal's own scrollback, with a pinned status bar (model · throughput · tasks ·
+watcher · connection). Illustrative frame from a real session:
 
 ```text
-[You] > what is 17 times 23?
-  [Qwen (planning)]
-  17 times 23 is 391.
-  [perf] TTFT 0.5s · 183 tok/2.9s = 64 tok/s · prompt 1739
-  ======== ✓ DONE · ready · 1 gen · 3s · 183 tok ========
-──────────────────────────────────────────────────────────────────────
-│ [You] >
-──────────────────────────────────────────────────────────────────────
- ██ Ironclad  powered by MJWC-AI-LAB
- ██  Orchestrator client · streaming   |   /help · exit · PageUp=history
-     qwen3.6-35b · 64 tok/s · tasks 0P/0IP/0D · http://<server>:8100
+ █▀▄▀█ Ironclad · Orchestrator Client
+   Ironclad CLI 0.1.0 · code . · ≤3 agents
+  /help · exit · mouse selects/copies natively
+
+ > what is 17 times 23?
+
+ 17 times 23 is 391.
+
+ ──────────────────────────────────────────────────────────────────────
+ >
+ ──────────────────────────────────────────────────────────────────────
+ ◆ Ironclad · qwen3.6-35b · ● conn · ○ watch ○ auto · 0P/0IP/0D · 64 tok/s     Developed in the UAE
 ```
 
 **Reply language is a setting** (`GX10_LANGUAGE` — `en` default, `ar`, `fr`, …). The
@@ -81,13 +120,14 @@ model answers in the configured language regardless of the input language. Real 
 with `GX10_LANGUAGE=ar`, same question:
 
 ```text
-[You] > what is 17 times 23?
-  حاصل ضرب 17 في 23 هو 391.
-  ======== ✓ DONE · ready · 1 gen · 2s ========
+ > what is 17 times 23?
+
+ حاصل ضرب 17 في 23 هو 391.
 ```
 
-`/command` routing (local + forwarded), scrollback (PageUp/PageDown) and compressed
-multi-line paste are built in. There's also a plain line REPL and a monolithic CLI.
+`/command` routing (local + forwarded), find-in-buffer (**Ctrl+F**), native
+scrollback/selection/copy and **Ctrl+V** paste are built in. Zero-Node Python clients (a
+plain line REPL + the legacy full-screen TUI) ship alongside it.
 
 ## Benchmarks
 
@@ -116,10 +156,17 @@ anything**.
 ## A starting point to build on
 
 Ironclad is a **foundation, not a finished product** — a generic agentic core meant
-to be extended. Concrete use cases dock onto it as **vessels** (see
-[`examples/demo-vessel/`](examples/demo-vessel/); a generator scaffolds new ones), so a
-broad audience can build their own domain agents on a reliable, self-hosted base
-rather than starting from scratch. Realistic directions the architecture supports today:
+to be extended. You extend it over **one open, versioned contract** — the
+**[plugin API](docs/plugin-api.md)**: drop a tool into a `skills/` directory, point
+`GX10_PLUGINS_DIR` at it, and the agent picks it up **without forking the core** (the
+coding CLI itself is swappable too — [bring your own](docs/code-agents.md)). Concrete use
+cases also dock on as **vessels** (see [`examples/demo-vessel/`](examples/demo-vessel/); a
+generator scaffolds new ones), so a broad audience can build their own domain agents on a
+reliable, self-hosted base rather than starting from scratch. The framework is built to
+**extend and maintain itself**: its own agents can scaffold new plugins, and a
+[dev container](docs/dev-environment.md) runs the full suite as a build+test gate — the
+internal **DEV → Prod → Public** promote pipeline that hardens releases is **in
+development** (today, a manual gated path). Realistic directions the architecture supports today:
 
 - **Edge & energy efficiency** — a small, enforced model on local/edge hardware
   instead of a large cloud one. That efficiency bet is the whole premise of the project.
@@ -128,6 +175,13 @@ rather than starting from scratch. Realistic directions the architecture support
 
 The repo's job is to give you a working starting point, not to ship every vertical —
 the verticals are yours to build.
+
+**New here, or not a developer?** AI lets you turn an idea into working software — and
+Ironclad's own agents are the on-ramp: you *describe* what you want, they plan it, write
+the code, write a test, and run it. Start with
+**[`docs/self-maintenance.md`](docs/self-maintenance.md)** — "describe an idea, let the
+agents build it" — whether you want to extend Ironclad with a plugin or repurpose the
+whole thing for your own project.
 
 ## Setup
 
@@ -140,7 +194,7 @@ pip install ironclad-ai          # the ACK library (import ack)
 pip install "ironclad-ai[engine]"  # + the orchestration engine deps
 ```
 
-**Or clone for the full engine + CLI/TUI** (recommended while pre-release):
+**Or clone for the full engine + clients** (recommended while pre-release):
 
 ```bash
 git clone https://github.com/GrokBuildMJW/ironclad.git
@@ -153,8 +207,11 @@ export GX10_BASE_URL=http://localhost:8000/v1
 export GX10_MODEL=your-served-model-name
 export GX10_API_KEY=...                             # only if your endpoint needs one
 
-# Monolithic full-screen CLI (one process):
-python engine/gx10.py --workdir ./my-workspace
+# the orchestrator + the recommended TypeScript client (install globally, once; needs Node ≥ 22):
+python engine/server.py &
+( cd clients/ink && npm install && npm install -g . )    # global `ironclad`, like claude / kimi
+ironclad --server http://localhost:8100                  # runs in the current folder (codedir = cwd)
+# zero-Node alternative: python engine/client.py --codedir .   (legacy TUI: engine/tui.py)
 ```
 
 - **Full walkthrough, the server/client split, and the reference vLLM launch:**
@@ -170,11 +227,11 @@ the doctor preflight. Real vessels stay in the operators' own private repos.
 ## Layout
 
 ```
-core/
-  ack/                 # Agent-Contract-Kernel: case-spec, validated-emit, registry, doctor, generator
-  engine/              # orchestration engine: agent loop, task store, fail-closed macros
-  examples/demo-vessel # runnable example workspace
-  LICENSE  NOTICE      # Apache-2.0
+ack/                   # Agent-Contract-Kernel: case-spec, validated-emit, registry, doctor, generator
+engine/                # orchestration engine: agent loop, task store, fail-closed macros
+clients/ink/           # recommended TypeScript terminal client (build-from-source)
+examples/demo-vessel   # runnable example workspace
+docs/  LICENSE  NOTICE  # guides + Apache-2.0
 ```
 
 ## Roadmap
@@ -186,16 +243,36 @@ features is in **[`docs/status.md`](docs/status.md)**. In short:
 - **Today — single-tenant, home-LAN trust.** One operator, one principal, no
   authentication on the server (it trusts its network like the model port). Code stays
   on the client by construction.
-- **In progress (Phase d) — secure, session-gated channel,** still single-operator:
+- **Phase d (done) — secure, session-gated channel,** still single-operator:
   selectable trust profiles (`open` / `token` / `sealed`), a client-managed tunnel
   option, and an explicit session that **seals on disconnect**. The token is a
-  *deployment secret*, not a user login.
+  *deployment secret*, not a user login. Built, unit-tested, and **live-verified** over
+  a real SSH tunnel on the reference GPU (see [`docs/status.md`](docs/status.md)).
+- **Phase e (done) — governed parallelism:** server-side concurrent reasoning the
+  orchestrator actually uses (`/fanout` + an in-engine `parallel_reason` tool), made
+  GPU-safe by a concurrency cap **and** a token-budget envelope so it can never
+  over-subscribe a local box. Conservative defaults in core; model-matched in the deploy.
+- **Extend it through itself (shipped surface; promote pipeline in development) —** an
+  **open, versioned plugin API** (`GX10_PLUGINS_DIR`), a **bring-your-own code-agent CLI**
+  (`GX10_AGENT_CMD`), a **dev container** build+test gate, and a beginner
+  **self-maintenance** guide are shipped and tested. The internal three-stage **DEV → Prod →
+  Public** promote pipeline that hardens our own releases is **in development** (today a
+  manual gated path); the core stays **inbound-closed** (the only inbound is a bug report we
+  reproduce → fix → ship).
+- **Shipped — the recommended terminal client.** A TypeScript client on a **purpose-built
+  renderer** (ghost-free resize, smooth streaming, native-grade scrollback/selection/copy)
+  over the same HTTP/tool-bridge contract, now **bundled in the repo**
+  (`clients/ink/`, build-from-source) and the recommended interactive UI. The Python
+  REPL/TUI remain as **legacy** fallbacks.
 - **Planned (Phase g) — Identity & Authorization (multi-tenant):** per-principal scope
   through tasks, memory namespaces, and data-source entitlements, with org/group
   RBAC via OIDC/SAML. **This does not exist yet** — until it lands, treat
   enterprise/government use as single-tenant on trusted infrastructure.
 - Also: broader tests, verified recipes for more local open models, **RAG over local
-  datasets** through the memory hook, and a first tagged release.
+  datasets**, and a **scalable-context memory** layer — a multi-tier system (bounded model
+  window + a new **short-term** summary/cache tier + long-term retrieval) with rolling
+  summarization and per-turn RAG, so total context exceeds the window while decode stays
+  fast (see the roadmap), and a first tagged release.
 
 **Sovereign AI / local deployments.** Ironclad is **model-agnostic** and **fully
 self-hostable** — it talks to any OpenAI-compatible endpoint, so it already runs

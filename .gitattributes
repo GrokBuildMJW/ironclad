@@ -1,0 +1,14 @@
+# Keep the generated OSS export byte-deterministic across platforms: LF in the repo
+# and on checkout, regardless of the contributor's OS.
+* text=auto eol=lf
+
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.pdf binary
+*.zip binary
+*.gz binary
+*.woff binary
+*.woff2 binary

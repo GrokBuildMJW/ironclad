@@ -4,7 +4,7 @@ Validation + regression guard for the kernel discovery surface: task-types, tool
 (with auto-derived grammar-clean schemas), filesystem skill discovery, MCP binding
 and unified capability resolution.
 
-  python -m pytest core/ack/tests/test_registry.py -v
+  python -m pytest ack/tests/test_registry.py -v
 """
 from __future__ import annotations
 

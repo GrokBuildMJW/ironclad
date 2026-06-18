@@ -1,0 +1,25 @@
+# Ironclad DEV / test image — builds the source and runs the FULL test suite inside the
+# container. This is the build+test gate of the dev pipeline: a green run here is the
+# precondition for promoting a change. Separate from the slim runtime image (which has no
+# test deps and ships no tests).
+FROM python:3.12-slim
+
+WORKDIR /app
+
+# Engine deps + pytest (the ACK kernel needs only pydantic; the engine adds openai +
+# prompt_toolkit; tests stub the network, so no endpoint is required to run them).
+RUN pip install --no-cache-dir "openai>=1" "pydantic>=2" "prompt_toolkit>=3" pytest
+
+# Source + tests (ack/ carries ack/tests/ and its conftest) + scripts (boundary check).
+COPY ack ./ack
+COPY engine ./engine
+COPY scripts ./scripts
+COPY pyproject.toml LICENSE NOTICE README.md ./
+
+ENV PYTHONIOENCODING=utf-8 \
+    PYTHONUNBUFFERED=1 \
+    PYTHONUTF8=1
+
+# Default: run the full suite. The dev-compose `test` service overrides this to also
+# write a JUnit artifact. A non-zero exit is the gate (fail-closed).
+CMD ["python", "-m", "pytest", "ack/tests", "-q"]

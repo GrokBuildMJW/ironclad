@@ -8,7 +8,7 @@ reaches the model ONLY through the INJECTED ``chat`` transport with the constrai
 kwargs in ``extra_body`` (any auth/vessel stamp lives in that transport, untouched
 here).
 
-  python -m pytest core/ack/tests/test_validated_emit.py -q
+  python -m pytest ack/tests/test_validated_emit.py -q
 """
 from __future__ import annotations
 

@@ -85,10 +85,13 @@ The orchestrator waits for vLLM's healthcheck before starting; host networking l
 reach vLLM on `localhost:8000` and bind `:8100`; the workspace persists in
 `ironclad-workdir/`. Long-term memory (Mem0) stays external — set `GX10_MEMORY_URL`.
 
-Then, from your workstation:
+Then, from your workstation — the recommended TypeScript client (install it once with
+`npm install && npm install -g .` in `clients/ink/` → a global `ironclad`), or the
+zero-dependency Python REPL:
 
 ```bash
-GX10_SERVER_URL=http://<spark-host>:8100 python engine/tui.py --codedir .
+GX10_SERVER_URL=http://<spark-host>:8100 ironclad
+# zero-Node alternative: GX10_SERVER_URL=http://<spark-host>:8100 python engine/client.py --codedir .
 ```
 
 ## Optional: long-term memory stack
@@ -123,6 +126,6 @@ curl -s http://localhost:8100/health             # {"ok": true, "model": "qwen3.
 - **Cold start** loads weights into VRAM up front — the first `/v1/models` can take a
   few minutes.
 - **Concurrency:** vLLM batches `--max-num-seqs` (8) concurrent sequences — Ironclad's
-  `/fanout` exploits this for parallel reasoning (measured ~5× over serial).
+  `/fanout` exploits this for parallel reasoning (measured ~5.8× over serial).
 - **One model at a time:** with 128 GB unified, run a single NVFP4 MoE plus the small
   services; don't try to co-host a second large model.

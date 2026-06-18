@@ -21,16 +21,16 @@ done task carrying `capability: "todo-list"`), `todo-create` (open), and `todo-a
 
 ## Run it
 
-From the repository root (so `ack` is importable, here via `PYTHONPATH=core`):
+From the repository root, with `ack` installed (`pip install -e .`):
 
 ```bash
 # 1) Regenerate the status tables (in the gap-tracking file) + the backlog from
 #    the MAPPING + the TaskStore:
-PYTHONPATH=core python -m ack.lodestar.tracking --root core/examples/demo-vessel
+python -m ack.lodestar.tracking --root examples/demo-vessel
 #    -> todo-api: 3 features -> 1 implemented, 2 not-started . todo-api-backlog.md
 
 # 2) Preflight the workspace (generic checks + the Lodestar capability checks):
-PYTHONPATH=core python -m ack.doctor --root core/examples/demo-vessel --lodestar
+python -m ack.doctor --root examples/demo-vessel --lodestar
 #    -> RESULT: All checks passed. (one warning: no .mcp.json -- fail-soft)
 ```
 

@@ -1,4 +1,4 @@
-"""Server/client split: the headless orchestrator server (core/engine/server.py).
+"""Server/client split: the headless orchestrator server (engine/server.py).
 
 Validates the pieces that make the split work WITHOUT touching the model:
   - the headless capture sink isolates output to the calling thread (a /chat request

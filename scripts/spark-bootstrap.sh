@@ -103,11 +103,19 @@ if [ "$WITH_ORCH" = 1 ] && [ "$ORCH_DOCKER" = 1 ]; then
   docker build -t "$ORCH_CONTAINER" "$REPO_ROOT" >/dev/null
   docker rm -f "$ORCH_CONTAINER" >/dev/null 2>&1 || true
   mkdir -p "$ORCH_WORKDIR"
+  # Forward-if-set: Phase-d trust profile + Phase-e fan-out governor. Empty → the
+  # engine's conservative defaults apply (the operator's private deploy pins the
+  # model-matched values; core stays model-agnostic).
   docker run -d --name "$ORCH_CONTAINER" --restart unless-stopped --network host \
     -e GX10_BASE_URL="http://localhost:${VLLM_PORT}/v1" \
     -e GX10_MODEL="$SERVED_NAME" -e GX10_SERVER_PORT="$ORCH_PORT" -e GX10_WORKDIR=/work \
     -e GX10_LANGUAGE="${GX10_LANGUAGE:-en}" \
     -e GX10_MEMORY_URL="${GX10_MEMORY_URL:-}" \
+    -e GX10_PROFILE="${GX10_PROFILE:-}" \
+    -e GX10_SERVER_TOKEN="${GX10_SERVER_TOKEN:-}" \
+    -e GX10_FANOUT_CONCURRENCY="${GX10_FANOUT_CONCURRENCY:-}" \
+    -e GX10_WORKERS_MAX_TOKENS="${GX10_WORKERS_MAX_TOKENS:-}" \
+    -e GX10_WORKERS_MAX_BATCH_TOKENS="${GX10_WORKERS_MAX_BATCH_TOKENS:-}" \
     -v "$ORCH_WORKDIR":/work "$ORCH_CONTAINER" >/dev/null
   log "orchestrator container '$ORCH_CONTAINER' on :$ORCH_PORT"
   for i in $(seq 1 30); do
@@ -126,6 +134,12 @@ elif [ "$WITH_ORCH" = 1 ]; then
   export GX10_MODEL="$SERVED_NAME"
   export GX10_LANGUAGE="${GX10_LANGUAGE:-en}"
   export GX10_MEMORY_URL="${GX10_MEMORY_URL:-}"
+  # Forward-if-set (trust profile + fan-out governor); inherited by tmux/nohup below.
+  export GX10_PROFILE="${GX10_PROFILE:-}"
+  export GX10_SERVER_TOKEN="${GX10_SERVER_TOKEN:-}"
+  export GX10_FANOUT_CONCURRENCY="${GX10_FANOUT_CONCURRENCY:-}"
+  export GX10_WORKERS_MAX_TOKENS="${GX10_WORKERS_MAX_TOKENS:-}"
+  export GX10_WORKERS_MAX_BATCH_TOKENS="${GX10_WORKERS_MAX_BATCH_TOKENS:-}"
   if command -v tmux >/dev/null; then
     tmux kill-session -t ironclad 2>/dev/null || true
     tmux new-session -d -s ironclad -c "$REPO_ROOT" \

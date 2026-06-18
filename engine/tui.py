@@ -1,5 +1,10 @@
 """Full-screen TUI client — the old GX10 look-and-feel over the server/client split.
 
+> **LEGACY / DEPRECATED — superseded by the TypeScript terminal client in
+> ``clients/ink/`` (the recommended interactive UI; see the top-level README / SETUP.md).**
+> Kept for the prompt_toolkit full-screen look and still maintained, but no longer the
+> primary client. The new client adds ghost-free resize + native scrollback/selection/copy.
+
 > **Same screen as the monolithic CLI, but the brain is remote.** This reuses the
 > orchestrator's own prompt_toolkit primitives (the scrolling output pane, the input
 > line, the colour helpers) from :mod:`gx10`, and drives them from the HTTP server
@@ -38,12 +43,13 @@ if str(_HERE) not in sys.path:
 try:
     from prompt_toolkit import Application
     from prompt_toolkit.buffer import Buffer
-    from prompt_toolkit.formatted_text import ANSI
+    from prompt_toolkit.formatted_text import ANSI, to_formatted_text
     from prompt_toolkit.key_binding import KeyBindings
     from prompt_toolkit.keys import Keys
     from prompt_toolkit.layout import Layout
     from prompt_toolkit.layout.containers import HSplit, Window
     from prompt_toolkit.layout.controls import BufferControl, FormattedTextControl
+    from prompt_toolkit.mouse_events import MouseEventType
     HAS_PT = True
 except ImportError:
     HAS_PT = False
@@ -140,9 +146,10 @@ def _worker(srv: Server, codedir: Path, q: "Queue[str]", app: "Application",
     def _stream(payload: str) -> None:
         gx10._status["thinking"] = True
         gx10._status["label"] = "Qwen"
-        # Buffer line by line so we can filter out the [perf] line: it belongs ONLY
-        # in the toolbar (bottom), not in the chat history.
-        partial = {"buf": ""}
+        # Buffer line by line so we can keep the chat pane clean: the [perf] line goes
+        # to the toolbar, and the orchestrator's internal role-scaffolding
+        # ([GX10], [Qwen (planning)]) + leading/duplicate blank lines are dropped.
+        partial = {"buf": "", "blank": True}              # blank=True suppresses leading blanks
 
         def _emit_line(line: str) -> None:
             clean = gx10._ANSI_LEN_RE.sub("", line)
@@ -150,6 +157,16 @@ def _worker(srv: Server, codedir: Path, q: "Queue[str]", app: "Application",
             if idx != -1:
                 _STATUS["perf"] = clean[idx:].strip()   # toolbar only
                 return
+            c = clean.strip()
+            if (c == "[GX10]" or (c.startswith("[Qwen") and c.endswith("]"))
+                    or (c.startswith("[") and "planning" in c and c.endswith("]"))):
+                return                                    # internal role label → drop
+            if not c:                                     # collapse runs of blank lines
+                if partial["blank"]:
+                    return
+                partial["blank"] = True
+            else:
+                partial["blank"] = False
             gx10._ui_print(line)                          # with newline into the pane
 
         def _on_text(t: str) -> None:
@@ -252,6 +269,26 @@ def _page_rows() -> int:
     return max(1, rows - 6)
 
 
+def _scroll_by(delta: int) -> None:
+    """Move the scrollback offset (positive = back into history)."""
+    _SCROLL["rows"] = max(0, _SCROLL["rows"] + delta)
+    if gx10._UI_APP is not None:
+        gx10._UI_APP.invalidate()
+
+
+def _on_output_mouse(mouse_event):
+    """Mouse-wheel over the output pane scrolls history (needs mouse_support=True).
+    Other mouse events fall through to default handling."""
+    et = mouse_event.event_type
+    if et == MouseEventType.SCROLL_UP:
+        _scroll_by(3)
+        return None
+    if et == MouseEventType.SCROLL_DOWN:
+        _scroll_by(-3)
+        return None
+    return NotImplemented
+
+
 def _output():
     """Like gx10._get_output but scrollable: show a window of visual rows ending
     ``_SCROLL["rows"]`` rows above the bottom (0 = follow newest). Whole-line
@@ -276,7 +313,10 @@ def _output():
         if pos + h > start and pos < end:
             out.append(ln)
         pos += h
-    return ANSI("\n".join(out))
+    # Attach the wheel-scroll handler to every fragment so scrolling works
+    # anywhere over the pane (mouse_support=True must be set on the Application).
+    frags = to_formatted_text(ANSI("\n".join(out)))
+    return [(style, txt, _on_output_mouse) for style, txt in frags]
 
 
 def _expand_pastes(text: str) -> str:
@@ -285,6 +325,64 @@ def _expand_pastes(text: str) -> str:
         idx = int(m.group(1)) - 1
         return _PASTES[idx] if 0 <= idx < len(_PASTES) else m.group(0)
     return _PASTE_RE.sub(_sub, text)
+
+
+def _read_clipboard() -> str:
+    """Read the OS clipboard as text — dependency-free. Used by the Ctrl+V binding so
+    paste works even when the terminal never delivers a bracketed-paste event (the
+    common case on the Windows console)."""
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            from ctypes import wintypes
+            CF_UNICODETEXT = 13
+            u, k = ctypes.windll.user32, ctypes.windll.kernel32
+            u.OpenClipboard.argtypes = [wintypes.HWND]
+            u.GetClipboardData.restype = ctypes.c_void_p   # HANDLE — must not truncate to int32
+            u.GetClipboardData.argtypes = [wintypes.UINT]
+            k.GlobalLock.restype = ctypes.c_void_p
+            k.GlobalLock.argtypes = [ctypes.c_void_p]
+            k.GlobalUnlock.argtypes = [ctypes.c_void_p]
+            if not u.OpenClipboard(None):
+                return ""
+            try:
+                handle = u.GetClipboardData(CF_UNICODETEXT)
+                if not handle:
+                    return ""
+                ptr = k.GlobalLock(handle)
+                if not ptr:
+                    return ""
+                try:
+                    return ctypes.c_wchar_p(ptr).value or ""
+                finally:
+                    k.GlobalUnlock(handle)
+            finally:
+                u.CloseClipboard()
+        except Exception:  # noqa: BLE001
+            return ""
+    import subprocess
+    for cmd in (["pbpaste"], ["xclip", "-selection", "clipboard", "-o"], ["xsel", "-b"]):
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=2)
+            if r.returncode == 0:
+                return r.stdout
+        except Exception:  # noqa: BLE001
+            continue
+    return ""
+
+
+def _insert_paste(buf, data: str) -> None:
+    """Insert pasted text into the input buffer, compressing multi-line blocks to a
+    ``[Pasted #N +L lines]`` placeholder (expanded on send)."""
+    data = data.replace("\r\n", "\n").replace("\r", "\n")
+    if not data:
+        return
+    if "\n" in data.strip():
+        n = data.count("\n") + 1
+        _PASTES.append(data)
+        buf.insert_text(f"[Pasted #{len(_PASTES)} +{n} lines]")
+    else:
+        buf.insert_text(data)
 
 
 def _build_app(q: "Queue[str]", srv: Server) -> "Application":
@@ -310,14 +408,16 @@ def _build_app(q: "Queue[str]", srv: Server) -> "Application":
         q.put(expanded)
 
     @kb.add(Keys.BracketedPaste)
-    def _paste(event):
-        data = event.data
-        if "\n" in data.strip():                  # multi-line -> show compressed
-            n = data.count("\n") + 1
-            _PASTES.append(data)
-            event.current_buffer.insert_text(f"[Pasted #{len(_PASTES)} +{n} lines]")
+    def _paste(event):                            # terminal delivered a real paste event
+        _insert_paste(event.current_buffer, event.data)
+
+    @kb.add("c-v")
+    def _paste_clip(event):                       # Strg+V -> OS-Clipboard direkt lesen
+        data = _read_clipboard()
+        if data:
+            _insert_paste(event.current_buffer, data)
         else:
-            event.current_buffer.insert_text(data)
+            gx10._ui_print(gx10.col("  (Zwischenablage leer oder nicht lesbar)", gx10.C.GRAY))
 
     # eager=True so the page keys win over the focused input buffer's defaults.
     @kb.add(Keys.PageUp, eager=True)
@@ -353,7 +453,7 @@ def _build_app(q: "Queue[str]", srv: Server) -> "Application":
         Window(content=FormattedTextControl(_toolbar, focusable=False), height=3),
     ]))
     return Application(layout=layout, key_bindings=kb, full_screen=True,
-                       refresh_interval=gx10.UI_REFRESH_INTERVAL, mouse_support=False)
+                       refresh_interval=gx10.UI_REFRESH_INTERVAL, mouse_support=True)
 
 
 def run_tui(srv: Server, codedir: Path, max_agents: int) -> None:
@@ -368,7 +468,7 @@ def run_tui(srv: Server, codedir: Path, max_agents: int) -> None:
     gx10._ui_print(gx10.col(f"  Server : {srv.base}", gx10.C.GRAY))
     gx10._ui_print(gx10.col(f"  Code   : {codedir}", gx10.C.GRAY))
     gx10._ui_print(gx10.col("  Type freely for a turn · /help for commands · exit", gx10.C.GRAY))
-    gx10._ui_print(gx10.col("  PageUp/PageDown = scroll history · multi-line paste is compressed", gx10.C.GRAY))
+    gx10._ui_print(gx10.col("  Mausrad / PageUp / PageDown = Historie scrollen · Paste wird komprimiert", gx10.C.GRAY))
 
     stop = threading.Event()
     pool = ThreadPoolExecutor(max_workers=max_agents, thread_name_prefix="codeagent")
@@ -394,10 +494,10 @@ def main() -> None:
     p.add_argument("--codedir", default=".")
     p.add_argument("--max-agents", type=int, default=client.DEFAULT_MAX_AGENTS)
     args = p.parse_args()
-    if os.name == "nt":
-        os.system("")
+    gx10._setup_output()   # UTF-8 stdout + color decision (TUI uses gx10.col)
     srv = Server(args.server)
     codedir = Path(args.codedir).expanduser().resolve()
+    os.chdir(codedir)   # passed-through code-tools (run_tool) act on YOUR local code root
     if not HAS_PT:
         print("  [WARN] prompt_toolkit missing — pip install prompt_toolkit for the TUI.")
         print("         Falling back to the plain line REPL.\n")

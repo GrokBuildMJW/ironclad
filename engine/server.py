@@ -38,11 +38,17 @@ from __future__ import annotations
 
 import json
 import os
+import secrets
+import socket
 import sys
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
+from urllib.parse import urlsplit
+
+#: Hard cap on a request body — bounds per-connection allocation on the threaded server.
+_MAX_BODY_BYTES = 8 * 1024 * 1024
 
 # The engine is run as a standalone script directory (gx10.py puts core/ on
 # sys.path, not as a package). We mirror that: put this dir (core/engine) on the
@@ -51,8 +57,10 @@ _HERE = Path(__file__).resolve().parent
 if str(_HERE) not in sys.path:
     sys.path.insert(0, str(_HERE))
 
-import gx10  # noqa: E402
+import gx10  # noqa: E402  (also puts core/ on sys.path → ack importable)
 from workers import ReasoningWorkers  # noqa: E402
+from security import SecurityPolicy, SessionRegistry  # noqa: E402
+from ack import doctor  # noqa: E402
 
 # --------------------------------------------------------------------------- #
 # Headless output capture — one buffer per request thread.
@@ -112,6 +120,54 @@ class _Streamed:
 
 
 # --------------------------------------------------------------------------- #
+# Client tool bridge — pass code-tools THROUGH to the driving client.
+# When a client opts in (header X-Local-Tools: 1) on /chat/stream, the engine routes
+# the LOCAL_TOOL_NAMES tools to this bridge: it emits a control frame in the stream
+# (``\x00TR\x00{json}\x00``), the client runs the tool on its LOCAL filesystem and POSTs
+# /tool-result, and the blocked turn resumes. Turns are agent-lock-serialized, so at most
+# one bridge is active → a single module-level holder suffices.
+# --------------------------------------------------------------------------- #
+_TR_PREFIX = "\x00TR"        # frame = \x00TR{json}\x00 — no internal \x00 (single delimiter)
+_TR_SUFFIX = "\x00"
+_ACTIVE_BRIDGE: Dict[str, Any] = {"b": None}
+
+
+class ToolBridge:
+    def __init__(self, emit: Any, timeout: float = 180.0) -> None:
+        self._emit = emit            # write(str) → the live stream
+        self._timeout = timeout
+        self._lock = threading.Lock()
+        self._pending: Dict[str, Dict[str, Any]] = {}   # id → {event, result}
+
+    def __call__(self, name: str, args: Dict[str, Any]) -> str:
+        return self.request(name, args)
+
+    def request(self, name: str, args: Dict[str, Any]) -> str:
+        rid = secrets.token_hex(8)
+        ev = threading.Event()
+        with self._lock:
+            self._pending[rid] = {"event": ev, "result": None}
+        self._emit(_TR_PREFIX + json.dumps({"id": rid, "name": name, "args": args})
+                   + _TR_SUFFIX)
+        if not ev.wait(self._timeout):
+            with self._lock:
+                self._pending.pop(rid, None)
+            return f"ERROR: client tool '{name}' timed out after {self._timeout:.0f}s"
+        with self._lock:
+            slot = self._pending.pop(rid, {})
+        return slot.get("result") or ""
+
+    def deliver(self, rid: str, result: str) -> bool:
+        with self._lock:
+            slot = self._pending.get(rid)
+            if not slot:
+                return False
+            slot["result"] = result
+            slot["event"].set()
+            return True
+
+
+# --------------------------------------------------------------------------- #
 # Bootstrap — same config pipeline + agent construction the CLI uses (main()),
 # but headless: no prompt_toolkit, autopilot forced OFF (the client launches
 # code-agents, never the server), watcher ON (the reconciler must advance).
@@ -123,6 +179,7 @@ def bootstrap(config_path: Optional[str] = None) -> Tuple[gx10.GX10, Dict[str, A
     cfg = gx10._apply_env(cfg)
     gx10._apply_config(cfg)
     gx10._EFFECTIVE_CFG = cfg
+    gx10._load_plugins(cfg["paths"].get("plugins_dir"))   # open extension surface
     gx10._CFG_SOURCE = cfg_path
 
     # Resolve the prompt absolutely before chdir (relative → SCRIPT_DIR), like main().
@@ -166,7 +223,8 @@ def bootstrap(config_path: Optional[str] = None) -> Tuple[gx10.GX10, Dict[str, A
 # The reconciler enqueues structured ADVANCE commands onto gx10._INPUT_QUEUE;
 # the consumer applies them (and any plain prompts) under the agent lock.
 # --------------------------------------------------------------------------- #
-def _queue_consumer(agent: gx10.GX10, stop: threading.Event) -> None:
+def _queue_consumer(agent: gx10.GX10, stop: threading.Event,
+                    sessions: Optional[SessionRegistry] = None) -> None:
     while not stop.is_set():
         try:
             item = gx10._INPUT_QUEUE.get(timeout=1.0)
@@ -191,9 +249,13 @@ def _queue_consumer(agent: gx10.GX10, stop: threading.Event) -> None:
                       flush=True)
                 # Autoplan (entkoppelt von Autopilot — Launch ist Client-Sache): bei
                 # empty pipeline, enqueue the next planning turn. Only fires when
-                # `/autoplan on` gesetzt ist und ein Backlog konfiguriert ist.
-                if res and res.startswith("OK"):
+                # `/autoplan on` gesetzt ist und ein Backlog konfiguriert ist —
+                # UND der Kanal nicht versiegelt ist (kein Client da, der ausführt).
+                sealed = sessions.is_sealed() if sessions is not None else False
+                if res and res.startswith("OK") and not sealed:
                     gx10._autoplan_tick(tid, lambda p: gx10._INPUT_QUEUE.put(p))
+                elif sealed:
+                    print("[AUTOPLAN] paused — channel sealed (no live session)", flush=True)
             continue
         # Plain prompt (e.g. autoplan) → normaler Turn.
         with _AGENT_LOCK:
@@ -234,6 +296,20 @@ def _pending_handovers() -> list[Dict[str, Any]]:
     return out
 
 
+def _doctor_report() -> Dict[str, Any]:
+    """Runtime ACK contract self-check (read-only) over the active workspace — the same
+    preflight the doctor CLI runs, exposed live so contract drift surfaces at runtime
+    instead of only via tooling. Includes Lodestar's checks when the plugin is enabled."""
+    extra = doctor._load_lodestar_checks(bool(gx10.LODESTAR_ENABLED))
+    report = doctor.run_doctor(Path(os.getcwd()), extra_checks=extra)
+    return {
+        "ok": not report.has_errors(),
+        "errors": report.count(doctor.Severity.ERROR),
+        "warnings": report.count(doctor.Severity.WARN),
+        "findings": [f.as_dict() for f in report.findings],
+    }
+
+
 def _write_feedback(task_id: str, agent: str, content: str) -> str:
     """Drop ``{task_id}_{AGENT}-feedback.md`` into the watch dir. The server-side
     reconciler detects it (mtime-stable) and advances the task."""
@@ -252,6 +328,10 @@ class _Handler(BaseHTTPRequestHandler):
     agent: gx10.GX10
     cfg: Dict[str, Any]
     workers: ReasoningWorkers
+    # Default to the open profile so the handler is usable even if a harness forgets to
+    # inject a policy; serve() overrides both from config.
+    policy: SecurityPolicy = SecurityPolicy("open", None, 30, "mount")
+    sessions: SessionRegistry = SessionRegistry(policy)
 
     def log_message(self, fmt: str, *args: Any) -> None:  # leiser, eine Zeile
         print(f"[http] {self.address_string()} {fmt % args}", flush=True)
@@ -265,9 +345,26 @@ class _Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _guard(self) -> bool:
+        """Phase-d gate: deployment-secret + session/seal check for protected routes.
+        Returns True if the request may proceed; otherwise sends a 401 and returns False.
+        ``open`` profiles pass everything through (GATED_PATHS check is a no-op)."""
+        refusal = self.sessions.authorize(
+            self.path,
+            self.headers.get("Authorization"),
+            self.headers.get("X-Session-Id"),
+        )
+        if refusal is None:
+            return True
+        self._send(refusal["code"], {"ok": False, "error": refusal["error"]})
+        return False
+
     def _read_json(self) -> Dict[str, Any]:
-        n = int(self.headers.get("Content-Length") or 0)
-        if n <= 0:
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            return {}
+        if n <= 0 or n > _MAX_BODY_BYTES:   # reject absurd/oversized bodies (no huge alloc)
             return {}
         raw = self.rfile.read(n)
         try:
@@ -279,6 +376,7 @@ class _Handler(BaseHTTPRequestHandler):
     # ── routes ───────────────────────────────────────────────
     def do_GET(self) -> None:
         try:
+            self.path = urlsplit(self.path).path   # gate + route on the query-free path
             if self.path == "/health":
                 self._send(200, {
                     "ok": True,
@@ -290,11 +388,21 @@ class _Handler(BaseHTTPRequestHandler):
                     "language": gx10.LANGUAGE,
                     "memory": ("off" if gx10._MEMORY is None
                                else ("up" if gx10._MEMORY.is_available() else "down")),
+                    "security": self.policy.summary(),
+                    "sealed": self.sessions.is_sealed(),
                 })
             elif self.path == "/tasks":
+                if not self._guard():
+                    return
                 self._send(200, {"tasks": gx10._store().list()})
             elif self.path == "/pending":
+                if not self._guard():
+                    return
                 self._send(200, {"pending": _pending_handovers()})
+            elif self.path == "/doctor":
+                if not self._guard():
+                    return
+                self._send(200, _doctor_report())
             else:
                 self._send(404, {"ok": False, "error": f"no route {self.path}"})
         except Exception as e:  # noqa: BLE001
@@ -302,6 +410,30 @@ class _Handler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         try:
+            self.path = urlsplit(self.path).path   # gate + route on the query-free path
+            # Session lifecycle (Phase d). /session/open needs only the deployment
+            # secret (no session yet); heartbeat/close just touch the registry.
+            if self.path == "/session/open":
+                if not self.policy.check_token(self.headers.get("Authorization")):
+                    self._send(401, {"ok": False, "error": "missing or invalid deployment secret"})
+                    return
+                self._send(200, {"ok": True, **self.sessions.open()})
+                return
+            if self.path == "/session/heartbeat":
+                sid = (self._read_json().get("session_id")
+                       or self.headers.get("X-Session-Id") or "")
+                ok = self.sessions.heartbeat(sid)
+                self._send(200 if ok else 410, {"ok": ok})
+                return
+            if self.path == "/session/close":
+                sid = (self._read_json().get("session_id")
+                       or self.headers.get("X-Session-Id") or "")
+                self._send(200, {"ok": True, "closed": self.sessions.close(sid)})
+                return
+
+            if not self._guard():
+                return
+
             if self.path == "/chat":
                 data = self._read_json()
                 message = (data.get("message") or "").strip()
@@ -325,6 +457,13 @@ class _Handler(BaseHTTPRequestHandler):
                 self.send_header("Cache-Control", "no-cache")
                 self.send_header("Connection", "close")
                 self.end_headers()
+                # Disable Nagle: a small flushed frame (e.g. a tool-call passthrough) must
+                # reach the client IMMEDIATELY, not wait for more data — otherwise the
+                # bridge round-trip deadlocks and live streaming stutters.
+                try:
+                    self.connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                except OSError:
+                    pass
 
                 def _write(text: str) -> None:
                     try:
@@ -332,9 +471,27 @@ class _Handler(BaseHTTPRequestHandler):
                         self.wfile.flush()
                     except (BrokenPipeError, ConnectionResetError, OSError):
                         pass  # client gone → the turn finishes server-side
+                # Opt-in: if the client offers local execution (X-Local-Tools: 1), pass
+                # code-tools through to it; otherwise they run server-side as before.
+                local = self.headers.get("X-Local-Tools") == "1"
+                bridge = ToolBridge(_write) if local else None
                 with _Streamed(_write):
                     with _AGENT_LOCK:
-                        gx10._dispatch(self.agent, message)
+                        if bridge is not None:
+                            _ACTIVE_BRIDGE["b"] = bridge
+                            gx10._LOCAL_TOOL_BRIDGE = bridge
+                        try:
+                            gx10._dispatch(self.agent, message)
+                        finally:
+                            gx10._LOCAL_TOOL_BRIDGE = None
+                            _ACTIVE_BRIDGE["b"] = None
+            elif self.path == "/tool-result":
+                # The client returns the result of a passed-through code-tool.
+                data = self._read_json()
+                rid = (data.get("id") or "").strip()
+                bridge = _ACTIVE_BRIDGE["b"]
+                ok = bool(rid) and bridge is not None and bridge.deliver(rid, data.get("result") or "")
+                self._send(200 if ok else 410, {"ok": ok})
             elif self.path == "/cancel":
                 # Bricht den gerade laufenden Turn ab: das Engine-_CANCEL_EVENT wird
                 # set; run() checks it per iteration/generation and stops cleanly.
@@ -380,7 +537,20 @@ class _Handler(BaseHTTPRequestHandler):
 # --------------------------------------------------------------------------- #
 def serve(host: str = "0.0.0.0", port: int = 8100,
           config_path: Optional[str] = None) -> None:
+    # UTF-8 stdout + color decision. Headless server stdout is not a TTY → color is
+    # dropped, so no ANSI escape codes leak into the captured /chat HTTP payload.
+    gx10._setup_output()
     agent, cfg, cfg_path, workdir = bootstrap(config_path)
+
+    # Phase-d trust policy (single-tenant). Fail-closed: a profile that demands a
+    # deployment secret refuses to boot without one. ``sealed`` forces a loopback bind.
+    policy = SecurityPolicy.from_config(cfg)
+    err = policy.startup_error()
+    if err:
+        print(f"  [SECURITY] refusing to start: {err}", flush=True)
+        raise SystemExit(2)
+    sessions = SessionRegistry(policy)
+    host = policy.effective_bind(host)
 
     # Headless-Capture aktivieren (UI bleibt aus → _UI_APP is None).
     gx10._UI_SINK = _capture_sink
@@ -393,23 +563,45 @@ def serve(host: str = "0.0.0.0", port: int = 8100,
         daemon=True,
     )
     rt.start()
-    # Queue-Consumer: wendet die vom Reconciler eingereihten ADVANCE-Befehle an.
-    qt = threading.Thread(target=_queue_consumer, args=(agent, stop), daemon=True)
+    # Queue-Consumer: wendet die vom Reconciler eingereihten ADVANCE-Befehle an;
+    # die Registry steuert die Autoplan-Pause bei versiegeltem Kanal.
+    qt = threading.Thread(target=_queue_consumer, args=(agent, stop, sessions), daemon=True)
     qt.start()
 
     _Handler.agent = agent
     _Handler.cfg = cfg
-    fanout_conc = int(os.environ.get("GX10_FANOUT_CONCURRENCY", "8"))
-    _Handler.workers = ReasoningWorkers(agent.client, agent.model,
-                                        max_concurrency=fanout_conc)
+    _Handler.policy = policy
+    _Handler.sessions = sessions
+    # Phase-e reasoning fan-out governor — config-driven, model-matched in conf/.
+    wcfg = cfg.get("workers") or {}
+    _Handler.workers = ReasoningWorkers(
+        agent.client, agent.model,
+        max_concurrency=int(wcfg.get("concurrency", 4)),
+        default_max_tokens=int(wcfg.get("max_tokens", 1024)),
+        max_batch_tokens=int(wcfg.get("max_batch_tokens", 8192)),
+    )
+    gx10._WORKERS = _Handler.workers   # shared handle for the in-engine parallel tool
     httpd = ThreadingHTTPServer((host, port), _Handler)
 
     print(f"  Ironclad Orchestrator-Server", flush=True)
     print(f"  Model  : {agent.model}  |  vLLM {cfg['connection']['base_url']}", flush=True)
     print(f"  WORKDIR: {workdir}", flush=True)
     print(f"  Config : {cfg_path or '— (Code-Defaults)'}", flush=True)
+    sec = policy.summary()
+    print(f"  Security: profile={sec['profile']}  auth={sec['auth']}  "
+          f"session={sec['session']}  code={sec['code_locality']}", flush=True)
+    # Runtime ACK contract self-check at boot — fail-loud-ish (log only, never blocks).
+    try:
+        rep = _doctor_report()
+        tail = (" (clean)" if not rep["errors"] and not rep["warnings"]
+                else f" — details: GET /doctor")
+        print(f"  Doctor : {rep['errors']} error(s), {rep['warnings']} warning(s){tail}",
+              flush=True)
+    except Exception as e:  # noqa: BLE001 — diagnostics must never block startup
+        print(f"  Doctor : self-check skipped ({e!r})", flush=True)
     print(f"  Listen : http://{host}:{port}  "
-          f"(GET /health /tasks /pending · POST /chat /chat/stream /cancel /feedback /fanout)",
+          f"(GET /health /tasks /pending /doctor · POST /chat /chat/stream /cancel "
+          f"/feedback /fanout /session/open|heartbeat|close)",
           flush=True)
     try:
         httpd.serve_forever()

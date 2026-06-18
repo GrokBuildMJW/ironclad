@@ -1,6 +1,6 @@
 """Engine ↔ ACK wiring: the stage_handover soft-path validation gate (_ack_validate).
 
-Imports the orchestration engine (core/engine/gx10.py) with a stubbed ``openai`` so
+Imports the orchestration engine (engine/gx10.py) with a stubbed ``openai`` so
 it loads without the heavy dependency, then exercises the gate directly. The gate is
 the integration seam: a model-emitted task_json is validated against the ACK contract
 before the TaskStore mutates anything; on a violation the exact error is returned so

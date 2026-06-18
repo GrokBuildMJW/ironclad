@@ -12,9 +12,12 @@ export GX10_MODEL=<served-model-name>          # the name the endpoint serves
 export GX10_API_KEY=...                         # only if the endpoint needs one
 ```
 
-Then run the client/CLI as usual (`python engine/gx10.py`, or the split server +
-`engine/tui.py`). That's it — this connection path is the same one the reference
-deploy uses and is exercised throughout the test suite.
+Then start the orchestrator (`python engine/server.py`) and drive it with a client — the
+recommended TypeScript client (`ironclad`, after a one-time `npm install -g .` in
+`clients/ink/`) or the zero-dependency Python REPL (`python engine/client.py --codedir .`).
+That's it —
+this connection path is the same one the reference deploy uses and is exercised throughout
+the test suite.
 
 > **Tool calling matters.** The orchestration engine uses function/tool calling. Pick
 > an **instruct/chat** model and serve it behind an endpoint that supports tool calls
@@ -60,7 +63,8 @@ released weights behind vLLM; either way Ironclad connects via `GX10_BASE_URL` /
 
 ```bash
 curl -s "$GX10_BASE_URL/models"            # your model should be listed
-python engine/gx10.py --thinking off       # then ask a question
+python engine/server.py --port 8100 &      # start the orchestrator, then drive it:
+python engine/client.py --codedir .        # ...and ask a question
 ```
 
 If `/models` lists your model and a turn returns an answer, Ironclad is wired to it.

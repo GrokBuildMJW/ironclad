@@ -1,0 +1,12 @@
+Ironclad Ink Client
+Copyright 2026 MJWC-AI-LAB and Ironclad contributors
+
+Licensed under the Apache License, Version 2.0 (the "License"); you may not use
+this package except in compliance with the License. A copy of the License is in
+the LICENSE file in this directory.
+
+This product bundles third-party components under permissive licenses (MIT,
+Apache-2.0, BSD, ISC). Their copyright notices and license texts are listed in
+THIRD_PARTY.md, which is generated from the resolved lockfile (see `npm run
+licenses`). No code from any proprietary product is included; the look-and-feel is
+an independent, clean-room reimplementation of the project's own Python client.

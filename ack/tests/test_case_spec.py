@@ -3,12 +3,12 @@
 Validation script + regression guard for the SSOT ``TaskSpec`` and the kernel
 utilities derived from its one schema (lint / prompt / vLLM-constraint / validate).
 
-Adapted to the core/ack/ API:
+Adapted to the ack/ API:
   * ``core.spec.case_spec`` -> ``ack.case_spec``
   * ``capability`` moved OUT of the base spec onto ``CapabilityTaskSpec``
     (``ack.lodestar.spec``); capability-mandatory / ``.capability`` tests use it.
 
-  python -m pytest core/ack/tests/test_case_spec.py -v
+  python -m pytest ack/tests/test_case_spec.py -v
 """
 from __future__ import annotations
 

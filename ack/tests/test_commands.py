@@ -1,4 +1,4 @@
-"""Shared client command routing (core/engine/commands.py).
+"""Shared client command routing (engine/commands.py).
 
 Locks the rule the REPL and the TUI both rely on: `/command` is a command (local or
 forwarded to the server), bare `exit`/`quit` leaves, everything else is a turn.

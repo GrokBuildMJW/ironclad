@@ -1,4 +1,4 @@
-"""Reasoning workers (core/engine/workers.py) — server-side fan-out.
+"""Reasoning workers (engine/workers.py) — server-side fan-out.
 
 Validates the fan-out semantics WITHOUT a real model (the OpenAI client is stubbed):
 real concurrency (N prompts run at once, wall-clock ≪ sum of latencies), results in
@@ -107,6 +107,31 @@ def test_error_isolation_keeps_order():
     assert res[0]["ok"] and res[0]["content"] == "echo:a"
     assert not res[1]["ok"] and "boom:b" in res[1]["error"] and res[1]["content"] is None
     assert res[2]["ok"] and res[2]["content"] == "echo:c"
+
+
+def test_plan_concurrency_envelope():
+    # Envelope = concurrency × max_tokens ≤ max_batch_tokens. A large per-call token
+    # count lowers the effective parallelism so the GPU is never over-subscribed.
+    w = ReasoningWorkers(_StubClient(), "m", max_concurrency=8, max_batch_tokens=8192)
+    assert w._plan_concurrency(20, 1024) == 8     # 8192//1024=8 → full concurrency
+    assert w._plan_concurrency(20, 2048) == 4     # 8192//2048=4 → halved
+    assert w._plan_concurrency(20, 9000) == 1     # one oversized call still runs, alone
+    assert w._plan_concurrency(3, 256) == 3       # request size is the binding cap here
+
+
+def test_envelope_caps_live_concurrency():
+    # max_batch_tokens 2000, max_tokens 1000 → budget cap 2, even with concurrency 8.
+    client = _StubClient(delay=0.1)
+    w = ReasoningWorkers(client, "m", max_concurrency=8, max_batch_tokens=2000)
+    w.fanout([str(i) for i in range(6)], max_tokens=1000)
+    assert client.max_live <= 2                   # governor held the line, no overload
+
+
+def test_small_tokens_use_full_concurrency():
+    client = _StubClient(delay=0.1)
+    w = ReasoningWorkers(client, "m", max_concurrency=8, max_batch_tokens=8192)
+    w.fanout([str(i) for i in range(8)], max_tokens=1024)
+    assert client.max_live == 8                   # within budget → full batch width
 
 
 def test_think_flag_forwarded():

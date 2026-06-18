@@ -5,7 +5,7 @@ carries the closed schema + a forcing tool_choice, and the runtime validator
 REJECTS any reply that omits a required field — on both the native-tool-call path
 (vLLM/Qwen3-Coder) and the content-JSON fallback path.
 
-    python -m pytest core/ack/tests/test_constrained_emission.py -v
+    python -m pytest ack/tests/test_constrained_emission.py -v
 """
 from __future__ import annotations
 

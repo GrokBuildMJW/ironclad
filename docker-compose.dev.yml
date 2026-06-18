@@ -1,0 +1,46 @@
+# Ironclad DEV compose — build + test gate and a resource-limited dev orchestrator.
+# See docs/dev-environment.md. Not needed to merely USE Ironclad (that's SETUP.md).
+#
+#   # the gate: build the source + run the full suite in the container (exit code = gate)
+#   docker compose -f docker-compose.dev.yml run --rm test
+#
+#   # a dev orchestrator (open profile, limited), pointed at an endpoint you choose
+#   GX10_BASE_URL=http://host.docker.internal:8000/v1 \
+#     docker compose -f docker-compose.dev.yml up -d orchestrator-dev
+services:
+  # Build + full test suite inside the container. A green run is the promote precondition.
+  test:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    image: ironclad-test
+    container_name: ironclad-test
+    # also emit a JUnit artifact as the test proof (lands on the host)
+    command: ["python", "-m", "pytest", "ack/tests", "-q",
+              "--junitxml=/out/report.xml"]
+    volumes:
+      - ./dev-artifacts:/out
+
+  # Dev orchestrator: built from source, open profile, resource-limited, endpoint of your
+  # choice. Use `sealed` (+ a token) for anything you expose; this is for local dev.
+  orchestrator-dev:
+    build: .                      # the slim runtime Dockerfile
+    image: ironclad-orchestrator
+    container_name: ironclad-orchestrator-dev
+    network_mode: host            # reach a host model on localhost, bind :8100
+    restart: unless-stopped
+    environment:
+      GX10_BASE_URL: ${GX10_BASE_URL:-http://localhost:8000/v1}
+      GX10_MODEL: ${GX10_MODEL:-qwen3.6-35b}
+      GX10_SERVER_PORT: ${GX10_SERVER_PORT:-8100}
+      GX10_PROFILE: ${GX10_PROFILE:-open}     # dev default; set sealed if exposed
+      GX10_LANGUAGE: ${GX10_LANGUAGE:-en}
+      GX10_MEMORY_URL: ${GX10_MEMORY_URL:-}
+      GX10_WORKDIR: /work
+    volumes:
+      - ./dev-workdir:/work       # tasks/, summaries/, session persist on the host
+    deploy:
+      resources:
+        limits:
+          cpus: ${IRONCLAD_DEV_CPUS:-2.0}
+          memory: ${IRONCLAD_DEV_MEM:-2g}

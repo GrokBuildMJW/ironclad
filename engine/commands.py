@@ -17,7 +17,22 @@ in the monolithic CLI) under a single, predictable ``/command`` convention.
 """
 from __future__ import annotations
 
+import os
+import sys
 from typing import Tuple
+
+
+def setup_output() -> None:
+    """UTF-8-safe stdout/stderr + ANSI enable on Windows — shared by the REPL and TUI so a
+    non-ASCII byte never raises the cp1252 ``UnicodeEncodeError`` class. Failure-tolerant."""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")  # py3.7+ text streams
+        except (AttributeError, ValueError):
+            pass
+    if os.name == "nt":
+        os.system("")  # enable ANSI/VT processing in legacy Windows consoles
+
 
 #: Handled on the client side (connection / local code-agents).
 LOCAL_COMMANDS = {"tasks", "pending", "work", "auto", "health", "help", "exit", "quit"}

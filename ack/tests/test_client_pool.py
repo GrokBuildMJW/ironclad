@@ -1,4 +1,4 @@
-"""Client-side code-agent parallelism (core/engine/client.py).
+"""Client-side code-agent parallelism (engine/client.py).
 
 The thin client runs ``claude --print`` for staged handovers in a bounded pool. These
 tests validate the pool semantics WITHOUT launching claude (the handover runner is
@@ -39,6 +39,58 @@ class _FakeServer:
 
 def _items(*ids):
     return [{"id": t, "agent": "OPUS", "title": t, "type": "feature"} for t in ids]
+
+
+def test_build_argv_default_is_claude_shape():
+    argv = client._build_agent_argv(
+        client.DEFAULT_AGENT_CMD, bin="claude", model="m", effort="high",
+        permission="acceptEdits", prompt="do the thing with spaces")
+    assert argv == ["claude", "--model", "m", "--effort", "high",
+                    "--permission-mode", "acceptEdits", "--print",
+                    "do the thing with spaces"]   # prompt stays ONE arg
+
+
+def test_build_argv_prompt_single_arg_any_template():
+    argv = client._build_agent_argv(
+        "mytool --yes {prompt}", bin="x", model="x", effort="x",
+        permission="x", prompt="a b c")
+    assert argv == ["mytool", "--yes", "a b c"]    # CLI with no model/effort flags
+
+
+def test_build_argv_embedded_placeholder():
+    argv = client._build_agent_argv(
+        "tool --model={model} {prompt}", bin="b", model="kimi-x", effort="e",
+        permission="p", prompt="hi there")
+    assert argv == ["tool", "--model=kimi-x", "hi there"]
+
+
+def test_run_handover_passes_permission_mode(tmp_path, monkeypatch):
+    """Regression: the headless code-agent MUST get a non-interactive permission mode,
+    else claude --print can't write files (it silently exits without doing the work)."""
+    captured = {}
+
+    class _R:
+        returncode = 0
+
+    def _fake_run(argv, **kw):
+        captured["argv"] = argv
+        # simulate claude writing the expected feedback file so the runner returns it
+        fb = tmp_path / "summaries" / "feedback" / "KGC-7_OPUS-feedback.md"
+        fb.parent.mkdir(parents=True, exist_ok=True)
+        fb.write_text("## Result\ndone", encoding="utf-8")
+        return _R()
+
+    monkeypatch.setattr(client.subprocess, "run", _fake_run)
+    item = {"id": "KGC-7", "agent": "OPUS",
+            "handover_file": "KGC-7_OPUS.md", "handover": "do the thing"}
+    out = client._run_handover(item, tmp_path, log=lambda *_: None)
+    assert out and "done" in out
+    argv = captured["argv"]
+    assert "--permission-mode" in argv
+    # the mode value follows the flag and is non-interactive (not "default")
+    mode = argv[argv.index("--permission-mode") + 1]
+    assert mode and mode != "default"
+    assert "--print" in argv and "--model" in argv
 
 
 def test_dispatch_claims_and_runs_each_once(monkeypatch, tmp_path):
