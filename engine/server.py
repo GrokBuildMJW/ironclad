@@ -39,6 +39,7 @@ from __future__ import annotations
 import json
 import os
 import secrets
+import shutil
 import socket
 import sys
 import threading
@@ -381,6 +382,7 @@ class _Handler(BaseHTTPRequestHandler):
                 self._send(200, {
                     "ok": True,
                     "model": self.agent.model,
+                    "orchestrator_version": gx10.orchestrator_version(),
                     "base_url": self.cfg["connection"]["base_url"],
                     "workdir": os.getcwd(),
                     "watcher": gx10._WATCHER_ENABLED,
@@ -581,9 +583,46 @@ def serve(host: str = "0.0.0.0", port: int = 8100,
         max_batch_tokens=int(wcfg.get("max_batch_tokens", 8192)),
     )
     gx10._WORKERS = _Handler.workers   # shared handle for the in-engine parallel tool
+    # P0 provider router (beside _WORKERS). The boot-fixed `setup.type` (offload-topology.md) drives the
+    # runner wiring: server → dispatcher inactive (in-engine only, byte-identical); local → local-subprocess
+    # runner (engine + agents co-located on the desktop). Orchestrator + agents are always co-located —
+    # no cross-machine offload. The dispatcher code is unchanged; only WHICH runner closure we inject differs.
+    pcfg = cfg.get("providers") or {}
+    try:
+        from client import CLAUDE_BIN
+        _cli_ok = shutil.which(CLAUDE_BIN) is not None
+    except Exception:
+        _cli_ok = False
+    try:
+        topo = gx10.resolve_offload_topology(cfg, cli_available=_cli_ok)   # FAIL-CLOSED on bad topology
+    except ValueError as e:
+        print(f"  [setup] FATAL: {e}", flush=True)
+        raise SystemExit(2)
+    if topo.get("note"):
+        print(f"  [setup] {topo['note']}", flush=True)
+    try:
+        from providers import load_registry
+        from dispatch import ProviderDispatcher
+        reg = load_registry(cfg)                          # None ⇒ no pool → dispatcher inactive
+        _runner = None
+        if topo["runner_mode"] == "local":               # local: offload = local subprocess CLI (co-located)
+            from client import default_cli_runner
+            _runner = (lambda spec, prompt, **kw:
+                       default_cli_runner(spec, prompt, timeout=pcfg.get("cli_timeout_s"), **kw))
+        # runner_mode == "none" → server: no runner, dispatcher stays on in-engine fanout.
+        gx10._DISPATCHER = ProviderDispatcher(
+            reg, workers=_Handler.workers, agent_runner=_runner,
+            enabled=bool(topo["providers_enabled"]),       # derived from setup.type (single source)
+            effort_max_tokens=pcfg.get("effort_max_tokens"),
+            max_agents=int(pcfg.get("max_agents", 3)),     # providers.max_agents (server cap, ≠ --max-agents)
+        )
+    except SystemExit:
+        raise
+    except Exception:
+        gx10._DISPATCHER = None                            # fail-soft: any wiring error → today's path
     httpd = ThreadingHTTPServer((host, port), _Handler)
 
-    print(f"  Ironclad Orchestrator-Server", flush=True)
+    print(f"  Ironclad Orchestrator-Server  (version {gx10.orchestrator_version()})", flush=True)
     print(f"  Model  : {agent.model}  |  vLLM {cfg['connection']['base_url']}", flush=True)
     print(f"  WORKDIR: {workdir}", flush=True)
     print(f"  Config : {cfg_path or '— (Code-Defaults)'}", flush=True)

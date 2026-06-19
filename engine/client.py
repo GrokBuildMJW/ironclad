@@ -142,6 +142,42 @@ def _build_agent_argv(template: str, *, bin: str, model: str, effort: str,
     return argv
 
 
+def default_cli_runner(spec, prompt: str, *, effort: str, max_tokens: Optional[int] = None,
+                       timeout: Optional[float] = None) -> Dict[str, Any]:
+    """CLI substrate for the provider dispatcher (MPR P0 §5.2) — CLIENT-lane.
+
+    Spawns a headless code-CLI for one reasoning perspective against the local model CLIs/subscriptions
+    on this machine (Sonnet/Kimi/Opus/…), keeping the Spark free. Lives here (not in the server/the
+    pure dispatcher) because it owns the subprocess; the server only *injects* this callable.
+    Returns the same result shape as ``workers._one`` so aggregation is uniform. Never raises.
+    ``permission_mode`` has one source: ``spec.permission_mode`` or ``CLAUDE_PERMISSION_MODE``.
+    """
+    argv = _build_agent_argv(
+        getattr(spec, "cmd_template", None) or AGENT_CMD,
+        bin=getattr(spec, "bin", None) or CLAUDE_BIN,
+        model=spec.model,
+        effort=str(effort),
+        permission=getattr(spec, "permission_mode", None) or CLAUDE_PERMISSION_MODE,
+        prompt=prompt,
+    )
+    t0 = time.monotonic()
+    try:
+        proc = subprocess.run(
+            argv, env={**os.environ, "PYTHONIOENCODING": "utf-8"},
+            stdin=subprocess.DEVNULL, text=True, capture_output=True, timeout=timeout,
+        )
+        return {
+            "ok": proc.returncode == 0,
+            "content": proc.stdout,
+            "error": (proc.stderr or None) if proc.returncode else None,
+            "completion_tokens": None,
+            "latency": round(time.monotonic() - t0, 3),
+        }
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError) as e:
+        return {"ok": False, "content": None, "error": repr(e),
+                "completion_tokens": None, "latency": round(time.monotonic() - t0, 3)}
+
+
 # --------------------------------------------------------------------------- #
 # HTTP (stdlib).
 # --------------------------------------------------------------------------- #

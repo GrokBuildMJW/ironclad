@@ -60,6 +60,9 @@ Commands (with a / prefix) — plain text without / is sent to the orchestrator 
   orchestrator (server):
     /status            status (model, perf, tasks, tools)
     /config            active configuration
+    /config get <key>          read a dotted config key (e.g. mpr.enabled)
+    /config set <key> <value>  override a config key at runtime
+                               (on|off|true|false|num|str)
     /clear             clear the orchestrator's context
     /read <path>       read a file in the server workdir
     /ls [path]         list a directory in the server workdir

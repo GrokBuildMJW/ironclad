@@ -1,0 +1,194 @@
+"""Provider routing-policy engine (P0) — pure, deterministic, spawn-free.
+
+Maps one reasoning item (a RouteRequest) to a provider from the registry along three axes, in this
+fail-closed order: (1) sovereignty filter (SENSITIVE / local-only → local providers only, else decline
+— never a silent offload), (2) capability filter (web/file/effort ceiling), (3) load/spill (Spark is
+the default target unless the chat-turn lock is held or the batch width is saturated → spill to
+external CLIs), (4) cost/effort scoring, (5) budget gate, (6) deterministic tie-break.
+
+No subprocess, no network, no ironclad import — just schema + arithmetic, so the decisions are
+snapshot-testable and the sovereignty guarantee is assertable (§9). The effort→max_tokens table is
+the single source feeding both the cost estimate and (downstream) the Spark governor — never a
+separate MPR token notion.
+"""
+from __future__ import annotations
+
+from enum import Enum
+from typing import Dict, List, Optional
+
+from pydantic import BaseModel, Field
+
+from providers import ProviderRegistry, ProviderSpec
+
+
+class ProviderPolicy(str, Enum):
+    LOCAL_ONLY = "local-only"      # NEVER external (sovereignty) — must land on capabilities.local
+    OFFLOADABLE = "offloadable"    # may be offloaded
+
+
+class Sensitivity(str, Enum):
+    PUBLIC = "public"              # public research → offload allowed
+    INTERNAL = "internal"         # internal context → prefer local
+    SENSITIVE = "sensitive"       # private code/secrets → forces local-only
+
+
+class RouteRequest(BaseModel):
+    index: int                                    # input position (order-preserving, 1:1 to items[])
+    effort: str = "medium"                        # low|medium|high|xhigh (→ max_tokens, §4.1)
+    provider_policy: ProviderPolicy = ProviderPolicy.OFFLOADABLE
+    sensitivity: Sensitivity = Sensitivity.INTERNAL
+    needs_web: bool = False                       # needs web_search capability
+    needs_file_io: bool = False                   # needs file_io capability
+    est_input_chars: int = 0                      # len(item)+len(context), filled by the dispatcher
+
+
+class LoadSignal(BaseModel):
+    """Live load for the spill axis. Filled by the server, fail-soft (defaults = idle)."""
+    spark_inflight: int = 0                       # currently running Spark reasoning calls (+already-routed-local)
+    spark_batch_width: int = 8                    # effective batch width (= _WORKERS.max_concurrency)
+    spark_chat_busy: bool = False                 # a /chat turn holds the agent lock → keep Spark free
+
+
+class Budget(BaseModel):
+    """Cost/rate cap per run (caller supplies; router counts along, §4.3)."""
+    usd_cap: Optional[float] = None               # hard $ ceiling for the run (None = no limit)
+    per_provider_max_concurrent: Dict[str, int] = Field(default_factory=dict)
+
+
+class RouteDecision(BaseModel):
+    index: int
+    provider_id: Optional[str]                    # None ⇒ not routable (caller fail-soft)
+    reason: str                                   # local-sovereign | spill-load | spill-budget | cost-fit |
+                                                  # no-local-provider | no-capable-provider | budget-exhausted
+    est_max_tokens: int                           # §4.1 mapping, passed to the substrate
+    est_cost_usd: float                           # for budget counting + manifest
+
+
+# ── Scoring SSOT (module constants; config-overridable via providers.scoring) ─────────────────────
+EFFORT_RANK = {"low": 0, "medium": 1, "high": 2, "xhigh": 3}
+EFFORT_MAX_TOKENS = {"low": 512, "medium": 1024, "high": 2048, "xhigh": 4096}
+W_COST = 1.0
+W_SENSITIVITY = 0.5
+COST_NORM_USD = 0.10
+INPUT_CHARS_PER_TOKEN = 4
+
+
+def _effort(req_effort: str) -> str:
+    return req_effort if req_effort in EFFORT_RANK else "medium"
+
+
+def _est_input_tokens(input_chars: int) -> int:
+    return max(0, input_chars) // INPUT_CHARS_PER_TOKEN
+
+
+def _cost_usd(p: ProviderSpec, in_tok: int, out_tok: int) -> float:
+    return p.cost_per_1k_in * in_tok / 1000.0 + p.cost_per_1k_out * out_tok / 1000.0
+
+
+def _effort_fit(p: ProviderSpec, effort: str) -> float:
+    """In [0,1]: 1.0 when max_effort exactly fits; falls 0.25 per tier of surplus/deficit."""
+    gap = abs(EFFORT_RANK[p.capabilities.max_effort] - EFFORT_RANK[effort])
+    return max(0.0, 1.0 - 0.25 * gap)
+
+
+def _cost_penalty(p: ProviderSpec, in_tok: int, out_tok: int) -> float:
+    return W_COST * (_cost_usd(p, in_tok, out_tok) / COST_NORM_USD)   # local (cost_*=0) ⇒ 0.0
+
+
+def _sensitivity_penalty(p: ProviderSpec, sensitivity: Sensitivity) -> float:
+    return W_SENSITIVITY if (sensitivity == Sensitivity.INTERNAL and not p.capabilities.local) else 0.0
+
+
+def _score(p: ProviderSpec, effort: str, in_tok: int, out_tok: int, sensitivity: Sensitivity) -> float:
+    return (_effort_fit(p, effort)
+            - _cost_penalty(p, in_tok, out_tok)
+            - _sensitivity_penalty(p, sensitivity)
+            + p.weight / 1000.0)
+
+
+def _pick(pool: List[ProviderSpec], effort: str, in_tok: int, out_tok: int, sensitivity: Sensitivity) -> ProviderSpec:
+    """Deterministic: score desc, then weight desc, then provider_id asc (snapshot-stable)."""
+    return sorted(
+        pool,
+        key=lambda p: (-_score(p, effort, in_tok, out_tok, sensitivity), -p.weight, p.provider_id),
+    )[0]
+
+
+def route_one(
+    req: RouteRequest,
+    registry: ProviderRegistry,
+    load: LoadSignal,
+    budget: Budget,
+    spent: float = 0.0,
+) -> RouteDecision:
+    effort = _effort(req.effort)
+    out_tok = EFFORT_MAX_TOKENS[effort]
+    in_tok = _est_input_tokens(req.est_input_chars)
+
+    def decision(p: Optional[ProviderSpec], reason: str) -> RouteDecision:
+        cost = round(_cost_usd(p, in_tok, out_tok), 6) if p is not None else 0.0
+        return RouteDecision(
+            index=req.index,
+            provider_id=p.provider_id if p is not None else None,
+            reason=reason,
+            est_max_tokens=out_tok,
+            est_cost_usd=cost,
+        )
+
+    candidates = list(registry.by_id().values())
+
+    # 1) Sovereignty filter (hard, first — fail-closed against leak)
+    force_local = req.sensitivity == Sensitivity.SENSITIVE or req.provider_policy == ProviderPolicy.LOCAL_ONLY
+    if force_local:
+        candidates = [p for p in candidates if p.capabilities.local]
+        if not candidates:
+            return decision(None, "no-local-provider")
+
+    # 2) Capability filter (web / file_io / effort ceiling — ordinal, not lexicographic)
+    def cap_ok(p: ProviderSpec) -> bool:
+        if req.needs_web and not p.capabilities.web_search:
+            return False
+        if req.needs_file_io and not p.capabilities.file_io:
+            return False
+        return EFFORT_RANK[p.capabilities.max_effort] >= EFFORT_RANK[effort]
+
+    candidates = [p for p in candidates if cap_ok(p)]
+    if not candidates:
+        return decision(None, "no-capable-provider")
+
+    locals_ = [p for p in candidates if p.capabilities.local]
+    externals = [p for p in candidates if not p.capabilities.local]
+
+    # 3) Load/spill: local (Spark) is the default target unless the chat lock is held or the batch
+    #    width is saturated (spark_inflight already includes items routed local earlier this run).
+    spark_full = load.spark_inflight >= load.spark_batch_width
+    spill = (load.spark_chat_busy or spark_full) and bool(externals)
+
+    if force_local:
+        pool, base_reason = locals_, "local-sovereign"
+    elif spill:
+        pool, base_reason = externals, "spill-load"
+    else:
+        # idle: local is the default target (§3.2-3); only spill scores among externals.
+        pool = locals_ if locals_ else externals
+        base_reason = "local-sovereign" if locals_ else "cost-fit"
+
+    # 5) Budget gate (applied before scoring so cost-exhausted candidates drop out)
+    if budget.usd_cap is not None:
+        affordable = [p for p in pool if spent + _cost_usd(p, in_tok, out_tok) <= budget.usd_cap]
+        if not affordable:
+            cheap_local = [p for p in locals_ if spent + _cost_usd(p, in_tok, out_tok) <= budget.usd_cap]
+            if cheap_local:
+                return decision(_pick(cheap_local, effort, in_tok, out_tok, req.sensitivity), "spill-budget")
+            return decision(None, "budget-exhausted")
+        pool = affordable
+
+    # 4)+6) Cost/effort scoring + deterministic tie-break
+    best = _pick(pool, effort, in_tok, out_tok, req.sensitivity)
+    if force_local or best.capabilities.local:
+        reason = "local-sovereign"
+    elif base_reason == "spill-load":
+        reason = "spill-load"
+    else:
+        reason = "cost-fit"
+    return decision(best, reason)

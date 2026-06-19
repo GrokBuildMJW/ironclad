@@ -95,6 +95,23 @@ DEFAULT_BASE_URL = "http://localhost:8000/v1"   # generischer Default; echter En
 DEFAULT_API_KEY  = "not-needed"
 DEFAULT_MODEL    = "qwen3.6-35b"   # aktuelles Orchestrator-Modell; echter Endpoint via conf/connection
 DEFAULT_PROMPT   = "prompts/GX10_Orchestrator_SystemPrompt.md"
+_ORCH_VERSION: Optional[str] = None
+
+
+def orchestrator_version() -> str:
+    """The orchestrator build identity (surfaced in /health + at boot). Read once, then cached.
+    Source order: env GX10_ORCHESTRATOR_VERSION → a sibling VERSION file (written by the deploy/install
+    stamp) → "unknown". Pure read — NO git/SHA logic in core (the deploy stamps it); generic + secret-free."""
+    global _ORCH_VERSION
+    if _ORCH_VERSION is None:
+        v = os.environ.get("GX10_ORCHESTRATOR_VERSION")
+        if not v:
+            try:
+                v = (Path(__file__).resolve().parent / "VERSION").read_text(encoding="utf-8").strip()
+            except OSError:
+                v = ""
+        _ORCH_VERSION = v or "unknown"
+    return _ORCH_VERSION
 DEFAULT_WORKDIR  = "."           # WORKDIR: Arbeitsort (CWD-Verhalten wie bisher)
 CODE_ROOT        = ""            # optionaler Code-Root für den Handover-Pfad-Guard
                                  # (vessel-spezifisch, z. B. ein Service-Unterordner
@@ -212,6 +229,9 @@ _WARM: Optional[Any] = None
 #: Phase-e reasoning fan-out (engine/workers.py). Set by the server; stays None in the
 #: monolithic CLI, so the parallel tool is offered only where the governed workers exist.
 _WORKERS: Optional[Any] = None
+#: P0 provider router — set at server boot beside _WORKERS (server.py). None or inactive ⇒
+#: parallel_reason uses today's _WORKERS.fanout path, byte-identically.
+_DISPATCHER: Optional[Any] = None
 #: §3c MAP — when True, each fan-out worker gets its own per-item retrieved context (memory
 #: read-citizen) PLUS the shared rolling-summary floor. Default ON (06-18); set False /
 #: GX10_WORKER_MEMORY=0 for the stateless fan-out. Config workers.memory_read.
@@ -2068,13 +2088,39 @@ def run_tool(name: str, args: Dict[str, Any]) -> str:
             floor = _worker_shared_floor()
             system = ((instruction + "\n\n" + floor) if instruction else floor) if floor else instruction
             contexts = _worker_contexts(items)
-            results = _WORKERS.fanout(
-                items,
-                system=system,
-                contexts=contexts,
-                max_tokens=int(mt) if mt else None,
-                think=True,
-            )
+            # P0: when the provider router is active (enabled + a pool), route each item to its
+            # provider (Spark fanout / external CLI) under per-substrate governors; otherwise the
+            # exact, byte-identical fanout path below. system/contexts/mt/instruction are REUSED
+            # (so §3c-MAP still applies). Lazy imports → no top-level import churn when off.
+            if _DISPATCHER is not None and _DISPATCHER.active():
+                from router import Budget, LoadSignal, RouteRequest
+                from dispatch import DispatchPolicy
+                probe = getattr(_DISPATCHER, "chat_busy_probe", None)
+                load = LoadSignal(
+                    spark_chat_busy=bool(probe()) if callable(probe) else False,
+                    spark_batch_width=_WORKERS.max_concurrency,
+                )
+                eff = args.get("effort", "medium")
+                reqs = [
+                    RouteRequest(index=i, effort=eff,
+                                 est_input_chars=len(it) + len((contexts[i] if contexts else "") or ""))
+                    for i, it in enumerate(items)
+                ]
+                _pcfg = (_EFFECTIVE_CFG or {}).get("providers") or {}
+                budget = Budget(usd_cap=(_pcfg.get("budget") or {}).get("usd_cap"))
+                results = _DISPATCHER.dispatch(
+                    items, contexts=contexts,
+                    policy=DispatchPolicy(reqs, system=system, load=load, budget=budget),
+                    max_tokens=int(mt) if mt else None, think=True,
+                )
+            else:
+                results = _WORKERS.fanout(
+                    items,
+                    system=system,
+                    contexts=contexts,
+                    max_tokens=int(mt) if mt else None,
+                    think=True,
+                )
             # §3c REDUCE: single-writer consolidation of the OK outputs into ONE cold write
             # (flag-gated, fail-soft, fire-and-forget) — no parallel-write races. Off ⇒ no-op.
             _reduce_worker_results(results, topic=(instruction or ""))
@@ -2197,12 +2243,13 @@ class GX10:
             _ui_print(col(f"[WARN] not found: {p}", C.YELLOW))
 
     def save_session(self):
+        # Silent by design: called after every turn (see _dispatch) — a per-turn "[OK] session saved"
+        # would stream into the client as noise. Only a real failure is surfaced.
         try:
             Path(SESSION_FILE).write_text(
                 json.dumps({"messages": self.messages}, ensure_ascii=False, indent=2),
                 encoding="utf-8"
             )
-            _ui_print(col(f"[OK] session saved: {SESSION_FILE}", C.GRAY))
         except Exception as e:
             _ui_print(col(f"[WARN] session not saved: {e}", C.YELLOW))
 
@@ -2869,6 +2916,9 @@ HELP = """
     clear            clear the context (the prompt stays)
     status           context info (incl. streaming/thinking/max_tokens)
     config           the effectively-loaded CLI config + source
+    config get <key>          read a dotted config key (e.g. mpr.enabled)
+    config set <key> <value>  override a dotted config key at runtime
+                              (on|off|true|false|num|str; e.g. mpr.enabled on)
     reload           reload gx10.py (the session stays)
     watcher on|off        enable / disable the feedback watcher
     autopilot on|off      toggle autopilot (auto-launch of Claude)
@@ -2910,6 +2960,107 @@ def _render_config() -> str:
     ])
 
 
+# ─── Runtime config control (/config get|set) ─────────────────
+# Generic, plugin-agnostic runtime override of the live config tree. `/config set <dotted.key> <value>`
+# writes the merged in-memory config (_EFFECTIVE_CFG) and re-derives the engine globals via _apply_config;
+# plugin sections (e.g. an `mpr` block read by the MPR plugin per request) take effect on their next call.
+# Secret-free + no plugin-specific knowledge here — see docs/config-runtime.md.
+#
+# Frozen keys are BOOT-ONLY: they wire something at startup (e.g. the offload runner for `setup.type`),
+# so a runtime mutation would be incoherent. `/config set` refuses them; `/config get` still reads them.
+_FROZEN_CONFIG_KEYS = frozenset({"setup.type"})
+
+
+def _coerce_cfg_value(raw: str):
+    """CLI string → bool/int/float/str. on|true|yes → True, off|false|no → False; else numeric, else str."""
+    low = raw.strip().lower()
+    if low in ("on", "true", "yes"):
+        return True
+    if low in ("off", "false", "no"):
+        return False
+    try:
+        return int(raw)
+    except ValueError:
+        pass
+    try:
+        return float(raw)
+    except ValueError:
+        pass
+    return raw
+
+
+def _cfg_set(cfg: Dict[str, Any], dotted: str, value) -> None:
+    """Write a dotted key path into *cfg*, creating intermediate dict sections as needed."""
+    keys = dotted.split(".")
+    node = cfg
+    for k in keys[:-1]:
+        nxt = node.get(k)
+        if not isinstance(nxt, dict):
+            nxt = {}
+            node[k] = nxt
+        node = nxt
+    node[keys[-1]] = value
+
+
+def _cfg_get(cfg: Dict[str, Any], dotted: str):
+    """Read a dotted key path from *cfg*; None if any segment is missing."""
+    node: Any = cfg
+    for k in dotted.split("."):
+        if not isinstance(node, dict) or k not in node:
+            return None
+        node = node[k]
+    return node
+
+
+# ─── Setup type (server | local) → offload runner wiring ──────
+# Boot-only derivation: the setup.type (offload-topology.md) selects WHERE the orchestrator + agents run,
+# and thus how the provider dispatcher's runner is wired. Orchestrator + agents are ALWAYS co-located
+# (one machine) — no cross-machine offload. Generic + secret-free (role names only). Fail-CLOSED on a
+# misconfigured topology (the server aborts boot rather than silently degrading).
+#   server (default): everything on the model host → in-engine only (external agents deferred); byte-identical.
+#   local:            engine + agents native on the desktop → offload = local subprocess (default_cli_runner);
+#                     the model + memory live remotely (over the network), so base_url must be REMOTE.
+_VALID_SETUP_TYPES = ("server", "local")
+
+
+def _is_local_url(url: str) -> bool:
+    """True if *url*'s host is loopback (localhost/127.0.0.1/::1) — used to reject a `local` setup that
+    points at an in-box model instead of the remote model host."""
+    import urllib.parse
+    host = (urllib.parse.urlsplit(url or "").hostname or "").lower()
+    return host in ("localhost", "127.0.0.1", "::1", "")
+
+
+def resolve_offload_topology(cfg: Dict[str, Any], *, cli_available: bool = True) -> Dict[str, Any]:
+    """Derive the runner wiring from the boot-fixed ``setup.type`` (offload-topology.md).
+
+    Returns ``{"setup_type", "providers_enabled", "runner_mode", "note"?}`` with
+    ``runner_mode`` ∈ {``"none"``, ``"local"``}. Pure + testable (``cli_available`` injected). Raises
+    ``ValueError`` (fail-closed) on an unknown or misconfigured topology. ``security.profile=sealed``
+    forces ``server`` (no egress), overriding any setup.type.
+    """
+    setup_type = ((cfg.get("setup") or {}).get("type") or "server").strip().lower()
+    if setup_type not in _VALID_SETUP_TYPES:
+        raise ValueError(f"unknown setup.type={setup_type!r} (expected one of {', '.join(_VALID_SETUP_TYPES)}).")
+    profile = (cfg.get("security") or {}).get("profile", "open")
+    # sealed = no egress → no external agents, regardless of setup.type → force server/in-engine.
+    if profile == "sealed" and setup_type != "server":
+        return {"setup_type": "server", "providers_enabled": False, "runner_mode": "none",
+                "note": f"sealed profile forces server (no egress); setup.type={setup_type} ignored"}
+    if setup_type == "server":
+        return {"setup_type": "server", "providers_enabled": False, "runner_mode": "none"}
+    # local
+    base_url = (cfg.get("connection") or {}).get("base_url", "")
+    if _is_local_url(base_url):
+        raise ValueError("setup.type=local requires a REMOTE base_url (the model runs on the GPU host; "
+                         "the engine co-locates with the code CLIs). Got a loopback endpoint — set "
+                         "GX10_BASE_URL to the remote model.")
+    if not cli_available:
+        raise ValueError("setup.type=local requires a reachable agent CLI on this host (none found via "
+                         "PATH). Install it or set GX10_CLAUDE_BIN/GX10_AGENT_CMD.")
+    return {"setup_type": "local", "providers_enabled": True, "runner_mode": "local"}
+
+
 # ─── Dispatcher ───────────────────────────────────────────────
 def _dispatch(agent: GX10, user_input: str):
     cmd = user_input.lower()
@@ -2921,6 +3072,27 @@ def _dispatch(agent: GX10, user_input: str):
         _ui_print(agent.status())
     elif cmd == "config":
         _ui_print(_render_config())
+    elif cmd.startswith("config get "):
+        key = user_input.split(None, 2)[2].strip()
+        val = _cfg_get(_EFFECTIVE_CFG if _EFFECTIVE_CFG is not None else _code_defaults(), key)
+        _ui_print(col(f"  {key} = {val!r}" if val is not None else f"  {key} = (not set)", C.CYAN))
+    elif cmd.startswith("config set "):
+        parts = user_input.split(None, 3)            # config set <dotted.key> <value...>  (original case)
+        if len(parts) < 4:
+            _ui_print(col("  usage: /config set <dotted.key> <value>", C.YELLOW))
+        elif _EFFECTIVE_CFG is None:
+            _ui_print(col("  [config] no live config to set (start the server first)", C.YELLOW))
+        elif parts[2].strip() in _FROZEN_CONFIG_KEYS:
+            _ui_print(col(f"  [config] '{parts[2].strip()}' is boot-only — set it in the deploy "
+                          f"(env/config-file), not at runtime.", C.YELLOW))
+        else:
+            key, val = parts[2].strip(), _coerce_cfg_value(parts[3])
+            _cfg_set(_EFFECTIVE_CFG, key, val)
+            try:
+                _apply_config(_EFFECTIVE_CFG)        # re-derive core globals; plugin sections re-read per call
+            except Exception as e:  # noqa: BLE001 — non-core key (e.g. a plugin section) → dict write stands
+                _ui_print(col(f"  [config] stored (not a core global: {e!r})", C.GRAY))
+            _ui_print(col(f"  [config] set {key} = {val!r}", C.GREEN))
     elif cmd.startswith("read "):
         _ui_print(agent.manual_read(user_input[5:].strip()))
     elif cmd.startswith("write "):
@@ -3036,6 +3208,10 @@ def _dispatch(agent: GX10, user_input: str):
         _ui_print(agent.context_report())
     else:
         agent.run(user_input)
+        # LOK-1: persist the LLM context after each real turn so it survives an orchestrator restart.
+        # In local mode the orchestrator is ephemeral (started per local-mode launch, stopped on client
+        # exit); load_session() runs on boot (server.py) but nothing wrote the file. Silent save.
+        agent.save_session()
 
 # ─── Autopilot: Handover → Claude starten (API-frei) ─────────
 _HO_AGENT_RE = re.compile(r"_([A-Za-z]+)\.md$")
@@ -3433,6 +3609,16 @@ def _code_defaults() -> Dict[str, Any]:
             "session_heartbeat_s": 30,
             "code_locality":       "mount",   # sealed forces "local"
         },
+        "setup": {
+            # Boot-fixed deployment topology (vault offload-topology.md). NOT runtime-switchable — a frozen
+            # key (`/config set setup.type` is refused). Orchestrator + agents are ALWAYS co-located; the
+            # setup.type just says on WHICH machine. Generic, secret-free:
+            #   server (default): everything on the model host → in-engine only (external agents deferred);
+            #                     byte-identical to a no-provider deployment.
+            #   local:            engine + agents native on the desktop → offload = local subprocess; the
+            #                     model + memory live remotely (base_url/memory_url point over the network).
+            "type": "server",
+        },
         "workers": {
             # Phase-e reasoning fan-out governor (engine/workers.py). CONSERVATIVE,
             # model-agnostic defaults — safe for an unknown endpoint, NOT tuned. The
@@ -3445,6 +3631,20 @@ def _code_defaults() -> Dict[str, Any]:
             "memory_read":      WORKER_MEMORY,      # §3c MAP: per-item RAG + shared floor (Default AUS)
             "memory_write":     WORKER_WRITE,       # §3c REDUCE: single-writer cold consolidation (Default AUS)
             "write_mode":       WORKER_WRITE_MODE,  # "reducer" (Default) | "direct" (autonome Agenten)
+        },
+        "providers": {
+            # P0 provider router (engine/providers.py + router.py + dispatch.py). Default EMPTY/OFF →
+            # parallel_reason stays on _WORKERS.fanout, byte-identical. The private deploy supplies the
+            # real pool (models, $/token, endpoints) in conf/ — NO provider literal in core/.
+            "enabled":     False,            # global on/off; off ⇒ dispatcher delegates to _WORKERS
+            "default_id":  None,
+            "max_agents":  3,                # server CLI-pool cap (own default; NOT == client --max-agents)
+            "cli_timeout_s": None,           # timeout for default_cli_runner (None ⇒ no timeout)
+            "effort_max_tokens": {"low": 512, "medium": 1024, "high": 2048, "xhigh": 4096},
+            "scoring":     {"w_cost": 1.0, "w_sensitivity": 0.5, "cost_norm_usd": 0.10,
+                            "input_chars_per_token": 4},
+            "budget":      {"usd_cap": None},
+            "pool":        [],               # no default providers hard-coded (boundary); conf/ fills it
         },
         "onboarding": {
             "enabled": ONBOARDING_MODE,
@@ -3625,12 +3825,18 @@ def _apply_env(cfg: Dict[str, Any]) -> Dict[str, Any]:
     setif("GX10_PROFILE",          "security", "profile")
     setif("GX10_SESSION_HEARTBEAT","security", "session_heartbeat_s", int)
     setif("GX10_CODE_LOCALITY",    "security", "code_locality")
+    setif("GX10_SETUP_TYPE",       "setup",    "type")    # boot-fixed offload topology (offload-topology.md)
     setif("GX10_PLUGINS_DIR",            "paths",    "plugins_dir")
     setif("GX10_FANOUT_CONCURRENCY",     "workers", "concurrency",      int)
     setif("GX10_WORKERS_MAX_TOKENS",     "workers", "max_tokens",       int)
     setif("GX10_WORKERS_MAX_BATCH_TOKENS","workers", "max_batch_tokens", int)
     _truthy = lambda v: v.strip().lower() in ("1", "true", "yes", "on", "an")
     setif("GX10_ONBOARDING", "onboarding", "enabled", _truthy)
+    setif("GX10_PROVIDERS",              "providers", "enabled",   _truthy)   # P0 router on/off (A/B switch)
+    setif("GX10_PROVIDERS_DEFAULT",      "providers", "default_id")           # default provider id
+    setif("GX10_PROVIDERS_BUDGET_USD",   "providers", "budget", lambda v: {"usd_cap": float(v)})  # run budget
+    setif("GX10_PROVIDERS_MAX_AGENTS",   "providers", "max_agents", int)      # server CLI-pool cap
+    setif("GX10_PROVIDERS_CLI_TIMEOUT_S","providers", "cli_timeout_s", int)   # CLI spawn timeout
     setif("GX10_CONTEXT_SUMMARY",    "context", "summarize_evicted",  _truthy)   # B1-Schalter
     setif("GX10_SUMMARY_MAX_TOKENS", "context", "summary_max_tokens", int)
     setif("GX10_CONTEXT_RAG",        "context", "rag_enabled",        _truthy)   # B2-Schalter
