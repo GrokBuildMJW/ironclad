@@ -29,9 +29,12 @@ You need: Python 3.10+ and a reachable model endpoint. That's it.
 
 ## Worked example — watch it build something
 
-Start the orchestrator and ask for something concrete:
+Start the orchestrator, **create a vorhaben** (a named workspace — this is required before any
+artefact-producing work; see [`state-and-vorhaben.md`](state-and-vorhaben.md)), then ask for something
+concrete:
 
 ```text
+> /vorhaben new calc-demo --typ software
 > Build a function add(a, b) in calc.py that returns a + b,
   plus a pytest test that checks add(2, 3) == 5. Run the test and make sure it's green.
 ```

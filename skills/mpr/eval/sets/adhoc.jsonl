@@ -1,0 +1,8 @@
+{"id": "adhoc-001", "domain": "adhoc", "mode": "decision", "evidence_source": "mixed", "route_hint": null, "query": "Sollten wir Remote-First bleiben oder zu einem Hybrid-Office-Modell wechseln?"}
+{"id": "adhoc-002", "domain": "adhoc", "mode": "decision", "evidence_source": "mixed", "route_hint": null, "query": "Lohnt sich der Aufbau eines eigenen Entwickler-Tooling-Teams gegenüber Standardwerkzeugen?"}
+{"id": "adhoc-003", "domain": "adhoc", "mode": "decision", "evidence_source": "mixed", "route_hint": null, "query": "Wie sollten wir unsere Open-Source-Strategie zwischen Offenheit und Monetarisierung austarieren?"}
+{"id": "adhoc-004", "domain": "adhoc", "mode": "decision", "evidence_source": "mixed", "route_hint": null, "query": "Sollten wir in eigene KI-Modelle investieren oder auf Drittanbieter setzen?"}
+{"id": "adhoc-005", "domain": "adhoc", "mode": "decision", "evidence_source": "mixed", "route_hint": null, "query": "Wie bewerten wir den Trade-off zwischen schnellem Wachstum und nachhaltiger Profitabilität?"}
+{"id": "adhoc-006", "domain": "adhoc", "mode": "decision", "evidence_source": "mixed", "route_hint": null, "query": "Sollten wir unsere Preisstruktur von Seat-based auf Usage-based umstellen?"}
+{"id": "adhoc-007", "domain": "adhoc", "mode": "decision", "evidence_source": "mixed", "route_hint": null, "query": "Welche Strategie sollten wir für den Markteintritt in eine neue Region wählen?"}
+{"id": "adhoc-008", "domain": "adhoc", "mode": "decision", "evidence_source": "mixed", "route_hint": null, "query": "Sollten wir technische Schulden abbauen oder neue Features priorisieren?"}

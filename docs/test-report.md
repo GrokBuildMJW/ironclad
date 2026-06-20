@@ -1,17 +1,18 @@
 # Test report
 
 > Maximum transparency: this is the actual state of testing, including issues found
-> **and fixed** during the campaign. Run date **2026-06-18** (offline suite re-confirmed;
-> live verification 2026-06-17). For per-component wiring status see
+> **and fixed** during the campaign. Counts re-confirmed **2026-06-20** (offline suite; live
+> verification 2026-06-17). For per-component wiring status see
 > [`status.md`](status.md); for what's planned see [`roadmap.md`](roadmap.md).
 
 ## Summary
 
 | | |
 |---|---|
-| Automated tests (offline, no model) | **227 passed** |
-| Live smoke tests (against a running deployment) | **9 passed** |
-| **Total** | **236** |
+| Automated tests (offline, no model) | **453 passed** |
+| Live smoke tests (skipped without a model) | **9** |
+| **Total Python** | **462** |
+| TypeScript client tests (`node:test`) | **328 passed** (332 total, 4 live-skipped) |
 | Full agentic loop, end to end, with a **real** code-agent | **verified** |
 | Issues found during the campaign | **1 functional gap + 5 review findings — all found and fixed** (see below) |
 
@@ -23,7 +24,7 @@ default** and only runs when pointed at a real server.
 
 ```bash
 # 1) offline suite — deterministic, no model needed
-pytest -q                                   # from core/  → 227 passed, 9 skipped
+pytest -q                                   # from core/  → 453 passed, 9 skipped
 
 # 2) live smoke — against your own running orchestrator
 GX10_LIVE_URL=http://<your-host>:8100 pytest -k live -q     # 9 passed
@@ -32,17 +33,23 @@ GX10_LIVE_URL=http://<your-host>:8100 pytest -k live -q     # 9 passed
 
 ## Coverage by area
 
+Counts below are reproduced from `pytest --collect-only` (2026-06-20) and sum to
+the **462** total (453 offline + 9 live).
+
 | Area | Test files | Tests |
 |------|-----------|-------|
 | **Agent-Contract-Kernel** (schema SSOT, validate→reask, constrained emission, registry) | `registry`, `case_spec`, `constrained_emission`, `validated_emit`, `engine_ack_gate`, `lodestar_tracking` | 87 |
 | **Function-calling robustness** (tool-arg validate→reask, model-agnostic recovery) | `tool_args`, `tool_extract` | 24 |
-| **Server / client split & security** (HTTP surface, trust profiles, sessions, sealing, config tree, command router, doctor, server-side tool bridge) | `server_split`, `security`, `config_tree`, `commands`, `doctor_endpoint`, `tool_bridge` | 49 |
-| **Open plugin surface** (discover + expose `skills/*` plugins, no core patch) | `plugins` | 6 |
-| **Orchestration state** (TaskStore lifecycle/dedup, autoplan) | `taskstore`, `autoplan` | 13 |
-| **Parallelism** (governed fan-out, in-engine tool) | `workers`, `parallel_tool` | 14 |
+| **Server / client split & security** (HTTP surface, trust profiles, sessions, sealing, config tree + runtime config, command router, doctor, server-side tool bridge) | `server_split`, `security`, `config_tree`, `config_runtime`, `commands`, `doctor_endpoint`, `tool_bridge`, `session_persist` | 76 |
+| **Provider-router / dispatch (P0)** (backend registry, routing policy, artifact routing, spill/fallback, setup-types) | `dispatch`, `router`, `providers`, `providers_config`, `artifact_routing`, `offload_topology` | 69 |
+| **Memory & context** (Mem0 client, chunking, RAG, summary, deep query, vault reconcile, warm tier) | `memory`, `memory_chunking`, `worker_memory`, `context_rag`, `context_summary`, `deep_query`, `reconcile_vault`, `warm` | 77 |
+| **Open plugin surface** (discover + expose `skills/*` plugins, no core patch) | `plugins` | 7 |
+| **Orchestration state** (TaskStore lifecycle/dedup, vorhaben, autoplan, state e2e) | `taskstore`, `vorhaben`, `autoplan`, `state_e2e` | 40 |
+| **Parallelism** (governed fan-out, in-engine tool, single-writer reduce, parallel router) | `workers`, `parallel_tool`, `worker_reduce`, `parallel_router` | 29 |
 | **Thin client + BYO code-agent** (agent pool, `GX10_AGENT_CMD` template, managed transport) | `client_pool`, `client_transport` | 14 |
-| **Runtime-aware output** (encoding safety, color gating) | `output` | 9 |
-| **Memory & language** (Mem0 client, reply language) | `memory`, `language` | 10 |
+| **Runtime-aware output & language** (encoding safety, color gating, reply language) | `output`, `language` | 14 |
+| **Token budget / context trimming** | `token_budget` | 8 |
+| **Misc** (manual cat tool, orchestrator version) | `manual_cat`, `version` | 7 |
 | **Demo vessel** (example workspace doctor preflight) | `demo_vessel` | 1 |
 | **Live smoke** (real model, all endpoints) | `live_smoke` | 9 |
 

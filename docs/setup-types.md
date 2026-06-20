@@ -5,7 +5,9 @@ code agents are **always co-located** on one machine — there is no cross-machi
 at startup** and wires the provider dispatcher's runner; it is **not** runtime-switchable (a
 [frozen key](config-runtime.md) — `/config set setup.type` is refused).
 
-Pick **one** value at deploy time (config file, `GX10_SETUP_TYPE`, or a CLI flag). There are **exactly two**
+Pick **one** value at deploy time — set it in the **config file** (`setup.type`) or via the
+**`GX10_SETUP_TYPE`** env var (there is no CLI flag for it). It is a [frozen config key](config-runtime.md):
+`/config get setup.type` reads it, `/config set setup.type …` is refused. There are **exactly two**
 values; the dispatcher code is the same for both — only *which runner closure* is injected at boot differs.
 
 | `setup.type` | Where the engine + agents run | Model + memory | Code agents | Effect |
@@ -26,9 +28,17 @@ At startup the engine derives the wiring from `setup.type` and **aborts with a c
 silently degrading when the mode can't be honored:
 
 - `server` → dispatcher inactive; in-engine only; byte-identical to running without any provider pool.
-- `local` → requires a **remote** `base_url` (the model lives elsewhere; the engine sits with the CLIs)
-  **and** a reachable agent CLI on `PATH`; otherwise the server **fails closed**.
+- `local` → requires a **remote** `base_url` (a loopback endpoint fails closed — the model lives elsewhere;
+  the engine sits with the CLIs) **and** a reachable agent CLI. The boot probe resolves
+  **`GX10_CLAUDE_BIN`** (default `claude`) on `PATH` via `shutil.which`; if you point the agent at a
+  different binary through the `GX10_AGENT_CMD` template, make sure that binary is the one on `PATH`.
+  Missing remote URL or missing CLI → the server **fails closed** (no silent degrade).
 - An unknown value → fails closed.
+
+**`setup.type` is the single boot control for dispatcher activation.** Whether the provider dispatcher
+runs is derived from `setup.type` alone (`server` → inactive, `local` → active); a `providers.enabled` /
+`GX10_PROVIDERS` flag does **not** gate activation and is not consulted at this level. Configure the
+topology with `setup.type`, not with a separate provider on/off switch.
 
 **Security override:** with `security.profile = sealed` (no egress) the engine is forced to `server`
 (in-engine only) regardless of `setup.type`. Items classified local-only/sensitive are never sent to an

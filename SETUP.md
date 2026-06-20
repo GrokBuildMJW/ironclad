@@ -79,10 +79,14 @@ env vars → CLI flags**. The simplest path is env vars:
 | `GX10_BASE_URL`   | OpenAI-compatible base URL               | `http://localhost:8000/v1`  |
 | `GX10_MODEL`      | served model name                        | `qwen3.6-35b`               |
 | `GX10_API_KEY`    | API key (only if your endpoint needs one)| `not-needed`                |
-| `GX10_WORKDIR`    | workspace (tasks/, summaries/, session)  | `.`                         |
+| `GX10_WORKDIR`    | code root; engine state → `.ironclad/`, artifacts → `vault/<slug>/` | `.`              |
 | `GX10_MAX_TOKENS` | output token cap                         | `8192`                      |
 | `GX10_THINKING`   | `auto` \| `first` \| `off` \| `all`      | `auto`                      |
 | `GX10_LANGUAGE`   | reply language (`en`,`de`,`fr`,…)        | `en`                        |
+| `GX10_SETUP_TYPE` | operating mode `server` \| `local` (boot-only/frozen — see [`docs/setup-types.md`](docs/setup-types.md)) | `server` |
+
+> More config than these few common vars (security, memory, autopilot, …) is steerable at runtime via
+> `/config get\|set` — see [`docs/config-runtime.md`](docs/config-runtime.md).
 
 Or drop a `gx10.config.json` next to where you run it:
 

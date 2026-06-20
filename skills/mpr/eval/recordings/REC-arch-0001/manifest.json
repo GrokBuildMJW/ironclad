@@ -1,0 +1,152 @@
+{
+  "schema_version": "1",
+  "run_id": "REC-arch-0001",
+  "created_at": "2026-06-19T00:00:00Z",
+  "finished_at": null,
+  "task_id": null,
+  "status": "ok",
+  "audit_level": "full-per-perspective",
+  "query": {
+    "text": "Sollen wir den Modulithen vor der Skalierung auf fünf Teams in Microservices aufteilen?",
+    "route_hint": null,
+    "attached_files": []
+  },
+  "router_decision": {
+    "decision": "run",
+    "decline_reason": null,
+    "route": "wide",
+    "domain": "adhoc",
+    "mode": "decision",
+    "synthesis_template": "decision-matrix",
+    "evidence_source": "internal",
+    "router_version": "1",
+    "guards": {}
+  },
+  "perspectives": [
+    {
+      "index": 1,
+      "role": "Evolvierbarkeit",
+      "lens_prompt": "Bewerte Wartbarkeit, Modulgrenzen und Änderungsfreundlichkeit der beiden Optionen.",
+      "effort": "high",
+      "provider": "spark-vllm",
+      "model": null,
+      "substrate": "in-engine",
+      "provider_policy": "local-only",
+      "prompt_hash": "sha256:1e1a51f41269a68a",
+      "context_sources": [],
+      "max_tokens": null,
+      "tokens": {
+        "prompt": 44,
+        "completion": 120,
+        "prompt_estimated": true
+      },
+      "latency_s": 0.1,
+      "cost": {
+        "currency": "USD",
+        "amount": 0.0,
+        "estimated": true
+      },
+      "ok": true,
+      "error": null,
+      "artifact": "perspective_01.md"
+    },
+    {
+      "index": 2,
+      "role": "Betrieb/SRE",
+      "lens_prompt": "Bewerte Betriebslast, Observability, Deploy-Komplexität und Ausfalldomänen.",
+      "effort": "medium",
+      "provider": "spark-vllm",
+      "model": null,
+      "substrate": "in-engine",
+      "provider_policy": "local-only",
+      "prompt_hash": "sha256:166a62a0666ee6be",
+      "context_sources": [],
+      "max_tokens": null,
+      "tokens": {
+        "prompt": 42,
+        "completion": 120,
+        "prompt_estimated": true
+      },
+      "latency_s": 0.1,
+      "cost": {
+        "currency": "USD",
+        "amount": 0.0,
+        "estimated": true
+      },
+      "ok": true,
+      "error": null,
+      "artifact": "perspective_02.md"
+    },
+    {
+      "index": 3,
+      "role": "Kosten/TCO",
+      "lens_prompt": "Bewerte Gesamtkosten: Infrastruktur, Personal, Migrationsaufwand über die Zeit.",
+      "effort": "medium",
+      "provider": "spark-vllm",
+      "model": null,
+      "substrate": "in-engine",
+      "provider_policy": "local-only",
+      "prompt_hash": "sha256:5cdbfc859eecdb1f",
+      "context_sources": [],
+      "max_tokens": null,
+      "tokens": {
+        "prompt": 43,
+        "completion": 120,
+        "prompt_estimated": true
+      },
+      "latency_s": 0.1,
+      "cost": {
+        "currency": "USD",
+        "amount": 0.0,
+        "estimated": true
+      },
+      "ok": true,
+      "error": null,
+      "artifact": "perspective_03.md"
+    }
+  ],
+  "provenance": {
+    "sovereignty_ok": true,
+    "egress": [],
+    "violations": []
+  },
+  "synthesis": {
+    "input": [],
+    "conflicts": [],
+    "output": null,
+    "synthesis_provider": null,
+    "synthesis_model": null,
+    "synthesis_tokens": {
+      "prompt": null,
+      "completion": null,
+      "prompt_estimated": true
+    },
+    "synthesis_latency_s": null
+  },
+  "final_answer": "| Kriterium (Gew.) | Modulith behalten | In Microservices aufteilen |\n|---|--:|--:|\n| Evolvierbarkeit (×3) | 3 | 4 |\n| Betriebslast (×2) | 5 | 2 |\n| TCO (×2) | 5 | 2 |\n| **Gewichteter Score** | **29** | **20** |\n\n**Empfehlung:** **Modulith behalten** — Bis fünf Teams überwiegen niedrigere Betriebslast und TCO; die Evolvierbarkeits-Lücke ist mit einem modularen Schnitt schließbar.\n**Rückzugsoption:** In Microservices aufteilen — auslösen wenn klare, stabile Domänengrenzen ODER >5 Teams mit Deploy-Konflikten.",
+  "inputs": {
+    "seed": "mpr-seed-1",
+    "rendered_prompts": [],
+    "registry_snapshot": null
+  },
+  "metrics": {
+    "n_perspectives": 0,
+    "n_ok": 0,
+    "total_completion_tokens": 0,
+    "wallclock_s": 0.0,
+    "total_cost": {
+      "currency": "USD",
+      "amount": 0.0,
+      "estimated": true
+    },
+    "n_written": 0
+  },
+  "security": null,
+  "budget": null,
+  "sovereignty_summary": {
+    "local_only_count": 3,
+    "offloaded_count": 0,
+    "external_egress_providers": [],
+    "violations": 0
+  }
+}

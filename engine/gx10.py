@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Ironclad orchestration engine — agent loop, deterministic TaskStore, fail-closed
-macros (advance_pipeline / stage_handover), config-tree loader, and the interactive
-CLI. Runs against any OpenAI-compatible endpoint; every model-emitted task_json is
-validated against the ACK contract at the stage_handover boundary.
+Ironclad orchestration engine **library** — agent loop, deterministic TaskStore,
+fail-closed macros (advance_pipeline / stage_handover), config-tree loader. Runs
+against any OpenAI-compatible endpoint; every model-emitted task_json is validated
+against the ACK contract at the stage_handover boundary.
+
+The standalone monolithic CLI was **removed** — the system is now a headless
+server (`server.py`) plus a thin client (`client.py` / the TS `clients/ink/`).
+This module is imported by the server; running it directly exits with a pointer
+(see `_REMOVED_MSG`).
 
 Key design points:
   - Macro tools collapse multi-step workflows into a single deterministic call
@@ -16,11 +21,7 @@ Key design points:
     emitter turns it off per-request for reliable structured output.
 
 Default system prompt: prompts/GX10_Orchestrator_SystemPrompt.md.
-
-Examples:
-    python gx10.py
-    python gx10.py --thinking off   # fastest
-    python gx10.py --prompt prompts/GX10_Orchestrator_SystemPrompt.md
+Start the system via the server: see SETUP.md.
 """
 
 import os
@@ -148,7 +149,15 @@ MAX_FILE_CHARS   = 24_000        # PERF-05: read_file-Cap (Head+Tail)
 LIST_DIR_HARD_CAP = 200          # HV-B: harter Cap in list_directory
 TEMPERATURE      = 0.3
 RETRY_BACKOFF    = 1.5           # OPT-4: Wartezeit (s) vor 1× Retry bei API-Fehler
-SESSION_FILE     = ".gx10_session.json"
+# Engine-Maschinerie liegt versteckt unter STATE_ROOT (vorhaben-unabhängig): session.json, der
+# lokale Warm-Cache (memory/), config.json/active (ITYPE). Relativ zum WORKDIR (nach chdir = CWD),
+# per cfg["paths"]["state_root"] (Default ".ironclad") überschreibbar — auch absolut. Boundary
+# clean (kein privates Literal). Helper: state_root() / session_path().
+STATE_ROOT       = ".ironclad"
+SESSION_FILE     = "session.json"   # Basename, aufgelöst unter STATE_ROOT (war ".gx10_session.json" im Root)
+# Sichtbare Wissens-Wurzel (Obsidian-navigierbar): vault/<slug>/ je Vorhaben. Engine-Maschinerie
+# ist STATE_ROOT, WISSEN ist VAULT_ROOT — strikt getrennt. Per cfg["paths"]["vault_root"] überschreibbar.
+VAULT_ROOT       = "vault"
 SPINNER_FRAMES   = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 UI_REFRESH_INTERVAL = 0.1        # prompt_toolkit Application-Refresh
 
@@ -188,7 +197,7 @@ AUTOPILOT_ENABLED        = False
 AUTOPILOT_CLAUDE_BIN     = "claude"
 AUTOPILOT_EXTRA_ARGS     = ["--dangerously-skip-permissions"]
 AUTOPILOT_DEFAULT_EFFORT = "medium"
-AUTOPILOT_LOGS_DIR       = "logs"
+AUTOPILOT_LOGS_DIR       = "logs"     # unter state_root() aufgelöst (.ironclad/logs); absoluter Pfad verbatim
 AUTOPILOT_MAX_CONCURRENT = 1            # 1 = sequentiell; >1 parallel; 0 = unbegrenzt
 AUTOPILOT_STREAM         = False        # Live-Log-Streaming (claude --verbose --output-format stream-json); Default AUS
 AUTOPILOT_TERMINATE_ON_ADVANCE = False  # beim advance die zugehörige claude-Session beenden; Default AUS
@@ -203,21 +212,436 @@ AUTOPILOT_LOG_TERMINAL   = False        # Bei jedem Autopilot-Start neues Termin
 # Kimi wurde am 2026-06-15 durch Sonnet ersetzt. "KIMI" bleibt nur als
 # Legacy-Alias und wird überall transparent auf SONNET normalisiert
 # (Claude Code CLI + claude-sonnet-4-6). Keine Kimi-CLI-Plumbing mehr.
-WATCHER_FEEDBACK_DIR = "summaries/feedback"   # Watch-Pfad (relativ zum WORKDIR)
+WATCHER_FEEDBACK_DIR = "feedback"   # Name der Feedback-Inbox unter <vorhaben>/.work/ (B3); via watcher.feedback_dir überschreibbar
 API_KEY_ENV      = "GX10_API_KEY"             # Secrets nur aus Env, nie aus Datei
 
-# Workspace-Struktur (von _ensure_dirs angelegt) — generischer Default,
-# pro Deployment/Vessel via Config (workspace.dirs) überschreibbar. Die
-# funktionalen Verzeichnisse (tasks/, summaries/handovers, summaries/feedback)
-# werden von den Makros und dem Reconciler vorausgesetzt.
+# Workspace-Struktur (von _ensure_dirs am WORKDIR angelegt). B3: die funktionalen Artefakt-
+# Verzeichnisse (tasks/, handovers/feedback, reviews …) sind NICHT mehr hier — sie wohnen pro
+# Vorhaben unter vault/<slug>/ (Skelett via vorhaben_new). Am WORKDIR bleibt nur die sichtbare
+# Wissens-Wurzel vault/; Engine-Maschinerie liegt versteckt unter state_root(). Per Config
+# (workspace.dirs) überschreibbar.
 WORKSPACE_DIRS = [
-    "tasks/pending", "tasks/in_progress", "tasks/done",
-    "summaries/handovers", "summaries/feedback",
-    "summaries/proposals", "summaries/decisions",
-    "reviews",
     "vault",
-    "memory",
 ]
+# Hinweis: der lokale Warm-Cache (memory/) ist KEIN Artefakt-Verzeichnis mehr — er ist
+# Engine-Maschinerie und liegt unter state_root()/"memory" (von _ensure_dirs angelegt).
+
+
+def state_root() -> Path:
+    """Wurzel der versteckten Engine-Maschinerie (vorhaben-unabhängig): session.json, der lokale
+    Warm-Cache (memory/), config.json/active. Relativ zum WORKDIR (nach chdir), per
+    cfg["paths"]["state_root"] (Default ``.ironclad``) überschreibbar; absolute Overrides werden
+    unverändert übernommen. Boundary clean — kein privates Literal."""
+    return Path(STATE_ROOT)
+
+
+def session_path() -> Path:
+    """Pfad der Session-Datei: ``state_root()/SESSION_FILE``. Ein absolut konfigurierter
+    SESSION_FILE wird unverändert verwendet (Rückwärts-Kompatibilität)."""
+    p = Path(SESSION_FILE)
+    return p if p.is_absolute() else state_root() / p
+
+
+def vault_root() -> Path:
+    """Sichtbare Wissens-Wurzel (vorhaben-zentrisch): ``vault/<slug>/`` je Vorhaben. Relativ zum
+    WORKDIR (nach chdir), per cfg["paths"]["vault_root"] (Default ``vault``) überschreibbar."""
+    return Path(VAULT_ROOT)
+
+
+# ─── Vorhaben (vorhaben-zentrischer vault) ────────────────────
+# Ein Vorhaben = eine sichtbare Wissens-/Arbeits-Einheit unter vault/<slug>/. meta.md (flat
+# frontmatter) ist die SSOT; das EINE aktive Vorhaben steht als slug in state_root()/active.
+# Artefakt-erzeugende Ops (Tasks, Handovers, Decisions, MPR-Runs) routen relativ zum aktiven
+# Vorhaben (B3) — fail-closed ohne aktives Vorhaben. Reine Konversations-Turns brauchen keins.
+VORHABEN_TYPES = ("mpr", "software")
+
+# Verstecktes Maschinen-Plumbing je Vorhaben (Hybrid-Layout, 06-20): active.md + Handover-/
+# Feedback-Inbox + Historie liegen unter <vorhaben>/.work/ (aus dem Blick); die sichtbaren
+# Artefakte (decisions/ proposals/ reviews/ runs/ tasks/) bleiben navigierbar oben.
+WORKFLOW_DIR = ".work"
+
+# Skelett-Verzeichnisse je Typ (relativ zu vault/<slug>/). software = Task-Pipeline +
+# file-communication-Plumbing; mpr = Reasoning-Runs + Entscheidungs-Reports.
+_VORHABEN_SKELETON: Dict[str, List[str]] = {
+    "software": ["tasks/pending", "tasks/in_progress", "tasks/done",
+                 "decisions", "proposals", "reviews",
+                 f"{WORKFLOW_DIR}/handovers", f"{WORKFLOW_DIR}/feedback",
+                 f"{WORKFLOW_DIR}/archive/handovers", f"{WORKFLOW_DIR}/archive/feedback"],
+    "mpr":      ["runs", "decisions"],
+}
+
+# Umlaut-Faltung für lesbare ASCII-slugs (ä→ae …). Reine Bequemlichkeit; Unicode-slugs gingen auch.
+_SLUG_UMLAUT = {"ä": "ae", "ö": "oe", "ü": "ue", "ß": "ss"}
+
+_NO_ACTIVE_MSG = ("kein aktives Vorhaben — `/vorhaben new <name> --typ mpr|software` "
+                  "(oder `/vorhaben use <slug>`) zuerst")
+
+
+def _slugify(name: str) -> str:
+    """Kebab-case-slug aus einem Vorhaben-Namen (LLM-frei, deterministisch). Deutsche Umlaute
+    werden gefaltet (ä→ae …); jeder Lauf aus Nicht-[a-z0-9] (Leerzeichen, Pfad-Trenner, sonstige
+    Punktuation, nicht-gefaltete Akzente) wird zu EINEM ``-``. Nie leer."""
+    s = (name or "").strip().lower()
+    s = "".join(_SLUG_UMLAUT.get(c, c) for c in s)
+    s = re.sub(r"[^a-z0-9]+", "-", s).strip("-")
+    return s or "vorhaben"
+
+
+def _parse_frontmatter(text: str) -> Dict[str, str]:
+    """Minimaler, flacher YAML-frontmatter-Parser (``key: value`` zwischen ``---``-Zeilen).
+    LLM-frei; wird von Vorhaben-meta UND reconcile_vault (Unit C) geteilt. Werte bleiben Strings
+    (inkl. roher Listen wie ``[a, b]``); leerer/fehlender Block → ``{}``."""
+    lines = (text or "").splitlines()
+    if not lines or lines[0].strip() != "---":
+        return {}
+    out: Dict[str, str] = {}
+    for s in lines[1:]:
+        if s.strip() == "---":
+            break
+        if ":" in s and not s.lstrip().startswith("#"):
+            k, _, v = s.partition(":")
+            k = k.strip()
+            if k:
+                out[k] = v.strip()
+    return out
+
+
+class Vorhaben:
+    """Metadaten + Pfade eines Vorhabens. Persistenz liegt in vault/<slug>/meta.md (SSOT)."""
+
+    __slots__ = ("slug", "typ", "titel", "erstellt", "status")
+
+    def __init__(self, slug: str, typ: str, titel: str, erstellt: str, status: str = "aktiv"):
+        self.slug     = slug
+        self.typ      = typ
+        self.titel    = titel
+        self.erstellt = erstellt
+        self.status   = status
+
+    @property
+    def path(self) -> Path:
+        return vault_root() / self.slug
+
+    @property
+    def meta_path(self) -> Path:
+        return self.path / "meta.md"
+
+    def to_meta(self) -> str:
+        return (
+            "---\n"
+            f"typ: {self.typ}\n"
+            f"titel: {self.titel}\n"
+            f"erstellt: {self.erstellt}\n"
+            f"status: {self.status}\n"
+            "---\n\n"
+            f"# {self.titel}\n\n"
+            f"_Vorhaben (typ: {self.typ}). Artefakte unter `{vault_root().as_posix()}/{self.slug}/`. "
+            "INDEX.md wird automatisch gepflegt (reconcile)._\n"
+        )
+
+    @classmethod
+    def from_meta(cls, slug: str, meta_path: Optional[Path] = None) -> "Vorhaben":
+        p = Path(meta_path) if meta_path else (vault_root() / slug / "meta.md")
+        fm = _parse_frontmatter(p.read_text(encoding="utf-8"))
+        return cls(
+            slug=slug,
+            typ=fm.get("typ", ""),
+            titel=fm.get("titel", slug),
+            erstellt=fm.get("erstellt", ""),
+            status=fm.get("status", "aktiv"),
+        )
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {"slug": self.slug, "typ": self.typ, "titel": self.titel,
+                "erstellt": self.erstellt, "status": self.status,
+                "path": self.path.as_posix()}
+
+
+def _active_path() -> Path:
+    return state_root() / "active"
+
+
+def active_slug() -> Optional[str]:
+    """Slug des aktiven Vorhabens aus state_root()/active, oder None."""
+    p = _active_path()
+    try:
+        return (p.read_text(encoding="utf-8").strip() or None) if p.exists() else None
+    except Exception:
+        return None
+
+
+def set_active_slug(slug: str) -> None:
+    p = _active_path()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text((slug or "").strip() + "\n", encoding="utf-8")
+
+
+def vorhaben_exists(slug: str) -> bool:
+    return bool(slug) and (vault_root() / slug / "meta.md").is_file()
+
+
+def vorhaben_get(slug: str) -> Optional[Vorhaben]:
+    if not vorhaben_exists(slug):
+        return None
+    try:
+        return Vorhaben.from_meta(slug)
+    except Exception:
+        return None
+
+
+def vorhaben_list() -> List[Vorhaben]:
+    """Alle Vorhaben (sortiert nach slug). Defekte meta.md werden still übersprungen."""
+    root = vault_root()
+    if not root.exists():
+        return []
+    out: List[Vorhaben] = []
+    for meta in sorted(root.glob("*/meta.md")):
+        try:
+            out.append(Vorhaben.from_meta(meta.parent.name, meta))
+        except Exception:
+            continue
+    return out
+
+
+def vorhaben_new(name: str, typ: str) -> Vorhaben:
+    """Legt ein neues Vorhaben an (meta.md + typ-Skelett), setzt es aktiv. Kollidierende slugs
+    bekommen ein -N-Suffix. Unbekannter Typ / leerer Name → ValueError."""
+    t = (typ or "").strip().lower()
+    if t not in VORHABEN_TYPES:
+        raise ValueError(f"unbekannter Vorhaben-Typ {typ!r} — erlaubt: {', '.join(VORHABEN_TYPES)}")
+    titel = (name or "").strip()
+    if not titel:
+        raise ValueError("Vorhaben braucht einen Namen")
+    base = _slugify(titel)
+    slug, n = base, 2
+    while (vault_root() / slug).exists():
+        slug, n = f"{base}-{n}", n + 1
+    v = Vorhaben(slug=slug, typ=t, titel=titel,
+                 erstellt=time.strftime("%Y-%m-%d", time.gmtime()), status="aktiv")
+    v.path.mkdir(parents=True, exist_ok=True)
+    for d in _VORHABEN_SKELETON[t]:
+        (v.path / d).mkdir(parents=True, exist_ok=True)
+    v.meta_path.write_text(v.to_meta(), encoding="utf-8")
+    set_active_slug(slug)
+    _reconcile_active_soft()   # C2: INDEX.md sofort seeden → von Anfang an navigierbar
+    return v
+
+
+def vorhaben_use(slug: str) -> Vorhaben:
+    """Setzt ein bestehendes Vorhaben aktiv. Unbekannter slug → ValueError."""
+    v = vorhaben_get((slug or "").strip())
+    if v is None:
+        raise ValueError(f"kein Vorhaben {slug!r} unter {vault_root().as_posix()}/ — "
+                         "`/vorhaben new <name> --typ mpr|software` zuerst")
+    set_active_slug(v.slug)
+    return v
+
+
+def vorhaben_active() -> Optional[Vorhaben]:
+    """Das aktive Vorhaben (oder None, auch wenn der active-Marker auf ein gelöschtes zeigt)."""
+    slug = active_slug()
+    return vorhaben_get(slug) if slug else None
+
+
+def active_vorhaben_path() -> Path:
+    """Pfad des aktiven Vorhabens — fail-closed (RuntimeError) ohne gültiges aktives Vorhaben.
+    Quelle des Artefakt-Routings (B3): Tasks/Handovers/Decisions/Reviews/MPR-Runs landen darunter."""
+    v = vorhaben_active()
+    if v is None:
+        raise RuntimeError(_NO_ACTIVE_MSG)
+    return v.path
+
+
+# ─── Artefakt-Routing (B3) ────────────────────────────────────
+# „file communication" (Tasks/Handovers/Feedback/Decisions/Proposals/Reviews/MPR-Runs) wohnt unter
+# dem AKTIVEN Vorhaben statt im WORKDIR. Erzeugende Ops fail-closed (active_vorhaben_path); Hintergrund-
+# Scanner (Reconciler/Watcher/Autopilot) nutzen die *_soft-Variante (None statt Fehler → Daemon crasht
+# nie). Sichtbares direkt unter <vorhaben>/, Maschinen-Plumbing unter <vorhaben>/.work/.
+def artifact_root_soft() -> Optional[Path]:
+    """Soft-Variante von active_vorhaben_path(): None ohne aktives Vorhaben."""
+    v = vorhaben_active()
+    return v.path if v else None
+
+
+def _work(soft: bool = False) -> Optional[Path]:
+    base = artifact_root_soft() if soft else active_vorhaben_path()
+    return (base / WORKFLOW_DIR) if base is not None else None
+
+
+def handovers_dir(soft: bool = False) -> Optional[Path]:
+    """Handover-Inbox <vorhaben>/.work/handovers (gestaged vom Orchestrator, gezogen vom Client)."""
+    w = _work(soft=soft)
+    return (w / "handovers") if w is not None else None
+
+
+def feedback_dir(soft: bool = False) -> Optional[Path]:
+    """Feedback-Inbox <vorhaben>/.work/<feedback> (vom lokalen Code-Agent befüllt, vom Reconciler gelesen).
+    Der Inbox-Name ist via watcher.feedback_dir konfigurierbar (Default ``feedback``)."""
+    w = _work(soft=soft)
+    return (w / WATCHER_FEEDBACK_DIR) if w is not None else None
+
+
+def active_md_path(soft: bool = False) -> Optional[Path]:
+    """Aktiver Handover <vorhaben>/.work/active.md (reine Projektion, nie von Hand pflegen)."""
+    w = _work(soft=soft)
+    return (w / "active.md") if w is not None else None
+
+
+def archive_handovers_dir(soft: bool = False) -> Optional[Path]:
+    """Handover-Historie <vorhaben>/.work/archive/handovers."""
+    w = _work(soft=soft)
+    return (w / "archive" / "handovers") if w is not None else None
+
+
+def archive_feedback_dir(soft: bool = False) -> Optional[Path]:
+    """Feedback-Historie <vorhaben>/.work/archive/feedback."""
+    w = _work(soft=soft)
+    return (w / "archive" / "feedback") if w is not None else None
+
+
+# ─── Self-maintaining vault (Unit C): reconcile_vault, LLM-frei ──
+# Scannt vault/<slug>/**/*.md (ohne INDEX.md und ohne das versteckte .work/), parst Frontmatter und
+# baut eine AUTO-gepflegte INDEX.md (nach Kategorie/Datum gruppiert, Obsidian-[[links]]) sowie —
+# optional — einen idempotenten „Verwandt (auto)"-Block in den kuratierten Docs (gemeinsame Tags /
+# Titel-Referenz im Text). Deterministisch, kein Modell-Call. Wie das MEMORY.md-Pattern.
+_INDEX_AUTO_START = "<!-- ironclad:index:auto START — generiert von reconcile_vault, nicht von Hand ändern -->"
+_INDEX_AUTO_END   = "<!-- ironclad:index:auto END -->"
+_LINKS_AUTO_START = "<!-- ironclad:related:auto START -->"
+_LINKS_AUTO_END   = "<!-- ironclad:related:auto END -->"
+# Doc-Kategorien (erstes Pfad-Segment) die einen „Verwandt"-Block bekommen — kuratiertes Wissen,
+# NICHT die auto-generierten MPR-runs/ und nicht die meta.md.
+_LINK_CATEGORIES  = {"decisions", "proposals", "reviews", "(root)"}
+
+
+def _parse_tags(raw: str) -> set:
+    """Tags aus einem flachen Frontmatter-Wert: ``[a, b]`` oder ``a, b`` → {a, b} (lowercase)."""
+    s = (raw or "").strip().strip("[]")
+    return {t.strip().strip("'\"").lower() for t in re.split(r"[,\s]+", s) if t.strip()}
+
+
+def _first_heading(text: str) -> str:
+    for line in text.splitlines():
+        m = re.match(r"^#{1,6}\s+(.*\S)", line)
+        if m:
+            return m.group(1).strip()
+    return ""
+
+
+def _set_managed_block(text: str, start: str, end: str, block: Optional[str]) -> str:
+    """Idempotenter, markierter Block: ``block`` ersetzt einen vorhandenen Block (oder wird angehängt);
+    ``block is None`` entfernt ihn. Ersatz via Funktion → keine Backref-Interpretation im Replacement."""
+    pat = re.compile(re.escape(start) + r".*?" + re.escape(end), re.DOTALL)
+    if block is None:
+        new = pat.sub("", text)
+        return (new.rstrip() + "\n") if new.strip() else ""
+    if pat.search(text):
+        return pat.sub(lambda _m: block, text)
+    return (text.rstrip() + "\n\n" + block + "\n") if text.strip() else (block + "\n")
+
+
+def _vault_docs(vdir: Path) -> List[Dict[str, Any]]:
+    """Index-fähige Docs unter dem Vorhaben (ohne INDEX.md, ohne verstecktes .work/), mit Metadaten."""
+    out: List[Dict[str, Any]] = []
+    for p in sorted(vdir.rglob("*.md")):
+        rel = p.relative_to(vdir)
+        if p.name == "INDEX.md" or (rel.parts and rel.parts[0] == WORKFLOW_DIR):
+            continue
+        try:
+            text = p.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        fm = _parse_frontmatter(text)
+        out.append({
+            "rel": rel, "stem": rel.with_suffix("").as_posix(), "path": p,
+            "title": fm.get("titel") or fm.get("title") or _first_heading(text) or p.stem,
+            "typ": fm.get("typ", ""), "status": fm.get("status", ""),
+            "datum": fm.get("erstellt") or fm.get("datum") or fm.get("date") or "",
+            "tags": _parse_tags(fm.get("tags", "")),
+            "category": rel.parts[0] if len(rel.parts) > 1 else "(root)",
+            "text": text,
+        })
+    return out
+
+
+def _index_block(slug: str, docs: List[Dict[str, Any]]) -> str:
+    lines = [_INDEX_AUTO_START,
+             f"_Automatisch gepflegt (reconcile_vault, LLM-frei) — {len(docs)} Dokument(e)._", ""]
+    by_cat: Dict[str, List[Dict[str, Any]]] = {}
+    for d in docs:
+        by_cat.setdefault(d["category"], []).append(d)
+    for cat in sorted(by_cat):
+        lines.append(f"## {cat}")
+        items = sorted(by_cat[cat], key=lambda x: x["title"].lower())
+        items = sorted(items, key=lambda x: x["datum"], reverse=True)   # neuestes zuerst, stabil nach Titel
+        for d in items:
+            bits = " · ".join(b for b in (d["typ"], d["status"], d["datum"]) if b)
+            lines.append(f"- [[{d['stem']}|{d['title']}]]" + (f"  ({bits})" if bits else ""))
+        lines.append("")
+    lines.append(_INDEX_AUTO_END)
+    return "\n".join(lines)
+
+
+def _related_docs(d: Dict[str, Any], docs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Verwandt = gemeinsame Tags ODER Titel-Referenz im Text. Selbstbezug + bereits injizierte
+    Related-Blöcke ausgenommen (sonst wüchse die Menge bei jedem Lauf → nicht idempotent)."""
+    clean = _set_managed_block(d["text"], _LINKS_AUTO_START, _LINKS_AUTO_END, None).lower()
+    rel: List[Dict[str, Any]] = []
+    for o in docs:
+        if o["stem"] == d["stem"]:
+            continue
+        shared = bool(d["tags"] & o["tags"])
+        title_ref = bool(o["title"]) and len(o["title"]) >= 4 and o["title"].lower() in clean
+        if shared or title_ref:
+            rel.append(o)
+    return rel
+
+
+def reconcile_vault(slug: str, *, links: bool = True) -> str:
+    """Pflegt INDEX.md (immer) + optional die „Verwandt (auto)"-Blöcke (``links=True``) eines Vorhabens.
+    Deterministisch, idempotent, LLM-frei. ``links=False`` (Auto-Trigger) hält nur den Index frisch und
+    fasst keine Doc-Bodies an (kein Konflikt mit einem offenen Editor)."""
+    vdir = vault_root() / slug
+    if not (vdir / "meta.md").is_file():
+        return f"kein Vorhaben {slug!r} unter {vault_root().as_posix()}/"
+    docs = _vault_docs(vdir)
+
+    index_path = vdir / "INDEX.md"
+    existing = index_path.read_text(encoding="utf-8") if index_path.exists() else f"# {slug} — INDEX\n"
+    new_index = _set_managed_block(existing, _INDEX_AUTO_START, _INDEX_AUTO_END, _index_block(slug, docs))
+    if new_index != existing:
+        index_path.write_text(new_index, encoding="utf-8")
+
+    linked = 0
+    if links:
+        for d in docs:
+            if d["category"] not in _LINK_CATEGORIES or d["rel"].name == "meta.md":
+                continue
+            related = _related_docs(d, docs)
+            if related:
+                items = sorted(related, key=lambda x: x["title"].lower())
+                body = "\n".join([_LINKS_AUTO_START, "", "## Verwandt (auto)",
+                                  *[f"- [[{o['stem']}|{o['title']}]]" for o in items],
+                                  "", _LINKS_AUTO_END])
+                new = _set_managed_block(d["text"], _LINKS_AUTO_START, _LINKS_AUTO_END, body)
+            else:   # keine Verwandten → vorhandenen Block entfernen (tidy)
+                new = _set_managed_block(d["text"], _LINKS_AUTO_START, _LINKS_AUTO_END, None)
+            if new != d["text"]:
+                d["path"].write_text(new, encoding="utf-8")
+                linked += 1
+    suffix = f", {linked} Related-Block/Blöcke aktualisiert" if links else " (nur Index)"
+    return f"{slug}: {len(docs)} Dokument(e) indiziert{suffix}"
+
+
+def _reconcile_active_soft(*, links: bool = False) -> None:
+    """Auto-Reconcile des aktiven Vorhabens nach einem Schreibvorgang (fail-soft, nie raise).
+    Default ``links=False`` → nur INDEX.md frisch halten, Doc-Bodies unangetastet."""
+    try:
+        s = active_slug()
+        if s:
+            reconcile_vault(s, links=links)
+    except Exception:   # noqa: BLE001 — Reconcile darf einen Schreibvorgang nie scheitern lassen
+        pass
+
 
 # Memory-Layer — module-level Singleton, initialisiert in GX10.__init__()
 _MEMORY_CONFIG: Dict[str, Any] = {}
@@ -712,9 +1136,9 @@ TOOLS = [
             "name": "move_file",
             "description": (
                 "Move, rename, or resolve file conflicts. "
-                "Task transitions: pending→in_progress→done. "
-                "Vault archiving: vault/_Workflow/active.md → vault/_Workflow/handovers/KGC-XXX_OPUS.md. "
-                "ID conflict resolution: rename existing file before writing new one."
+                "ID conflict resolution: rename existing file before writing new one. "
+                "For task transitions and handover archiving DO NOT move files by hand — use "
+                "advance_pipeline (it routes everything under the active vorhaben deterministically)."
             ),
             "parameters": {
                 "type": "object",
@@ -743,9 +1167,9 @@ TOOLS = [
         "function": {
             "name": "copy_file",
             "description": (
-                "Copy a file without removing the original. "
-                "Primary use: copy KGC-XXX_OPUS.md to vault/_Workflow/active.md. "
-                "Also: copy feedback to vault/_Workflow/feedback/."
+                "Copy a file without removing the original. For the task/handover/feedback "
+                "workflow use the deterministic tools (stage_handover / advance_pipeline) instead — "
+                "they route under the active vorhaben; copying by hand bypasses that."
             ),
             "parameters": {
                 "type": "object",
@@ -793,13 +1217,13 @@ TOOLS = [
             "name": "advance_pipeline",
             "description": (
                 "Advance the workflow pipeline for ONE completed task in a single "
-                "deterministic step: archive vault/_Workflow/active.md → handovers/, "
-                "copy the feedback into the vault, set the task JSON to status=done and "
-                "move it to tasks/done/, delete the handover in summaries/handovers/, and "
-                "optionally activate the next task. "
+                "deterministic step (everything under the ACTIVE vorhaben): archive the active "
+                "handover, archive the feedback, set the task JSON to status=done and move it to "
+                "tasks/done/, delete the handover from the .work/handovers inbox, and optionally "
+                "activate the next task. "
                 "On 'done' ALWAYS use this tool instead of individual "
                 "move_file/copy_file/delete_file calls. Fail-closed: aborts if the "
-                "feedback file is missing. Never touches code/ or the audit chain."
+                "feedback file is missing OR no vorhaben is active. Never touches code/ or the audit chain."
             ),
             "parameters": {
                 "type": "object",
@@ -840,8 +1264,9 @@ TOOLS = [
     }
 ]
 
-# Nur im Onboarding-Modus angebotenes Tool: billige Duplikat-Vorprüfung,
-# die DIESELBE deterministische Store-Dedup nutzt wie das stage_handover-Gate.
+# query_memory wird angeboten, sobald Memory KONFIGURIERT ist (jeder Modus, NICHT onboarding-only):
+# _effective_tools() fügt [MEMORY_TOOL, DEEP_MEMORY_TOOL] bei `_MEMORY is not None` hinzu. (Die
+# onboarding-only Duplikat-Vorprüfung ist ein anderes Tool, check_task_exists in ONBOARDING_TOOLS.)
 MEMORY_TOOL = {
     "type": "function",
     "function": {
@@ -1001,6 +1426,9 @@ def _advance_pipeline(task_id: str, agent: str, next_task_id: Optional[str] = No
     if next_task_id and not _TASK_ID_RE.match(next_task_id):
         return f"ERROR: invalid next_task_id: {next_task_id!r}"
 
+    if artifact_root_soft() is None:
+        return f"ERROR: {_NO_ACTIVE_MSG}"     # B3: fail-closed — Artefakte routen ans aktive Vorhaben
+
     store = _store()
     log: List[str] = []
 
@@ -1008,27 +1436,27 @@ def _advance_pipeline(task_id: str, agent: str, next_task_id: Optional[str] = No
     existing = store.get(task_id)
     if existing and existing.get("status") == "done":
         return (f"OK: task {task_id} is already done — no re-advance needed. "
-                f"Feedback liegt in vault/_Workflow/feedback/{task_id}_{agent}-feedback.md")
+                f"Feedback liegt in {(archive_feedback_dir() / f'{task_id}_{agent}-feedback.md').as_posix()}")
 
     # 0. Fail-closed-Gate: Feedback MUSS existieren
-    # Primär: summaries/feedback/ (Reconciler-Inbox)
-    # Fallback: vault/_Workflow/feedback/ (bereits vom Reconciler archiviert)
-    fb = Path(f"summaries/feedback/{task_id}_{agent}-feedback.md")
+    # Primär: <vorhaben>/.work/feedback/ (Reconciler-Inbox)
+    # Fallback: <vorhaben>/.work/archive/feedback/ (bereits vom Reconciler archiviert)
+    fb = feedback_dir() / f"{task_id}_{agent}-feedback.md"
     if not fb.exists():
-        fb_vault = Path(f"vault/_Workflow/feedback/{task_id}_{agent}-feedback.md")
-        if fb_vault.exists():
-            fb = fb_vault
-            log.append(f"feedback aus Vault-Archiv gelesen: {fb_vault}")
+        fb_arch = archive_feedback_dir() / f"{task_id}_{agent}-feedback.md"
+        if fb_arch.exists():
+            fb = fb_arch
+            log.append(f"feedback aus Archiv gelesen: {fb_arch}")
         else:
-            return (f"ERROR: Feedback fehlt: summaries/feedback/{task_id}_{agent}-feedback.md "
-                    f"und vault/_Workflow/feedback/{task_id}_{agent}-feedback.md "
+            return (f"ERROR: Feedback fehlt: {fb.as_posix()} "
+                    f"und {fb_arch.as_posix()} "
                     f"— Task gilt als NICHT abgeschlossen. Pipeline nicht weitergeschaltet.")
     log.append(f"feedback found: {fb}")
 
     try:
         # 1. aktuellen active.md-Handover archivieren (vor dem Umschalten)
-        active  = Path("vault/_Workflow/active.md")
-        archive = Path(f"vault/_Workflow/handovers/{task_id}_{agent}.md")
+        active  = active_md_path()
+        archive = archive_handovers_dir() / f"{task_id}_{agent}.md"
         if active.exists():
             archive.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(str(active), str(archive))
@@ -1036,11 +1464,10 @@ def _advance_pipeline(task_id: str, agent: str, next_task_id: Optional[str] = No
         else:
             log.append("active.md not present (skip archive)")
 
-        # 2. Feedback ins Vault archivieren UND Original entfernen — sonst
-        #    sammeln sich Alt-Feedbacks in summaries/feedback/ und matchen bei
-        #    ID-Wiederverwendung erneut (Stale-Trigger).
-        #    Wenn fb bereits aus vault/ kommt (Fallback), kein Copy+Delete nötig.
-        vfb = Path("vault/_Workflow/feedback") / fb.name
+        # 2. Feedback ins Archiv ziehen UND Original entfernen — sonst sammeln sich
+        #    Alt-Feedbacks in der Inbox und matchen bei ID-Wiederverwendung erneut
+        #    (Stale-Trigger). Wenn fb bereits aus dem Archiv kommt (Fallback), kein Copy+Delete.
+        vfb = archive_feedback_dir() / fb.name
         vfb.parent.mkdir(parents=True, exist_ok=True)
         if fb.resolve() != vfb.resolve():
             shutil.copy2(str(fb), str(vfb))
@@ -1050,7 +1477,7 @@ def _advance_pipeline(task_id: str, agent: str, next_task_id: Optional[str] = No
             except OSError:
                 log.append(f"feedback → {vfb}")
         else:
-            log.append(f"feedback already in vault: {vfb} (no copy needed)")
+            log.append(f"feedback already archived: {vfb} (no copy needed)")
 
         # 3. Status-Übergang → done (über den Store)
         try:
@@ -1067,17 +1494,18 @@ def _advance_pipeline(task_id: str, agent: str, next_task_id: Optional[str] = No
             except Exception:
                 pass
 
-        # 4. Handover in summaries/handovers löschen
+        # 4. Handover in der Inbox (.work/handovers) löschen
         deleted = False
-        for cand in (Path(f"summaries/handovers/{task_id}_{agent}.md"),
-                     Path(f"summaries/handovers/{task_id}_{agent.capitalize()}.md")):
+        _hod = handovers_dir()
+        for cand in (_hod / f"{task_id}_{agent}.md",
+                     _hod / f"{task_id}_{agent.capitalize()}.md"):
             if cand.exists():
                 cand.unlink()
                 log.append(f"handover deleted: {cand}")
                 deleted = True
                 break
         if not deleted:
-            log.append("no handover in summaries/handovers (skip)")
+            log.append("no handover in .work/handovers (skip)")
 
         # 5. nächsten Task aktivieren (Store) — active.md folgt aus Projektion
         if next_task_id:
@@ -1117,6 +1545,7 @@ def _advance_pipeline(task_id: str, agent: str, next_task_id: Optional[str] = No
     except Exception as e:
         return f"ERROR: pipeline step failed: {e}\nso far:\n" + "\n".join(f"  - {l}" for l in log)
 
+    _reconcile_active_soft()   # C2: INDEX.md des aktiven Vorhabens frisch halten (fail-soft, nur Index)
     return f"OK: pipeline advanced for {task_id} ({agent})\n" + "\n".join(f"  - {l}" for l in log)
 
 
@@ -1231,7 +1660,7 @@ def _stage_handover(task_id: Optional[str], agent: str, handover_md: str,
                         log.append("Memory-Kontext injiziert")
                 except Exception:
                     pass
-            ho = Path(f"summaries/handovers/{tid}_{agent}.md")
+            ho = handovers_dir() / f"{tid}_{agent}.md"
             _atomic_write(ho, ho_md)
             log.append(f"handover geschrieben: {ho} ({len(ho_md)} Zeichen)")
         else:
@@ -1239,7 +1668,7 @@ def _stage_handover(task_id: Optional[str], agent: str, handover_md: str,
             if not task_id or not _TASK_ID_RE.match(task_id):
                 return f"ERROR: without task_json a valid task_id is required (was: {task_id!r})"
             tid = task_id
-            ho = Path(f"summaries/handovers/{tid}_{agent}.md")
+            ho = handovers_dir() / f"{tid}_{agent}.md"
             _atomic_write(ho, handover_md)
             log.append(f"handover geschrieben: {ho} ({len(handover_md)} Zeichen)")
 
@@ -1263,6 +1692,7 @@ def _stage_handover(task_id: Optional[str], agent: str, handover_md: str,
               "korrigiere sie, sonst baut der Agent neu statt zu erweitern (Dublette). "
               "Neu anzulegende Dateien sind ok."
         )
+    _reconcile_active_soft()   # C2: INDEX.md des aktiven Vorhabens frisch halten (fail-soft, nur Index)
     return result
 
 
@@ -1292,31 +1722,49 @@ class TaskStore:
         "to", "of", "with", "on", "at",
     }
 
-    def __init__(self, root: str = ".", dedup_threshold: Optional[float] = None):
-        # Default zur INSTANZIIERUNGSZEIT aus dem (ggf. per Config gesetzten)
-        # Global lesen — nicht als Param-Default binden (würde den Import-Wert
-        # einfrieren und spätere Config-Änderungen ignorieren).
-        self.root            = Path(root)
+    def __init__(self, root: Optional[str] = None, dedup_threshold: Optional[float] = None):
+        # B3: root=None → die Pfade routen dynamisch ans AKTIVE Vorhaben (Produktions-Singleton);
+        # ein expliziter root (Tests/Spezialfälle) hält das Legacy-Verhalten (root-relativ). Der
+        # dedup_threshold-Default wird zur Instanziierungszeit aus dem (ggf. per Config gesetzten)
+        # Global gelesen — nicht als Param-Default einfrieren.
+        self.root            = Path(root) if root is not None else None
         self.dedup_threshold = float(dedup_threshold if dedup_threshold is not None
                                      else TASKS_DEDUP_THRESHOLD)
         self._lock           = threading.RLock()
 
-    # ── Pfade ────────────────────────────────────────────────
-    def _dir(self, status: str) -> Path:
-        return self.root / "tasks" / status
+    # ── Pfade (B3: dynamisch ans aktive Vorhaben, soft für Lese-/Scan-Pfade) ──
+    def _base(self) -> Optional[Path]:
+        """Routing-Wurzel: expliziter root ODER das aktive Vorhaben (soft → None ohne aktives,
+        damit Lese-/Scan-Pfade einen Daemon nie crashen)."""
+        return self.root if self.root is not None else artifact_root_soft()
 
-    def _path(self, task_id: str, status: str) -> Path:
-        return self._dir(status) / f"{task_id}.json"
+    def _require_base(self) -> Path:
+        """Wie _base, aber fail-closed (RuntimeError) — für erzeugende Ops (create/transition)."""
+        b = self._base()
+        if b is None:
+            raise RuntimeError(_NO_ACTIVE_MSG)
+        return b
+
+    def _dir(self, status: str) -> Optional[Path]:
+        b = self._base()
+        return (b / "tasks" / status) if b is not None else None
+
+    def _path(self, task_id: str, status: str) -> Optional[Path]:
+        d = self._dir(status)
+        return (d / f"{task_id}.json") if d is not None else None
 
     def _find(self, task_id: str) -> Tuple[Optional[Path], Optional[str]]:
         for s in self.STATUSES:
             p = self._path(task_id, s)
-            if p.exists():
+            if p is not None and p.exists():
                 return p, s
         return None, None
 
     def _handover_path(self, task_id: str) -> Optional[Path]:
-        d = self.root / "summaries" / "handovers"
+        b = self._base()
+        if b is None:
+            return None
+        d = b / WORKFLOW_DIR / "handovers"
         if not d.exists():
             return None
         hits = sorted(d.glob(f"{task_id}_*.md"))
@@ -1333,7 +1781,7 @@ class TaskStore:
             mx = 0
             for s in self.STATUSES:
                 d = self._dir(s)
-                if not d.exists():
+                if d is None or not d.exists():
                     continue
                 for f in d.glob(f"{pref}-*.json"):
                     m = id_re.match(f.stem)
@@ -1398,7 +1846,7 @@ class TaskStore:
             out: List[Dict[str, Any]] = []
             for s in ((status,) if status else self.STATUSES):
                 d = self._dir(s)
-                if not d.exists():
+                if d is None or not d.exists():
                     continue
                 for f in sorted(d.glob("KGC-*.json")):
                     try:
@@ -1423,6 +1871,7 @@ class TaskStore:
         id/created_at/status werden IGNORIERT/überschrieben."""
         with self._lock:
             self._validate(fields)
+            self._require_base()   # B3: fail-closed — ohne aktives Vorhaben kein Schreiben in den Root
             if not force:
                 dup = self.find_duplicate(fields["title"], fields.get("description", ""))
                 if dup:
@@ -1443,6 +1892,7 @@ class TaskStore:
         if to_status not in self.STATUSES:
             raise ValueError(f"invalid status: {to_status!r}")
         with self._lock:
+            self._require_base()   # B3: fail-closed
             p, s = self._find(task_id)
             if not p:
                 raise KeyError(f"task not found: {task_id}")
@@ -1464,7 +1914,10 @@ class TaskStore:
         pending bei gleichem Zeitstempel), sonst idle. Reine Projektion — nie
         von Hand zu pflegen."""
         with self._lock:
-            active = self.root / "vault" / "_Workflow" / "active.md"
+            b = self._base()
+            if b is None:
+                return                       # kein aktives Vorhaben → keine Projektion (soft)
+            active = b / WORKFLOW_DIR / "active.md"
             # in_progress rangiert vor pending; innerhalb nach created_at/id.
             cands = [(0, t) for t in self.list("pending")] + \
                     [(1, t) for t in self.list("in_progress")]
@@ -1477,14 +1930,14 @@ class TaskStore:
             _atomic_write(active, _IDLE_ACTIVE)
 
 
-# Einziger, geteilter Store (ein Lock → serialisierte Mutationen über Makros
-# UND Reconciler). root="." ist spät aufgelöst → greift im WORKDIR (nach chdir).
+# Einziger, geteilter Store (ein Lock → serialisierte Mutationen über Makros UND Reconciler).
+# B3: root=None → Pfade routen dynamisch ans aktive Vorhaben (vault/<slug>/), spät aufgelöst.
 STORE: Optional["TaskStore"] = None
 
 def _store() -> "TaskStore":
     global STORE
     if STORE is None:
-        STORE = TaskStore()
+        STORE = TaskStore(root=None)
     return STORE
 
 
@@ -1709,6 +2162,9 @@ def _load_plugins(plugins_dir: Optional[str]) -> int:
         if r.handler is None:
             continue
         name = str(r.name)
+        if name in _PLUGIN_TOOLS:        # Tool-Namen müssen eindeutig sein — sonst stille Verdrängung
+            _ui_print(col(f"  [plugins] doppelter Tool-Name {name!r} — erster bleibt, weitere übersprungen", C.YELLOW))
+            continue
         _PLUGIN_TOOLS[name] = {
             "schema": {"type": "function", "function": {
                 "name": name,
@@ -2246,7 +2702,9 @@ class GX10:
         # Silent by design: called after every turn (see _dispatch) — a per-turn "[OK] session saved"
         # would stream into the client as noise. Only a real failure is surfaced.
         try:
-            Path(SESSION_FILE).write_text(
+            p = session_path()
+            p.parent.mkdir(parents=True, exist_ok=True)   # state_root existiert i.d.R. (ensure_dirs); idempotent
+            p.write_text(
                 json.dumps({"messages": self.messages}, ensure_ascii=False, indent=2),
                 encoding="utf-8"
             )
@@ -2297,7 +2755,7 @@ class GX10:
         return out
 
     def load_session(self) -> int:
-        p = Path(SESSION_FILE)
+        p = session_path()
         if not p.exists():
             return 0
         try:
@@ -2472,6 +2930,9 @@ class GX10:
         return _rag_block(hits, RAG_MAX_TOKENS, in_window)
 
     def _ensure_dirs(self):
+        # Engine-Maschinerie (versteckt): state_root + lokaler Warm-Cache.
+        state_root().mkdir(parents=True, exist_ok=True)
+        (state_root() / "memory").mkdir(parents=True, exist_ok=True)
         for d in WORKSPACE_DIRS:
             Path(d).mkdir(parents=True, exist_ok=True)
 
@@ -2919,6 +3380,10 @@ HELP = """
     config get <key>          read a dotted config key (e.g. mpr.enabled)
     config set <key> <value>  override a dotted config key at runtime
                               (on|off|true|false|num|str; e.g. mpr.enabled on)
+    tool <name> <args|text>   run a tool DIRECTLY/deterministically (no model election, no RAG);
+                              text → first required arg, or {json}. e.g. tool mpr_research <frage>
+    vorhaben new <name> --typ mpr|software   create + activate a vorhaben (artefact home)
+    vorhaben list | use <slug> | active | reconcile [slug]
     reload           reload gx10.py (the session stays)
     watcher on|off        enable / disable the feedback watcher
     autopilot on|off      toggle autopilot (auto-launch of Claude)
@@ -2946,7 +3411,7 @@ def _render_config() -> str:
         col(f"  connection    : {conn['base_url']} · {conn['model']}", C.GRAY),
         col(f"  api-key       : aus Env {key_env} ({key_state})", C.GRAY),
         col(f"  platform      : {PLATFORM} (mode={pl['mode']})", C.GRAY),
-        col(f"  paths         : prompt={pa['system_prompt']} · workdir={pa['workdir']} · session={pa['session_file']}", C.GRAY),
+        col(f"  paths         : prompt={pa['system_prompt']} · workdir={pa['workdir']} · state={pa.get('state_root','.ironclad')} · vault={pa.get('vault_root','vault')} · session={pa['session_file']}", C.GRAY),
         col(f"  generation    : temp={gen['temperature']} · max_tokens={gen['max_tokens']} · thinking={gen['thinking_mode']} · stream={gen['stream']} · retry={gen['retry_backoff']}", C.GRAY),
         col(f"  context       : iter={ctx['max_iterations']} · ctx={ctx['max_ctx_chars']} · trim={ctx['trim_target_chars']} · file_cap={ctx['max_file_chars']} · list_cap={ctx['list_dir_hard_cap']}", C.GRAY),
         col(f"  tasks         : dedup_threshold={tk['dedup_threshold']}", C.GRAY),
@@ -2968,7 +3433,11 @@ def _render_config() -> str:
 #
 # Frozen keys are BOOT-ONLY: they wire something at startup (e.g. the offload runner for `setup.type`),
 # so a runtime mutation would be incoherent. `/config set` refuses them; `/config get` still reads them.
-_FROZEN_CONFIG_KEYS = frozenset({"setup.type"})
+# Boot-only keys: read once at startup to wire the runner/topology (setup.type) bzw. die Trust-Policy
+# + den effektiven Bind-Host (security.profile, z. B. sealed→loopback). Eine Laufzeit-Änderung würde
+# den schon gebauten Dispatcher/die Policy/den Socket NICHT neu verdrahten → `/config set` lehnt sie
+# mit der boot-only-Meldung ab. In der Deploy-Config setzen + neu starten. Siehe config-runtime.md.
+_FROZEN_CONFIG_KEYS = frozenset({"setup.type", "security.profile"})
 
 
 def _coerce_cfg_value(raw: str):
@@ -3013,7 +3482,7 @@ def _cfg_get(cfg: Dict[str, Any], dotted: str):
 
 
 # ─── Setup type (server | local) → offload runner wiring ──────
-# Boot-only derivation: the setup.type (offload-topology.md) selects WHERE the orchestrator + agents run,
+# Boot-only derivation: the setup.type (docs/setup-types.md) selects WHERE the orchestrator + agents run,
 # and thus how the provider dispatcher's runner is wired. Orchestrator + agents are ALWAYS co-located
 # (one machine) — no cross-machine offload. Generic + secret-free (role names only). Fail-CLOSED on a
 # misconfigured topology (the server aborts boot rather than silently degrading).
@@ -3032,7 +3501,7 @@ def _is_local_url(url: str) -> bool:
 
 
 def resolve_offload_topology(cfg: Dict[str, Any], *, cli_available: bool = True) -> Dict[str, Any]:
-    """Derive the runner wiring from the boot-fixed ``setup.type`` (offload-topology.md).
+    """Derive the runner wiring from the boot-fixed ``setup.type`` (docs/setup-types.md).
 
     Returns ``{"setup_type", "providers_enabled", "runner_mode", "note"?}`` with
     ``runner_mode`` ∈ {``"none"``, ``"local"``}. Pure + testable (``cli_available`` injected). Raises
@@ -3062,6 +3531,56 @@ def resolve_offload_topology(cfg: Dict[str, Any], *, cli_available: bool = True)
 
 
 # ─── Dispatcher ───────────────────────────────────────────────
+def _vorhaben_command(arg_str: str) -> str:
+    """`/vorhaben new|list|use|active|reconcile` — deterministische CLI-Steuerung des
+    vorhaben-zentrischen vault. Reines Bookkeeping (kein Modell-Call). Fehler (unbekannter Typ,
+    kein aktives/bekanntes Vorhaben) werden als klare, fail-closed Meldung zurückgegeben."""
+    parts = arg_str.split()
+    sub = parts[0].lower() if parts else "list"
+    rest = arg_str[len(parts[0]):].strip() if parts else ""
+    try:
+        if sub == "new":
+            m = re.search(r"--typ[=\s]+(\S+)", rest)   # --typ X oder --typ=X (positions-unabhängig)
+            if not m:
+                return "usage: /vorhaben new <name> --typ mpr|software"
+            name = (rest[:m.start()] + rest[m.end():]).strip()
+            v = vorhaben_new(name, m.group(1))
+            return (f"[vorhaben] angelegt + aktiv: {v.slug} (typ {v.typ}) → {v.path.as_posix()}/\n"
+                    f"  Artefakte (Tasks/Handovers/Decisions/MPR-Runs) landen jetzt hier; "
+                    f"INDEX.md wird automatisch gepflegt.")
+        if sub == "use":
+            if not rest:
+                return "usage: /vorhaben use <slug>"
+            v = vorhaben_use(rest)
+            return f"[vorhaben] aktiv: {v.slug} (typ {v.typ}) → {v.path.as_posix()}/"
+        if sub == "list":
+            vs = vorhaben_list()
+            if not vs:
+                return "[vorhaben] keine — `/vorhaben new <name> --typ mpr|software`"
+            cur = active_slug()
+            lines = ["[vorhaben]  (* = aktiv)"]
+            for v in vs:
+                mark = "*" if v.slug == cur else " "
+                lines.append(f"  {mark} {v.slug}  ·  typ {v.typ} · status {v.status} · {v.erstellt}")
+            return "\n".join(lines)
+        if sub == "active":
+            v = vorhaben_active()
+            return (f"[vorhaben] aktiv: {v.slug} (typ {v.typ}) → {v.path.as_posix()}/"
+                    if v else "[vorhaben] keins aktiv — `/vorhaben new …` oder `/vorhaben use <slug>`")
+        if sub == "reconcile":
+            fn = globals().get("reconcile_vault")          # Unit C liefert die Funktion
+            if fn is None:
+                return "[vorhaben] reconcile kommt mit Unit C (INDEX.md + [[links]])"
+            slug = rest.strip() or active_slug()
+            if not slug:
+                return "[vorhaben] reconcile: kein Vorhaben angegeben/aktiv"
+            return f"[vorhaben] reconcile {slug}: {fn(slug)}"
+        return ("usage: /vorhaben new <name> --typ mpr|software | list | use <slug> | "
+                "active | reconcile [slug]")
+    except (ValueError, RuntimeError) as e:
+        return f"[vorhaben] {e}"
+
+
 def _dispatch(agent: GX10, user_input: str):
     cmd = user_input.lower()
     if cmd == "help":
@@ -3206,6 +3725,37 @@ def _dispatch(agent: GX10, user_input: str):
             _ui_print(f"  per-turn retrieval (RAG): {state}  |  rag on / rag off")
     elif cmd == "context":
         _ui_print(agent.context_report())
+    elif cmd == "vorhaben" or cmd.startswith("vorhaben "):
+        _ui_print(col(_vorhaben_command(user_input[len("vorhaben"):].strip()), C.CYAN))
+    elif cmd.startswith("tool "):
+        # Deterministic, model-free tool call: `/tool <name> <json|text>`. Runs run_tool() DIRECTLY, so a
+        # tool (e.g. the mpr_research panel) fires WITHOUT depending on the model electing it AND without the
+        # per-turn RAG context (there is no model turn) — fixes the run_mpr trigger/RAG-recycle fork. Plain
+        # text maps to the tool's first required parameter; `{...}` is parsed as explicit JSON args.
+        parts = user_input.split(None, 2)
+        name = parts[1] if len(parts) > 1 else ""
+        rest = parts[2].strip() if len(parts) > 2 else ""
+        args: Optional[Dict[str, Any]] = {}
+        if not name:
+            _ui_print(col("  usage: /tool <name> <json-args | text-for-first-arg>", C.YELLOW))
+            args = None
+        elif rest.startswith("{"):
+            try:
+                args = json.loads(rest)
+            except Exception as e:  # noqa: BLE001
+                _ui_print(col(f"  [tool] invalid JSON args: {e}", C.RED)); args = None
+        elif rest:
+            prim = None
+            for t in _effective_tools():
+                fn = t.get("function", {})
+                if fn.get("name") == name:
+                    pa = fn.get("parameters", {}) or {}
+                    reqs = pa.get("required") or list((pa.get("properties") or {}).keys())
+                    prim = reqs[0] if reqs else None
+                    break
+            args = {prim: rest} if prim else {}
+        if args is not None:
+            _ui_print(run_tool(name, args))
     else:
         agent.run(user_input)
         # LOK-1: persist the LLM context after each real turn so it survives an orchestrator restart.
@@ -3253,8 +3803,8 @@ def _terminate_autopilot(task_id: str):
         _ui_print(col(f"  [AUTO] could not terminate the session for {task_id}: {e!r}", C.YELLOW))
 
 def _find_handover(task_id: str) -> Optional[Path]:
-    d = Path("summaries/handovers")
-    if not d.exists():
+    d = handovers_dir(soft=True)          # B3: <vorhaben>/.work/handovers (soft → Daemon-sicher)
+    if d is None or not d.exists():
         return None
     hits = sorted(d.glob(f"{task_id}_*.md"))
     return hits[0] if hits else None
@@ -3311,8 +3861,8 @@ def _do_launch(task_id: str, agent: str):
     # Kimi wurde durch Sonnet ersetzt (2026-06-15): jede Rest-Referenz läuft als Sonnet.
     if agent == "KIMI":
         agent = "SONNET"
-    prompt = (f"Lies und bearbeite autonom den Handover {ho.name} in "
-              f"summaries/handovers/. Folge den Anweisungen in .claude/CLAUDE.md.")
+    prompt = (f"Lies und bearbeite autonom den Handover {ho.as_posix()}. "
+              f"Folge den Anweisungen in .claude/CLAUDE.md.")
     if model and str(model).startswith("kimi"):
         model = None                          # Legacy-Kimi-Modell → Default (Sonnet/Opus)
     model  = model or ("claude-opus-4-8" if agent == "OPUS" else "claude-sonnet-4-6")
@@ -3326,7 +3876,10 @@ def _do_launch(task_id: str, agent: str):
         if "--output-format" not in extra:
             extra += ["--output-format", "stream-json"]
     argv += extra + ["--print", prompt]
-    logdir = Path(AUTOPILOT_LOGS_DIR)
+    # Autopilot-Logs sind Engine-Maschinerie (Subprozess-stdout), kein Vorhaben-Artefakt → unter
+    # state_root() (.ironclad/logs) statt verstreut im WORKDIR-Root. Absoluter Override bleibt.
+    _ld = Path(AUTOPILOT_LOGS_DIR)
+    logdir = _ld if _ld.is_absolute() else state_root() / _ld
     logdir.mkdir(parents=True, exist_ok=True)
     logfile = logdir / f"{task_id}_{agent}.log"
     try:
@@ -3397,8 +3950,8 @@ def _do_launch(task_id: str, agent: str):
         # Feedback-Check: Warnung wenn Claude beendet hat ohne Feedback zu schreiben.
         # Kein Alert wenn Task bereits done (Advance lief vor _wait → Feedback schon gelöscht).
         try:
-            fb_dir = Path("summaries/feedback")
-            found = list(fb_dir.glob(f"{task_id}_*-feedback.md")) if fb_dir.exists() else []
+            fb_dir = feedback_dir(soft=True)     # B3: <vorhaben>/.work/feedback (soft)
+            found = list(fb_dir.glob(f"{task_id}_*-feedback.md")) if (fb_dir and fb_dir.exists()) else []
             if not found:
                 # Task bereits abgeschlossen? → kein Alert (Advance hat Feedback korrekt gelöscht)
                 t = _store().get(task_id)
@@ -3406,7 +3959,7 @@ def _do_launch(task_id: str, agent: str):
                 if not already_done:
                     _ui_print(col(
                         f"  ⚠ [AUTO] {task_id}: claude beendet (exit {rc}) "
-                        f"aber KEIN Feedback in summaries/feedback/ — Task bleibt in_progress!",
+                        f"aber KEIN Feedback in .work/feedback/ — Task bleibt in_progress!",
                         C.RED))
         except Exception:
             pass
@@ -3457,8 +4010,8 @@ def _reconcile_once(store: "TaskStore", enqueue, seen_mtime: Dict[str, float],
     #    manuell (außerhalb autopilot) abgearbeitet wurde, bleibt in `pending`
     #    (kein pending→in_progress-Launch). Würde nur `in_progress` gescannt,
     #    bliebe so ein Task mit fertigem Feedback ewig liegen (Bug: KGC-387).
-    d = Path(WATCHER_FEEDBACK_DIR)
-    if not d.exists():
+    d = feedback_dir(soft=True)          # B3: <vorhaben>/.work/feedback (soft → kein aktives Vorhaben = nichts zu tun)
+    if d is None or not d.exists():
         return
     # Warnung für Dateien die nicht dem Muster {task_id}_{agent}-feedback.md entsprechen
     # (z.B. Analyse-Dokumente die Qwen fälschlicherweise in den Feedback-Inbox schreibt)
@@ -3470,7 +4023,7 @@ def _reconcile_once(store: "TaskStore", enqueue, seen_mtime: Dict[str, float],
                 _ui_print(col(
                     f"  ⚠ [WATCHER] Fremde Datei in feedback-Inbox: {orphan.name} "
                     f"— kein Advance möglich (kein task_id_agent-Format). "
-                    f"Analyse-Dokumente gehören nach vault/_Workflow/analysis/",
+                    f"Analyse-Dokumente gehören nicht in die .work/feedback-Inbox",
                     C.YELLOW))
     for task in (store.list("pending") + store.list("in_progress")):
         tid = task.get("id") or ""
@@ -3610,7 +4163,7 @@ def _code_defaults() -> Dict[str, Any]:
             "code_locality":       "mount",   # sealed forces "local"
         },
         "setup": {
-            # Boot-fixed deployment topology (vault offload-topology.md). NOT runtime-switchable — a frozen
+            # Boot-fixed deployment topology (docs/setup-types.md). NOT runtime-switchable — a frozen
             # key (`/config set setup.type` is refused). Orchestrator + agents are ALWAYS co-located; the
             # setup.type just says on WHICH machine. Generic, secret-free:
             #   server (default): everything on the model host → in-engine only (external agents deferred);
@@ -3628,8 +4181,8 @@ def _code_defaults() -> Dict[str, Any]:
             "concurrency":      4,
             "max_tokens":       1024,
             "max_batch_tokens": 8192,
-            "memory_read":      WORKER_MEMORY,      # §3c MAP: per-item RAG + shared floor (Default AUS)
-            "memory_write":     WORKER_WRITE,       # §3c REDUCE: single-writer cold consolidation (Default AUS)
+            "memory_read":      WORKER_MEMORY,      # §3c MAP: per-item RAG + shared floor (Default AN, 06-18)
+            "memory_write":     WORKER_WRITE,       # §3c REDUCE: single-writer cold consolidation (Default AN, 06-18)
             "write_mode":       WORKER_WRITE_MODE,  # "reducer" (Default) | "direct" (autonome Agenten)
         },
         "providers": {
@@ -3665,7 +4218,9 @@ def _code_defaults() -> Dict[str, Any]:
         "paths": {
             "system_prompt": DEFAULT_PROMPT,
             "workdir":       DEFAULT_WORKDIR,
-            "session_file":  SESSION_FILE,
+            "state_root":    STATE_ROOT,    # versteckte Engine-Maschinerie (session.json, memory/, …)
+            "vault_root":    VAULT_ROOT,    # sichtbare Wissens-Wurzel (vault/<slug>/ je Vorhaben)
+            "session_file":  SESSION_FILE,  # Basename, aufgelöst unter state_root
             "code_root":     CODE_ROOT,
             # Open plugin surface: a dir scanned for `skills/*.py` plugins at startup
             # (GX10_PLUGINS_DIR). Empty = no plugins. See docs/plugin-api.md.
@@ -3687,9 +4242,9 @@ def _code_defaults() -> Dict[str, Any]:
             "token_budget":       TOKEN_BUDGET,     # MEM-9: Trim ans Fenster koppeln (Default AN)
             "max_file_chars":     MAX_FILE_CHARS,
             "list_dir_hard_cap":  LIST_DIR_HARD_CAP,
-            "summarize_evicted":  SUMMARIZE_EVICTED,   # B1: Default AUS → byte-identischer Trim
+            "summarize_evicted":  SUMMARIZE_EVICTED,   # B1: Default AN (06-18); aus → byte-identischer Trim
             "summary_max_tokens": SUMMARY_MAX_TOKENS,
-            "rag_enabled":        RAG_ENABLED,         # B2: Default AUS → User-Message verbatim
+            "rag_enabled":        RAG_ENABLED,         # B2: Default AN (06-18); aus → User-Message verbatim
             "rag_top_k":          RAG_TOP_K,
             "rag_max_tokens":     RAG_MAX_TOKENS,
         },
@@ -3825,7 +4380,7 @@ def _apply_env(cfg: Dict[str, Any]) -> Dict[str, Any]:
     setif("GX10_PROFILE",          "security", "profile")
     setif("GX10_SESSION_HEARTBEAT","security", "session_heartbeat_s", int)
     setif("GX10_CODE_LOCALITY",    "security", "code_locality")
-    setif("GX10_SETUP_TYPE",       "setup",    "type")    # boot-fixed offload topology (offload-topology.md)
+    setif("GX10_SETUP_TYPE",       "setup",    "type")    # boot-fixed offload topology (docs/setup-types.md)
     setif("GX10_PLUGINS_DIR",            "paths",    "plugins_dir")
     setif("GX10_FANOUT_CONCURRENCY",     "workers", "concurrency",      int)
     setif("GX10_WORKERS_MAX_TOKENS",     "workers", "max_tokens",       int)
@@ -3882,7 +4437,7 @@ def _apply_config(cfg: Dict[str, Any]):
     """Schreibt die gemergte Config in die Modul-Globals zurück, sodass die
     bestehenden Referenzen (run_tool, Makros, _trim_context, _classify_thinking,
     Watcher, UI …) unverändert weiterlaufen."""
-    global DEFAULT_BASE_URL, DEFAULT_MODEL, API_KEY_ENV, SESSION_FILE, CODE_ROOT
+    global DEFAULT_BASE_URL, DEFAULT_MODEL, API_KEY_ENV, STATE_ROOT, VAULT_ROOT, SESSION_FILE, CODE_ROOT
     global PLATFORM_MODE, PLATFORM, TASKS_DEDUP_THRESHOLD, ONBOARDING_MODE, TASK_PREFIX, _TASK_ID_RE, ACK_ENABLED, LODESTAR_ENABLED
     global AUTOPILOT_ENABLED, AUTOPILOT_CLAUDE_BIN, AUTOPILOT_EXTRA_ARGS
     global AUTOPILOT_DEFAULT_EFFORT, AUTOPILOT_LOGS_DIR, AUTOPILOT_MAX_CONCURRENT, AUTOPILOT_STREAM, AUTOPILOT_TERMINATE_ON_ADVANCE, AUTOPILOT_AUTOPLAN, AUTOPILOT_MAX_TASKS, AUTOPILOT_LOG_TERMINAL
@@ -3903,6 +4458,8 @@ def _apply_config(cfg: Dict[str, Any]):
     DEFAULT_BASE_URL = conn["base_url"]
     DEFAULT_MODEL    = conn["model"]
     API_KEY_ENV      = conn.get("api_key_env", API_KEY_ENV)
+    STATE_ROOT       = paths.get("state_root", STATE_ROOT)
+    VAULT_ROOT       = paths.get("vault_root", VAULT_ROOT)
     SESSION_FILE     = paths["session_file"]
     CODE_ROOT        = paths.get("code_root", CODE_ROOT)
 
@@ -4017,7 +4574,7 @@ def _apply_config(cfg: Dict[str, Any]):
 _REMOVED_MSG = (
     "The monolithic gx10 CLI has been removed - gx10 is now the engine library. "
     "Run the server (engine/server.py) and connect with the client (engine/client.py "
-    "or engine/tui.py). See docs/SETUP.md."
+    "or engine/tui.py). See SETUP.md."
 )
 
 

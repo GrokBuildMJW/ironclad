@@ -22,4 +22,4 @@ jobs:
           python -m pip install --upgrade pip
           pip install -e ".[engine]" pytest
       - name: Tests
-        run: python -m pytest ack/tests -q
+        run: python -m pytest ack/tests skills/mpr -q   # core kernel + the bundled MPR plugin

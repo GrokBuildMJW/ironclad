@@ -29,6 +29,7 @@ export const COMMANDS: readonly Command[] = [
   {name: 'work', scope: 'local', desc: 'run all open handovers ONCE locally (in parallel)'},
   {name: 'auto', scope: 'local', usage: 'on|off', desc: 'background poller for handovers'},
   {name: 'health', scope: 'local', desc: 'server status'},
+  {name: 'tool', scope: 'server', usage: '<name> <args|text>', desc: 'run a tool directly/deterministic, e.g. tool mpr_research <frage>'},
   {name: 'reset', scope: 'local', desc: 'start clean — transcript + server context + summary (keeps long-term memory)'},
   {name: 'resume', scope: 'local', desc: 'restore the previous session (default start is fresh; or --resume)'},
   {name: 'update', scope: 'local', usage: '[pull]', desc: 'rebuild + reinstall the client from source (GX10_SRC), then restart'},
@@ -48,6 +49,7 @@ export const COMMANDS: readonly Command[] = [
   {name: 'autopilot', scope: 'server', usage: 'on|off', desc: 'autopilot'},
   {name: 'autoplan', scope: 'server', usage: 'on|off [N]', desc: 'auto-plan the next tasks'},
   {name: 'log-terminal', scope: 'server', usage: 'on|off', desc: 'live autopilot log window'},
+  {name: 'vorhaben', scope: 'server', usage: 'new <name> --typ mpr|software | list | use <slug> | active | reconcile', desc: 'manage the vorhaben-centric vault (artefact home)'},
   {name: 'doctor', scope: 'server', desc: 'read-only preflight report'},
 ];
 

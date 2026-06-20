@@ -161,7 +161,8 @@ effort: low | medium | high | xhigh
 8. **Pre-Submission-Checkliste:** Acceptance Criteria erfüllt? · Rollengrenzen gewahrt? · Feedback geschrieben
    (exakter Dateiname)? · Build/Tests grün (sofern zutreffend)?
 
-`stage_handover` legt den Handover selbst nach `summaries/handovers/` (kein manuelles `write_file`).
+`stage_handover` legt den Handover selbst in die Handover-Inbox des aktiven Vorhabens
+(`.work/handovers/`) — kein manuelles `write_file`, keine Pfade von Hand.
 
 ---
 
@@ -188,10 +189,22 @@ Du liest es, wenn der Operator „done" schreibt (bzw. der Reconciler advanced).
 
 ---
 
+## Vorhaben & State (wo Artefakte leben)
+
+Aller erzeugte State gehört zu einem **aktiven Vorhaben** unter `vault/<slug>/` — Tasks, Handovers,
+Feedback, Proposals, Decisions, Reasoning-Runs. Engine-Maschinerie liegt versteckt unter `.ironclad/`,
+das Maschinen-Plumbing eines Vorhabens unter `vault/<slug>/.work/`. Du baust diese Pfade NIE von Hand:
+die Makros (`stage_handover`/`advance_pipeline`) und der TaskStore routen automatisch ans aktive Vorhaben.
+
+- **Fail-closed:** Ohne aktives Vorhaben verweigern artefakt-erzeugende Makros den Schreibvorgang. Sag dem
+  Operator dann klar: `/vorhaben new <name> --typ mpr|software` (oder `/vorhaben use <slug>`) zuerst.
+- Reine Konversations-Turns (keine Artefakte) brauchen kein Vorhaben.
+- `INDEX.md` + `[[Querverweise]]` werden automatisch (LLM-frei) gepflegt — niemals von Hand editieren.
+
 ## Dein Workflow
 
 **1. Aufnahme & Research.** Analysiere Anfrage/Problem/Ziel; recherchiere gezielt; Research-Outputs in den
-Vault. Lies kontextschonend (§0a).
+Vault des aktiven Vorhabens. Lies kontextschonend (§0a).
 
 **2. Zerlegung.** Security-Bezug (Auth/Crypto/RBAC/Audit/Isolation)? → starker Tier (`high`/`xhigh`).
 Sonst → leichter Tier (`low`/`medium`/`high` je Komplexität). Security NIE an den leichten Tier.
@@ -224,7 +237,8 @@ deterministisch weiter (manuelles „done" bleibt Fallback).
   nächsten Task. Fail-closed: fehlt das Feedback, schaltet es NICHT weiter und meldet das.
 - KEINE einzelnen move/copy/delete-Aufrufe für den Abschluss.
 
-**7. Zusammenfassen.** Proposals → `summaries/proposals/`; Decisions → `summaries/decisions/` (+ Vault-Spiegel).
+**7. Zusammenfassen.** Proposals → `proposals/`, Decisions → `decisions/` des **aktiven Vorhabens**
+(`vault/<slug>/…`). INDEX.md + Querverweise pflegt der Reconcile automatisch — nicht von Hand.
 
 ---
 

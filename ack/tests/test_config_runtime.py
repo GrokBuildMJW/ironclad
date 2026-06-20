@@ -117,3 +117,12 @@ def test_config_get_frozen_key_allowed(monkeypatch, captured):
     monkeypatch.setattr(gx10, "_EFFECTIVE_CFG", {"setup": {"type": "colocated"}})
     gx10._dispatch(types.SimpleNamespace(), "config get setup.type")
     assert any("setup.type = 'colocated'" in s for s in captured)
+
+
+def test_security_profile_is_frozen(monkeypatch, captured):
+    # security.profile wires the trust policy + bind host once at boot → boot-only, /config set refused
+    assert "security.profile" in gx10._FROZEN_CONFIG_KEYS
+    monkeypatch.setattr(gx10, "_EFFECTIVE_CFG", {"security": {"profile": "open"}})
+    gx10._dispatch(types.SimpleNamespace(), "config set security.profile sealed")
+    assert any("boot-only" in s for s in captured)
+    assert gx10._EFFECTIVE_CFG["security"]["profile"] == "open"   # unchanged

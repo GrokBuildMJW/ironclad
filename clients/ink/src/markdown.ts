@@ -10,8 +10,10 @@ import './forceColor.js'; // MEM-20: must run before marked-terminal so chalk in
 import {Marked} from 'marked';
 import {markedTerminal} from 'marked-terminal';
 
-/** Markdown syntax probe — if a block matches none of this, it renders verbatim (the fast path). */
-const HAS_MARKDOWN = /[*_`~#]|\[[^\]]*\]\(|^\s{0,3}([-+*]|\d+\.)\s|^\s{0,3}>|^\s{0,3}#{1,6}\s|```/m;
+/** Markdown syntax probe — if a block matches none of this, it renders verbatim (the fast path).
+ * Includes GFM table rows (a line starting with `|`) so decision-matrix tables go through the parser
+ * instead of being printed verbatim as flow text (LOK-6). */
+const HAS_MARKDOWN = /[*_`~#]|\[[^\]]*\]\(|^\s{0,3}([-+*]|\d+\.)\s|^\s{0,3}>|^\s{0,3}#{1,6}\s|^\s{0,3}\||```/m;
 
 /** Count fence lines (``` possibly indented) in a chunk — an odd count toggles the fence open/closed. */
 function fenceCount(s: string): number {

@@ -34,7 +34,7 @@ class _FakeServer:
     def feedback(self, task_id, agent, content):
         with self._lock:
             self.uploaded.append((task_id, agent, content))
-        return {"feedback_file": f"summaries/feedback/{task_id}_{agent}-feedback.md"}
+        return {"feedback_file": f".ironclad/agent/feedback/{task_id}_{agent}-feedback.md"}
 
 
 def _items(*ids):
@@ -75,7 +75,8 @@ def test_run_handover_passes_permission_mode(tmp_path, monkeypatch):
     def _fake_run(argv, **kw):
         captured["argv"] = argv
         # simulate claude writing the expected feedback file so the runner returns it
-        fb = tmp_path / "summaries" / "feedback" / "KGC-7_OPUS-feedback.md"
+        # (B3c: local agent scratch lives under the hidden .ironclad/agent/, not the project root)
+        fb = tmp_path / ".ironclad" / "agent" / "feedback" / "KGC-7_OPUS-feedback.md"
         fb.parent.mkdir(parents=True, exist_ok=True)
         fb.write_text("## Result\ndone", encoding="utf-8")
         return _R()

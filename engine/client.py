@@ -16,11 +16,13 @@ The loop, end to end:
   1. You type → ``POST /chat`` → the server runs one orchestrator turn → its output
      prints here. ``stage_handover`` on the server creates handover files server-side.
   2. ``/pending`` (or the ``/auto`` poller) pulls handovers the server has staged.
-  3. For each, the client writes the handover into the LOCAL ``summaries/handovers/``
-     and runs ``claude --print`` with the local code root as cwd — so the code-agent
-     edits *local* code, reading ``.claude/CLAUDE.md`` like a normal CLI session.
-  4. claude writes ``summaries/feedback/{id}_{AGENT}-feedback.md`` locally; the client
-     uploads it via ``POST /feedback``; the server's reconciler advances the task.
+  3. For each, the client writes the handover into a hidden LOCAL scratch dir
+     (``.ironclad/agent/handovers/``) and runs ``claude --print`` with the local code root as
+     cwd — so the code-agent edits *local* code, reading ``.claude/CLAUDE.md`` like a normal session.
+  4. claude writes ``.ironclad/agent/feedback/{id}_{AGENT}-feedback.md`` locally; the client
+     uploads it via ``POST /feedback``; the server's reconciler advances the task. (The scratch
+     dir is HTTP-mediated, hence independent of the server-side vorhaben routing — and kept out
+     of the project root.)
 
 Because the client pulls (never the server pushing in), session-gating and
 code-locality are structural, not enforced by extra machinery.
@@ -423,9 +425,9 @@ def _run_handover(item: Dict[str, Any], codedir: Path, log=print) -> Optional[st
     """Run a single staged handover LOCALLY with ``claude --print`` and return the
     feedback text it wrote (or None if it produced none).
 
-    The handover content is materialised into the local ``summaries/handovers/`` so
+    The handover content is materialised into the hidden local ``.ironclad/agent/handovers/`` so
     claude reads it exactly as in a normal session; claude is expected to write
-    ``summaries/feedback/{id}_{AGENT}-feedback.md`` locally, which we read back.
+    ``.ironclad/agent/feedback/{id}_{AGENT}-feedback.md`` locally, which we read back.
     ``log`` is the output sink (default ``print``; the TUI passes ``gx10._ui_print``
     so messages land in the full-screen pane, not over the layout)."""
     tid = item.get("id") or ""
@@ -433,7 +435,9 @@ def _run_handover(item: Dict[str, Any], codedir: Path, log=print) -> Optional[st
     ho_name = item.get("handover_file") or f"{tid}_{agent}.md"
     ho_text = item.get("handover") or ""
 
-    ho_dir = codedir / "summaries" / "handovers"
+    # Local agent scratch is kept OUT of the project root: a hidden .ironclad/agent/ drop zone
+    # (the handover round-trip is HTTP-mediated, so this path is independent of the server's vorhaben).
+    ho_dir = codedir / ".ironclad" / "agent" / "handovers"
     ho_dir.mkdir(parents=True, exist_ok=True)
     (ho_dir / ho_name).write_text(ho_text, encoding="utf-8")
 
@@ -443,9 +447,9 @@ def _run_handover(item: Dict[str, Any], codedir: Path, log=print) -> Optional[st
     # Claude-only .claude/CLAUDE.md), so any headless code-agent can fulfil the contract.
     fb_name = f"{tid}_{agent}-feedback.md"
     prompt = (f"Autonomously read and complete the handover at "
-              f"summaries/handovers/{ho_name}. Follow any agent guide in this repo "
+              f".ironclad/agent/handovers/{ho_name}. Follow any agent guide in this repo "
               f"(e.g. AGENTS.md / CLAUDE.md). When done, write a short result summary to "
-              f"summaries/feedback/{fb_name}.")
+              f".ironclad/agent/feedback/{fb_name}.")
 
     argv = _build_agent_argv(AGENT_CMD, bin=CLAUDE_BIN, model=str(model),
                              effort=str(effort), permission=CLAUDE_PERMISSION_MODE,
@@ -461,7 +465,7 @@ def _run_handover(item: Dict[str, Any], codedir: Path, log=print) -> Optional[st
         return None
     rc = proc.returncode
 
-    fb_path = codedir / "summaries" / "feedback" / f"{tid}_{agent}-feedback.md"
+    fb_path = codedir / ".ironclad" / "agent" / "feedback" / f"{tid}_{agent}-feedback.md"
     if fb_path.exists():
         return fb_path.read_text(encoding="utf-8")
     log(f"  ⚠ claude exited (exit {rc}) without a feedback file {fb_path.name}")

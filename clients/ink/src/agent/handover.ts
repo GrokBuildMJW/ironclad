@@ -133,7 +133,9 @@ export async function runHandover(
   const hoName = str(item['handover_file']) || `${tid}_${agent}.md`;
   const hoText = str(item['handover']);
 
-  const hoDir = path.join(codedir, 'summaries', 'handovers');
+  // Local agent scratch is kept OUT of the project root: a hidden .ironclad/agent/ drop zone
+  // (the handover round-trip is HTTP-mediated, so this path is independent of the server's vorhaben).
+  const hoDir = path.join(codedir, '.ironclad', 'agent', 'handovers');
   await fs.mkdir(hoDir, {recursive: true});
   await fs.writeFile(path.join(hoDir, hoName), hoText, 'utf-8');
 
@@ -141,9 +143,9 @@ export async function runHandover(
   const effort = str(item['effort']) || cfg.claudeEffort;
   const fbName = `${tid}_${agent}-feedback.md`;
   const prompt =
-    `Autonomously read and complete the handover at summaries/handovers/${hoName}. ` +
+    `Autonomously read and complete the handover at .ironclad/agent/handovers/${hoName}. ` +
     `Follow any agent guide in this repo (e.g. AGENTS.md / CLAUDE.md). When done, write a ` +
-    `short result summary to summaries/feedback/${fbName}.`;
+    `short result summary to .ironclad/agent/feedback/${fbName}.`;
 
   const argv = buildAgentArgv(cfg.agentCmd, {
     bin: cfg.claudeBin,
@@ -158,7 +160,7 @@ export async function runHandover(
     log(`  ✗ code-agent binary '${argv[0] ?? cfg.claudeBin}' not found (set GX10_CLAUDE_BIN / GX10_AGENT_CMD) — handover ${tid} skipped`);
     return null;
   }
-  const fbPath = path.join(codedir, 'summaries', 'feedback', fbName);
+  const fbPath = path.join(codedir, '.ironclad', 'agent', 'feedback', fbName);
   try {
     return await fs.readFile(fbPath, 'utf-8');
   } catch {

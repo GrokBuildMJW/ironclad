@@ -1,0 +1,10 @@
+{
+  "reg-001": {"axes": ["jurisdiction", "market", "enforcement", "precedent"], "known_conflicts": ["EU-Datentransferregeln vs. US-Cloud-Zugriffsrechte"]},
+  "reg-002": {"axes": ["jurisdiction", "market", "enforcement", "precedent"], "known_conflicts": ["EU-AI-Act-Auflagen vs. US-/UAE-Praxis"]},
+  "reg-003": {"axes": ["jurisdiction", "market", "enforcement", "precedent"], "known_conflicts": ["GDPR-Löschpflichten vs. CCPA-/UAE-Aufbewahrung"]},
+  "reg-004": {"axes": ["jurisdiction", "market", "enforcement", "precedent"], "known_conflicts": ["Forschungsnutzen vs. grenzüberschreitende Gesundheitsdaten-Restriktionen"]},
+  "reg-005": {"axes": ["jurisdiction", "market", "enforcement", "precedent"], "known_conflicts": ["Einwilligungspflicht vs. Markt-übliche Tracking-Praxis"]},
+  "reg-006": {"axes": ["jurisdiction", "market", "enforcement", "precedent"], "known_conflicts": ["Lizenz-Klauseln vs. kommerzielle Nutzung je Jurisdiktion"]},
+  "reg-007": {"axes": ["jurisdiction", "market", "enforcement", "precedent"], "known_conflicts": ["Monetarisierungs-Modell vs. einschlägige Präzedenzfälle"]},
+  "reg-008": {"axes": ["jurisdiction", "market", "enforcement", "precedent"], "known_conflicts": ["Anbieter-Wechselkosten vs. DSGVO-Konformität"]}
+}

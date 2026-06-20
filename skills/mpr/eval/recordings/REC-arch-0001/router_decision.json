@@ -1,0 +1,32 @@
+{
+  "classifier_raw": "{\"decision\": \"run\", \"route\": \"wide\", \"domain\": \"adhoc\", \"mode\": \"decision\", \"synthesis_template\": \"decision-matrix\", \"evidence_source\": \"internal\", \"perspectives\": [{\"role\": \"Evolvierbarkeit\", \"lens_prompt\": \"Bewerte Wartbarkeit, Modulgrenzen und \\u00c4nderungsfreundlichkeit der beiden Optionen.\", \"effort\": \"high\", \"provider_policy\": \"local-only\"}, {\"role\": \"Betrieb/SRE\", \"lens_prompt\": \"Bewerte Betriebslast, Observability, Deploy-Komplexit\\u00e4t und Ausfalldom\\u00e4nen.\", \"effort\": \"medium\", \"provider_policy\": \"local-only\"}, {\"role\": \"Kosten/TCO\", \"lens_prompt\": \"Bewerte Gesamtkosten: Infrastruktur, Personal, Migrationsaufwand \\u00fcber die Zeit.\", \"effort\": \"medium\", \"provider_policy\": \"local-only\"}]}",
+  "decision": "run",
+  "decline_reason": null,
+  "domain": "adhoc",
+  "evidence_source": "internal",
+  "guards_applied": [],
+  "mode": "decision",
+  "perspectives": [
+    {
+      "effort": "high",
+      "lens_prompt": "Bewerte Wartbarkeit, Modulgrenzen und Änderungsfreundlichkeit der beiden Optionen.",
+      "provider_policy": "local-only",
+      "role": "Evolvierbarkeit"
+    },
+    {
+      "effort": "medium",
+      "lens_prompt": "Bewerte Betriebslast, Observability, Deploy-Komplexität und Ausfalldomänen.",
+      "provider_policy": "local-only",
+      "role": "Betrieb/SRE"
+    },
+    {
+      "effort": "medium",
+      "lens_prompt": "Bewerte Gesamtkosten: Infrastruktur, Personal, Migrationsaufwand über die Zeit.",
+      "provider_policy": "local-only",
+      "role": "Kosten/TCO"
+    }
+  ],
+  "route": "wide",
+  "schema_version": "mpr.router/1",
+  "synthesis_template": "decision-matrix"
+}

@@ -110,8 +110,9 @@ def _real_cost(spec: ProviderSpec, est_in_tok: int, completion_tokens: Optional[
 
 class ProviderDispatcher:
     """Provider-agnostic dispatch OVER the existing substrates. Brings no own fan-out/store:
-    Spark → ReasoningWorkers.fanout, CLI → an injected agent_runner (PC pull-lane). Inactive (no
-    pool / disabled) ⇒ delegates the whole batch to fanout, byte-identical to today's parallel_reason."""
+    in-engine → ReasoningWorkers.fanout, local setup.type → an injected agent_runner (a local
+    co-located subprocess CLI). Inactive (no pool / disabled) ⇒ delegates the whole batch to fanout,
+    byte-identical to today's parallel_reason."""
 
     def __init__(self, registry: Optional[ProviderRegistry], *, workers: Optional[ReasoningWorkers],
                  agent_runner: Optional[Callable[..., Dict[str, Any]]] = None,

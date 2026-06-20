@@ -1,0 +1,10 @@
+{
+  "comp-001": {"axes": ["product", "pricing", "moat", "customer", "threat"], "known_conflicts": ["Preis-Wettbewerbsfähigkeit vs. Margen-Erhalt"]},
+  "comp-002": {"axes": ["product", "pricing", "moat", "customer", "threat"], "known_conflicts": ["Feature-Breite vs. Fokus/Reife"]},
+  "comp-003": {"axes": ["product", "pricing", "moat", "customer", "threat"], "known_conflicts": ["Moat-Tiefe vs. Wachstumsgeschwindigkeit der Herausforderer"]},
+  "comp-004": {"axes": ["product", "pricing", "moat", "customer", "threat"], "known_conflicts": ["Segment-Fokus vs. Marktbreite"]},
+  "comp-005": {"axes": ["product", "pricing", "moat", "customer", "threat"], "known_conflicts": ["GTM-Reichweite vs. Conversion-Effizienz"]},
+  "comp-006": {"axes": ["product", "pricing", "moat", "customer", "threat"], "known_conflicts": ["Funktionsumfang vs. Preis-/Support-Position"]},
+  "comp-007": {"axes": ["product", "pricing", "moat", "customer", "threat"], "known_conflicts": ["Reaktion auf Disruptoren vs. Kerngeschäft-Schutz"]},
+  "comp-008": {"axes": ["product", "pricing", "moat", "customer", "threat"], "known_conflicts": ["Gesamtposition vs. Einzel-Achsen-Schwächen"]}
+}

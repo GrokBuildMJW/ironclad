@@ -21,7 +21,7 @@ import gx10  # noqa: E402
 
 
 def test_save_load_roundtrip(tmp_path, monkeypatch):
-    monkeypatch.chdir(tmp_path)  # SESSION_FILE is cwd-relative (the project workdir)
+    monkeypatch.chdir(tmp_path)  # session_path() resolves under state_root() (.ironclad/), workdir-relative
 
     class A:
         _sanitize_messages = staticmethod(gx10.GX10._sanitize_messages)
@@ -33,7 +33,10 @@ def test_save_load_roundtrip(tmp_path, monkeypatch):
         {"role": "assistant", "content": "hi"},
     ]
     gx10.GX10.save_session(src)
-    assert (tmp_path / gx10.SESSION_FILE).exists()
+    sp = tmp_path / gx10.session_path()           # .ironclad/session.json under the workdir
+    assert sp.exists()
+    assert sp.parent.name == ".ironclad"          # A2: session lives in state_root, not the project root
+    assert not (tmp_path / ".gx10_session.json").exists()  # old root-level location is gone
 
     dst = A()
     dst.messages = [{"role": "system", "content": "sys"}]  # the system prompt is kept, the rest reloaded

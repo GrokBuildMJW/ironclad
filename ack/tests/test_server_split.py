@@ -72,21 +72,25 @@ def test_capture_does_not_leak_across_threads():
 # --------------------------------------------------------------------------- #
 def test_write_feedback_creates_reconciler_file(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
+    gx10.vorhaben_new("Demo", "software")          # B3: feedback routes to the active vorhaben
     path = server._write_feedback("KGC-7", "opus", "## Result\nok")
     p = Path(path)
     assert p.name == "KGC-7_OPUS-feedback.md"
     assert p.parent.name == "feedback"
+    assert p.parent.parent.name == ".work"         # inbox lives under <vorhaben>/.work/
+    assert "vault" in p.parts and "demo" in p.parts # …and under vault/<slug>/, not the project root
     assert "## Result" in p.read_text(encoding="utf-8")
 
 
 def test_pending_handovers_surfaces_staged_task(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
-    store = gx10.TaskStore(root=".")
+    gx10.vorhaben_new("Demo", "software")          # B3: routing target
+    store = gx10._store()                           # the production singleton (routes to the vorhaben)
     store.create({"type": "feature", "priority": "high",
                   "title": "wire it", "description": "do the thing"}, force=True)
     tid = store.list("pending")[0]["id"]
-    ho_dir = tmp_path / "summaries" / "handovers"
-    ho_dir.mkdir(parents=True)
+    ho_dir = gx10.handovers_dir()                   # <vorhaben>/.work/handovers
+    ho_dir.mkdir(parents=True, exist_ok=True)
     (ho_dir / f"{tid}_OPUS.md").write_text("---\nto: claude-opus-4-8\neffort: high\n---\nbody",
                                            encoding="utf-8")
     pend = server._pending_handovers()
@@ -115,6 +119,7 @@ def _start_server(monkeypatch, tmp_path):
     from http.server import ThreadingHTTPServer
 
     monkeypatch.chdir(tmp_path)
+    gx10.vorhaben_new("Server Demo", "software")    # B3: active vorhaben so /feedback can route
 
     def _fake_dispatch(agent, message):
         gx10._ui_print(f"echo:{message}")

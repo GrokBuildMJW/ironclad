@@ -15,7 +15,7 @@ One env var, `GX10_AGENT_CMD`, is the command template. Placeholders:
 | `{bin}` | the binary (also settable via `GX10_CLAUDE_BIN`) |
 | `{model}` | the model the orchestrator picked for the task |
 | `{effort}` | the effort level (`GX10_CLAUDE_EFFORT`, default `high`) |
-| `{permission}` | the permission mode (`GX10_CLAUDE_PERMISSION_MODE`) |
+| `{permission}` | the permission mode (`GX10_CLAUDE_PERMISSION_MODE`, default `acceptEdits`) |
 | `{prompt}` | the instruction (stays a **single argument**, even with spaces) |
 
 Use **only the placeholders your CLI needs** — drop the rest. The default template is
@@ -25,8 +25,8 @@ The contract any code-agent must satisfy is simple, and stated in the prompt its
 
 1. run **headless / non-interactive** (no prompts to a human),
 2. be able to **write files** in the working directory,
-3. **read** the handover at `summaries/handovers/<ID>_<AGENT>.md`, do the task, and
-4. **write** a short result to `summaries/feedback/<ID>_<AGENT>-feedback.md`.
+3. **read** the handover at `.ironclad/agent/handovers/<ID>_<AGENT>.md`, do the task, and
+4. **write** a short result to `.ironclad/agent/feedback/<ID>_<AGENT>-feedback.md`.
 
 The client reads that feedback file back and reports the task done. Whatever CLI you use,
 if it honours those four points, it works.
@@ -77,5 +77,5 @@ template — the orchestrator's model hint is then ignored and the CLI uses its 
   against your code. See [`self-maintenance.md`](self-maintenance.md).
 - **Concurrency.** `GX10_MAX_AGENTS` bounds how many run at once (default 3).
 - **Quick check.** Set `GX10_AGENT_CMD`, start a small handover, and confirm the agent
-  writes `summaries/feedback/<ID>_<AGENT>-feedback.md`. If it doesn't, the CLI either
+  writes `.ironclad/agent/feedback/<ID>_<AGENT>-feedback.md`. If it doesn't, the CLI either
   isn't running headless or didn't get a write/approve flag.

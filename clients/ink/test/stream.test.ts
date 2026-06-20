@@ -36,6 +36,25 @@ test('stream parser — multi-byte UTF-8 split across chunks', async () => {
   assert.equal(texts.join(''), 'café');
 });
 
+test('stream parser — heartbeat frame (\\x00HB\\x00) dropped, text intact', async () => {
+  // BUG-7: the server emits \x00HB\x00 keep-alive frames during long silent turns so the
+  // HTTP body stream never idles into a timeout. The client must treat HB as a control
+  // frame with no valid TR-JSON → drop it silently (no text, no tool), text around it joins.
+  const texts: string[] = [];
+  const frames: ToolFrame[] = [];
+  const feed = createStreamParser({
+    onText: (s) => texts.push(s),
+    onTool: (f) => {
+      frames.push(f);
+    },
+  });
+  await feed(enc.encode('Hallo' + NUL + 'HB' + NUL + 'Welt'));
+  await feed(enc.encode(NUL + 'HB' + NUL)); // a lone heartbeat between text bursts
+  await feed(null);
+  assert.deepEqual(texts, ['Hallo', 'Welt']);
+  assert.equal(frames.length, 0);
+});
+
 test('stream parser — malformed frame dropped, stream continues', async () => {
   const texts: string[] = [];
   const frames: ToolFrame[] = [];

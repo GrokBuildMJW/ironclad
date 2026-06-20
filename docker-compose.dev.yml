@@ -36,9 +36,10 @@ services:
       GX10_PROFILE: ${GX10_PROFILE:-open}     # dev default; set sealed if exposed
       GX10_LANGUAGE: ${GX10_LANGUAGE:-en}
       GX10_MEMORY_URL: ${GX10_MEMORY_URL:-}
+      GX10_WARM_URL: ${GX10_WARM_URL:-redis://localhost:6379}   # warm tier via mem-valkey (--profile memory); fail-soft
       GX10_WORKDIR: /work
     volumes:
-      - ./dev-workdir:/work       # tasks/, summaries/, session persist on the host
+      - ./dev-workdir:/work       # engine state → .ironclad/, artifacts → vault/<slug>/ (persist on the host)
     deploy:
       resources:
         limits:

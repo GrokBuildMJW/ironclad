@@ -42,7 +42,7 @@ LOCAL_COMMANDS = {"tasks", "pending", "work", "auto", "health", "help", "exit", 
 #: letting the server decide.)
 SERVER_COMMANDS = {
     "status", "config", "clear", "read", "write", "cat", "ls",
-    "watcher", "autopilot", "autoplan", "log-terminal",
+    "watcher", "autopilot", "autoplan", "log-terminal", "vorhaben",
 }
 
 HELP_TEXT = """\
@@ -69,6 +69,8 @@ Commands (with a / prefix) — plain text without / is sent to the orchestrator 
     /watcher on|off    auto-advance (reconciler)
     /autopilot on|off  autopilot
     /autoplan on|off [N]
+    /vorhaben new <name> --typ mpr|software   create + activate a vorhaben
+    /vorhaben list | use <slug> | active | reconcile [slug]
     (more: /write, /cat, /log-terminal)"""
 
 

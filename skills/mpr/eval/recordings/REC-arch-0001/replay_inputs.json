@@ -1,0 +1,88 @@
+{
+  "run_id": "REC-arch-0001",
+  "query": "Sollen wir den Modulithen vor der Skalierung auf fünf Teams in Microservices aufteilen?",
+  "mode": "decision",
+  "synthesis_template": "decision-matrix",
+  "domain": "adhoc",
+  "evidence_source": "internal",
+  "perspectives": [
+    {
+      "role": "Evolvierbarkeit",
+      "content": "Microservices erlauben unabhängige Evolution je Domäne, erkaufen das aber mit verteilter Kopplung und Vertragspflege. Vor klaren Domänengrenzen überwiegt der Nachteil; ein modularer Monolith hält die Änderungskosten niedriger.",
+      "provider": "spark-vllm",
+      "effort": "high",
+      "provider_policy": "local-only"
+    },
+    {
+      "role": "Betrieb/SRE",
+      "content": "Services vervielfachen Deploy-Pipelines, Observability und Ausfalldomänen. Ohne reifes Plattform-Team steigt die operative Last überproportional; der Monolith ist betrieblich schlanker.",
+      "provider": "spark-vllm",
+      "effort": "medium",
+      "provider_policy": "local-only"
+    },
+    {
+      "role": "Kosten/TCO",
+      "content": "Die TCO steigt durch Infra- und Personalbedarf sowie Migrationsaufwand. Bis zur Skalierung auf fünf Teams ist der Monolith klar günstiger; danach kann sich der Schnitt lohnen.",
+      "provider": "spark-vllm",
+      "effort": "medium",
+      "provider_policy": "local-only"
+    }
+  ],
+  "synthesis_json": {
+    "options": [
+      "Modulith behalten",
+      "In Microservices aufteilen"
+    ],
+    "criteria": [
+      {
+        "name": "Evolvierbarkeit",
+        "weight": 3
+      },
+      {
+        "name": "Betriebslast",
+        "weight": 2
+      },
+      {
+        "name": "TCO",
+        "weight": 2
+      }
+    ],
+    "cells": [
+      {
+        "option": "Modulith behalten",
+        "criterion": "Evolvierbarkeit",
+        "score": 3
+      },
+      {
+        "option": "Modulith behalten",
+        "criterion": "Betriebslast",
+        "score": 5
+      },
+      {
+        "option": "Modulith behalten",
+        "criterion": "TCO",
+        "score": 5
+      },
+      {
+        "option": "In Microservices aufteilen",
+        "criterion": "Evolvierbarkeit",
+        "score": 4
+      },
+      {
+        "option": "In Microservices aufteilen",
+        "criterion": "Betriebslast",
+        "score": 2
+      },
+      {
+        "option": "In Microservices aufteilen",
+        "criterion": "TCO",
+        "score": 2
+      }
+    ],
+    "recommendation": "Modulith behalten",
+    "recommendation_rationale": "Bis fünf Teams überwiegen niedrigere Betriebslast und TCO; die Evolvierbarkeits-Lücke ist mit einem modularen Schnitt schließbar.",
+    "fallback": "In Microservices aufteilen",
+    "fallback_trigger": "klare, stabile Domänengrenzen ODER >5 Teams mit Deploy-Konflikten",
+    "conflict_notes": []
+  }
+}

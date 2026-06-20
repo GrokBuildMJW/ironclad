@@ -19,17 +19,21 @@ turn produced, while background threads (reconciler / queue consumer) log to the
 server's stdout. The engine's agent state is serialized behind a single lock — one
 turn at a time — so a request and a reconciler-driven advance never race.
 
-Endpoints (all JSON; trust model = home LAN, no auth — same as the vLLM port):
-  GET  /health   → liveness + effective config summary
-  POST /chat     → ``{"message": str}`` → run one orchestrator turn, return captured output
-  GET  /tasks    → TaskStore snapshot (all statuses)
-  GET  /pending  → tasks awaiting a local code-agent (pending + handover present)
-  POST /feedback → ``{"task_id","agent","content"}`` → drop the feedback file the
-                   reconciler advances on
-  POST /fanout   → ``{"prompts":[...], "system"?, "max_tokens"?, "temperature"?,
-                   "think"?}`` → run independent reasoning prompts CONCURRENTLY against
-                   the local model (co-located with the GPU); results in input order.
-                   Stateless — does not take the agent lock.
+Endpoints (all JSON; trust model = the configured security.profile — see security.md):
+  GET  /health        → liveness + effective config summary
+  GET  /tasks         → TaskStore snapshot (all statuses)
+  GET  /pending       → tasks awaiting a local code-agent (pending + handover present)
+  GET  /doctor        → runtime ACK/registry self-check (read-only)
+  POST /chat          → ``{"message": str}`` → run one orchestrator turn, return captured output
+  POST /chat/stream   → streamed turn; passes local code-tool calls back over the wire as
+                        ``\x00TR\x00`` frames (+ ``\x00HB\x00`` heartbeats) for the client tool-bridge
+  POST /tool-result   → ``{"id","result"}`` → the client returns a passed-through code-tool result
+  POST /feedback      → ``{"task_id","agent","content"}`` → drop the feedback file the reconciler advances on
+  POST /cancel        → set the engine cancel event; the running turn aborts at its next iteration
+  POST /fanout        → ``{"prompts":[...], "system"?, "max_tokens"?, "temperature"?, "think"?}`` → run
+                        independent reasoning prompts CONCURRENTLY against the local model; input order.
+                        Stateless — does not take the agent lock.
+  POST /session/open|heartbeat|close → Phase-d session lifecycle (gated profiles; see security.md)
 
 Secret-free: imports only :mod:`gx10` + stdlib. All connection details come from the
 config tree (``conf/…``), never hard-coded here.
@@ -206,7 +210,7 @@ def bootstrap(config_path: Optional[str] = None) -> Tuple[gx10.GX10, Dict[str, A
         platform=gx10.PLATFORM,
         onboarding=gx10.ONBOARDING_MODE,
     )
-    if Path(gx10.SESSION_FILE).exists():
+    if gx10.session_path().exists():
         try:
             agent.load_session()
         except Exception:
@@ -302,7 +306,10 @@ def _doctor_report() -> Dict[str, Any]:
     preflight the doctor CLI runs, exposed live so contract drift surfaces at runtime
     instead of only via tooling. Includes Lodestar's checks when the plugin is enabled."""
     extra = doctor._load_lodestar_checks(bool(gx10.LODESTAR_ENABLED))
-    report = doctor.run_doctor(Path(os.getcwd()), extra_checks=extra)
+    # B3: the task/handover artifacts live under the active vorhaben — point the doctor there
+    # (fall back to the workdir when no vorhaben is active, so the read-only check never crashes).
+    root = gx10.artifact_root_soft() or Path(os.getcwd())
+    report = doctor.run_doctor(root, extra_checks=extra)
     return {
         "ok": not report.has_errors(),
         "errors": report.count(doctor.Severity.ERROR),
@@ -312,9 +319,10 @@ def _doctor_report() -> Dict[str, Any]:
 
 
 def _write_feedback(task_id: str, agent: str, content: str) -> str:
-    """Drop ``{task_id}_{AGENT}-feedback.md`` into the watch dir. The server-side
-    reconciler detects it (mtime-stable) and advances the task."""
-    d = Path(gx10.WATCHER_FEEDBACK_DIR)
+    """Drop ``{task_id}_{AGENT}-feedback.md`` into the active vorhaben's feedback inbox
+    (``<vorhaben>/.work/feedback``). The server-side reconciler detects it (mtime-stable)
+    and advances the task. Fail-closed: requires an active vorhaben (B3)."""
+    d = gx10.feedback_dir()
     d.mkdir(parents=True, exist_ok=True)
     agent_u = (agent or "OPUS").upper()
     fb = d / f"{task_id}_{agent_u}-feedback.md"
@@ -467,26 +475,50 @@ class _Handler(BaseHTTPRequestHandler):
                 except OSError:
                     pass
 
+                # Serialize all writes: a heartbeat frame must never interleave INSIDE a
+                # text chunk or a \x00TR…\x00 tool frame (a stray \x00 would split the
+                # frame and desync the client parser).
+                _write_lock = threading.Lock()
+
                 def _write(text: str) -> None:
-                    try:
-                        self.wfile.write(text.encode("utf-8", "replace"))
-                        self.wfile.flush()
-                    except (BrokenPipeError, ConnectionResetError, OSError):
-                        pass  # client gone → the turn finishes server-side
+                    with _write_lock:
+                        try:
+                            self.wfile.write(text.encode("utf-8", "replace"))
+                            self.wfile.flush()
+                        except (BrokenPipeError, ConnectionResetError, OSError):
+                            pass  # client gone → the turn finishes server-side
                 # Opt-in: if the client offers local execution (X-Local-Tools: 1), pass
                 # code-tools through to it; otherwise they run server-side as before.
                 local = self.headers.get("X-Local-Tools") == "1"
                 bridge = ToolBridge(_write) if local else None
-                with _Streamed(_write):
-                    with _AGENT_LOCK:
-                        if bridge is not None:
-                            _ACTIVE_BRIDGE["b"] = bridge
-                            gx10._LOCAL_TOOL_BRIDGE = bridge
-                        try:
-                            gx10._dispatch(self.agent, message)
-                        finally:
-                            gx10._LOCAL_TOOL_BRIDGE = None
-                            _ACTIVE_BRIDGE["b"] = None
+                # Keep-alive: a turn can run for minutes with NO output (e.g. a reasoning
+                # panel computing perspectives). Without bytes on the wire the client's HTTP
+                # body stream idles into a timeout ("TypeError: terminated") and the result —
+                # though finished server-side — never reaches the live view. So while the turn
+                # runs we emit a no-op frame \x00HB\x00 every few seconds; the client parser
+                # sees a control frame with no valid TR-JSON and silently drops it (it never
+                # appears in the text). Stops as soon as _dispatch returns.
+                _hb_stop = threading.Event()
+
+                def _heartbeat() -> None:
+                    while not _hb_stop.wait(10.0):
+                        _write("\x00HB\x00")
+                hb_thread = threading.Thread(target=_heartbeat, daemon=True)
+                hb_thread.start()
+                try:
+                    with _Streamed(_write):
+                        with _AGENT_LOCK:
+                            if bridge is not None:
+                                _ACTIVE_BRIDGE["b"] = bridge
+                                gx10._LOCAL_TOOL_BRIDGE = bridge
+                            try:
+                                gx10._dispatch(self.agent, message)
+                            finally:
+                                gx10._LOCAL_TOOL_BRIDGE = None
+                                _ACTIVE_BRIDGE["b"] = None
+                finally:
+                    _hb_stop.set()
+                    hb_thread.join(timeout=1.0)
             elif self.path == "/tool-result":
                 # The client returns the result of a passed-through code-tool.
                 data = self._read_json()
@@ -583,7 +615,7 @@ def serve(host: str = "0.0.0.0", port: int = 8100,
         max_batch_tokens=int(wcfg.get("max_batch_tokens", 8192)),
     )
     gx10._WORKERS = _Handler.workers   # shared handle for the in-engine parallel tool
-    # P0 provider router (beside _WORKERS). The boot-fixed `setup.type` (offload-topology.md) drives the
+    # P0 provider router (beside _WORKERS). The boot-fixed `setup.type` (docs/setup-types.md) drives the
     # runner wiring: server → dispatcher inactive (in-engine only, byte-identical); local → local-subprocess
     # runner (engine + agents co-located on the desktop). Orchestrator + agents are always co-located —
     # no cross-machine offload. The dispatcher code is unchanged; only WHICH runner closure we inject differs.

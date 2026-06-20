@@ -66,9 +66,13 @@ services:
       GX10_SERVER_PORT: ${GX10_SERVER_PORT:-8100}
       GX10_LANGUAGE: ${GX10_LANGUAGE:-en}
       GX10_MEMORY_URL: ${GX10_MEMORY_URL:-}
+      # Warm tier (B0): the host-network orchestrator reaches the mem-valkey loopback publish at
+      # localhost:6379 → wired automatically under `--profile memory`. Fail-soft: with valkey absent
+      # the tier is a no-op (one failed connect, then disabled). Override/disable via GX10_WARM_URL.
+      GX10_WARM_URL: ${GX10_WARM_URL:-redis://localhost:6379}
       GX10_WORKDIR: /work
     volumes:
-      - ./ironclad-workdir:/work   # tasks/, summaries/, session persist on the host
+      - ./ironclad-workdir:/work   # engine state → .ironclad/, artifacts → vault/<slug>/ (persist on the host)
 
   # --- Long-term memory (Mem0) — started with `--profile memory` -------------
   # Then also set GX10_MEMORY_URL=http://localhost:8800 so the orchestrator uses it.

@@ -9,6 +9,48 @@ Released versions are listed below; upcoming work accumulates under *Unreleased*
 
 ## [Unreleased]
 
+## [0.0.4] - 2026-06-20
+
+### Added
+- **Vorhaben-centric state layout.** Engine machinery moves out of the project root into a hidden
+  `state_root` (`.ironclad/`: `session.json`, the local warm-cache, the `active` marker) and every
+  produced artifact lives under the **active vorhaben** `vault/<slug>/` — visible `decisions/`,
+  `proposals/`, `reviews/`, `runs/`, `tasks/`; hidden `.work/` machine plumbing (active handover,
+  handover/feedback inbox, archive). Vorhaben are created explicitly
+  (`/vorhaben new|list|use|active|reconcile`, `--typ mpr|software`); the `TaskStore`,
+  `stage_handover`/`advance_pipeline`, reviews and the MPR `runs_dir` all route to the active
+  vorhaben, **fail-closed** when none is active (no writes into the project root), while background
+  scanners soft-skip. The local code-agent scratch moves to a hidden `.ironclad/agent/` drop zone.
+  Overridable via `paths.state_root` / `paths.vault_root`. See [`docs/state-and-vorhaben.md`](docs/state-and-vorhaben.md).
+- **Self-maintaining vault** (`reconcile_vault`, `/vorhaben reconcile`): deterministic, **LLM-free**
+  upkeep — a regenerated `INDEX.md` (grouped, Obsidian `[[links]]`, manual prose preserved outside the
+  AUTO block) plus an idempotent "Verwandt (auto)" relation block injected into curated docs
+  (shared frontmatter tags / title reference). Auto-fires index-only after a write (vorhaben create,
+  `stage_handover`, `advance_pipeline`, an MPR run); the full link pass runs on the explicit command.
+- **MPR multi-perspective reasoner** (`skills/mpr/`) now ships in the OSS as the flagship plugin
+  example: an expert role-panel router → governed fan-out → deterministic synthesis (decision-matrix /
+  comparison / risk / evidence templates) with a sovereignty/budget-gated audit trail. Loaded via the
+  open plugin surface (`GX10_PLUGINS_DIR`), runtime-gated by `mpr.enabled` (default off), used through a
+  `--typ mpr` vorhaben. See [`skills/mpr/README.md`](skills/mpr/README.md).
+- **Operator security guide** ([`docs/security.md`](docs/security.md)): the trust profiles
+  (`open`/`token`/`sealed`), their config keys + env overrides, the gated routes, the session
+  lifecycle, and the client header contract — in one place.
+
+### Changed
+- `session.json` now lives under `.ironclad/` (was `.gx10_session.json` in the project root).
+- Default workspace no longer scatters `tasks/`/`summaries/`/`reviews/` into the project root.
+- **Warm tier wired by default** — the shipped `docker-compose` now sets `GX10_WARM_URL` to the
+  `mem-valkey` loopback, so the warm tier (rolling summary + retrieval cache) activates automatically
+  under `--profile memory` (fail-soft otherwise); previously the container shipped but was never wired.
+- **`security.profile` is now a boot-only (frozen) config key** — `/config set security.profile …` is
+  refused (it wires the trust policy + bind host once at boot); set it in the deploy and restart.
+- **Plugin tool names must be unique** — a name clash now keeps the first-loaded tool and warns,
+  instead of silently shadowing it.
+- **Docs reconciled against the code** (a 10-dimension docs↔code audit): `status.md`, `setup-types.md`,
+  `config-runtime.md`, `plugin-api.md`, `code-agents.md`, README/SETUP/AGENTS — corrected over-claims
+  (the boundary check does not sandbox plugins), completed the env/config surface, added the
+  `/vorhaben new` onboarding prerequisite, and refreshed the test counts.
+
 ## [0.0.3] - 2026-06-19
 
 ### Added

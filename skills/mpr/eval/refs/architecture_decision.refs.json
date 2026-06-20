@@ -1,0 +1,10 @@
+{
+  "arch-001": {"axes": ["maintainability", "operability", "security", "performance", "reversibility", "team-fit", "cost"], "known_conflicts": ["Service-Autonomie vs. operative Komplexität"]},
+  "arch-002": {"axes": ["maintainability", "operability", "security", "performance", "reversibility", "team-fit", "cost"], "known_conflicts": ["Performance-Gewinn vs. Tooling-/Debugging-Reife"]},
+  "arch-003": {"axes": ["maintainability", "operability", "security", "performance", "reversibility", "team-fit", "cost"], "known_conflicts": ["Entkopplung vs. Nachvollziehbarkeit/Debugging"]},
+  "arch-004": {"axes": ["maintainability", "operability", "security", "performance", "reversibility", "team-fit", "cost"], "known_conflicts": ["Kontrolle/Anpassbarkeit vs. Wartungslast & Sicherheitsverantwortung"]},
+  "arch-005": {"axes": ["maintainability", "operability", "security", "performance", "reversibility", "team-fit", "cost"], "known_conflicts": ["Skalierbarkeit vs. Reife/Lock-in"]},
+  "arch-006": {"axes": ["maintainability", "operability", "security", "performance", "reversibility", "team-fit", "cost"], "known_conflicts": ["Evolvierbarkeit vs. Betriebslast bei kleinem Team"]},
+  "arch-007": {"axes": ["maintainability", "operability", "security", "performance", "reversibility", "team-fit", "cost"], "known_conflicts": ["Kontrolle vs. Betriebsaufwand/TCO"]},
+  "arch-008": {"axes": ["maintainability", "operability", "security", "performance", "reversibility", "team-fit", "cost"], "known_conflicts": ["Umbaukosten jetzt vs. Schulden-Zins später"]}
+}

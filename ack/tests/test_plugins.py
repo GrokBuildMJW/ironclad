@@ -51,6 +51,22 @@ def test_plugin_is_discovered_and_offered(tmp_path):
     assert "name" in params["properties"] and params["properties"]["name"]["type"] == "string"
 
 
+def test_duplicate_tool_name_keeps_first(tmp_path):
+    # two skills with DISTINCT capabilities but the SAME tool name → the name must stay unique
+    # (one registered tool, not a silent overwrite). Audit #28.
+    skills = tmp_path / "skills"
+    skills.mkdir(parents=True, exist_ok=True)
+    (skills / "a.py").write_text(
+        'CASE = {"name": "dup", "capability": "capa", "description": "A"}\n'
+        "def run(x: str) -> str:\n    return 'A:' + x\n", encoding="utf-8")
+    (skills / "b.py").write_text(
+        'CASE = {"name": "dup", "capability": "capb", "description": "B"}\n'
+        "def run(x: str) -> str:\n    return 'B:' + x\n", encoding="utf-8")
+    n = gx10._load_plugins(str(tmp_path))
+    assert n == 1                          # collision resolved: exactly one tool registered
+    assert "dup" in gx10._PLUGIN_TOOLS
+
+
 def test_plugin_tool_dispatches_to_run(tmp_path):
     gx10._load_plugins(_plugin_dir(tmp_path, "greet.py", _GREET))
     assert gx10.run_tool("greet", {"name": "Ada"}) == "Hello, Ada!"

@@ -1,0 +1,28 @@
+{
+  "decision": "run",
+  "route": "wide",
+  "domain": "adhoc",
+  "mode": "decision",
+  "synthesis_template": "decision-matrix",
+  "evidence_source": "internal",
+  "perspectives": [
+    {
+      "role": "Evolvierbarkeit",
+      "lens_prompt": "Bewerte Wartbarkeit, Modulgrenzen und Änderungsfreundlichkeit der beiden Optionen.",
+      "effort": "high",
+      "provider_policy": "local-only"
+    },
+    {
+      "role": "Betrieb/SRE",
+      "lens_prompt": "Bewerte Betriebslast, Observability, Deploy-Komplexität und Ausfalldomänen.",
+      "effort": "medium",
+      "provider_policy": "local-only"
+    },
+    {
+      "role": "Kosten/TCO",
+      "lens_prompt": "Bewerte Gesamtkosten: Infrastruktur, Personal, Migrationsaufwand über die Zeit.",
+      "effort": "medium",
+      "provider_policy": "local-only"
+    }
+  ]
+}

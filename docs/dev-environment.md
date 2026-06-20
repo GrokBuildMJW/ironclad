@@ -35,7 +35,7 @@ GX10_BASE_URL=http://host.docker.internal:8000/v1 \
   set it to a shared dev/Spark endpoint if you have one.
 - **`open` profile** (no auth) — for local development. Use `sealed` for anything exposed.
 - **Resource limits** keep it from swamping your machine (tune in the compose file).
-- Workdir (`tasks/`, `summaries/`) persists in `./dev-workdir` on the host.
+- Workdir persists in `./dev-workdir` on the host (engine state under `.ironclad/`, artifacts under `vault/<slug>/`).
 
 Then drive it with the **recommended TypeScript client** from your host (so your code stays on
 your machine; build it once per [`SETUP.md`](../SETUP.md)):

@@ -3,11 +3,13 @@
 ironclad merges its configuration once at startup with the precedence
 
 ```
-code-defaults  <  file / conf  <  env  <  CLI flags
+code-defaults  <  file / conf  <  env
 ```
 
 into a single in-memory tree (`gx10._EFFECTIVE_CFG`). `/config get` and `/config set` let an operator
-**read and override** any key of that tree **at runtime**, without restarting the server.
+**read and override** any key of that tree **at runtime**, without restarting the server. (The standalone
+launcher also accepts a few CLI flags like `--model`/`--workdir`; the **headless server** — which is what
+actually builds `_EFFECTIVE_CFG` — takes its config from defaults + file/conf + env only.)
 
 These commands are **generic and plugin-agnostic** — core carries no knowledge of any specific section.
 Any section (core or plugin) that reads `_EFFECTIVE_CFG` can be steered through them.
@@ -39,24 +41,31 @@ Example:
 /config get context.token_budget        # → context.token_budget = True
 ```
 
+> `/config get` renders a key whose value is `None` (a legitimate default, e.g. `providers.default_id`)
+> the same as a truly absent key — both show `(not set)`; it does not distinguish them.
+
 ## Semantics
 
 1. `set` writes the (coerced) value into `_EFFECTIVE_CFG` at the dotted path.
 2. It then calls `_apply_config(_EFFECTIVE_CFG)` to **re-derive the engine globals** from the full tree
    (idempotent; reads the merged tree as the source of truth).
-3. If `_apply_config` cannot apply the key (e.g. it belongs to a **plugin** section that core does not
-   model), the write still stands and a `stored (not a core global: …)` note is shown — plugin sections
-   are expected to re-read their own slice of `_EFFECTIVE_CFG` on their next use.
+3. `_apply_config` re-derives **all** core globals from the whole tree and simply **ignores** sections it
+   does not model — so setting a **plugin** key normally succeeds quietly (the plugin re-reads its own
+   slice of `_EFFECTIVE_CFG` on its next use). The `stored (not a core global: …)` note is a defensive
+   fallback shown **only if `_apply_config` raises** (e.g. the live tree is missing a section core expects);
+   the dotted write itself still stands.
 4. With no live config yet (`_EFFECTIVE_CFG is None`, i.e. before the server has merged its config) `set`
    is a friendly no-op.
 
 ## Frozen (boot-only) keys
 
-Some keys wire something at **startup** (e.g. `setup.type` selects the offload runner — see
-[`setup-types.md`](setup-types.md)). Mutating them at runtime would be incoherent, so they are **frozen**:
-`/config get <key>` still reads them, but `/config set <key> …` is **refused** with a clear message
-("boot-only — set it in the deploy"). The frozen set lives in core (`_FROZEN_CONFIG_KEYS`), generic and
-extensible. Change a frozen key in the config file / env and restart.
+Some keys wire something at **startup** that a later write cannot re-thread. Currently frozen
+(`_FROZEN_CONFIG_KEYS`): **`setup.type`** (selects the offload runner — see [`setup-types.md`](setup-types.md))
+and **`security.profile`** (builds the trust policy + the effective bind host, e.g. `sealed`→loopback — see
+[`security.md`](security.md)). Mutating either at runtime would be incoherent, so `/config get <key>` still
+reads them but `/config set <key> …` is **refused** with a clear message ("boot-only — set it in the
+deploy"). The frozen set lives in core, generic and extensible. Change a frozen key in the config file /
+env and restart.
 
 > **When does an override take effect?** Core globals: immediately (step 2). Plugin sections: on their
 > next read of `_EFFECTIVE_CFG` (most plugins re-read per request, so effectively the next call).

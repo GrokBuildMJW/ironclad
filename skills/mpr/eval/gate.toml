@@ -1,0 +1,20 @@
+# MPR eval regression-gate thresholds (Spec 08 §6) — tunebar OHNE Code-Edit (gelesen via stdlib tomllib).
+# Diese Schwellen sind Start-Werte; sie werden mit der Ev-8-Kalibrierung (reale Eval-Sets, Provider-
+# Pricing, Judge-Panel) nachgezogen — nicht der Gate-CODE.
+
+[regression]
+# §6.1 — Anteil des Negativ-Sets (single_fact_decline.jsonl), der declinen MUSS (Über-Feuern ausgeschlossen).
+decline_rate_min = 0.95
+
+[ab]
+# §6.2 — aus dem JUDGED A/B-Report (harness diff_arms + judge_panel-Scores) abgeleitet.
+coverage_floor = 3.0            # mediane MPR(A)-Coverage muss diese Schwelle erreichen (Skala 0-5)
+coverage_epsilon = 0.0          # A_coverage >= B_coverage - epsilon (kein Coverage-Rückschritt)
+pairwise_epsilon = 0.10         # A-Gesamt-Win-Rate >= B-Win-Rate - epsilon (A nicht systematisch schlechter)
+max_cost_usd_per_run = 2.00     # Summe der A-Arm-Kosten <= Budget (Kosten-Runaway-Guard, Risiko §12)
+
+[judge]
+# §5.2 — 3-Stimmen-Blind-A/B-Panel (Provider aus mpr.providers; Default Sonnet·Opus·Spark, User-bestätigt
+# Ev-8). Nach erster Kalibrierung gegen Human-Spot-Checks justieren (Inter-Judge-Agreement als Metrik).
+panel = ["claude-sonnet", "claude-opus", "spark-vllm"]
+self_consistency_tol = 1.0      # eine Stimme verwerfen, deren zwei temp=0-Läufe je Dim um mehr abweichen

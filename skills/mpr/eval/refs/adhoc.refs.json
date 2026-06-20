@@ -1,0 +1,10 @@
+{
+  "adhoc-001": {"axes": ["productivity", "collaboration", "talent-retention", "cost", "culture"], "known_conflicts": ["Flexibilität/Talent-Pool vs. Zusammenarbeit/Kultur"]},
+  "adhoc-002": {"axes": ["developer-velocity", "maintenance-burden", "cost", "control", "hiring"], "known_conflicts": ["Maßanfertigung vs. Wartungslast & Opportunitätskosten"]},
+  "adhoc-003": {"axes": ["community", "monetization", "moat", "adoption", "legal"], "known_conflicts": ["Offenheit/Adoption vs. Monetarisierung/Moat"]},
+  "adhoc-004": {"axes": ["capability", "cost", "control", "time-to-market", "dependency-risk"], "known_conflicts": ["Differenzierung/Kontrolle vs. Kosten & Time-to-Market"]},
+  "adhoc-005": {"axes": ["growth", "profitability", "runway", "market-position", "risk"], "known_conflicts": ["Wachstumstempo vs. nachhaltige Profitabilität"]},
+  "adhoc-006": {"axes": ["revenue-predictability", "adoption", "fairness", "competitiveness", "ops-complexity"], "known_conflicts": ["Planbarkeit (Seat) vs. Nutzungsgerechtigkeit/Adoption (Usage)"]},
+  "adhoc-007": {"axes": ["market-fit", "go-to-market", "regulatory", "cost", "competition"], "known_conflicts": ["Geschwindigkeit/Reichweite vs. lokale Anpassung & Compliance"]},
+  "adhoc-008": {"axes": ["maintainability", "feature-velocity", "risk", "morale", "cost"], "known_conflicts": ["Schuldenabbau vs. Feature-Lieferung/Marktdruck"]}
+}

@@ -1,0 +1,10 @@
+{
+  "risk-001": {"axes": ["technical", "operational", "regulatory", "financial", "reputation"], "known_conflicts": ["Datensouveränität vs. Betriebs-/Wartungslast"]},
+  "risk-002": {"axes": ["technical", "operational", "regulatory", "financial", "reputation"], "known_conflicts": ["Kontrolle/Kostenkontrolle vs. Migrations-/Betriebsrisiko"]},
+  "risk-003": {"axes": ["technical", "operational", "regulatory", "financial", "reputation"], "known_conflicts": ["Time-to-Market vs. Qualitäts-/Stabilitätsrisiko"]},
+  "risk-004": {"axes": ["technical", "operational", "regulatory", "financial", "reputation"], "known_conflicts": ["Meldepflichten vs. Reputations-/Vertrauensschaden"]},
+  "risk-005": {"axes": ["technical", "operational", "regulatory", "financial", "reputation"], "known_conflicts": ["Single-Vendor-Effizienz vs. Konzentrations-/Lock-in-Risiko"]},
+  "risk-006": {"axes": ["technical", "operational", "regulatory", "financial", "reputation"], "known_conflicts": ["Innovationsvorsprung vs. Reife-/Support-Risiko"]},
+  "risk-007": {"axes": ["technical", "operational", "regulatory", "financial", "reputation"], "known_conflicts": ["UX/Sicherheit vs. biometrische Compliance-Auflagen"]},
+  "risk-008": {"axes": ["technical", "operational", "regulatory", "financial", "reputation"], "known_conflicts": ["Kosten/Einfachheit vs. Ausfall-/Verfügbarkeitsrisiko"]}
+}

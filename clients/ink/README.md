@@ -103,7 +103,7 @@ CLI flags (highest precedence): `--server`, `--codedir`, `--max-agents`, and
 ```bash
 npm run dev         # run from source via tsx (no build step)
 npm run typecheck   # tsc --noEmit
-npm test            # node:test suite (renderer + UI + net + tools)
+npm test            # node:test API via tsx --test (renderer + UI + net + tools)
 npm run licenses    # fail if any non-permissive dependency appears
 ```
 
