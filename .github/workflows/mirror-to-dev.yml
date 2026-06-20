@@ -19,9 +19,18 @@ jobs:
           set -u
           gh issue comment "$NUM" --repo "$GITHUB_REPOSITORY" \
             --body "Thanks! Tracked internally on our dev repo and will be fixed and released." || true
+          # Ensure the triage label exists before applying it (idempotent, self-healing).
+          gh label create triaged --repo "$GITHUB_REPOSITORY" \
+            --color BFD4F2 --description "Triaged & mirrored to private dev SSOT" --force || true
           gh issue edit "$NUM" --repo "$GITHUB_REPOSITORY" --add-label triaged || true
-          if ! gh issue list --repo GrokBuildMJW/mjw_agentic --search "in:body ironclad#$NUM" --state all --json number --jq 'length' | grep -qx 0; then
-            echo "mirror already exists"; exit 0
+          # Dedup: list existing mirrors (all carry the source/upstream label) and match the
+          # exact provenance line locally. The trailing colon keeps #2 from matching #20, and
+          # avoids GitHub search tokenizing "ironclad#N" into a loose "ironclad" + "N" match.
+          existing=$(gh issue list --repo GrokBuildMJW/mjw_agentic --state all --limit 500 \
+            --label source/upstream --json body \
+            --jq "[.[] | select(.body | contains(\"Mirrored from ironclad#$NUM:\"))] | length")
+          if [ "${existing:-0}" != "0" ]; then
+            echo "mirror already exists for ironclad#$NUM"; exit 0
           fi
           gh issue create --repo GrokBuildMJW/mjw_agentic \
             --title "[upstream] $TITLE" \
