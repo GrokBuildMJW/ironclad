@@ -9,7 +9,10 @@ from __future__ import annotations
 
 import importlib.util
 import json
-import tomllib
+try:                       # Python 3.11+: stdlib
+    import tomllib
+except ModuleNotFoundError:  # Python 3.10: tomli backport
+    import tomli as tomllib
 from pathlib import Path
 
 from _router_fakes import FakeClassifierLLM, persp, registry, run_panel

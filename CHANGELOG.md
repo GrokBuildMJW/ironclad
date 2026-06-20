@@ -9,6 +9,11 @@ Released versions are listed below; upcoming work accumulates under *Unreleased*
 
 ## [Unreleased]
 
+### Fixed
+- Python 3.10 compatibility for the bundled MPR plugin: its eval gate read TOML via the stdlib
+  `tomllib` (3.11+ only). It now falls back to the `tomli` backport (declared as an `[engine]`
+  dependency on `python_version < "3.11"`), so MPR loads and its tests pass on 3.10.
+
 ## [0.0.4] - 2026-06-20
 
 ### Added

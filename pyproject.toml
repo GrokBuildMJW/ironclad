@@ -29,7 +29,8 @@ dependencies = ["pydantic>=2"]
 [project.optional-dependencies]
 # The orchestration engine (engine/) additionally talks to an OpenAI-compatible
 # endpoint and renders a terminal UI.
-engine = ["openai>=1", "prompt_toolkit>=3", "textual>=0.80", "rich>=13"]
+engine = ["openai>=1", "prompt_toolkit>=3", "textual>=0.80", "rich>=13",
+          "tomli>=2; python_version < '3.11'"]   # MPR eval gate reads TOML; tomllib is stdlib only on 3.11+
 # Optional warm tier (Valkey) for short-term session state + a retrieval cache. The MIT `redis`
 # client speaks the Valkey wire protocol; the tier is lazily imported and fail-soft, so this stays
 # optional (no warm tier configured → never imported).

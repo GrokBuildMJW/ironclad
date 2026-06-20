@@ -11,7 +11,10 @@ Judged-report shape (per query_id):
 """
 from __future__ import annotations
 
-import tomllib
+try:                       # Python 3.11+: stdlib
+    import tomllib
+except ModuleNotFoundError:  # Python 3.10: the tomli backport (declared dep on <3.11)
+    import tomli as tomllib
 from pathlib import Path
 from statistics import median
 from typing import Dict, List, Optional, Tuple
