@@ -1,0 +1,29 @@
+name: mirror issue to dev
+on:
+  issues:
+    types: [opened, reopened]
+permissions:
+  issues: write
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Triage + mirror to private dev SSOT
+        env:
+          GH_TOKEN: ${{ secrets.DEV_SYNC_TOKEN }}
+          NUM: ${{ github.event.issue.number }}
+          TITLE: ${{ github.event.issue.title }}
+          URL: ${{ github.event.issue.html_url }}
+          BODY: ${{ github.event.issue.body }}
+        run: |
+          set -u
+          gh issue comment "$NUM" --repo "$GITHUB_REPOSITORY" \
+            --body "Thanks! Tracked internally on our dev repo and will be fixed and released." || true
+          gh issue edit "$NUM" --repo "$GITHUB_REPOSITORY" --add-label triaged || true
+          if ! gh issue list --repo GrokBuildMJW/mjw_agentic --search "in:body ironclad#$NUM" --state all --json number --jq 'length' | grep -qx 0; then
+            echo "mirror already exists"; exit 0
+          fi
+          gh issue create --repo GrokBuildMJW/mjw_agentic \
+            --title "[upstream] $TITLE" \
+            --label source/upstream \
+            --body "$(printf 'Mirrored from ironclad#%s: %s\n\n%s' "$NUM" "$URL" "$BODY")"
