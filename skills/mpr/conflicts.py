@@ -9,7 +9,7 @@ blocking-first.
 ``detect_conflicts`` takes the OK perspectives duck-typed (anything with ``.role`` + ``.content``) so it
 is buildable + testable before synthesis.py exists and never imports it (no cycle). ``subjects``/``mode``
 are the §3.1 context (options from the router / query entities); omitted → inferred from the contents
-(those inferred subjects yield ``minor`` polarity — "Neben-Subjekt", §3.2 severity rule).
+(those inferred subjects yield ``minor`` polarity — "secondary subject", §3.2 severity rule).
 
 Detection quality (hardened after adversarial review):
 * polarity reads negation per *clause* around the subject, not sentence-wide, and never lets the first
@@ -81,6 +81,23 @@ _STOP = frozenset({
     "wird", "werden", "im", "in", "auf", "an", "als", "bei", "aus", "für", "mit", "von", "zu", "man",
     "es", "sich", "the", "a", "an", "and", "or", "is", "are", "be", "to", "of", "for", "with", "on",
     "in", "at", "as", "this", "that", "it",
+    # question words — a question opens with one, capitalised at sentence start, and would otherwise
+    # become a bogus subject ("pro Sollte ↔ contra Sollte"); #55.
+    "sollte", "soll", "sollen", "wie", "was", "warum", "welche", "welcher", "welches", "wann", "wer",
+    "wo", "wofür", "kann", "können", "muss", "müssen", "ob",
+    "should", "could", "would", "how", "what", "why", "which", "when", "who", "where", "can", "must",
+    "whether", "do", "does",
+})
+
+# MPR structure/meta vocabulary that appears in the QUERY (the instruction) but is never a decision
+# subject — excluded from subject inference so "pro Entscheidungsmatrix ↔ contra Entscheidungsmatrix"
+# (and a fake "top: Empfehlung ↔ top: Entscheidungsmatrix" recommendation conflict) can't arise (#55).
+_META_TERMS = frozenset({
+    "entscheidungsmatrix", "matrix", "empfehlung", "empfehlungen", "rückzugsoption", "rückzugsoptionen",
+    "option", "optionen", "vergleich", "vergleichsmatrix", "analyse", "bewertung", "kriterium",
+    "kriterien", "score", "scores", "dimension", "dimensionen", "auslöser", "fazit",
+    "decision", "recommendation", "fallback", "options", "comparison", "analysis", "criterion",
+    "criteria", "evidence", "report", "summary",
 })
 
 _SEV_RANK = {"blocking": 0, "material": 1, "minor": 2}
@@ -162,6 +179,18 @@ def _parse_num(s: str) -> Optional[float]:
         return None
 
 
+def _dedupe_substrings(subjects: List[str]) -> List[str]:
+    """Drop a subject that is contained in a more specific one (e.g. "Containern" ⊂ "Docker-Containern")
+    so fragmented duplicates don't each raise their own conflict zone (#55). Longest kept first."""
+    kept: List[str] = []
+    for s in sorted(subjects, key=len, reverse=True):  # most-specific (longest) first
+        sl = s.lower()
+        if any(sl != k.lower() and sl in k.lower() for k in kept):
+            continue
+        kept.append(s)
+    return kept
+
+
 def _infer_subjects(ok: Sequence[Any], query: str = "") -> List[str]:
     # best-effort: capitalised multi-char tokens shared by >=2 perspectives. In German EVERY noun is
     # capitalised, so this over-generates (e.g. "Kosten", "API", "Risiko") → bogus polarity conflicts
@@ -171,13 +200,18 @@ def _infer_subjects(ok: Sequence[Any], query: str = "") -> List[str]:
     counts: Counter = Counter()
     for p in ok:
         counts.update({w for w in re.findall(r"\b[A-ZÄÖÜ][\wäöüß-]{2,}\b", p.content or "")})
-    # drop stopwords/articles/prepositions — in German they are capitalised at sentence start and would
-    # otherwise become bogus subjects ("Für", "Die" → "pro Für ↔ contra Für" / "Für k"); LB-7.
-    cands = [w for w, n in counts.items() if n >= 2 and w.lower() not in _STOP]
+    # drop stopwords/question-words (LB-7/#55) AND MPR meta/structure terms — the latter appear in the
+    # query instruction ("Erstelle eine Entscheidungsmatrix …") but are never decision subjects (#55).
+    cands = [w for w, n in counts.items()
+             if n >= 2 and w.lower() not in _STOP and w.lower() not in _META_TERMS]
     if query:
-        ql = query.lower()
-        return [w for w in cands if re.search(r"\b" + re.escape(w.lower()) + r"\b", ql)]
-    return cands
+        # Anchor to the QUESTION part — the text before the first '?'. The options being weighed are named
+        # in the question; criteria + meta ("entlang Stabilität, Sicherheit …", "mit Empfehlung und
+        # Rückzugsoption") sit in the instruction tail and must not become subjects (#55). No '?' → whole query.
+        q = query.split("?", 1)[0] if "?" in query else query
+        ql = q.lower()
+        cands = [w for w in cands if re.search(r"\b" + re.escape(w.lower()) + r"\b", ql)]
+    return _dedupe_substrings(cands)
 
 
 # ── sub-detectors (signature: ok, subjects, mode, spread, provided) ───────────────────────────────
@@ -199,7 +233,7 @@ def _polarity(ok, subjects, mode, spread, provided) -> List[Conflict]:
             elif saw_contra and not saw_pro:
                 contra.append(p.role)
         if pro and contra:
-            severity = "material" if subject in provided else "minor"  # inferred subj → Neben-Subjekt
+            severity = "material" if subject in provided else "minor"  # inferred subj → secondary subject
             out.append(Conflict(
                 kind="polarity", topic=subject, severity=severity, detector="polarity",
                 sides=[ConflictSide(roles=pro, stance=f"pro {subject}"),

@@ -75,7 +75,7 @@ Globale Präzedenz ist ironclads: **code-defaults < datei/conf < env < CLI (`/co
 | `mpr.enabled` | bool | `false` | **RUNTIME-Gate** (s.o.) |
 | `mpr.panel_mode` | `direct`\|`deep` | `direct` | Panel-Ausführungstiefe (s.o.) |
 | `mpr.audit_level` | str | `full-per-perspective` | Audit-Granularität (`full-per-perspective`\|`manifest-only`) |
-| `mpr.runs_dir` | str | `runs/mpr` | Config-Fallback. **STATE-Layout (B3):** ein Run routet ans aktive Vorhaben → `vault/<slug>/runs/<run_id>/`; ohne aktives Vorhaben ist `mpr_research` fail-closed (kein Schreiben in den Root). |
+| `mpr.runs_dir` | str | `runs/mpr` | Config-Fallback. **STATE-Layout (B3):** ein Run routet ans aktive Initiative → `vault/<slug>/runs/<run_id>/`; ohne aktives Initiative ist `mpr_research` fail-closed (kein Schreiben in den Root). |
 | `mpr.sovereignty.default_policy` | str | `offloadable` | Default-Datenpolitik je Item (`offloadable`\|`local-only`) |
 | `mpr.sovereignty.internal_is_local_only` | bool | `true` | interne/sensible Daten nie auslagern |
 | `mpr.sovereignty.fail_closed` | bool | `true` | im Zweifel **lokal** halten (nie spillen) |
@@ -144,8 +144,8 @@ ironclad --server http://<your-server-host>:8100 --codedir .
 /config get mpr.enabled          # → mpr.enabled = False
 <eine Reasoning-Frage>           # → run_mpr antwortet „MPR ist deaktiviert …" (Single-Pass bleibt)
 
-# 3) Scharf schalten + dieselbe Frage → Panel läuft (Vorhaben muss aktiv sein, sonst fail-closed)
-/vorhaben new Architektur-Frage --typ mpr
+# 3) Scharf schalten + dieselbe Frage → Panel läuft (Initiative muss aktiv sein, sonst fail-closed)
+/initiative new Architektur-Frage --type mpr
 /config set mpr.enabled on
 <dieselbe Frage>                 # → Panel, Run-Verzeichnis unter vault/<slug>/runs/<run_id>/
 

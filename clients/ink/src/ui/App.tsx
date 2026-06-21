@@ -343,7 +343,7 @@ export function App({
     }
     // MEM-16(2): while the suggestion menu is open, Tab/↑/↓/Esc drive it; everything else falls through
     if (menuOpen) {
-      const act = menuKey(menuSel, menuItems, key);
+      const act = menuKey(menuSel, menuItems, key, buffer);
       if (act.type === 'move') {
         setMenuSel(act.sel);
         return;

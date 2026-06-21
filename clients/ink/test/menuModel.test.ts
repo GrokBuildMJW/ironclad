@@ -29,8 +29,32 @@ test('menuKey — Esc closes', () => {
   assert.deepEqual(menuKey(0, res, emptyKey({escape: true})), {type: 'close'});
 });
 
-test('menuKey — Enter / Backspace / plain key fall through as none', () => {
-  assert.equal(menuKey(0, res, emptyKey({return: true})).type, 'none');
+test('menuKey — Enter accepts the highlighted command (unless the buffer already is it)', () => {
+  // buffer still a prefix → Enter fills the highlighted command (↓-then-Enter)
+  const a = menuKey(1, res, emptyKey({return: true}), '/res');
+  assert.equal(a.type, 'complete');
+  assert.equal(a.type === 'complete' && a.cmd.name, 'resume');
+  // buffer already equals the completed command → fall through (none) so the line submits
+  assert.equal(menuKey(1, res, emptyKey({return: true}), completionText(res[1]!)).type, 'none');
+});
+
+test('menuKey — single match accepts via Enter (#17: no ↓ feedback for one item)', () => {
+  const one = [res[0]!];
+  assert.equal(menuKey(0, one, emptyKey({return: true}), '/r').type, 'complete');
+});
+
+test('menuKey — single match accepts via ↓ or ↑ (#53: a lone value is picked by an arrow)', () => {
+  const one = [res[0]!];
+  const down = menuKey(0, one, emptyKey({downArrow: true}));
+  const up = menuKey(0, one, emptyKey({upArrow: true}));
+  assert.equal(down.type, 'complete');
+  assert.equal(down.type === 'complete' && down.cmd.name, res[0]!.name);
+  assert.equal(up.type, 'complete');
+  // multiple matches still navigate (no premature accept)
+  assert.deepEqual(menuKey(0, res, emptyKey({downArrow: true})), {type: 'move', sel: 1});
+});
+
+test('menuKey — Backspace / plain key fall through as none', () => {
   assert.equal(menuKey(0, res, emptyKey({backspace: true})).type, 'none');
   assert.equal(menuKey(0, res, emptyKey()).type, 'none'); // plain character
 });

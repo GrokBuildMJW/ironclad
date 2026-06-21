@@ -21,7 +21,7 @@ The loop, end to end:
      cwd — so the code-agent edits *local* code, reading ``.claude/CLAUDE.md`` like a normal session.
   4. claude writes ``.ironclad/agent/feedback/{id}_{AGENT}-feedback.md`` locally; the client
      uploads it via ``POST /feedback``; the server's reconciler advances the task. (The scratch
-     dir is HTTP-mediated, hence independent of the server-side vorhaben routing — and kept out
+     dir is HTTP-mediated, hence independent of the server-side initiative routing — and kept out
      of the project root.)
 
 Because the client pulls (never the server pushing in), session-gating and
@@ -436,7 +436,7 @@ def _run_handover(item: Dict[str, Any], codedir: Path, log=print) -> Optional[st
     ho_text = item.get("handover") or ""
 
     # Local agent scratch is kept OUT of the project root: a hidden .ironclad/agent/ drop zone
-    # (the handover round-trip is HTTP-mediated, so this path is independent of the server's vorhaben).
+    # (the handover round-trip is HTTP-mediated, so this path is independent of the server's initiative).
     ho_dir = codedir / ".ironclad" / "agent" / "handovers"
     ho_dir.mkdir(parents=True, exist_ok=True)
     (ho_dir / ho_name).write_text(ho_text, encoding="utf-8")
@@ -508,7 +508,7 @@ def dispatch_pending(srv: Server, codedir: Path, pool: ThreadPoolExecutor,
         tid = item.get("id") or ""
         if not tid or tid in claimed:
             continue
-        claimed.add(tid)  # sofort beanspruchen → kein Doppel-Launch beim nächsten Poll
+        claimed.add(tid)  # claim immediately → no double-launch on the next poll
         futures.append(pool.submit(_process_one, srv, codedir, item, claimed, log))
     return futures
 
@@ -522,7 +522,7 @@ def _style_stream_line(line: str) -> str:
     s = line.lstrip()
     if "[perf]" in s:
         return _c(line, "gray")
-    if "===" in s and ("DONE" in s or "FERTIG" in s):
+    if "===" in s and "DONE" in s:
         return _c(line, "green")
     if s.startswith("[") and ("Qwen" in s or "GX10" in s or "planning" in s):
         return _c(line, "dim")
@@ -622,7 +622,7 @@ def repl(srv: Server, codedir: Path, max_agents: int = DEFAULT_MAX_AGENTS) -> No
                 else:
                     print(f"  [AUTO] {'AN' if auto_stop else 'AUS'}  |  /auto on / /auto off")
             continue
-        # kind in ("server", "turn") → an den Orchestrator (Server-Befehl ohne / bzw. Turn).
+        # kind in ("server", "turn") → to the orchestrator (a server command without / or a turn).
         # Stream so code-tools are passed through to us and run on the LOCAL filesystem.
         try:
             buf = {"s": ""}

@@ -1,25 +1,25 @@
 #!/usr/bin/env python3
-"""MPR A/B-Harness — „MPR on/off" über eine kuratierte Query-Menge (Spec 08 §3).
+"""MPR A/B harness — "MPR on/off" over a curated query set (Spec 08 §3).
 
-Im Stil von ``deploy/spark/ctx_harness.py``: **stdlib-only** (urllib/json/argparse/re/pathlib), treibt
-ECHTE ``/chat``-Turns gegen den Orchestrator (:8100) und liest Perf aus der ``[perf]``-Zeile der Antwort
-(``TTFT {s}s · {ct} tok/{gt}s = {rate} tok/s · prompt {n}`` — verifiziert gx10.py:2206-2213). Die
-**reinen** Funktionen (extract_perf/estimate_cost/diff_arms/assert_off_byte_identical/load_*/write_report)
-sind deterministisch und im ``--selftest`` + im pytest-Gate abgedeckt; der **Live-A/B** (run_arm/main)
-kostet Tokens und läuft NICHT im pytest-Gate, sondern vor dem Merge (Spec 08 §7 Stufe 4).
+In the style of ``deploy/spark/ctx_harness.py``: **stdlib-only** (urllib/json/argparse/re/pathlib), drives
+REAL ``/chat`` turns against the orchestrator (:8100) and reads perf from the ``[perf]`` line of the response
+(``TTFT {s}s · {ct} tok/{gt}s = {rate} tok/s · prompt {n}`` — verified gx10.py:2206-2213). The
+**pure** functions (extract_perf/estimate_cost/diff_arms/assert_off_byte_identical/load_*/write_report)
+are deterministic and covered by ``--selftest`` + the pytest gate; the **live A/B** (run_arm/main)
+costs tokens and does NOT run in the pytest gate, but before the merge (Spec 08 §7 stage 4).
 
-Secret-frei: das Deployment-Secret kommt NUR über ``--token`` (oder fehlt); die Spark-Adresse über
-``--base`` — kein Host/Token-Literal im Code.
+Secret-free: the deployment secret comes ONLY via ``--token`` (or is absent); the Spark address via
+``--base`` — no host/token literal in the code.
 
-Hinweis (wie ctx_harness): die MPR-Posture (on/off) setzt der **Server/Build**, auf den ``--base``
-zeigt — die HTTP-API hat keinen Per-Request-Schalter. Der ``mpr``-Parameter von ``run_arm`` ist daher
-das **Arm-Label** (A=on gegen ``--base``, B=off gegen ``--base-off``), nicht ein Server-Toggle.
+Note (like ctx_harness): the MPR posture (on/off) is set by the **server/build** that ``--base``
+points to — the HTTP API has no per-request switch. The ``mpr`` parameter of ``run_arm`` is therefore
+the **arm label** (A=on against ``--base``, B=off against ``--base-off``), not a server toggle.
 
 Usage:
   python skills/mpr/eval/harness.py --base http://localhost:8100 --base-off http://localhost:8101 \
       --set skills/mpr/eval/sets/architecture_decision.jsonl \
       --refs skills/mpr/eval/refs/architecture_decision.refs.json --token <secret> --out runs/ab/arch/
-  python skills/mpr/eval/harness.py --selftest          # reine Funktionen, kein Netz
+  python skills/mpr/eval/harness.py --selftest          # pure functions, no network
 """
 from __future__ import annotations
 
@@ -31,8 +31,8 @@ import urllib.request
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-# Perf-Zeile (gx10.py:2206-2213). prompt: letzter Treffer; completion: erster `N tok` (= {ct} tok/{gt}s,
-# wie cli.py:306 _TOK_RE — die Rate `K tok/s` käme erst danach); ttft: `TTFT {s}s`.
+# Perf line (gx10.py:2206-2213). prompt: last match; completion: first `N tok` (= {ct} tok/{gt}s,
+# like cli.py:306 _TOK_RE — the rate `K tok/s` would only come after that); ttft: `TTFT {s}s`.
 _PROMPT_RE = re.compile(r"prompt\s+(\d+)")
 _TTFT_RE = re.compile(r"TTFT\s+(\d+(?:\.\d+)?)\s*s")   # strict float → no malformed-capture ValueError
 _TOK_RE = re.compile(r"(\d+)\s*tok")
@@ -41,10 +41,10 @@ REPORT_OPEN = "<<<MPR_REPORT>>>"
 REPORT_CLOSE = "<<<END>>>"
 
 
-# ── reine Mess-/Aggregations-Funktionen (im --selftest + pytest-Gate) ───────────────────────────────
+# ── pure measurement/aggregation functions (in --selftest + pytest gate) ────────────────────────────
 def extract_perf(output: Optional[str]) -> Dict[str, Optional[float]]:
-    """``{prompt_tokens, ttft_s, completion_tokens}`` aus der ``[perf]``-Zeile. Fehlt ein Feld → None;
-    keine Perf-Zeile → alle None. Rein → unit-getestet."""
+    """``{prompt_tokens, ttft_s, completion_tokens}`` from the ``[perf]`` line. Missing field → None;
+    no perf line → all None. Pure → unit-tested."""
     s = str(output or "")
     pm = _PROMPT_RE.findall(s)
     tm = _TTFT_RE.search(s)
@@ -57,9 +57,9 @@ def extract_perf(output: Optional[str]) -> Dict[str, Optional[float]]:
 
 
 def estimate_cost(perspectives: List[dict], pricing: Dict[str, dict]) -> float:
-    """Σ je Perspektive von ``prompt/1k·in + completion/1k·out`` mit der Provider-Pool-Preisliste
-    (``cost_per_1k_in_usd``/``cost_per_1k_out_usd``). Rein. Unbekannter Provider/fehlende Tokens →
-    0-Beitrag (nie Crash). local-only (Kosten 0) trägt 0 bei."""
+    """Σ per perspective of ``prompt/1k·in + completion/1k·out`` with the provider-pool price list
+    (``cost_per_1k_in_usd``/``cost_per_1k_out_usd``). Pure. Unknown provider/missing tokens →
+    0 contribution (never crashes). local-only (cost 0) contributes 0."""
     total = 0.0
     for p in perspectives or []:
         price = (pricing or {}).get(p.get("provider", ""), {}) or {}
@@ -76,7 +76,7 @@ def _sub(x: Optional[float], y: Optional[float]) -> Optional[float]:
 
 
 def diff_arms(a: List[dict], b: List[dict]) -> Dict[str, dict]:
-    """Paarweiser A/B-Vergleich je ``id``: Antworten + Perf-/Kosten-/Latenz-Deltas (A−B). Rein."""
+    """Pairwise A/B comparison per ``id``: answers + perf/cost/latency deltas (A−B). Pure."""
     bi = {r.get("id"): r for r in (b or [])}
     out: Dict[str, dict] = {}
     for ra in a or []:
@@ -96,9 +96,9 @@ def diff_arms(a: List[dict], b: List[dict]) -> Dict[str, dict]:
 
 
 def assert_off_byte_identical(off: List[dict], plain: List[dict]) -> None:
-    """§3.3(2): „MPR off == MPR-freier Build" je ``id`` (deterministisches Sampling, temp=0). Bei Drift
-    → AssertionError (Gate-Fail). Rein. FAIL-CLOSED: ein leerer Arm, doppelte ids ODER ein fehlgeschlagener
-    Turn auf einer Seite gelten NICHT als Parität (sonst grünt das stärkste Regressions-Gate vakuum)."""
+    """§3.3(2): "MPR off == MPR-free build" per ``id`` (deterministic sampling, temp=0). On drift
+    → AssertionError (gate fail). Pure. FAIL-CLOSED: an empty arm, duplicate ids OR a failed
+    turn on one side do NOT count as parity (otherwise the strongest regression gate goes green vacuously)."""
     off, plain = off or [], plain or []
     assert off and plain, "byte-identity gate ran on an empty arm — nothing compared"
     oa = {r.get("id"): r for r in off}
@@ -116,7 +116,7 @@ def assert_off_byte_identical(off: List[dict], plain: List[dict]) -> None:
 
 
 def load_set(path: str) -> List[dict]:
-    """jsonl-Eval-Set → ``[{id, query, domain, route_hint?}]`` (Leerzeilen übersprungen). Rein-ish (I/O)."""
+    """jsonl eval set → ``[{id, query, domain, route_hint?}]`` (blank lines skipped). Pure-ish (I/O)."""
     out: List[dict] = []
     for line in Path(path).read_text(encoding="utf-8").splitlines():
         line = line.strip()
@@ -126,7 +126,7 @@ def load_set(path: str) -> List[dict]:
 
 
 def load_refs(path: str) -> Dict[str, dict]:
-    """Referenz-Dimensionslisten je ``query_id`` (json)."""
+    """Reference dimension lists per ``query_id`` (json)."""
     return json.loads(Path(path).read_text(encoding="utf-8"))
 
 
@@ -146,7 +146,7 @@ def _render_md(diff: Dict[str, dict]) -> str:
 
 
 def write_report(diff: Dict[str, dict], out_dir: str) -> str:
-    """``report.json`` (sortiert, git-diffbar) + ``report.md``. Gibt den json-Pfad zurück."""
+    """``report.json`` (sorted, git-diffable) + ``report.md``. Returns the json path."""
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
     jp = out / "report.json"
@@ -155,7 +155,7 @@ def write_report(diff: Dict[str, dict], out_dir: str) -> str:
     return str(jp)
 
 
-# ── Live-Schicht (NICHT im pytest-Gate; nur Live-A/B vor Merge) ─────────────────────────────────────
+# ── live layer (NOT in the pytest gate; only live A/B before merge) ──────────────────────────────────
 def _auth(token: Optional[str]) -> Dict[str, str]:
     return {"Authorization": f"Bearer {token}"} if token else {}
 
@@ -188,10 +188,10 @@ def _manifest_perspectives(resp: Dict[str, Any], manifest_ref: Any,
 def run_arm(base: str, queries: List[dict], *, mpr: bool, token: Optional[str] = None,
             timeout: float = 120.0, pricing: Optional[Dict[str, dict]] = None,
             runs_dir: Optional[str] = None) -> List[dict]:
-    """Ein Arm (A=mpr on / B=baseline) über die Query-Menge. Die MPR-Posture setzt der Server hinter
-    *base*; *mpr* ist das Arm-Label im Result. Fail-soft je Query (Turn-Fehler → ok=False, weiter).
-    Sind *pricing* + (inline-Perspektiven ODER *runs_dir*) verfügbar, wird ``cost_usd`` aus der
-    Manifest-Provenance geschätzt (estimate_cost); sonst bleibt es None."""
+    """One arm (A=mpr on / B=baseline) over the query set. The MPR posture is set by the server behind
+    *base*; *mpr* is the arm label in the result. Fail-soft per query (turn error → ok=False, continue).
+    If *pricing* + (inline perspectives OR *runs_dir*) are available, ``cost_usd`` is estimated from the
+    manifest provenance (estimate_cost); otherwise it stays None."""
     out: List[dict] = []
     for q in queries:
         t0 = time.monotonic()
@@ -207,7 +207,7 @@ def run_arm(base: str, queries: List[dict], *, mpr: bool, token: Optional[str] =
                 persps = _manifest_perspectives(resp, rec["manifest_ref"], runs_dir)
                 if persps is not None:
                     rec["cost_usd"] = estimate_cost(persps, pricing)
-        except Exception as e:  # noqa: BLE001 — fail-soft Beobachtung, Arm weiterführen
+        except Exception as e:  # noqa: BLE001 — fail-soft observation, continue the arm
             rec["ok"], rec["error"] = False, repr(e)
         rec["latency_s"] = round(time.monotonic() - t0, 3)
         out.append(rec)
@@ -215,10 +215,10 @@ def run_arm(base: str, queries: List[dict], *, mpr: bool, token: Optional[str] =
 
 
 def _selftest() -> None:
-    """Reine-Funktions-Checks, KEIN Netz (Spec 08 §7 Stufe 3)."""
+    """Pure-function checks, NO network (Spec 08 §7 stage 3)."""
     p = extract_perf("[perf] TTFT 0.5s · 120 tok/2.0s = 60 tok/s · prompt 2175")
     assert p == {"prompt_tokens": 2175, "ttft_s": 0.5, "completion_tokens": 120}, p
-    assert extract_perf("a prompt 10 b prompt 20")["prompt_tokens"] == 20      # letzter prompt gewinnt
+    assert extract_perf("a prompt 10 b prompt 20")["prompt_tokens"] == 20      # last prompt wins
     assert extract_perf("keine perf") == {"prompt_tokens": None, "ttft_s": None, "completion_tokens": None}
     assert extract_perf(None)["prompt_tokens"] is None
     pricing = {"claude-sonnet": {"cost_per_1k_in_usd": 0.003, "cost_per_1k_out_usd": 0.015},

@@ -66,8 +66,8 @@ Done-A: `import ack` works and `pytest` is green.
    `GX10_SERVER_URL=http://localhost:8100 ironclad`.)
    - Check: a coherent answer + a `✓ FERTIG`/`DONE` line. Stop if the call errors.
    - A plain question needs nothing more; to drive an artefact-producing **build** task, first
-     `/vorhaben new <name> --typ software` (fail-closed without one — see
-     [`docs/state-and-vorhaben.md`](docs/state-and-vorhaben.md)).
+     `/initiative new <name> --type software` (fail-closed without one — see
+     [`docs/state-and-initiative.md`](docs/state-and-initiative.md)).
 
 Done-B: a real model turn returns through the engine.
 

@@ -252,17 +252,17 @@ def _queue_consumer(agent: gx10.GX10, stop: threading.Event,
                         res = f"ERROR: {e!r}"
                 print(f"[ADVANCE] {tid} ({agent_adv}): {res.splitlines()[0] if res else res}",
                       flush=True)
-                # Autoplan (entkoppelt von Autopilot — Launch ist Client-Sache): bei
+                # Autoplan (decoupled from autopilot — launching is the client's job): on
                 # empty pipeline, enqueue the next planning turn. Only fires when
-                # `/autoplan on` gesetzt ist und ein Backlog konfiguriert ist —
-                # UND der Kanal nicht versiegelt ist (kein Client da, der ausführt).
+                # `/autoplan on` is set and a backlog is configured —
+                # AND the channel is not sealed (no client present to execute).
                 sealed = sessions.is_sealed() if sessions is not None else False
                 if res and res.startswith("OK") and not sealed:
                     gx10._autoplan_tick(tid, lambda p: gx10._INPUT_QUEUE.put(p))
                 elif sealed:
                     print("[AUTOPLAN] paused — channel sealed (no live session)", flush=True)
             continue
-        # Plain prompt (e.g. autoplan) → normaler Turn.
+        # Plain prompt (e.g. autoplan) → normal turn.
         with _AGENT_LOCK:
             try:
                 gx10._dispatch(agent, item)
@@ -306,8 +306,8 @@ def _doctor_report() -> Dict[str, Any]:
     preflight the doctor CLI runs, exposed live so contract drift surfaces at runtime
     instead of only via tooling. Includes Lodestar's checks when the plugin is enabled."""
     extra = doctor._load_lodestar_checks(bool(gx10.LODESTAR_ENABLED))
-    # B3: the task/handover artifacts live under the active vorhaben — point the doctor there
-    # (fall back to the workdir when no vorhaben is active, so the read-only check never crashes).
+    # B3: the task/handover artifacts live under the active initiative — point the doctor there
+    # (fall back to the workdir when no initiative is active, so the read-only check never crashes).
     root = gx10.artifact_root_soft() or Path(os.getcwd())
     report = doctor.run_doctor(root, extra_checks=extra)
     return {
@@ -319,9 +319,9 @@ def _doctor_report() -> Dict[str, Any]:
 
 
 def _write_feedback(task_id: str, agent: str, content: str) -> str:
-    """Drop ``{task_id}_{AGENT}-feedback.md`` into the active vorhaben's feedback inbox
-    (``<vorhaben>/.work/feedback``). The server-side reconciler detects it (mtime-stable)
-    and advances the task. Fail-closed: requires an active vorhaben (B3)."""
+    """Drop ``{task_id}_{AGENT}-feedback.md`` into the active initiative's feedback inbox
+    (``<initiative>/.work/feedback``). The server-side reconciler detects it (mtime-stable)
+    and advances the task. Fail-closed: requires an active initiative (B3)."""
     d = gx10.feedback_dir()
     d.mkdir(parents=True, exist_ok=True)
     agent_u = (agent or "OPUS").upper()
@@ -342,7 +342,7 @@ class _Handler(BaseHTTPRequestHandler):
     policy: SecurityPolicy = SecurityPolicy("open", None, 30, "mount")
     sessions: SessionRegistry = SessionRegistry(policy)
 
-    def log_message(self, fmt: str, *args: Any) -> None:  # leiser, eine Zeile
+    def log_message(self, fmt: str, *args: Any) -> None:  # quieter, single line
         print(f"[http] {self.address_string()} {fmt % args}", flush=True)
 
     # ── helpers ──────────────────────────────────────────────
@@ -460,8 +460,8 @@ class _Handler(BaseHTTPRequestHandler):
                 if not message:
                     self._send(400, {"ok": False, "error": "missing 'message'"})
                     return
-                # Live: kein Content-Length, Connection: close → der Client liest bis
-                # EOF. Jeder _ui_print-Chunk wird sofort auf den Socket geflusht.
+                # Live: no Content-Length, Connection: close → the client reads until
+                # EOF. Every _ui_print chunk is flushed to the socket immediately.
                 self.send_response(200)
                 self.send_header("Content-Type", "text/plain; charset=utf-8")
                 self.send_header("Cache-Control", "no-cache")
@@ -527,7 +527,7 @@ class _Handler(BaseHTTPRequestHandler):
                 ok = bool(rid) and bridge is not None and bridge.deliver(rid, data.get("result") or "")
                 self._send(200 if ok else 410, {"ok": ok})
             elif self.path == "/cancel":
-                # Bricht den gerade laufenden Turn ab: das Engine-_CANCEL_EVENT wird
+                # Aborts the currently running turn: the engine _CANCEL_EVENT is
                 # set; run() checks it per iteration/generation and stops cleanly.
                 # No agent lock needed — the event is thread-safe and the running
                 # turn thread polls it. The next turn clears it on start.
@@ -586,19 +586,19 @@ def serve(host: str = "0.0.0.0", port: int = 8100,
     sessions = SessionRegistry(policy)
     host = policy.effective_bind(host)
 
-    # Headless-Capture aktivieren (UI bleibt aus → _UI_APP is None).
+    # Enable headless capture (UI stays off → _UI_APP is None).
     gx10._UI_SINK = _capture_sink
 
     stop = threading.Event()
-    # Feedback-Reconciler (Server-seitig; Launch-Seite no-op weil Autopilot aus).
+    # Feedback reconciler (server-side; launch side is a no-op because autopilot is off).
     rt = threading.Thread(
         target=gx10._reconciler_loop,
         args=(stop, gx10.RECONCILER_INTERVAL),
         daemon=True,
     )
     rt.start()
-    # Queue-Consumer: wendet die vom Reconciler eingereihten ADVANCE-Befehle an;
-    # die Registry steuert die Autoplan-Pause bei versiegeltem Kanal.
+    # Queue consumer: applies the ADVANCE commands enqueued by the reconciler;
+    # the registry drives the autoplan pause when the channel is sealed.
     qt = threading.Thread(target=_queue_consumer, args=(agent, stop, sessions), daemon=True)
     qt.start()
 

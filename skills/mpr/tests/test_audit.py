@@ -283,7 +283,7 @@ def test_run_indexed_as_task():
     assert tid == "KGC-001"
     fields, force = store.created[0]
     assert force is True and fields["type"] == "mpr-run" and fields["mpr_run_id"] == "mpr-r1"
-    assert fields["manifest_path"] == "runs/mpr-r1/manifest.json"   # B3: vorhaben-relativ (runs/<id>/)
+    assert fields["manifest_path"] == "runs/mpr-r1/manifest.json"   # B3: initiative-relativ (runs/<id>/)
     assert store.transitions == [("KGC-001", "done")]
 
 

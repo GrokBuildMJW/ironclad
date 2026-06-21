@@ -326,7 +326,7 @@ def _stream_turn(srv: Server, payload: str) -> None:
                 _STATUS["tokens"] = int(m.group(1))
             return
         # 2) "======== ✓ DONE … ========" banner → drop.
-        if "===" in st and ("DONE" in st or "FERTIG" in st or "✓" in st):
+        if "===" in st and ("DONE" in st or "✓" in st):
             return
         # 3) role labels ([GX10] / [Qwen (planning)] / [… planning …]) → drop.
         if (st == "[GX10]"

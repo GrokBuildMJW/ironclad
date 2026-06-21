@@ -18,7 +18,7 @@ export const MENU_MAX_VISIBLE = 8;
 export type MenuAction =
   | {type: 'none'} // not a menu key (or menu closed) → let normal input handling proceed
   | {type: 'move'; sel: number} // selection changed (↑/↓, wraps)
-  | {type: 'complete'; cmd: Command} // Tab → fill the highlighted command
+  | {type: 'complete'; cmd: Command} // Tab/Enter → fill the highlighted command
   | {type: 'close'}; // Esc → dismiss the menu until the buffer changes
 
 /** Clamp a selection index into `[0, n-1]` (0 when empty). */
@@ -32,13 +32,20 @@ export function clampSel(sel: number, n: number): number {
  * is closed, so every key is `none` (normal input). Selection wraps. Tab completes the highlight;
  * Esc closes. Anything else is `none` so typing/Enter/Backspace fall through unchanged.
  */
-export function menuKey(sel: number, items: readonly Command[], key: Key): MenuAction {
+export function menuKey(sel: number, items: readonly Command[], key: Key, buffer = ''): MenuAction {
   const n = items.length;
   if (n === 0) return {type: 'none'};
   const cur = clampSel(sel, n);
+  // A lone suggestion has nowhere to navigate, so an arrow key accepts it (the user expects ↓ to pick
+  // a single value, not sit idle). With multiple matches the arrows navigate as usual.
+  if ((key.upArrow || key.downArrow) && n === 1) return {type: 'complete', cmd: items[0]!};
   if (key.upArrow) return {type: 'move', sel: (cur - 1 + n) % n};
   if (key.downArrow) return {type: 'move', sel: (cur + 1) % n};
   if (key.tab) return {type: 'complete', cmd: items[cur]!};
+  // Enter accepts the highlighted suggestion — this makes ↓-then-Enter work AND lets a single
+  // match be accepted (it has no ↓ feedback). Once the buffer already IS the completed command,
+  // fall through (none) so the line submits instead of re-completing.
+  if (key.return) return completionText(items[cur]!) !== buffer ? {type: 'complete', cmd: items[cur]!} : {type: 'none'};
   if (key.escape) return {type: 'close'};
   return {type: 'none'};
 }

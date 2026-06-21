@@ -39,15 +39,15 @@ from collections import deque
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Tuple, Callable
 
-# Hinweis: Der frühere watchdog-basierte Feedback-Watcher wurde durch einen
-# Polling-Reconciler ersetzt (zuverlässiger, keine Abhängigkeit nötig).
+# Note: the earlier watchdog-based feedback watcher was replaced by a
+# polling reconciler (more reliable, no dependency required).
 
 try:
     from openai import OpenAI
 except ImportError:
-    # Soft: das Modul bleibt importierbar OHNE openai (z. B. der Thin-Client lädt nur
-    # die UI-Primitive). Erst die GX10-Konstruktion (die einen Client braucht) failt
-    # dann mit klarer Meldung — siehe GX10.__init__.
+    # Soft: the module stays importable WITHOUT openai (e.g. the thin client loads only
+    # the UI primitives). Only GX10 construction (which needs a client) then fails
+    # with a clear message — see GX10.__init__.
     OpenAI = None  # type: ignore[assignment,misc]
 
 try:
@@ -71,30 +71,30 @@ try:
     HAS_PT = True
 except ImportError:
     HAS_PT = False
-    # prompt_toolkit fehlt (z. B. headless Server-Modus): `Application` trotzdem als
-    # Name bereitstellen, sonst crasht die Modul-Annotation `Optional[Application]`
-    # beim Import. Any ist hier korrekt — die echte App wird nur unter HAS_PT gebaut.
+    # prompt_toolkit is missing (e.g. headless server mode): still provide `Application`
+    # as a name, otherwise the module annotation `Optional[Application]` crashes on
+    # import. Any is correct here — the real app is only built under HAS_PT.
     Application = Any  # type: ignore[assignment,misc]
 
-# ─── Installationsort (Code, read-only) ─────────────────────
-# SCRIPT_DIR = wo gx10_v3.py + prompts/ liegen. Davon getrennt: WORKDIR
-# (wo der Orchestrator arbeitet) — siehe Config-Loader / main().
+# ─── Installation location (code, read-only) ─────────────────────
+# SCRIPT_DIR = where gx10_v3.py + prompts/ live. Separate from this: WORKDIR
+# (where the orchestrator works) — see the config loader / main().
 SCRIPT_DIR = Path(__file__).resolve().parent
 
-# core/ auf sys.path, damit das ACK-Paket (core/ack) importierbar ist, wenn die
-# Engine als Script läuft — SCRIPT_DIR ist core/engine, der Parent ist core/.
+# core/ on sys.path so the ACK package (core/ack) is importable when the
+# engine runs as a script — SCRIPT_DIR is core/engine, its parent is core/.
 _CORE_DIR = SCRIPT_DIR.parent
 if str(_CORE_DIR) not in sys.path:
     sys.path.insert(0, str(_CORE_DIR))
 
-# ─── Konfiguration (Code-Defaults) ──────────────────────────
-# Diese Modul-Konstanten sind die schwächste Stufe der Wert-Precedence
-# (Code-Defaults < Config-Datei < Env < CLI). Beim Start überschreibt
-# `_apply_config()` sie aus der geladenen Config — so bleiben alle
-# bestehenden Referenzen (run_tool, Makros, _trim_context …) unverändert.
-DEFAULT_BASE_URL = "http://localhost:8000/v1"   # generischer Default; echter Endpoint via Config (connection.base_url)
+# ─── Configuration (code defaults) ──────────────────────────
+# These module constants are the weakest level of value precedence
+# (code defaults < config file < env < CLI). At startup
+# `_apply_config()` overrides them from the loaded config — so all
+# existing references (run_tool, macros, _trim_context …) stay unchanged.
+DEFAULT_BASE_URL = "http://localhost:8000/v1"   # generic default; real endpoint via config (connection.base_url)
 DEFAULT_API_KEY  = "not-needed"
-DEFAULT_MODEL    = "qwen3.6-35b"   # aktuelles Orchestrator-Modell; echter Endpoint via conf/connection
+DEFAULT_MODEL    = "qwen3.6-35b"   # current orchestrator model; real endpoint via conf/connection
 DEFAULT_PROMPT   = "prompts/GX10_Orchestrator_SystemPrompt.md"
 _ORCH_VERSION: Optional[str] = None
 
@@ -113,156 +113,156 @@ def orchestrator_version() -> str:
                 v = ""
         _ORCH_VERSION = v or "unknown"
     return _ORCH_VERSION
-DEFAULT_WORKDIR  = "."           # WORKDIR: Arbeitsort (CWD-Verhalten wie bisher)
-CODE_ROOT        = ""            # optionaler Code-Root für den Handover-Pfad-Guard
-                                 # (vessel-spezifisch, z. B. ein Service-Unterordner
-                                 # im Repo); leer = nur Repo-Root prüfen. Via paths.code_root.
+DEFAULT_WORKDIR  = "."           # WORKDIR: work location (CWD behaviour as before)
+CODE_ROOT        = ""            # optional code root for the handover path guard
+                                 # (vessel-specific, e.g. a service subfolder
+                                 # in the repo); empty = check repo root only. Via paths.code_root.
 MAX_ITERATIONS   = 20
-MAX_CTX_CHARS    = 80_000        # High-Water: erst hier wird getrimmt (char-basiert; bei TOKEN_BUDGET aus MAX_MODEL_LEN abgeleitet)
-TRIM_TARGET_CHARS = 48_000       # PERF-06: Low-Water nach dem Trim (60 %)
-MAX_TOKENS       = 8192          # PERF-10: vorher 4096 → Handover-Truncation
-# MEM-9 / §3-Mechanismus 3 — token-genaues Budgeting: den Trim-Working-Set ans MODELLFENSTER
-# koppeln statt an feste Zeichen. Bei TOKEN_BUDGET=True leitet _apply_config MAX_CTX_CHARS/
-# TRIM_TARGET_CHARS aus MAX_MODEL_LEN ab (minus Reserve für Output+RAG+Summary, chars/4-Schätzung,
-# 10 % Headroom) → der Working-Set skaliert mit dem Fenster, überläuft es aber nie. AUS = feste
-# Zeichen-Schwellen wie heute (dann greifen context.max_ctx_chars / GX10_MAX_CTX_CHARS).
-MAX_MODEL_LEN    = 32768         # hartes Per-Request-Token-Fenster (vLLM --max-model-len); GX10_MAX_MODEL_LEN/IRONCLAD_MAX_MODEL_LEN
-TOKEN_BUDGET     = True          # Default AN (06-18); aus via context.token_budget=false / GX10_TOKEN_BUDGET=0
-CHARS_PER_TOKEN  = 4             # grobe Token-Schätzung (chars/token)
-# B1 — Rolling summarization: beim Trim die evict'eten Runden in einen kompakten
-# Summary-Block direkt UNTER dem System-Prompt rollen UND den Rohtext verlustfrei
-# nach Mem0 (/add_bulk, vektor-only) archivieren. Flag-gated, fail-soft, off-critical-
-# path; FLAG-AUS = byte-identisch zum heutigen Trim (kein Modell-Call, kein Block).
-SUMMARIZE_EVICTED  = True        # B1-Schalter (Default AN, 06-18 Entscheidung); aus via context.summarize_evicted=false / GX10_CONTEXT_SUMMARY=0
-SUMMARY_MAX_TOKENS = 512         # gedeckelte Ausgabe des Eviction-Summaries
-_SUMMARY_MARKER    = "## Conversation so far (rolling summary)"   # stabiler Block-Marker (find-and-update statt duplizieren)
-# B2 — Auto-Retrieval-Assembly: pro User-Turn EINE vektor-only Suche (graph=false) auf die
-# User-Message, dedup gegen das Fenster, token-budgetierter Context-Block VOR die User-Message
-# (am Tail → Prefix-Cache bleibt). Warm-Cache (B0) davor (cache-aside). Flag-gated, fail-soft;
-# FLAG-AUS = User-Message verbatim angehängt → byte-identisch zum heutigen Verhalten.
-RAG_ENABLED     = True            # B2-Schalter (Default AN, 06-18 Entscheidung); aus via context.rag_enabled=false / GX10_CONTEXT_RAG=0
-RAG_TOP_K       = 5               # Treffer pro Retrieval
-RAG_MAX_TOKENS  = 1024            # Token-Budget des injizierten Blocks (chars/4-Schätzung)
+MAX_CTX_CHARS    = 80_000        # high-water: trimming starts only here (char-based; derived from MAX_MODEL_LEN under TOKEN_BUDGET)
+TRIM_TARGET_CHARS = 48_000       # PERF-06: low-water after the trim (60 %)
+MAX_TOKENS       = 8192          # PERF-10: was 4096 → handover truncation
+# MEM-9 / §3-mechanism 3 — token-accurate budgeting: couple the trim working set to the MODEL WINDOW
+# instead of fixed chars. When TOKEN_BUDGET=True, _apply_config derives MAX_CTX_CHARS/
+# TRIM_TARGET_CHARS from MAX_MODEL_LEN (minus reserve for output+RAG+summary, chars/4 estimate,
+# 10 % headroom) → the working set scales with the window but never overflows it. OFF = fixed
+# char thresholds as today (then context.max_ctx_chars / GX10_MAX_CTX_CHARS apply).
+MAX_MODEL_LEN    = 32768         # hard per-request token window (vLLM --max-model-len); GX10_MAX_MODEL_LEN/IRONCLAD_MAX_MODEL_LEN
+TOKEN_BUDGET     = True          # default ON (06-18); off via context.token_budget=false / GX10_TOKEN_BUDGET=0
+CHARS_PER_TOKEN  = 4             # rough token estimate (chars/token)
+# B1 — rolling summarization: on trim, roll the evicted rounds into a compact
+# summary block directly BELOW the system prompt AND archive the raw text losslessly
+# to Mem0 (/add_bulk, vector-only). Flag-gated, fail-soft, off-critical-
+# path; FLAG OFF = byte-identical to today's trim (no model call, no block).
+SUMMARIZE_EVICTED  = True        # B1 switch (default ON, 06-18 decision); off via context.summarize_evicted=false / GX10_CONTEXT_SUMMARY=0
+SUMMARY_MAX_TOKENS = 512         # capped output of the eviction summary
+_SUMMARY_MARKER    = "## Conversation so far (rolling summary)"   # stable block marker (find-and-update instead of duplicating)
+# B2 — auto-retrieval assembly: per user turn ONE vector-only search (graph=false) on the
+# user message, dedup against the window, a token-budgeted context block BEFORE the user message
+# (at the tail → prefix cache stays). Warm cache (B0) in front (cache-aside). Flag-gated, fail-soft;
+# FLAG OFF = user message appended verbatim → byte-identical to today's behaviour.
+RAG_ENABLED     = True            # B2 switch (default ON, 06-18 decision); off via context.rag_enabled=false / GX10_CONTEXT_RAG=0
+RAG_TOP_K       = 5               # hits per retrieval
+RAG_MAX_TOKENS  = 1024            # token budget of the injected block (chars/4 estimate)
 _RAG_MARKER     = "## Relevant context (retrieved)"
-LANGUAGE         = "en"          # Antwortsprache des Orchestrators (OSS-Default en; per GX10_LANGUAGE/Config)
-MAX_FILE_CHARS   = 24_000        # PERF-05: read_file-Cap (Head+Tail)
-LIST_DIR_HARD_CAP = 200          # HV-B: harter Cap in list_directory
+LANGUAGE         = "en"          # the orchestrator's reply language (OSS default en; via GX10_LANGUAGE/config)
+MAX_FILE_CHARS   = 24_000        # PERF-05: read_file cap (head+tail)
+LIST_DIR_HARD_CAP = 200          # HV-B: hard cap in list_directory
 TEMPERATURE      = 0.3
-RETRY_BACKOFF    = 1.5           # OPT-4: Wartezeit (s) vor 1× Retry bei API-Fehler
-# Engine-Maschinerie liegt versteckt unter STATE_ROOT (vorhaben-unabhängig): session.json, der
-# lokale Warm-Cache (memory/), config.json/active (ITYPE). Relativ zum WORKDIR (nach chdir = CWD),
-# per cfg["paths"]["state_root"] (Default ".ironclad") überschreibbar — auch absolut. Boundary
-# clean (kein privates Literal). Helper: state_root() / session_path().
+RETRY_BACKOFF    = 1.5           # OPT-4: wait time (s) before 1× retry on an API error
+# Engine machinery lives hidden under STATE_ROOT (initiative-independent): session.json, the
+# local warm cache (memory/), config.json/active (ITYPE). Relative to WORKDIR (after chdir = CWD),
+# overridable via cfg["paths"]["state_root"] (default ".ironclad") — absolute too. Boundary
+# clean (no private literal). Helpers: state_root() / session_path().
 STATE_ROOT       = ".ironclad"
-SESSION_FILE     = "session.json"   # Basename, aufgelöst unter STATE_ROOT (war ".gx10_session.json" im Root)
-# Sichtbare Wissens-Wurzel (Obsidian-navigierbar): vault/<slug>/ je Vorhaben. Engine-Maschinerie
-# ist STATE_ROOT, WISSEN ist VAULT_ROOT — strikt getrennt. Per cfg["paths"]["vault_root"] überschreibbar.
+SESSION_FILE     = "session.json"   # basename, resolved under STATE_ROOT (was ".gx10_session.json" at the root)
+# Visible knowledge root (Obsidian-navigable): vault/<slug>/ per initiative. Engine machinery
+# is STATE_ROOT, KNOWLEDGE is VAULT_ROOT — strictly separated. Overridable via cfg["paths"]["vault_root"].
 VAULT_ROOT       = "vault"
 SPINNER_FRAMES   = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
-UI_REFRESH_INTERVAL = 0.1        # prompt_toolkit Application-Refresh
+UI_REFRESH_INTERVAL = 0.1        # prompt_toolkit Application refresh
 
-# Plattform-Modus: bestimmt Shell + Befehls-Syntax in execute_command.
-# PLATFORM_MODE ist der Config-Wert ("auto" wird beim Start aufgelöst);
-# PLATFORM ist der EFFEKTIVE Modus ("windows" | "linux"), nie "auto".
+# Platform mode: determines shell + command syntax in execute_command.
+# PLATFORM_MODE is the config value ("auto" is resolved at startup);
+# PLATFORM is the EFFECTIVE mode ("windows" | "linux"), never "auto".
 PLATFORM_MODE = "auto"           # "auto" | "windows" | "linux"
 PLATFORM      = "windows" if os.name == "nt" else "linux"
 
-# Task-Management (TaskStore): Schwelle für deterministische Themen-Dedup.
-TASKS_DEDUP_THRESHOLD = 0.8      # Jaccard über Titel+Beschreibung
+# Task management (TaskStore): threshold for deterministic topic dedup.
+TASKS_DEDUP_THRESHOLD = 0.8      # Jaccard over title+description
 
-# Task-ID-Prefix (vessel-konfigurierbar via tasks.id_prefix). IDs sind
-# {prefix}-N (monoton). Default "KGC" erhält bestehendes Verhalten; die
-# Beispiel-IDs in den Tool-Beschreibungen nennen weiterhin den Default-Prefix.
+# Task ID prefix (vessel-configurable via tasks.id_prefix). IDs are
+# {prefix}-N (monotonic). Default "KGC" keeps the existing behaviour; the
+# example IDs in the tool descriptions still name the default prefix.
 TASK_PREFIX = "KGC"
 
-# ─── ACK (Agent-Contract-Kernel) Integration ──────────────────
-# Validiert jedes modell-emittierte task_json an der stage_handover-Grenze gegen den
-# ACK-Vertrag (ack.case_spec). Soft-Pfad: bei Verletzung wird der exakte Fehler
-# zurückgegeben → der Agent-Loop reicht ihn dem Modell als Tool-Result zurück (Reask),
-# nichts wird angelegt. LODESTAR_ENABLED → CapabilityTaskSpec (capability pflicht für
-# buildable types). Beide config-getrieben (ack.enabled / lodestar.enabled).
+# ─── ACK (Agent-Contract-Kernel) integration ──────────────────
+# Validates every model-emitted task_json at the stage_handover boundary against the
+# ACK contract (ack.case_spec). Soft path: on a violation the exact error is
+# returned → the agent loop hands it back to the model as a tool result (reask),
+# nothing is created. LODESTAR_ENABLED → CapabilityTaskSpec (capability mandatory for
+# buildable types). Both config-driven (ack.enabled / lodestar.enabled).
 ACK_ENABLED      = True
 LODESTAR_ENABLED = False
 
-# Onboarding-Modus: proaktive Duplikat-Vorprüfung VOR dem (teuren) Handover.
-# Default aus (Store-Dedup garantiert Korrektheit ohnehin). Hilfreich bei
-# Migration von einem anderen CLI / vielen Alt-Tasks. Bei aktivem Modus wird
-# das Tool `check_task_exists` angeboten und der Prompt weist zur Vorprüfung an.
+# Onboarding mode: proactive duplicate pre-check BEFORE the (expensive) handover.
+# Default off (store dedup guarantees correctness anyway). Helpful when
+# migrating from another CLI / with many legacy tasks. When active, the
+# `check_task_exists` tool is offered and the prompt instructs to pre-check.
 ONBOARDING_MODE = False
 
-# Autopilot (Path B): Der Reconciler startet für pending-Tasks mit Handover
-# automatisch `claude --print` (API-freie Ausführung) und schaltet pending →
-# in_progress. Default AUS (startet Claude autonom mit skip-permissions).
+# Autopilot (Path B): for pending tasks with a handover the reconciler
+# automatically starts `claude --print` (API-free execution) and moves pending →
+# in_progress. Default OFF (starts Claude autonomously with skip-permissions).
 AUTOPILOT_ENABLED        = False
 AUTOPILOT_CLAUDE_BIN     = "claude"
 AUTOPILOT_EXTRA_ARGS     = ["--dangerously-skip-permissions"]
 AUTOPILOT_DEFAULT_EFFORT = "medium"
-AUTOPILOT_LOGS_DIR       = "logs"     # unter state_root() aufgelöst (.ironclad/logs); absoluter Pfad verbatim
-AUTOPILOT_MAX_CONCURRENT = 1            # 1 = sequentiell; >1 parallel; 0 = unbegrenzt
-AUTOPILOT_STREAM         = False        # Live-Log-Streaming (claude --verbose --output-format stream-json); Default AUS
-AUTOPILOT_TERMINATE_ON_ADVANCE = False  # beim advance die zugehörige claude-Session beenden; Default AUS
-AUTOPILOT_AUTOPLAN       = False   # Nach leerem Queue GX10 automatisch den nächsten Task planen; Default AUS
-AUTOPILOT_MAX_TASKS      = 0       # Max. Tasks die autoplan plant (0 = unbegrenzt — NUR lokale vLLM verwenden!)
-_AUTOPLAN_DONE           = 0       # Session-Zähler (nur im agent_thread angefasst → kein Lock nötig)
-_TURN_DID_ADVANCE        = False   # Guard: True nach advance_pipeline im laufenden Turn. Verhindert,
-                                   # dass das Modell im SELBEN Turn (ohne Operator-Eingabe) direkt
-                                   # stage_handover nachschiebt ("Auto-Plan"), solange AUTOPILOT_AUTOPLAN
-                                   # aus ist. Reset bei jedem neuen Operator-Turn (run()).
-AUTOPILOT_LOG_TERMINAL   = False        # Bei jedem Autopilot-Start neues Terminal mit Get-Content -Wait öffnen; Default AUS
-# Kimi wurde am 2026-06-15 durch Sonnet ersetzt. "KIMI" bleibt nur als
-# Legacy-Alias und wird überall transparent auf SONNET normalisiert
-# (Claude Code CLI + claude-sonnet-4-6). Keine Kimi-CLI-Plumbing mehr.
-WATCHER_FEEDBACK_DIR = "feedback"   # Name der Feedback-Inbox unter <vorhaben>/.work/ (B3); via watcher.feedback_dir überschreibbar
-API_KEY_ENV      = "GX10_API_KEY"             # Secrets nur aus Env, nie aus Datei
+AUTOPILOT_LOGS_DIR       = "logs"     # resolved under state_root() (.ironclad/logs); absolute path verbatim
+AUTOPILOT_MAX_CONCURRENT = 1            # 1 = sequential; >1 parallel; 0 = unlimited
+AUTOPILOT_STREAM         = False        # live log streaming (claude --verbose --output-format stream-json); default OFF
+AUTOPILOT_TERMINATE_ON_ADVANCE = False  # terminate the associated claude session on advance; default OFF
+AUTOPILOT_AUTOPLAN       = False   # after an empty queue, have GX10 automatically plan the next task; default OFF
+AUTOPILOT_MAX_TASKS      = 0       # max tasks autoplan plans (0 = unlimited — use LOCAL vLLM ONLY!)
+_AUTOPLAN_DONE           = 0       # session counter (touched only in the agent_thread → no lock needed)
+_TURN_DID_ADVANCE        = False   # guard: True after advance_pipeline in the running turn. Prevents
+                                   # the model from immediately pushing a stage_handover in the SAME
+                                   # turn (without operator input) ("auto-plan"), as long as AUTOPILOT_AUTOPLAN
+                                   # is off. Reset on every new operator turn (run()).
+AUTOPILOT_LOG_TERMINAL   = False        # on every autopilot start open a new terminal with Get-Content -Wait; default OFF
+# Kimi was replaced by Sonnet on 2026-06-15. "KIMI" remains only as a
+# legacy alias and is transparently normalized to SONNET everywhere
+# (Claude Code CLI + claude-sonnet-4-6). No Kimi CLI plumbing anymore.
+WATCHER_FEEDBACK_DIR = "feedback"   # name of the feedback inbox under <initiative>/.work/ (B3); overridable via watcher.feedback_dir
+API_KEY_ENV      = "GX10_API_KEY"             # secrets only from env, never from a file
 
-# Workspace-Struktur (von _ensure_dirs am WORKDIR angelegt). B3: die funktionalen Artefakt-
-# Verzeichnisse (tasks/, handovers/feedback, reviews …) sind NICHT mehr hier — sie wohnen pro
-# Vorhaben unter vault/<slug>/ (Skelett via vorhaben_new). Am WORKDIR bleibt nur die sichtbare
-# Wissens-Wurzel vault/; Engine-Maschinerie liegt versteckt unter state_root(). Per Config
-# (workspace.dirs) überschreibbar.
+# Workspace structure (created by _ensure_dirs at WORKDIR). B3: the functional artefact
+# directories (tasks/, handovers/feedback, reviews …) are NO LONGER here — they live per
+# initiative under vault/<slug>/ (skeleton via initiative_new). At WORKDIR only the visible
+# knowledge root vault/ remains; engine machinery lives hidden under state_root(). Overridable
+# via config (workspace.dirs).
 WORKSPACE_DIRS = [
     "vault",
 ]
-# Hinweis: der lokale Warm-Cache (memory/) ist KEIN Artefakt-Verzeichnis mehr — er ist
-# Engine-Maschinerie und liegt unter state_root()/"memory" (von _ensure_dirs angelegt).
+# Note: the local warm cache (memory/) is NO LONGER an artefact directory — it is
+# engine machinery and lives under state_root()/"memory" (created by _ensure_dirs).
 
 
 def state_root() -> Path:
-    """Wurzel der versteckten Engine-Maschinerie (vorhaben-unabhängig): session.json, der lokale
-    Warm-Cache (memory/), config.json/active. Relativ zum WORKDIR (nach chdir), per
-    cfg["paths"]["state_root"] (Default ``.ironclad``) überschreibbar; absolute Overrides werden
-    unverändert übernommen. Boundary clean — kein privates Literal."""
+    """Root of the hidden engine machinery (initiative-independent): session.json, the local
+    warm cache (memory/), config.json/active. Relative to WORKDIR (after chdir), overridable via
+    cfg["paths"]["state_root"] (default ``.ironclad``); absolute overrides are taken
+    unchanged. Boundary clean — no private literal."""
     return Path(STATE_ROOT)
 
 
 def session_path() -> Path:
-    """Pfad der Session-Datei: ``state_root()/SESSION_FILE``. Ein absolut konfigurierter
-    SESSION_FILE wird unverändert verwendet (Rückwärts-Kompatibilität)."""
+    """Path of the session file: ``state_root()/SESSION_FILE``. An absolutely configured
+    SESSION_FILE is used unchanged (backward compatibility)."""
     p = Path(SESSION_FILE)
     return p if p.is_absolute() else state_root() / p
 
 
 def vault_root() -> Path:
-    """Sichtbare Wissens-Wurzel (vorhaben-zentrisch): ``vault/<slug>/`` je Vorhaben. Relativ zum
-    WORKDIR (nach chdir), per cfg["paths"]["vault_root"] (Default ``vault``) überschreibbar."""
+    """Visible knowledge root (initiative-centric): ``vault/<slug>/`` per initiative. Relative to
+    WORKDIR (after chdir), overridable via cfg["paths"]["vault_root"] (default ``vault``)."""
     return Path(VAULT_ROOT)
 
 
-# ─── Vorhaben (vorhaben-zentrischer vault) ────────────────────
-# Ein Vorhaben = eine sichtbare Wissens-/Arbeits-Einheit unter vault/<slug>/. meta.md (flat
-# frontmatter) ist die SSOT; das EINE aktive Vorhaben steht als slug in state_root()/active.
-# Artefakt-erzeugende Ops (Tasks, Handovers, Decisions, MPR-Runs) routen relativ zum aktiven
-# Vorhaben (B3) — fail-closed ohne aktives Vorhaben. Reine Konversations-Turns brauchen keins.
-VORHABEN_TYPES = ("mpr", "software")
+# ─── Initiative (initiative-centric vault) ────────────────────
+# An initiative = one visible knowledge/work unit under vault/<slug>/. meta.md (flat
+# frontmatter) is the SSOT; the ONE active initiative is stored as a slug in state_root()/active.
+# Artefact-producing ops (tasks, handovers, decisions, MPR runs) route relative to the active
+# initiative (B3) — fail-closed without an active initiative. Pure conversation turns need none.
+INITIATIVE_TYPES = ("mpr", "software")
 
-# Verstecktes Maschinen-Plumbing je Vorhaben (Hybrid-Layout, 06-20): active.md + Handover-/
-# Feedback-Inbox + Historie liegen unter <vorhaben>/.work/ (aus dem Blick); die sichtbaren
-# Artefakte (decisions/ proposals/ reviews/ runs/ tasks/) bleiben navigierbar oben.
+# Hidden machine plumbing per initiative (hybrid layout, 06-20): active.md + handover/
+# feedback inbox + history live under <initiative>/.work/ (out of sight); the visible
+# artefacts (decisions/ proposals/ reviews/ runs/ tasks/) stay navigable on top.
 WORKFLOW_DIR = ".work"
 
-# Skelett-Verzeichnisse je Typ (relativ zu vault/<slug>/). software = Task-Pipeline +
-# file-communication-Plumbing; mpr = Reasoning-Runs + Entscheidungs-Reports.
-_VORHABEN_SKELETON: Dict[str, List[str]] = {
+# Skeleton directories per type (relative to vault/<slug>/). software = task pipeline +
+# file-communication plumbing; mpr = reasoning runs + decision reports.
+_INITIATIVE_SKELETON: Dict[str, List[str]] = {
     "software": ["tasks/pending", "tasks/in_progress", "tasks/done",
                  "decisions", "proposals", "reviews",
                  f"{WORKFLOW_DIR}/handovers", f"{WORKFLOW_DIR}/feedback",
@@ -270,27 +270,27 @@ _VORHABEN_SKELETON: Dict[str, List[str]] = {
     "mpr":      ["runs", "decisions"],
 }
 
-# Umlaut-Faltung für lesbare ASCII-slugs (ä→ae …). Reine Bequemlichkeit; Unicode-slugs gingen auch.
+# Umlaut folding for readable ASCII slugs (ä→ae …). Pure convenience; Unicode slugs would work too.
 _SLUG_UMLAUT = {"ä": "ae", "ö": "oe", "ü": "ue", "ß": "ss"}
 
-_NO_ACTIVE_MSG = ("kein aktives Vorhaben — `/vorhaben new <name> --typ mpr|software` "
-                  "(oder `/vorhaben use <slug>`) zuerst")
+_NO_ACTIVE_MSG = ("kein aktives Initiative — `/initiative new <name> --type mpr|software` "
+                  "(oder `/initiative use <slug>`) zuerst")
 
 
 def _slugify(name: str) -> str:
-    """Kebab-case-slug aus einem Vorhaben-Namen (LLM-frei, deterministisch). Deutsche Umlaute
-    werden gefaltet (ä→ae …); jeder Lauf aus Nicht-[a-z0-9] (Leerzeichen, Pfad-Trenner, sonstige
-    Punktuation, nicht-gefaltete Akzente) wird zu EINEM ``-``. Nie leer."""
+    """Kebab-case slug from an initiative name (LLM-free, deterministic). German umlauts
+    are folded (ä→ae …); every run of non-[a-z0-9] (spaces, path separators, other
+    punctuation, non-folded accents) becomes a SINGLE ``-``. Never empty."""
     s = (name or "").strip().lower()
     s = "".join(_SLUG_UMLAUT.get(c, c) for c in s)
     s = re.sub(r"[^a-z0-9]+", "-", s).strip("-")
-    return s or "vorhaben"
+    return s or "initiative"
 
 
 def _parse_frontmatter(text: str) -> Dict[str, str]:
-    """Minimaler, flacher YAML-frontmatter-Parser (``key: value`` zwischen ``---``-Zeilen).
-    LLM-frei; wird von Vorhaben-meta UND reconcile_vault (Unit C) geteilt. Werte bleiben Strings
-    (inkl. roher Listen wie ``[a, b]``); leerer/fehlender Block → ``{}``."""
+    """Minimal, flat YAML frontmatter parser (``key: value`` between ``---`` lines).
+    LLM-free; shared by initiative meta AND reconcile_vault (Unit C). Values stay strings
+    (incl. raw lists like ``[a, b]``); empty/missing block → ``{}``."""
     lines = (text or "").splitlines()
     if not lines or lines[0].strip() != "---":
         return {}
@@ -306,16 +306,16 @@ def _parse_frontmatter(text: str) -> Dict[str, str]:
     return out
 
 
-class Vorhaben:
-    """Metadaten + Pfade eines Vorhabens. Persistenz liegt in vault/<slug>/meta.md (SSOT)."""
+class Initiative:
+    """Metadata + paths of an initiative. Persistence lives in vault/<slug>/meta.md (SSOT)."""
 
-    __slots__ = ("slug", "typ", "titel", "erstellt", "status")
+    __slots__ = ("slug", "type", "title", "created", "status")
 
-    def __init__(self, slug: str, typ: str, titel: str, erstellt: str, status: str = "aktiv"):
+    def __init__(self, slug: str, type: str, title: str, created: str, status: str = "active"):
         self.slug     = slug
-        self.typ      = typ
-        self.titel    = titel
-        self.erstellt = erstellt
+        self.type      = type
+        self.title    = title
+        self.created = created
         self.status   = status
 
     @property
@@ -329,31 +329,31 @@ class Vorhaben:
     def to_meta(self) -> str:
         return (
             "---\n"
-            f"typ: {self.typ}\n"
-            f"titel: {self.titel}\n"
-            f"erstellt: {self.erstellt}\n"
+            f"type: {self.type}\n"
+            f"title: {self.title}\n"
+            f"created: {self.created}\n"
             f"status: {self.status}\n"
             "---\n\n"
-            f"# {self.titel}\n\n"
-            f"_Vorhaben (typ: {self.typ}). Artefakte unter `{vault_root().as_posix()}/{self.slug}/`. "
+            f"# {self.title}\n\n"
+            f"_Initiative (type: {self.type}). Artefakte unter `{vault_root().as_posix()}/{self.slug}/`. "
             "INDEX.md wird automatisch gepflegt (reconcile)._\n"
         )
 
     @classmethod
-    def from_meta(cls, slug: str, meta_path: Optional[Path] = None) -> "Vorhaben":
+    def from_meta(cls, slug: str, meta_path: Optional[Path] = None) -> "Initiative":
         p = Path(meta_path) if meta_path else (vault_root() / slug / "meta.md")
         fm = _parse_frontmatter(p.read_text(encoding="utf-8"))
         return cls(
             slug=slug,
-            typ=fm.get("typ", ""),
-            titel=fm.get("titel", slug),
-            erstellt=fm.get("erstellt", ""),
-            status=fm.get("status", "aktiv"),
+            type=fm.get("type", ""),
+            title=fm.get("title", slug),
+            created=fm.get("created", ""),
+            status=fm.get("status", "active"),
         )
 
     def to_dict(self) -> Dict[str, Any]:
-        return {"slug": self.slug, "typ": self.typ, "titel": self.titel,
-                "erstellt": self.erstellt, "status": self.status,
+        return {"slug": self.slug, "type": self.type, "title": self.title,
+                "created": self.created, "status": self.status,
                 "path": self.path.as_posix()}
 
 
@@ -362,7 +362,7 @@ def _active_path() -> Path:
 
 
 def active_slug() -> Optional[str]:
-    """Slug des aktiven Vorhabens aus state_root()/active, oder None."""
+    """Slug of the active initiative from state_root()/active, or None."""
     p = _active_path()
     try:
         return (p.read_text(encoding="utf-8").strip() or None) if p.exists() else None
@@ -373,148 +373,160 @@ def active_slug() -> Optional[str]:
 def set_active_slug(slug: str) -> None:
     p = _active_path()
     p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text((slug or "").strip() + "\n", encoding="utf-8")
+    p.write_text((slug or "").strip() + "\n", encoding="utf-8", newline="\n")
 
 
-def vorhaben_exists(slug: str) -> bool:
+def initiative_exists(slug: str) -> bool:
     return bool(slug) and (vault_root() / slug / "meta.md").is_file()
 
 
-def vorhaben_get(slug: str) -> Optional[Vorhaben]:
-    if not vorhaben_exists(slug):
+def initiative_get(slug: str) -> Optional[Initiative]:
+    if not initiative_exists(slug):
         return None
     try:
-        return Vorhaben.from_meta(slug)
+        return Initiative.from_meta(slug)
     except Exception:
         return None
 
 
-def vorhaben_list() -> List[Vorhaben]:
-    """Alle Vorhaben (sortiert nach slug). Defekte meta.md werden still übersprungen."""
+def initiative_list() -> List[Initiative]:
+    """All initiatives (sorted by slug). Broken meta.md files are silently skipped."""
     root = vault_root()
     if not root.exists():
         return []
-    out: List[Vorhaben] = []
+    out: List[Initiative] = []
     for meta in sorted(root.glob("*/meta.md")):
         try:
-            out.append(Vorhaben.from_meta(meta.parent.name, meta))
+            out.append(Initiative.from_meta(meta.parent.name, meta))
         except Exception:
             continue
     return out
 
 
-def vorhaben_new(name: str, typ: str) -> Vorhaben:
-    """Legt ein neues Vorhaben an (meta.md + typ-Skelett), setzt es aktiv. Kollidierende slugs
-    bekommen ein -N-Suffix. Unbekannter Typ / leerer Name → ValueError."""
-    t = (typ or "").strip().lower()
-    if t not in VORHABEN_TYPES:
-        raise ValueError(f"unbekannter Vorhaben-Typ {typ!r} — erlaubt: {', '.join(VORHABEN_TYPES)}")
-    titel = (name or "").strip()
-    if not titel:
-        raise ValueError("Vorhaben braucht einen Namen")
-    base = _slugify(titel)
+def initiative_new(name: str, type: str) -> Initiative:
+    """Creates a new initiative (meta.md + type skeleton), sets it active. Colliding slugs
+    get a -N suffix. Unknown type / empty name → ValueError."""
+    t = (type or "").strip().lower()
+    if t not in INITIATIVE_TYPES:
+        raise ValueError(f"unbekannter Initiative-Typ {type!r} — erlaubt: {', '.join(INITIATIVE_TYPES)}")
+    title = (name or "").strip()
+    if not title:
+        raise ValueError("Initiative braucht einen Namen")
+    base = _slugify(title)
     slug, n = base, 2
     while (vault_root() / slug).exists():
         slug, n = f"{base}-{n}", n + 1
-    v = Vorhaben(slug=slug, typ=t, titel=titel,
-                 erstellt=time.strftime("%Y-%m-%d", time.gmtime()), status="aktiv")
+    v = Initiative(slug=slug, type=t, title=title,
+                 created=time.strftime("%Y-%m-%d", time.localtime()), status="active")
     v.path.mkdir(parents=True, exist_ok=True)
-    for d in _VORHABEN_SKELETON[t]:
+    for d in _INITIATIVE_SKELETON[t]:
         (v.path / d).mkdir(parents=True, exist_ok=True)
-    v.meta_path.write_text(v.to_meta(), encoding="utf-8")
+    v.meta_path.write_text(v.to_meta(), encoding="utf-8", newline="\n")
     set_active_slug(slug)
-    _reconcile_active_soft()   # C2: INDEX.md sofort seeden → von Anfang an navigierbar
+    _reconcile_active_soft()   # C2: seed INDEX.md immediately → navigable from the start
     return v
 
 
-def vorhaben_use(slug: str) -> Vorhaben:
-    """Setzt ein bestehendes Vorhaben aktiv. Unbekannter slug → ValueError."""
-    v = vorhaben_get((slug or "").strip())
+def initiative_use(slug: str) -> Initiative:
+    """Sets an existing initiative active. Unknown slug → ValueError."""
+    v = initiative_get((slug or "").strip())
     if v is None:
-        raise ValueError(f"kein Vorhaben {slug!r} unter {vault_root().as_posix()}/ — "
-                         "`/vorhaben new <name> --typ mpr|software` zuerst")
+        raise ValueError(f"kein Initiative {slug!r} unter {vault_root().as_posix()}/ — "
+                         "`/initiative new <name> --type mpr|software` zuerst")
     set_active_slug(v.slug)
     return v
 
 
-def vorhaben_active() -> Optional[Vorhaben]:
-    """Das aktive Vorhaben (oder None, auch wenn der active-Marker auf ein gelöschtes zeigt)."""
+def initiative_active() -> Optional[Initiative]:
+    """The active initiative (or None, even when the active marker points at a deleted one)."""
     slug = active_slug()
-    return vorhaben_get(slug) if slug else None
+    return initiative_get(slug) if slug else None
 
 
-def active_vorhaben_path() -> Path:
-    """Pfad des aktiven Vorhabens — fail-closed (RuntimeError) ohne gültiges aktives Vorhaben.
-    Quelle des Artefakt-Routings (B3): Tasks/Handovers/Decisions/Reviews/MPR-Runs landen darunter."""
-    v = vorhaben_active()
+def active_initiative_path() -> Path:
+    """Path of the active initiative — fail-closed (RuntimeError) without a valid active initiative.
+    Source of artefact routing (B3): tasks/handovers/decisions/reviews/MPR runs land under it."""
+    v = initiative_active()
     if v is None:
         raise RuntimeError(_NO_ACTIVE_MSG)
     return v.path
 
 
-# ─── Artefakt-Routing (B3) ────────────────────────────────────
-# „file communication" (Tasks/Handovers/Feedback/Decisions/Proposals/Reviews/MPR-Runs) wohnt unter
-# dem AKTIVEN Vorhaben statt im WORKDIR. Erzeugende Ops fail-closed (active_vorhaben_path); Hintergrund-
-# Scanner (Reconciler/Watcher/Autopilot) nutzen die *_soft-Variante (None statt Fehler → Daemon crasht
-# nie). Sichtbares direkt unter <vorhaben>/, Maschinen-Plumbing unter <vorhaben>/.work/.
+def _mpr_blocks_tasks() -> Optional[str]:
+    """Issue #15 — the task pipeline (tasks/handovers/feedback) is software-only. If the ACTIVE
+    initiative is type mpr (reasoning-only), return a clear refusal message; otherwise None. The type
+    becomes a real contract instead of only choosing the seed skeleton."""
+    v = initiative_active()
+    if v is not None and v.type == "mpr":
+        return (f"Task-Pipeline (tasks/handovers/feedback) nur in einem `--type software`-Initiative — "
+                f"aktives Initiative '{v.slug}' ist type mpr (reasoning-only). "
+                f"`/initiative new <name> --type software` oder `/initiative use <slug>`.")
+    return None
+
+
+# ─── Artefact routing (B3) ────────────────────────────────────
+# "file communication" (tasks/handovers/feedback/decisions/proposals/reviews/MPR runs) lives under
+# the ACTIVE initiative instead of WORKDIR. Producing ops are fail-closed (active_initiative_path); background
+# scanners (reconciler/watcher/autopilot) use the *_soft variant (None instead of an error → the daemon never
+# crashes). Visible directly under <initiative>/, machine plumbing under <initiative>/.work/.
 def artifact_root_soft() -> Optional[Path]:
-    """Soft-Variante von active_vorhaben_path(): None ohne aktives Vorhaben."""
-    v = vorhaben_active()
+    """Soft variant of active_initiative_path(): None without an active initiative."""
+    v = initiative_active()
     return v.path if v else None
 
 
 def _work(soft: bool = False) -> Optional[Path]:
-    base = artifact_root_soft() if soft else active_vorhaben_path()
+    base = artifact_root_soft() if soft else active_initiative_path()
     return (base / WORKFLOW_DIR) if base is not None else None
 
 
 def handovers_dir(soft: bool = False) -> Optional[Path]:
-    """Handover-Inbox <vorhaben>/.work/handovers (gestaged vom Orchestrator, gezogen vom Client)."""
+    """Handover inbox <initiative>/.work/handovers (staged by the orchestrator, pulled by the client)."""
     w = _work(soft=soft)
     return (w / "handovers") if w is not None else None
 
 
 def feedback_dir(soft: bool = False) -> Optional[Path]:
-    """Feedback-Inbox <vorhaben>/.work/<feedback> (vom lokalen Code-Agent befüllt, vom Reconciler gelesen).
-    Der Inbox-Name ist via watcher.feedback_dir konfigurierbar (Default ``feedback``)."""
+    """Feedback inbox <initiative>/.work/<feedback> (filled by the local code agent, read by the reconciler).
+    The inbox name is configurable via watcher.feedback_dir (default ``feedback``)."""
     w = _work(soft=soft)
     return (w / WATCHER_FEEDBACK_DIR) if w is not None else None
 
 
 def active_md_path(soft: bool = False) -> Optional[Path]:
-    """Aktiver Handover <vorhaben>/.work/active.md (reine Projektion, nie von Hand pflegen)."""
+    """Active handover <initiative>/.work/active.md (pure projection, never maintain by hand)."""
     w = _work(soft=soft)
     return (w / "active.md") if w is not None else None
 
 
 def archive_handovers_dir(soft: bool = False) -> Optional[Path]:
-    """Handover-Historie <vorhaben>/.work/archive/handovers."""
+    """Handover history <initiative>/.work/archive/handovers."""
     w = _work(soft=soft)
     return (w / "archive" / "handovers") if w is not None else None
 
 
 def archive_feedback_dir(soft: bool = False) -> Optional[Path]:
-    """Feedback-Historie <vorhaben>/.work/archive/feedback."""
+    """Feedback history <initiative>/.work/archive/feedback."""
     w = _work(soft=soft)
     return (w / "archive" / "feedback") if w is not None else None
 
 
-# ─── Self-maintaining vault (Unit C): reconcile_vault, LLM-frei ──
-# Scannt vault/<slug>/**/*.md (ohne INDEX.md und ohne das versteckte .work/), parst Frontmatter und
-# baut eine AUTO-gepflegte INDEX.md (nach Kategorie/Datum gruppiert, Obsidian-[[links]]) sowie —
-# optional — einen idempotenten „Verwandt (auto)"-Block in den kuratierten Docs (gemeinsame Tags /
-# Titel-Referenz im Text). Deterministisch, kein Modell-Call. Wie das MEMORY.md-Pattern.
+# ─── Self-maintaining vault (Unit C): reconcile_vault, LLM-free ──
+# Scans vault/<slug>/**/*.md (excluding INDEX.md and the hidden .work/), parses frontmatter and
+# builds an AUTO-maintained INDEX.md (grouped by category/date, Obsidian [[links]]) plus —
+# optionally — an idempotent "Verwandt (auto)" (related) block in the curated docs (shared tags /
+# title reference in the text). Deterministic, no model call. Like the MEMORY.md pattern.
 _INDEX_AUTO_START = "<!-- ironclad:index:auto START — generiert von reconcile_vault, nicht von Hand ändern -->"
 _INDEX_AUTO_END   = "<!-- ironclad:index:auto END -->"
 _LINKS_AUTO_START = "<!-- ironclad:related:auto START -->"
 _LINKS_AUTO_END   = "<!-- ironclad:related:auto END -->"
-# Doc-Kategorien (erstes Pfad-Segment) die einen „Verwandt"-Block bekommen — kuratiertes Wissen,
-# NICHT die auto-generierten MPR-runs/ und nicht die meta.md.
+# Doc categories (first path segment) that get a "Verwandt" (related) block — curated knowledge,
+# NOT the auto-generated MPR runs/ and not the meta.md.
 _LINK_CATEGORIES  = {"decisions", "proposals", "reviews", "(root)"}
 
 
 def _parse_tags(raw: str) -> set:
-    """Tags aus einem flachen Frontmatter-Wert: ``[a, b]`` oder ``a, b`` → {a, b} (lowercase)."""
+    """Tags from a flat frontmatter value: ``[a, b]`` or ``a, b`` → {a, b} (lowercase)."""
     s = (raw or "").strip().strip("[]")
     return {t.strip().strip("'\"").lower() for t in re.split(r"[,\s]+", s) if t.strip()}
 
@@ -528,8 +540,8 @@ def _first_heading(text: str) -> str:
 
 
 def _set_managed_block(text: str, start: str, end: str, block: Optional[str]) -> str:
-    """Idempotenter, markierter Block: ``block`` ersetzt einen vorhandenen Block (oder wird angehängt);
-    ``block is None`` entfernt ihn. Ersatz via Funktion → keine Backref-Interpretation im Replacement."""
+    """Idempotent, marked block: ``block`` replaces an existing block (or is appended);
+    ``block is None`` removes it. Replacement via a function → no backref interpretation in the replacement."""
     pat = re.compile(re.escape(start) + r".*?" + re.escape(end), re.DOTALL)
     if block is None:
         new = pat.sub("", text)
@@ -540,7 +552,7 @@ def _set_managed_block(text: str, start: str, end: str, block: Optional[str]) ->
 
 
 def _vault_docs(vdir: Path) -> List[Dict[str, Any]]:
-    """Index-fähige Docs unter dem Vorhaben (ohne INDEX.md, ohne verstecktes .work/), mit Metadaten."""
+    """Indexable docs under the initiative (excluding INDEX.md and the hidden .work/), with metadata."""
     out: List[Dict[str, Any]] = []
     for p in sorted(vdir.rglob("*.md")):
         rel = p.relative_to(vdir)
@@ -553,9 +565,9 @@ def _vault_docs(vdir: Path) -> List[Dict[str, Any]]:
         fm = _parse_frontmatter(text)
         out.append({
             "rel": rel, "stem": rel.with_suffix("").as_posix(), "path": p,
-            "title": fm.get("titel") or fm.get("title") or _first_heading(text) or p.stem,
-            "typ": fm.get("typ", ""), "status": fm.get("status", ""),
-            "datum": fm.get("erstellt") or fm.get("datum") or fm.get("date") or "",
+            "title": fm.get("title") or _first_heading(text) or p.stem,
+            "type": fm.get("type", ""), "status": fm.get("status", ""),
+            "date": fm.get("created") or fm.get("date") or "",
             "tags": _parse_tags(fm.get("tags", "")),
             "category": rel.parts[0] if len(rel.parts) > 1 else "(root)",
             "text": text,
@@ -572,9 +584,9 @@ def _index_block(slug: str, docs: List[Dict[str, Any]]) -> str:
     for cat in sorted(by_cat):
         lines.append(f"## {cat}")
         items = sorted(by_cat[cat], key=lambda x: x["title"].lower())
-        items = sorted(items, key=lambda x: x["datum"], reverse=True)   # neuestes zuerst, stabil nach Titel
+        items = sorted(items, key=lambda x: x["date"], reverse=True)   # newest first, stable by title
         for d in items:
-            bits = " · ".join(b for b in (d["typ"], d["status"], d["datum"]) if b)
+            bits = " · ".join(b for b in (d["type"], d["status"], d["date"]) if b)
             lines.append(f"- [[{d['stem']}|{d['title']}]]" + (f"  ({bits})" if bits else ""))
         lines.append("")
     lines.append(_INDEX_AUTO_END)
@@ -582,8 +594,8 @@ def _index_block(slug: str, docs: List[Dict[str, Any]]) -> str:
 
 
 def _related_docs(d: Dict[str, Any], docs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Verwandt = gemeinsame Tags ODER Titel-Referenz im Text. Selbstbezug + bereits injizierte
-    Related-Blöcke ausgenommen (sonst wüchse die Menge bei jedem Lauf → nicht idempotent)."""
+    """Related = shared tags OR a title reference in the text. Self-reference + already-injected
+    related blocks excluded (otherwise the set would grow on every run → not idempotent)."""
     clean = _set_managed_block(d["text"], _LINKS_AUTO_START, _LINKS_AUTO_END, None).lower()
     rel: List[Dict[str, Any]] = []
     for o in docs:
@@ -597,19 +609,25 @@ def _related_docs(d: Dict[str, Any], docs: List[Dict[str, Any]]) -> List[Dict[st
 
 
 def reconcile_vault(slug: str, *, links: bool = True) -> str:
-    """Pflegt INDEX.md (immer) + optional die „Verwandt (auto)"-Blöcke (``links=True``) eines Vorhabens.
-    Deterministisch, idempotent, LLM-frei. ``links=False`` (Auto-Trigger) hält nur den Index frisch und
-    fasst keine Doc-Bodies an (kein Konflikt mit einem offenen Editor)."""
+    """Maintains INDEX.md (always) + optionally the "Verwandt (auto)" (related) blocks (``links=True``) of an initiative.
+    Deterministic, idempotent, LLM-free. ``links=False`` (auto-trigger) only keeps the index fresh and
+    does not touch doc bodies (no conflict with an open editor)."""
     vdir = vault_root() / slug
     if not (vdir / "meta.md").is_file():
-        return f"kein Vorhaben {slug!r} unter {vault_root().as_posix()}/"
+        return f"kein Initiative {slug!r} unter {vault_root().as_posix()}/"
     docs = _vault_docs(vdir)
 
     index_path = vdir / "INDEX.md"
-    existing = index_path.read_text(encoding="utf-8") if index_path.exists() else f"# {slug} — INDEX\n"
+    # Seed the H1 from the initiative's title (meta.md is guaranteed present above), not the slug —
+    # keeps the overview header consistent with meta.md and the wikilink label. Fallback: slug.
+    try:
+        seed_title = Initiative.from_meta(slug).title or slug
+    except Exception:
+        seed_title = slug
+    existing = index_path.read_text(encoding="utf-8") if index_path.exists() else f"# {seed_title} — INDEX\n"
     new_index = _set_managed_block(existing, _INDEX_AUTO_START, _INDEX_AUTO_END, _index_block(slug, docs))
     if new_index != existing:
-        index_path.write_text(new_index, encoding="utf-8")
+        index_path.write_text(new_index, encoding="utf-8", newline="\n")
 
     linked = 0
     if links:
@@ -623,31 +641,31 @@ def reconcile_vault(slug: str, *, links: bool = True) -> str:
                                   *[f"- [[{o['stem']}|{o['title']}]]" for o in items],
                                   "", _LINKS_AUTO_END])
                 new = _set_managed_block(d["text"], _LINKS_AUTO_START, _LINKS_AUTO_END, body)
-            else:   # keine Verwandten → vorhandenen Block entfernen (tidy)
+            else:   # no related docs → remove any existing block (tidy)
                 new = _set_managed_block(d["text"], _LINKS_AUTO_START, _LINKS_AUTO_END, None)
             if new != d["text"]:
-                d["path"].write_text(new, encoding="utf-8")
+                d["path"].write_text(new, encoding="utf-8", newline="\n")
                 linked += 1
     suffix = f", {linked} Related-Block/Blöcke aktualisiert" if links else " (nur Index)"
     return f"{slug}: {len(docs)} Dokument(e) indiziert{suffix}"
 
 
 def _reconcile_active_soft(*, links: bool = False) -> None:
-    """Auto-Reconcile des aktiven Vorhabens nach einem Schreibvorgang (fail-soft, nie raise).
-    Default ``links=False`` → nur INDEX.md frisch halten, Doc-Bodies unangetastet."""
+    """Auto-reconcile of the active initiative after a write (fail-soft, never raises).
+    Default ``links=False`` → only keep INDEX.md fresh, doc bodies untouched."""
     try:
         s = active_slug()
         if s:
             reconcile_vault(s, links=links)
-    except Exception:   # noqa: BLE001 — Reconcile darf einen Schreibvorgang nie scheitern lassen
+    except Exception:   # noqa: BLE001 — reconcile must never make a write fail
         pass
 
 
-# Memory-Layer — module-level Singleton, initialisiert in GX10.__init__()
+# Memory layer — module-level singleton, initialized in GX10.__init__()
 _MEMORY_CONFIG: Dict[str, Any] = {}
 _MEMORY: Optional[Any] = None
-# Warm-Tier (Valkey, B0) — optionaler cache-aside-Layer vor dem Cold-Vektor-Store (B2-Retrieval)
-# + Session-State. Singleton, initialisiert in GX10.__init__(); ohne url bleibt es None (no-op).
+# Warm tier (Valkey, B0) — optional cache-aside layer in front of the cold vector store (B2 retrieval)
+# + session state. Singleton, initialized in GX10.__init__(); without a url it stays None (no-op).
 _WARM_CONFIG: Dict[str, Any] = {}
 _WARM: Optional[Any] = None
 #: Phase-e reasoning fan-out (engine/workers.py). Set by the server; stays None in the
@@ -687,7 +705,7 @@ _LOCAL_TOOL_BRIDGE: Optional[Any] = None
 #: unless ``paths.plugins_dir`` / ``GX10_PLUGINS_DIR`` is set. See docs/plugin-api.md.
 _PLUGIN_TOOLS: Dict[str, Dict[str, Any]] = {}
 
-# ─── Farben ──────────────────────────────────────────────────
+# ─── Colors ──────────────────────────────────────────────────
 class C:
     GREEN   = "\033[92m"
     CYAN    = "\033[96m"
@@ -743,9 +761,9 @@ THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
 def clean(text: str) -> str:
     return THINK_RE.sub("", text).strip() if text else ""
 
-# ─── Thinking-Auto-Klassifikation ────────────────────────────
-# Sicherer Fehlermodus: im Zweifel DENKEN. Thinking wird nur bei klarer
-# Routine (Status/Lookup/done) OHNE Planungs-Verb abgeschaltet.
+# ─── Thinking auto-classification ────────────────────────────
+# Safe failure mode: when in doubt, THINK. Thinking is only switched off for clear
+# routine (status/lookup/done) WITHOUT a planning verb.
 _PLANNING_KW = (
     "erstell", "plane", "plan ", "zerleg", "analysier", "entscheid", "review",
     "architekt", "design", "warum", "weshalb", "vergleich", "refactor",
@@ -756,8 +774,8 @@ _ROUTINE_KW = (
     "welche", "was ist offen", "offen", "status", "liste", "list ", "zeig",
     "übersicht", "überblick", "wie viele", "show", "open task", "lies ",
     "cat ", "ls ", "gib mir", "welcher", "welches",
-    # Routine-Status-Abfragen (eng gehalten — kein breites "gibt es" / "liegt an",
-    # damit diagnostisches "woran liegt das?" weiterhin denkt):
+    # Routine status queries (kept narrow — no broad "gibt es" / "liegt an",
+    # so that diagnostic "woran liegt das?" still thinks):
     "etwas zu tun", "zu tun", "steht an", "todo", "to-do", "idle",
     "anything to do", "was liegt an", "liegt was an",
 )
@@ -773,11 +791,11 @@ _SMALLTALK_KW = (
 )
 
 
-# ─── Streaming Think-Filter (PERF-01 + PERF-02 Anzeige) ──────
+# ─── Streaming think filter (PERF-01 + PERF-02 display) ──────
 class _ThinkFilter:
-    """Inkrementeller Filter: unterdrückt alles zwischen <think> und
-    </think> über Chunk-Grenzen hinweg. Hält am Puffer-Ende einen
-    möglichen Teil-Tag zurück, damit kein Tag zerschnitten wird."""
+    """Incremental filter: suppresses everything between <think> and
+    </think> across chunk boundaries. Holds back a possible partial
+    tag at the end of the buffer so no tag is cut apart."""
     OPEN  = "<think>"
     CLOSE = "</think>"
 
@@ -787,8 +805,8 @@ class _ThinkFilter:
 
     @staticmethod
     def _safe_cut(s: str, tag: str) -> int:
-        """Index bis zu dem s gefahrlos emittiert/verworfen werden darf;
-        hält ein Suffix zurück, das Präfix von tag sein könnte."""
+        """Index up to which s may be safely emitted/discarded;
+        holds back a suffix that could be a prefix of tag."""
         maxk = min(len(tag) - 1, len(s))
         for k in range(maxk, 0, -1):
             if s.endswith(tag[:k]):
@@ -813,7 +831,7 @@ class _ThinkFilter:
                 j = self.buf.find(self.CLOSE)
                 if j == -1:
                     cut = self._safe_cut(self.buf, self.CLOSE)
-                    self.buf = self.buf[cut:]   # verwerfen, Teil-Tag behalten
+                    self.buf = self.buf[cut:]   # discard, keep partial tag
                     break
                 self.buf = self.buf[j + len(self.CLOSE):]
                 self.in_think = False
@@ -825,18 +843,18 @@ class _ThinkFilter:
         return rest
 
 
-# ─── Tabellen-bewusste Zeilenausgabe (Code-gerenderte Tabellen) ──
+# ─── Table-aware line output (code-rendered tables) ──
 class _TableLineRenderer:
-    """Nimmt Text zeilenweise an. Markdown-/Pipe-Tabellen werden gepuffert
-    und mit exakt ausgerichteten Spalten ausgegeben; alles andere geht
-    unverändert (zeilenweise) durch. Die `|---|`-Trennzeile und `**`/`` ` ``
-    werden entfernt. Kostet KEINE zusätzlichen Tokens — die Ausrichtung
-    passiert lokal beim Rendern."""
+    """Takes text line by line. Markdown/pipe tables are buffered
+    and emitted with exactly aligned columns; everything else passes
+    through unchanged (line by line). The `|---|` separator row and `**`/`` ` ``
+    are removed. Costs NO extra tokens — the alignment
+    happens locally during rendering."""
 
     def __init__(self, emit_line):
-        self.emit_line = emit_line     # callable(str): gibt EINE fertige Zeile aus
+        self.emit_line = emit_line     # callable(str): emits ONE finished line
         self.buf   = ""
-        self.table = []                # gesammelte Roh-Tabellenzeilen (ohne Trenner)
+        self.table = []                # collected raw table rows (without separators)
 
     @staticmethod
     def _is_row(line: str) -> bool:
@@ -866,7 +884,7 @@ class _TableLineRenderer:
                 self.table.append(line)
             return
         self._flush_table()
-        self.emit_line(line.replace("**", ""))   # literale Markdown-Bold-Marker entfernen
+        self.emit_line(line.replace("**", ""))   # remove literal markdown bold markers
 
     def _flush_table(self):
         if not self.table:
@@ -890,40 +908,40 @@ class _TableLineRenderer:
         self._flush_table()
 
 
-# ─── Globaler UI-State ────────────────────────────────────────
+# ─── Global UI state ────────────────────────────────────────
 _UI_MAX_LINES                 = 5000
 _UI_LINES:   "deque[str]"     = deque(maxlen=_UI_MAX_LINES)
 _UI_PARTIAL: str              = ""
 _UI_LOCK                      = threading.Lock()
 _UI_APP: Optional[Application] = None
 
-# Headless-Capture-Hook: wird vom Server-Modus (engine/server.py) gesetzt,
-# wenn KEINE prompt_toolkit-UI läuft (_UI_APP is None). Ein Callable(text:str)->None,
-# das die Ausgabe abgreift (z. B. in einen Thread-lokalen Request-Buffer) statt auf
-# stdout zu drucken. Bleibt None im normalen CLI-/REPL-Betrieb → Verhalten unverändert.
+# Headless capture hook: set by the server mode (engine/server.py)
+# when NO prompt_toolkit UI is running (_UI_APP is None). A callable(text:str)->None
+# that taps the output (e.g. into a thread-local request buffer) instead of printing
+# to stdout. Stays None in normal CLI/REPL operation → behaviour unchanged.
 _UI_SINK: Optional[Callable[[str], None]] = None
 
 _INPUT_QUEUE: _q.Queue        = _q.Queue()
 _CANCEL_EVENT                 = threading.Event()
 _RELOAD_FLAG                  = False
-_WATCHER_ENABLED              = True    # Auto-Advance via Reconciler (jetzt stabil → Default an)
-RECONCILER_INTERVAL           = 3.0     # Polling-Intervall (s)
-_ADVANCE_CMD                  = "\x00advance\x00"   # interner strukturierter Reconciler-Befehl
-_LAUNCH_CMD                   = "\x00launch\x00"    # interner Autopilot-Launch-Befehl
+_WATCHER_ENABLED              = True    # auto-advance via reconciler (stable now → default on)
+RECONCILER_INTERVAL           = 3.0     # polling interval (s)
+_ADVANCE_CMD                  = "\x00advance\x00"   # internal structured reconciler command
+_LAUNCH_CMD                   = "\x00launch\x00"    # internal autopilot launch command
 
-# Autopilot: Zähler reservierter/laufender claude-Prozesse (Nebenläufigkeits-Gate)
+# Autopilot: counter of reserved/running claude processes (concurrency gate)
 _AUTOPILOT_ACTIVE             = 0
 _AUTOPILOT_LOCK               = threading.Lock()
-_AUTOPILOT_PROCS: Dict[str, Any] = {}   # task_id -> Popen (für gezieltes Beenden beim advance)
+_AUTOPILOT_PROCS: Dict[str, Any] = {}   # task_id -> Popen (for targeted termination on advance)
 
 _status = {"thinking": False, "label": "bereit"}
 
-# Effektiv geladene Config + Quelle (in main() gesetzt) — für den `config`-Befehl.
+# Effectively loaded config + source (set in main()) — for the `config` command.
 _EFFECTIVE_CFG: Optional[Dict[str, Any]] = None
 _CFG_SOURCE: Optional[Path] = None
 
 def _ui_print(*args, sep: str = " ", end: str = "\n", flush: bool = False):
-    """Universelle Ausgabe: Application-Fenster oder Fallback-stdout."""
+    """Universal output: Application window or fallback stdout."""
     global _UI_PARTIAL
     text = sep.join(str(a) for a in args)
     if _UI_APP is not None:
@@ -935,7 +953,7 @@ def _ui_print(*args, sep: str = " ", end: str = "\n", flush: bool = False):
                 _UI_LINES.extend(parts)
         _UI_APP.invalidate()
     elif _UI_SINK is not None:
-        # Headless-Server-Modus: Ausgabe an den Capture-Hook geben statt stdout.
+        # Headless server mode: send the output to the capture hook instead of stdout.
         _UI_SINK(text + end)
     else:
         print(*args, sep=sep, end=end, flush=flush)
@@ -943,16 +961,16 @@ def _ui_print(*args, sep: str = " ", end: str = "\n", flush: bool = False):
 _ANSI_LEN_RE = re.compile(r"\x1b\[[0-9;]*m")
 
 def _visual_rows(line: str, width: int) -> int:
-    """Wie viele Bildschirmzeilen eine (ggf. umbrechende) Zeile belegt —
-    ANSI-Farbcodes zählen nicht zur Breite."""
+    """How many screen rows a (possibly wrapping) line occupies —
+    ANSI color codes do not count toward the width."""
     n = len(_ANSI_LEN_RE.sub("", line))
     return max(1, -(-n // width))   # ceil(n/width)
 
 def _get_output():
-    # WICHTIG: Größe aus prompt_toolkits EIGENER Quelle nehmen, wenn die App
-    # läuft — sonst kann sie von shutil abweichen (bis zum ersten Resize), und
-    # das Tail-Budget passt nicht zur tatsächlichen Fensterhöhe → unterste
-    # Zeilen (perf, ✓ FERTIG) werden geclippt, bis man das Terminal bewegt.
+    # IMPORTANT: take the size from prompt_toolkit's OWN source when the app
+    # is running — otherwise it can diverge from shutil (until the first resize), and
+    # the tail budget doesn't match the actual window height → the bottom
+    # lines (perf, ✓ DONE) get clipped until you move the terminal.
     term_rows = term_cols = None
     if _UI_APP is not None:
         try:
@@ -963,15 +981,15 @@ def _get_output():
     if term_rows is None:
         s = shutil.get_terminal_size((80, 24))
         term_rows, term_cols = s.lines, s.columns
-    # Untere, fixe UI: Trennlinie(1) + Eingabe(1) + Trennlinie(1) + Toolbar(3) = 6.
+    # Bottom fixed UI: separator(1) + input(1) + separator(1) + toolbar(3) = 6.
     rows  = max(1, term_rows - 6)
     width = max(1, term_cols)
     with _UI_LOCK:
         lines = list(_UI_LINES)
         if _UI_PARTIAL:
             lines.append(_UI_PARTIAL)
-    # Vom ENDE her sammeln, bis das Fenster (in SICHTBAREN, umgebrochenen Zeilen)
-    # voll ist — so bleibt die neueste Zeile (✓ FERTIG) garantiert unten sichtbar.
+    # Collect from the END until the window (in VISIBLE, wrapped lines)
+    # is full — this guarantees the newest line (✓ DONE) stays visible at the bottom.
     visible: List[str] = []
     used = 0
     for ln in reversed(lines):
@@ -987,7 +1005,7 @@ def _toolbar():
     cwd   = str(Path.cwd())
     frame = SPINNER_FRAMES[int(time.time() * 8) % len(SPINNER_FRAMES)]
 
-    # Status-Indikatoren — immer sichtbar, auch während Thinking
+    # Status indicators — always visible, even during thinking
     w_color = "fg:ansigreen bold" if _WATCHER_ENABLED    else "fg:ansired bold"
     a_color = "fg:ansigreen bold" if AUTOPILOT_ENABLED   else "fg:ansigray"
     r_color = "fg:ansigreen bold" if (AUTOPILOT_ENABLED and AUTOPILOT_AUTOPLAN) else "fg:ansigray"
@@ -1061,7 +1079,7 @@ class Spinner:
         if _UI_APP:
             _UI_APP.invalidate()
 
-# ─── Tool Definitionen ────────────────────────────────────────
+# ─── Tool definitions ────────────────────────────────────────
 TOOLS = [
     {
         "type": "function",
@@ -1138,7 +1156,7 @@ TOOLS = [
                 "Move, rename, or resolve file conflicts. "
                 "ID conflict resolution: rename existing file before writing new one. "
                 "For task transitions and handover archiving DO NOT move files by hand — use "
-                "advance_pipeline (it routes everything under the active vorhaben deterministically)."
+                "advance_pipeline (it routes everything under the active initiative deterministically)."
             ),
             "parameters": {
                 "type": "object",
@@ -1169,7 +1187,7 @@ TOOLS = [
             "description": (
                 "Copy a file without removing the original. For the task/handover/feedback "
                 "workflow use the deterministic tools (stage_handover / advance_pipeline) instead — "
-                "they route under the active vorhaben; copying by hand bypasses that."
+                "they route under the active initiative; copying by hand bypasses that."
             ),
             "parameters": {
                 "type": "object",
@@ -1217,13 +1235,13 @@ TOOLS = [
             "name": "advance_pipeline",
             "description": (
                 "Advance the workflow pipeline for ONE completed task in a single "
-                "deterministic step (everything under the ACTIVE vorhaben): archive the active "
+                "deterministic step (everything under the ACTIVE initiative): archive the active "
                 "handover, archive the feedback, set the task JSON to status=done and move it to "
                 "tasks/done/, delete the handover from the .work/handovers inbox, and optionally "
                 "activate the next task. "
                 "On 'done' ALWAYS use this tool instead of individual "
                 "move_file/copy_file/delete_file calls. Fail-closed: aborts if the "
-                "feedback file is missing OR no vorhaben is active. Never touches code/ or the audit chain."
+                "feedback file is missing OR no initiative is active. Never touches code/ or the audit chain."
             ),
             "parameters": {
                 "type": "object",
@@ -1264,9 +1282,9 @@ TOOLS = [
     }
 ]
 
-# query_memory wird angeboten, sobald Memory KONFIGURIERT ist (jeder Modus, NICHT onboarding-only):
-# _effective_tools() fügt [MEMORY_TOOL, DEEP_MEMORY_TOOL] bei `_MEMORY is not None` hinzu. (Die
-# onboarding-only Duplikat-Vorprüfung ist ein anderes Tool, check_task_exists in ONBOARDING_TOOLS.)
+# query_memory is offered as soon as memory is CONFIGURED (any mode, NOT onboarding-only):
+# _effective_tools() adds [MEMORY_TOOL, DEEP_MEMORY_TOOL] when `_MEMORY is not None`. (The
+# onboarding-only duplicate pre-check is a different tool, check_task_exists in ONBOARDING_TOOLS.)
 MEMORY_TOOL = {
     "type": "function",
     "function": {
@@ -1369,26 +1387,26 @@ ONBOARDING_TOOLS = [
 ]
 
 def _effective_tools() -> List[Dict[str, Any]]:
-    """Tool-Liste je nach Modus — Onboarding-Tools nur, wenn aktiv."""
-    # Tool nur anbieten, wenn Memory KONFIGURIERT ist (nicht bloß das Modul da ist) —
-    # sonst böte sich der Tool an, obwohl jeder Aufruf "nicht verfügbar" zurückgäbe.
+    """Tool list depending on the mode — onboarding tools only when active."""
+    # Offer the tool only when memory is CONFIGURED (not just the module present) —
+    # otherwise the tool would be offered even though every call would return "unavailable".
     mem = [MEMORY_TOOL, DEEP_MEMORY_TOOL] if _MEMORY is not None else []
     par = [PARALLEL_TOOL] if _WORKERS is not None else []
     plug = [t["schema"] for t in _PLUGIN_TOOLS.values()]
     return TOOLS + mem + par + plug + (ONBOARDING_TOOLS if ONBOARDING_MODE else [])
 
-# ─── Makro-Tool: deterministische Pipeline (HV-A) ─────────────
+# ─── Macro tool: deterministic pipeline (HV-A) ─────────────
 _TASK_ID_RE = re.compile(rf"^{re.escape(TASK_PREFIX)}-[A-Za-z0-9_]+$")
 _IDLE_ACTIVE = "# Workflow — idle\n\nKein aktiver Handover.\n"
 
 def _atomic_write(p: Path, content: str):
     p.parent.mkdir(parents=True, exist_ok=True)
     tmp = p.with_name(p.name + ".tmp")
-    tmp.write_text(content, encoding="utf-8")
-    # Windows: os.replace scheitert mit [WinError 5], wenn das Ziel von einem
-    # anderen Prozess offen gehalten wird (z. B. Obsidian auf active.md). Der
-    # Lock ist i. d. R. transient → kurz zurückversuchen; hält er an, direkt
-    # (nicht-atomar) überschreiben, statt die ganze Pipeline scheitern zu lassen.
+    tmp.write_text(content, encoding="utf-8", newline="\n")
+    # Windows: os.replace fails with [WinError 5] when the target is held open by
+    # another process (e.g. Obsidian on active.md). The lock is usually
+    # transient → retry briefly; if it persists, overwrite directly
+    # (non-atomic) instead of letting the whole pipeline fail.
     for attempt in range(8):
         try:
             tmp.replace(p)
@@ -1397,7 +1415,7 @@ def _atomic_write(p: Path, content: str):
             if attempt < 7:
                 time.sleep(0.25)
                 continue
-            p.write_text(content, encoding="utf-8")   # Fallback: direkt schreiben
+            p.write_text(content, encoding="utf-8", newline="\n")   # fallback: direct (non-atomic) write
             try:
                 tmp.unlink()
             except OSError:
@@ -1405,42 +1423,45 @@ def _atomic_write(p: Path, content: str):
             return
 
 def _normalize_handover_id(md: str, tid: str) -> str:
-    """Setzt ALLE `task_id:`-Zeilen im Handover (Frontmatter + Feedback-Template)
-    auf die vom Store vergebene ID. count=0 = alle Vorkommen ersetzen, damit
-    das Feedback-Template im Body nicht KGC-XXX behält (Reconciler-Fallback)."""
+    """Sets ALL `task_id:` lines in the handover (frontmatter + feedback template)
+    to the ID assigned by the store. count=0 = replace all occurrences, so
+    the feedback template in the body doesn't keep KGC-XXX (reconciler fallback)."""
     return re.sub(r"(?m)^(task_id:\s*).*$", rf"\g<1>{tid}", md, count=0)
 
 
 def _advance_pipeline(task_id: str, agent: str, next_task_id: Optional[str] = None) -> str:
-    """Schaltet die 'done'-Pipeline für EINEN Task deterministisch weiter.
-    Status-Übergänge laufen über den TaskStore (Verzeichnis = Wahrheit),
-    active.md wird projiziert. Fail-closed: ohne Feedback-Datei kein
-    Abschluss. Rührt weder code/ noch die Audit-Chain an."""
+    """Advances the 'done' pipeline for ONE task deterministically.
+    Status transitions go through the TaskStore (directory = truth),
+    active.md is projected. Fail-closed: no completion without a feedback
+    file. Touches neither code/ nor the audit chain."""
     if not task_id or not _TASK_ID_RE.match(task_id):
         return f"ERROR: invalid task_id: {task_id!r} (expected e.g. KGC-315)"
     agent = (agent or "").upper()
     if agent == "KIMI":
-        agent = "SONNET"                      # Kimi → Sonnet (Legacy-Alias, 2026-06-15)
+        agent = "SONNET"                      # Kimi → Sonnet (legacy alias, 2026-06-15)
     if agent not in ("OPUS", "SONNET"):
         return f"ERROR: agent must be OPUS or SONNET (was: {agent!r})"
     if next_task_id and not _TASK_ID_RE.match(next_task_id):
         return f"ERROR: invalid next_task_id: {next_task_id!r}"
 
     if artifact_root_soft() is None:
-        return f"ERROR: {_NO_ACTIVE_MSG}"     # B3: fail-closed — Artefakte routen ans aktive Vorhaben
+        return f"ERROR: {_NO_ACTIVE_MSG}"     # B3: fail-closed — artefacts route to the active initiative
+    _mpr = _mpr_blocks_tasks()
+    if _mpr:
+        return f"ERROR: {_mpr}"               # #15: mpr initiative is reasoning-only
 
     store = _store()
     log: List[str] = []
 
-    # Idempotenz-Gate: Task bereits done → kein erneutes Advance nötig
+    # Idempotency gate: task already done → no re-advance needed
     existing = store.get(task_id)
     if existing and existing.get("status") == "done":
         return (f"OK: task {task_id} is already done — no re-advance needed. "
                 f"Feedback liegt in {(archive_feedback_dir() / f'{task_id}_{agent}-feedback.md').as_posix()}")
 
-    # 0. Fail-closed-Gate: Feedback MUSS existieren
-    # Primär: <vorhaben>/.work/feedback/ (Reconciler-Inbox)
-    # Fallback: <vorhaben>/.work/archive/feedback/ (bereits vom Reconciler archiviert)
+    # 0. Fail-closed gate: feedback MUST exist
+    # Primary: <initiative>/.work/feedback/ (reconciler inbox)
+    # Fallback: <initiative>/.work/archive/feedback/ (already archived by the reconciler)
     fb = feedback_dir() / f"{task_id}_{agent}-feedback.md"
     if not fb.exists():
         fb_arch = archive_feedback_dir() / f"{task_id}_{agent}-feedback.md"
@@ -1454,7 +1475,7 @@ def _advance_pipeline(task_id: str, agent: str, next_task_id: Optional[str] = No
     log.append(f"feedback found: {fb}")
 
     try:
-        # 1. aktuellen active.md-Handover archivieren (vor dem Umschalten)
+        # 1. archive the current active.md handover (before the switch)
         active  = active_md_path()
         archive = archive_handovers_dir() / f"{task_id}_{agent}.md"
         if active.exists():
@@ -1464,9 +1485,9 @@ def _advance_pipeline(task_id: str, agent: str, next_task_id: Optional[str] = No
         else:
             log.append("active.md not present (skip archive)")
 
-        # 2. Feedback ins Archiv ziehen UND Original entfernen — sonst sammeln sich
-        #    Alt-Feedbacks in der Inbox und matchen bei ID-Wiederverwendung erneut
-        #    (Stale-Trigger). Wenn fb bereits aus dem Archiv kommt (Fallback), kein Copy+Delete.
+        # 2. move feedback into the archive AND remove the original — otherwise
+        #    old feedbacks pile up in the inbox and match again on ID reuse
+        #    (stale trigger). If fb already comes from the archive (fallback), no copy+delete.
         vfb = archive_feedback_dir() / fb.name
         vfb.parent.mkdir(parents=True, exist_ok=True)
         if fb.resolve() != vfb.resolve():
@@ -1479,14 +1500,14 @@ def _advance_pipeline(task_id: str, agent: str, next_task_id: Optional[str] = No
         else:
             log.append(f"feedback already archived: {vfb} (no copy needed)")
 
-        # 3. Status-Übergang → done (über den Store)
+        # 3. status transition → done (via the store)
         try:
             store.transition(task_id, "done")
             log.append(f"task {task_id} → tasks/done (status=done)")
         except KeyError:
             log.append("task-json not found (skip)")
 
-        # 3a. Memory: Task-Abschluss als Episode speichern (fail-soft)
+        # 3a. Memory: store the task completion as an episode (fail-soft)
         if _MEMORY is not None and _MEMORY.is_available():
             try:
                 fb_text = vfb.read_text(encoding="utf-8") if vfb.exists() else ""
@@ -1494,7 +1515,7 @@ def _advance_pipeline(task_id: str, agent: str, next_task_id: Optional[str] = No
             except Exception:
                 pass
 
-        # 4. Handover in der Inbox (.work/handovers) löschen
+        # 4. delete the handover in the inbox (.work/handovers)
         deleted = False
         _hod = handovers_dir()
         for cand in (_hod / f"{task_id}_{agent}.md",
@@ -1507,7 +1528,7 @@ def _advance_pipeline(task_id: str, agent: str, next_task_id: Optional[str] = No
         if not deleted:
             log.append("no handover in .work/handovers (skip)")
 
-        # 5. nächsten Task aktivieren (Store) — active.md folgt aus Projektion
+        # 5. activate the next task (store) — active.md follows from the projection
         if next_task_id:
             try:
                 store.transition(next_task_id, "in_progress")
@@ -1515,23 +1536,23 @@ def _advance_pipeline(task_id: str, agent: str, next_task_id: Optional[str] = No
             except KeyError:
                 log.append(f"WARN: next task {next_task_id} not found")
 
-        # 6. active.md projizieren (neuester nicht-done Handover bzw. idle)
+        # 6. project active.md (newest non-done handover, or idle)
         store.project_active()
         log.append("active.md projiziert")
 
-        # 7. Optional: zugehörige Autopilot-Session beenden (Task ist done)
+        # 7. Optional: terminate the associated autopilot session (task is done)
         if AUTOPILOT_TERMINATE_ON_ADVANCE:
             _terminate_autopilot(task_id)
-            log.append("autopilot-session beendet (falls aktiv)")
+            log.append("autopilot-session beendet (falls active)")
 
-        # 8. Vault-Projektionen DETERMINISTISCH regenerieren — mechanisch, NICHT
-        #    von GX10s Schritt-6-Disziplin abhängig (verhindert Stale-Backlog →
-        #    Autoplan plant sonst aus veralteten Daten → Dublette). Idempotent +
-        #    fail-soft: ein Skript-Fehler bricht den bereits erfolgten Advance NICHT.
-        #    UTF-8-Env, damit Emoji-Ausgaben nicht an cp1252-stdout crashen.
+        # 8. regenerate the vault projections DETERMINISTICALLY — mechanically, NOT
+        #    dependent on GX10's step-6 discipline (prevents a stale backlog →
+        #    otherwise autoplan plans from outdated data → duplicate). Idempotent +
+        #    fail-soft: a script error does NOT abort the already-completed advance.
+        #    UTF-8 env so emoji output doesn't crash on cp1252 stdout.
         _env = {**os.environ, "PYTHONIOENCODING": "utf-8"}
-        # update_capability_tracking.py regeneriert ALLE Capability-Domains
-        # (n8n-parity, frontend-ux-parity, …) generisch aus ihren *-gap-tracking.md.
+        # update_capability_tracking.py regenerates ALL capability domains
+        # (n8n-parity, frontend-ux-parity, …) generically from their *-gap-tracking.md.
         for _script in ("update_capability_tracking.py", "update_workflow_mocs.py",
                         "update_masterplan_status.py"):
             try:
@@ -1545,16 +1566,16 @@ def _advance_pipeline(task_id: str, agent: str, next_task_id: Optional[str] = No
     except Exception as e:
         return f"ERROR: pipeline step failed: {e}\nso far:\n" + "\n".join(f"  - {l}" for l in log)
 
-    _reconcile_active_soft()   # C2: INDEX.md des aktiven Vorhabens frisch halten (fail-soft, nur Index)
+    _reconcile_active_soft()   # C2: keep the active initiative's INDEX.md fresh (fail-soft, index only)
     return f"OK: pipeline advanced for {task_id} ({agent})\n" + "\n".join(f"  - {l}" for l in log)
 
 
-# ─── Pfad-Guard: erfundene Codebase-Pfade im Handover erkennen ───
-# Der Orchestrator rät mitunter nicht-existente "Aktueller Codebase-Zustand"-
-# Pfade, was den Code-Agenten zum Neubau statt Erweitern verleitet
-# (Dublettenrisiko). Dieser Check meldet code-artige Pfade, die weder relativ
-# zum Repo-Root noch unter dem optionalen, vessel-spezifischen CODE_ROOT
-# (paths.code_root; leer = aus) existieren.
+# ─── Path guard: detect invented codebase paths in the handover ───
+# The orchestrator sometimes guesses non-existent "current codebase state"
+# paths, which lures the code agent into rebuilding instead of extending
+# (duplication risk). This check reports code-like paths that exist neither
+# relative to the repo root nor under the optional, vessel-specific CODE_ROOT
+# (paths.code_root; empty = off).
 _HANDOVER_PATH_RE = re.compile(
     r"(?<![\w@.-])((?:code|core|routers|config|tests|scripts|services|docker|frontend)/[\w./-]+(?:\.\w{1,6}|/))"
 )
@@ -1573,13 +1594,13 @@ def _handover_path_warnings(handover_md: str) -> List[str]:
     return missing
 
 
-# ─── Makro-Tool: Handover veröffentlichen (OPT-2, store-gestützt) ──
+# ─── Macro tool: publish a handover (OPT-2, store-backed) ──
 def _ack_validate(fields: Dict[str, Any]) -> Optional[str]:
-    """ACK-Soft-Pfad-Gate: validiert ein modell-emittiertes task_json gegen den
-    ACK-Vertrag. Liefert einen EXAKTEN Fehlerstring bei Verletzung, sonst None
-    (gültig / Gate aus / ACK-Paket nicht verfügbar → degradiert weich, die Engine
-    läuft weiter). Bei aktiviertem Lodestar wird die capability-tragende Spec
-    genutzt (capability pflicht für buildable types)."""
+    """ACK soft-path gate: validates a model-emitted task_json against the
+    ACK contract. Returns an EXACT error string on a violation, otherwise None
+    (valid / gate off / ACK package unavailable → degrades softly, the engine
+    keeps running). With Lodestar enabled, the capability-bearing spec is
+    used (capability mandatory for buildable types)."""
     if not ACK_ENABLED:
         return None
     try:
@@ -1590,7 +1611,7 @@ def _ack_validate(fields: Dict[str, Any]) -> Optional[str]:
             spec_cls = CapabilityTaskSpec
         from pydantic import ValidationError
     except Exception:
-        return None  # ACK nicht importierbar → weich degradieren
+        return None  # ACK not importable → degrade softly
     try:
         spec_cls.model_validate(fields)
         return None
@@ -1601,24 +1622,27 @@ def _ack_validate(fields: Dict[str, Any]) -> Optional[str]:
 def _stage_handover(task_id: Optional[str], agent: str, handover_md: str,
                     task_json: Optional[str] = None, set_active: bool = True,
                     force: bool = False) -> str:
-    """Veröffentlicht einen NEUEN Task+Handover in EINEM Schritt über den
-    TaskStore: ID-Vergabe, created_at-Stempel, Schema- und Themen-Dedup sind
-    deterministisch (kein KI-Anteil). Bei Themen-Duplikat fail-closed —
-    nichts wird angelegt, der bestehende Task wird genannt."""
+    """Publishes a NEW task+handover in ONE step via the
+    TaskStore: ID assignment, created_at stamp, schema and topic dedup are
+    deterministic (no AI involvement). On a topic duplicate, fail-closed —
+    nothing is created, the existing task is named."""
     agent = (agent or "").upper()
     if agent == "KIMI":
-        agent = "SONNET"                      # Kimi → Sonnet (Legacy-Alias, 2026-06-15)
+        agent = "SONNET"                      # Kimi → Sonnet (legacy alias, 2026-06-15)
     if agent not in ("OPUS", "SONNET"):
         return f"ERROR: agent must be OPUS or SONNET (was: {agent!r})"
     if not handover_md or not handover_md.strip():
         return "ERROR: handover_md is empty — the full handover text is required."
+    _mpr = _mpr_blocks_tasks()
+    if _mpr:
+        return f"ERROR: {_mpr}"               # #15: mpr initiative is reasoning-only
 
     store = _store()
     log: List[str] = []
     task_type = ""
     try:
         if task_json:
-            # Task-Felder parsen
+            # parse task fields
             if isinstance(task_json, dict):
                 fields = dict(task_json)
             else:
@@ -1629,14 +1653,14 @@ def _stage_handover(task_id: Optional[str], agent: str, handover_md: str,
                 if not isinstance(fields, dict):
                     return "ERROR: task_json must be a JSON object — nothing created."
             task_type = str(fields.get("type", "")).lower()
-            # ACK-Soft-Pfad-Gate: validiere das task_json gegen den Vertrag, BEVOR
-            # der Store etwas mutiert. Bei Verletzung fail-closed mit exaktem Fehler
-            # → der Agent-Loop reicht ihn dem Modell zurück (Reask).
+            # ACK soft-path gate: validate the task_json against the contract BEFORE
+            # the store mutates anything. On a violation, fail-closed with the exact error
+            # → the agent loop hands it back to the model (reask).
             ack_err = _ack_validate(fields)
             if ack_err:
                 return ("ERROR: task_json verletzt den ACK-Vertrag (nichts angelegt):\n"
                         + ack_err + "\n→ Felder korrigieren und stage_handover erneut aufrufen.")
-            # Store: Dedup + ID + created_at + Schema, schreibt pending-JSON
+            # Store: dedup + ID + created_at + schema, writes the pending JSON
             try:
                 task = store.create(fields, force=bool(force))
             except DuplicateTaskError as e:
@@ -1648,7 +1672,7 @@ def _stage_handover(task_id: Optional[str], agent: str, handover_md: str,
             tid = task["id"]
             log.append(f"task created: {tid} (pending, created_at={task['created_at']})")
             ho_md = _normalize_handover_id(handover_md, tid)
-            # Memory-Kontext aus Vergangenheits-Patterns anhängen (fail-soft)
+            # append memory context from past patterns (fail-soft)
             if _MEMORY is not None and _MEMORY.is_available():
                 try:
                     mem_ctx = _MEMORY.get_context(
@@ -1664,7 +1688,7 @@ def _stage_handover(task_id: Optional[str], agent: str, handover_md: str,
             _atomic_write(ho, ho_md)
             log.append(f"handover geschrieben: {ho} ({len(ho_md)} Zeichen)")
         else:
-            # Reiner Handover ohne Task-JSON — verlangt eine gültige task_id.
+            # Pure handover without task JSON — requires a valid task_id.
             if not task_id or not _TASK_ID_RE.match(task_id):
                 return f"ERROR: without task_json a valid task_id is required (was: {task_id!r})"
             tid = task_id
@@ -1680,8 +1704,8 @@ def _stage_handover(task_id: Optional[str], agent: str, handover_md: str,
         return f"ERROR: stage_handover fehlgeschlagen: {e}\nBisher:\n" + "\n".join(f"  - {l}" for l in log)
 
     result = f"OK: Handover {tid} ({agent}) bereitgestellt\n" + "\n".join(f"  - {l}" for l in log)
-    # Pfad-Guard nur für Code-Tasks: bei type=documentation (Memory-Seed, Doku)
-    # baut der Agent keinen Code → kein Dubletten-Risiko, der Check wäre nur Rauschen.
+    # Path guard only for code tasks: with type=documentation (memory seed, docs)
+    # the agent builds no code → no duplication risk, the check would only be noise.
     bad = [] if task_type == "documentation" else _handover_path_warnings(handover_md)
     if bad:
         result += (
@@ -1692,19 +1716,19 @@ def _stage_handover(task_id: Optional[str], agent: str, handover_md: str,
               "korrigiere sie, sonst baut der Agent neu statt zu erweitern (Dublette). "
               "Neu anzulegende Dateien sind ok."
         )
-    _reconcile_active_soft()   # C2: INDEX.md des aktiven Vorhabens frisch halten (fail-soft, nur Index)
+    _reconcile_active_soft()   # C2: keep the active initiative's INDEX.md fresh (fail-soft, index only)
     return result
 
 
-# ─── TaskStore: deterministische Task-Wahrheit (Modell 3) ─────
-# Einzige Wahrheit: tasks/<status>/KGC-NNN.json. Das VERZEICHNIS ist die
-# Status-Autorität; das status-Feld wird vom Store nachgezogen; active.md
-# ist eine Projektion des in_progress-Handovers. Alle Mutationen laufen
-# durch diese API, serialisiert (Single-Writer). KEIN KI-Anteil:
-# ID-Vergabe, created_at, Schema, Doppel-ID- und Themen-Dedup sind Code.
+# ─── TaskStore: deterministic task truth (model 3) ─────
+# Single truth: tasks/<status>/KGC-NNN.json. The DIRECTORY is the
+# status authority; the status field is updated by the store; active.md
+# is a projection of the in_progress handover. All mutations go
+# through this API, serialized (single-writer). NO AI involvement:
+# ID assignment, created_at, schema, double-ID and topic dedup are code.
 
 class DuplicateTaskError(Exception):
-    """Wird ausgelöst, wenn ein themengleicher Task bereits existiert."""
+    """Raised when a task on the same topic already exists."""
     def __init__(self, existing_id: str):
         super().__init__(f"Duplikat zu {existing_id}")
         self.existing_id = existing_id
@@ -1713,7 +1737,7 @@ class DuplicateTaskError(Exception):
 class TaskStore:
     STATUSES = ("pending", "in_progress", "done")
     REQUIRED = ("type", "priority", "title", "description")
-    # Generische Funktionswörter (de/en) — Domänenbegriffe bleiben erhalten.
+    # Generic function words (de/en) — domain terms are kept.
     _STOP = {
         "der", "die", "das", "den", "dem", "des", "ein", "eine", "einen",
         "einer", "eines", "und", "oder", "fur", "für", "zu", "mit", "von",
@@ -1723,26 +1747,30 @@ class TaskStore:
     }
 
     def __init__(self, root: Optional[str] = None, dedup_threshold: Optional[float] = None):
-        # B3: root=None → die Pfade routen dynamisch ans AKTIVE Vorhaben (Produktions-Singleton);
-        # ein expliziter root (Tests/Spezialfälle) hält das Legacy-Verhalten (root-relativ). Der
-        # dedup_threshold-Default wird zur Instanziierungszeit aus dem (ggf. per Config gesetzten)
-        # Global gelesen — nicht als Param-Default einfrieren.
+        # B3: root=None → the paths route dynamically to the ACTIVE initiative (production singleton);
+        # an explicit root (tests/special cases) keeps the legacy behaviour (root-relative). The
+        # dedup_threshold default is read at instantiation time from the (possibly config-set)
+        # global — not frozen as a param default.
         self.root            = Path(root) if root is not None else None
         self.dedup_threshold = float(dedup_threshold if dedup_threshold is not None
                                      else TASKS_DEDUP_THRESHOLD)
         self._lock           = threading.RLock()
 
-    # ── Pfade (B3: dynamisch ans aktive Vorhaben, soft für Lese-/Scan-Pfade) ──
+    # ── Paths (B3: dynamic to the active initiative, soft for read/scan paths) ──
     def _base(self) -> Optional[Path]:
-        """Routing-Wurzel: expliziter root ODER das aktive Vorhaben (soft → None ohne aktives,
-        damit Lese-/Scan-Pfade einen Daemon nie crashen)."""
+        """Routing root: explicit root OR the active initiative (soft → None without an active one,
+        so read/scan paths never crash a daemon)."""
         return self.root if self.root is not None else artifact_root_soft()
 
     def _require_base(self) -> Path:
-        """Wie _base, aber fail-closed (RuntimeError) — für erzeugende Ops (create/transition)."""
+        """Like _base, but fail-closed (RuntimeError) — for producing ops (create/transition)."""
         b = self._base()
         if b is None:
             raise RuntimeError(_NO_ACTIVE_MSG)
+        if self.root is None:                  # #15: only gate when routed to the ACTIVE initiative
+            _mpr = _mpr_blocks_tasks()
+            if _mpr:
+                raise RuntimeError(_mpr)
         return b
 
     def _dir(self, status: str) -> Optional[Path]:
@@ -1770,11 +1798,11 @@ class TaskStore:
         hits = sorted(d.glob(f"{task_id}_*.md"))
         return hits[0] if hits else None
 
-    # ── Identität ────────────────────────────────────────────
+    # ── Identity ────────────────────────────────────────────
     def next_id(self) -> str:
-        """Nächste freie ID über ALLE Status (monoton, nie wiederverwendet).
-        Prefix aus dem (ggf. per Config gesetzten) TASK_PREFIX-Global zur
-        Laufzeit lesen — nicht einfrieren."""
+        """Next free ID across ALL statuses (monotonic, never reused).
+        Read the prefix from the (possibly config-set) TASK_PREFIX global at
+        runtime — don't freeze it."""
         pref = TASK_PREFIX
         id_re = re.compile(rf"^{re.escape(pref)}-(\d+)$")
         with self._lock:
@@ -1789,7 +1817,7 @@ class TaskStore:
                         mx = max(mx, int(m.group(1)))
             return f"{pref}-{mx + 1}"
 
-    # ── Dedup (rein deterministisch) ─────────────────────────
+    # ── Dedup (purely deterministic) ─────────────────────────
     @classmethod
     def _tokens(cls, text: str) -> List[str]:
         t = re.sub(r"[^\w\s]", " ", (text or "").lower(), flags=re.UNICODE)
@@ -1829,7 +1857,7 @@ class TaskStore:
         if missing:
             raise ValueError(f"required fields missing: {', '.join(missing)}")
 
-    # ── Lesen ────────────────────────────────────────────────
+    # ── Reading ────────────────────────────────────────────────
     def get(self, task_id: str) -> Optional[Dict[str, Any]]:
         with self._lock:
             p, s = self._find(task_id)
@@ -1837,7 +1865,7 @@ class TaskStore:
                 return None
             data = json.loads(p.read_text(encoding="utf-8"))
             if isinstance(data, dict):
-                data["status"] = s          # Verzeichnis ist Autorität
+                data["status"] = s          # directory is authority
                 data.setdefault("id", task_id)
             return data
 
@@ -1859,19 +1887,19 @@ class TaskStore:
                         out.append(data)
             return out
 
-    # ── Mutationen ───────────────────────────────────────────
+    # ── Mutations ───────────────────────────────────────────
     @staticmethod
     def _now_iso() -> str:
         return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
     def create(self, fields: Dict[str, Any], *, force: bool = False,
                now_iso: Optional[str] = None) -> Dict[str, Any]:
-        """Legt einen pending-Task an. Vergibt ID, stempelt created_at,
-        validiert, lehnt Themen-Duplikat ab (außer force). Modell-gelieferte
-        id/created_at/status werden IGNORIERT/überschrieben."""
+        """Creates a pending task. Assigns the ID, stamps created_at,
+        validates, rejects a topic duplicate (unless force). Model-supplied
+        id/created_at/status are IGNORED/overwritten."""
         with self._lock:
             self._validate(fields)
-            self._require_base()   # B3: fail-closed — ohne aktives Vorhaben kein Schreiben in den Root
+            self._require_base()   # B3: fail-closed — no writing to the root without an active initiative
             if not force:
                 dup = self.find_duplicate(fields["title"], fields.get("description", ""))
                 if dup:
@@ -1887,8 +1915,8 @@ class TaskStore:
             return task
 
     def transition(self, task_id: str, to_status: str) -> Dict[str, Any]:
-        """Verschiebt das Task-JSON zwischen Status-Ordnern (atomar), zieht
-        das status-Feld nach und projiziert active.md neu."""
+        """Moves the task JSON between status folders (atomically), updates
+        the status field and re-projects active.md."""
         if to_status not in self.STATUSES:
             raise ValueError(f"invalid status: {to_status!r}")
         with self._lock:
@@ -1910,15 +1938,15 @@ class TaskStore:
             return data
 
     def project_active(self):
-        """active.md = Handover des neuesten NICHT-done Tasks (in_progress vor
-        pending bei gleichem Zeitstempel), sonst idle. Reine Projektion — nie
-        von Hand zu pflegen."""
+        """active.md = handover of the newest NON-done task (in_progress before
+        pending at the same timestamp), otherwise idle. Pure projection — never
+        to be maintained by hand."""
         with self._lock:
             b = self._base()
             if b is None:
-                return                       # kein aktives Vorhaben → keine Projektion (soft)
+                return                       # no active initiative → no projection (soft)
             active = b / WORKFLOW_DIR / "active.md"
-            # in_progress rangiert vor pending; innerhalb nach created_at/id.
+            # in_progress ranks before pending; within, by created_at/id.
             cands = [(0, t) for t in self.list("pending")] + \
                     [(1, t) for t in self.list("in_progress")]
             if cands:
@@ -1930,8 +1958,8 @@ class TaskStore:
             _atomic_write(active, _IDLE_ACTIVE)
 
 
-# Einziger, geteilter Store (ein Lock → serialisierte Mutationen über Makros UND Reconciler).
-# B3: root=None → Pfade routen dynamisch ans aktive Vorhaben (vault/<slug>/), spät aufgelöst.
+# Single, shared store (one lock → serialized mutations across macros AND reconciler).
+# B3: root=None → paths route dynamically to the active initiative (vault/<slug>/), resolved late.
 STORE: Optional["TaskStore"] = None
 
 def _store() -> "TaskStore":
@@ -1941,16 +1969,16 @@ def _store() -> "TaskStore":
     return STORE
 
 
-# ─── Plattform-Modus (Shell + Syntax-Guidance aus EINER Quelle) ──
+# ─── Platform mode (shell + syntax guidance from ONE source) ──
 def _resolve_platform(mode: Optional[str]) -> str:
-    """Löst 'auto' beim Start zu einem konkreten Modus auf. Ungültige Werte
-    fallen sicher auf die OS-Detektion zurück."""
+    """Resolves 'auto' at startup to a concrete mode. Invalid values
+    fall back safely to OS detection."""
     m = (mode or "auto").strip().lower()
     if m in ("windows", "win", "nt"):
         return "windows"
     if m in ("linux", "posix", "unix", "mac", "darwin"):
         return "linux"
-    # "auto" oder unbekannt → automatisch erkennen
+    # "auto" or unknown → auto-detect
     return "windows" if os.name == "nt" else "linux"
 
 
@@ -1996,7 +2024,7 @@ def _language_guidance(lang: str) -> str:
 
 
 def _platform_guidance(platform: str) -> str:
-    """Dynamisch injizierte Laufzeit-Notiz — hält den Prompt-File neutral."""
+    """Dynamically injected runtime note — keeps the prompt file neutral."""
     if platform == "windows":
         return (
             "## Runtime environment\n"
@@ -2023,7 +2051,7 @@ def _onboarding_guidance() -> str:
     )
 
 
-# ─── Tool Ausführung ──────────────────────────────────────────
+# ─── Tool execution ──────────────────────────────────────────
 def _tool_param_schema(name: str) -> Optional[Dict[str, Any]]:
     """The JSON-schema ``parameters`` block for a tool by name (or None if unknown)."""
     for t in _effective_tools():
@@ -2162,7 +2190,7 @@ def _load_plugins(plugins_dir: Optional[str]) -> int:
         if r.handler is None:
             continue
         name = str(r.name)
-        if name in _PLUGIN_TOOLS:        # Tool-Namen müssen eindeutig sein — sonst stille Verdrängung
+        if name in _PLUGIN_TOOLS:        # tool names must be unique — otherwise silent shadowing
             _ui_print(col(f"  [plugins] doppelter Tool-Name {name!r} — erster bleibt, weitere übersprungen", C.YELLOW))
             continue
         _PLUGIN_TOOLS[name] = {
@@ -2221,7 +2249,7 @@ def _retrieve_hits(query: str, top_k: int) -> List[str]:
 def _rag_block(hits: List[str], budget_tokens: int, in_window: str = "") -> str:
     """Format hits into a token-budgeted, deduped ``## Relevant context (retrieved)`` block (or
     ""). Dedups within the block and against *in_window* (already-visible context; "" ⇒ skip)."""
-    budget_chars = max(0, budget_tokens) * 4   # grobe chars/4-Token-Schätzung
+    budget_chars = max(0, budget_tokens) * 4   # rough chars/4 token estimate
     lines: List[str] = []
     seen: set = set()
     used = 0
@@ -2355,7 +2383,7 @@ def run_tool(name: str, args: Dict[str, Any]) -> str:
                 return f"ERROR: Not found: {args['path']}"
             # errors="replace": a non-UTF-8 file is read lossily, never crashes the read.
             text = p.read_text(encoding="utf-8", errors="replace")
-            # PERF-05: sehr große Dateien nicht ungekappt in den Kontext laden
+            # PERF-05: don't load very large files uncapped into the context
             if len(text) > MAX_FILE_CHARS:
                 head_n = MAX_FILE_CHARS * 2 // 3
                 tail_n = MAX_FILE_CHARS - head_n
@@ -2388,7 +2416,7 @@ def run_tool(name: str, args: Dict[str, Any]) -> str:
             else:
                 items.sort(key=lambda x: (x.is_file(), x.name.lower()))
 
-            # HV-B: optionales Limit + harter Cap gegen Kontext-Bomben
+            # HV-B: optional limit + hard cap against context bombs
             limit = args.get("limit")
             try:
                 limit = int(limit) if limit is not None else None
@@ -2414,10 +2442,10 @@ def run_tool(name: str, args: Dict[str, Any]) -> str:
         elif name == "execute_command":
             timeout = int(args.get("timeout", 30))
             command = args["command"]
-            # Plattform-Modus bestimmt den Interpreter — konsistent mit der
-            # Syntax-Guidance, die dem Modell injiziert wird.
-            # stdin=DEVNULL: interaktive Befehle (z. B. cmd-`date` ohne Arg)
-            # bekommen sofort EOF statt die volle Timeout-Zeit zu blockieren.
+            # Platform mode determines the interpreter — consistent with the
+            # syntax guidance injected into the model.
+            # stdin=DEVNULL: interactive commands (e.g. cmd `date` without an arg)
+            # get EOF immediately instead of blocking for the full timeout.
             # encoding/errors explicit: decode command output as UTF-8 lossily, so a
             # non-locale byte (cp1252 on Windows) never raises decoding the result.
             if PLATFORM == "windows":
@@ -2460,8 +2488,8 @@ def run_tool(name: str, args: Dict[str, Any]) -> str:
             raw          = args["pattern"]
             directory    = args.get("directory", ".")
             file_pattern = args.get("file_pattern", "*.md")
-            # Echtes Regex (case-insensitive); bei ungültigem Muster sicherer
-            # Fallback auf literalen Substring-Match.
+            # Real regex (case-insensitive); on an invalid pattern, safe
+            # fallback to a literal substring match.
             try:
                 rx = re.compile(raw, re.IGNORECASE)
                 def _hit(line: str) -> bool:
@@ -2615,26 +2643,26 @@ class GX10:
         self.onboarding    = ONBOARDING_MODE if onboarding is None else bool(onboarding)
         self.messages: List[Dict] = []
         self.last_response = ""
-        self._turn_think = True   # auto-Entscheidung je Turn (sicherer Default)
-        # OPT-3: kumulierte Performance-Zähler über die Session
+        self._turn_think = True   # auto decision per turn (safe default)
+        # OPT-3: cumulative performance counters over the session
         self._perf = {"gens": 0, "prompt": 0, "completion": 0, "wall": 0.0, "last": ""}
         self._load_prompt(prompt_path)
         self._inject_platform_guidance()
         if self.onboarding:
             self._append_guidance(_onboarding_guidance())
         self._ensure_dirs()
-        # Memory-Layer initialisieren (fail-soft, einmalig pro Prozess)
+        # Initialize the memory layer (fail-soft, once per process)
         global _MEMORY, _WARM
         if _MemoryManager is not None and _MEMORY_CONFIG and _MEMORY is None:
             _MEMORY = _MemoryManager(_MEMORY_CONFIG)
-        # Warm-Tier (B0) initialisieren — optional; ohne url bleibt der Tier no-op (fail-soft).
+        # Initialize the warm tier (B0) — optional; without a url the tier stays a no-op (fail-soft).
         if _WarmTier is not None and _WARM_CONFIG and _WARM is None:
             _WARM = _WarmTier(_WARM_CONFIG)
 
     def _append_guidance(self, note: str):
-        """Hängt eine Laufzeit-Notiz an den System-Prompt (oder legt eine
-        minimale System-Nachricht an, falls --no-prompt). Geschieht VOR
-        load_session, damit die Notiz beim Session-Resume erhalten bleibt."""
+        """Appends a runtime note to the system prompt (or creates a
+        minimal system message if --no-prompt). Happens BEFORE
+        load_session, so the note is preserved on session resume."""
         sys_msg = next((m for m in self.messages if m.get("role") == "system"), None)
         if sys_msg:
             sys_msg["content"] = sys_msg["content"].rstrip() + "\n\n" + note
@@ -2645,7 +2673,7 @@ class GX10:
         self._append_guidance(_platform_guidance(self.platform))
         self._append_guidance(_language_guidance(LANGUAGE))
 
-    # OPT-4: ein Completion-Call mit 1× Retry bei transientem API-Fehler
+    # OPT-4: one completion call with 1× retry on a transient API error
     def _make_completion(self, think: bool, stream: bool):
         kwargs: Dict[str, Any] = dict(
             model=self.model,
@@ -2658,7 +2686,7 @@ class GX10:
         )
         if stream:
             kwargs["stream"] = True
-            kwargs["stream_options"] = {"include_usage": True}   # OPT-3: Usage im Stream
+            kwargs["stream_options"] = {"include_usage": True}   # OPT-3: usage in the stream
         last_err = None
         for attempt in range(2):
             if _CANCEL_EVENT.is_set():
@@ -2713,9 +2741,9 @@ class GX10:
 
     @staticmethod
     def _sanitize_messages(msgs: List[Dict]) -> List[Dict]:
-        """Repariert eine Nachrichtenliste so, dass die API-Invariante hält:
-        - verwaiste tool-Antworten (ohne passenden tool_call) werden verworfen
-        - assistant.tool_calls ohne (vollständige) tool-Antwort werden entfernt."""
+        """Repairs a message list so the API invariant holds:
+        - orphaned tool responses (without a matching tool_call) are discarded
+        - assistant.tool_calls without a (complete) tool response are removed."""
         out: List[Dict] = []
         open_ids: set = set()
 
@@ -2773,46 +2801,46 @@ class GX10:
         def total_len(msgs):
             return sum(len(str(m.get("content") or "")) for m in msgs)
 
-        # PERF-06: Hysterese-Trimming für den vLLM Prefix-Cache.
-        # Solange unter dem High-Water bleibt die Nachrichtenliste
-        # UNVERÄNDERT → der Prefix nach dem System-Prompt ist stabil und
-        # der KV-/Prefix-Cache des Servers greift über viele Runden.
+        # PERF-06: hysteresis trimming for the vLLM prefix cache.
+        # As long as it stays below the high-water mark, the message list
+        # stays UNCHANGED → the prefix after the system prompt is stable and
+        # the server's KV/prefix cache holds across many rounds.
         others_len = total_len([m for m in self.messages if m.get("role") != "system"])
         if others_len <= MAX_CTX_CHARS:
             return
 
-        # Erst beim Überschreiten wird gekürzt — dann aber in einem Rutsch
-        # bis auf das Low-Water, statt jede Runde ein bisschen. So entsteht
-        # nur SELTEN eine Cache-Invalidierung statt bei jeder Iteration.
+        # Trimming happens only when exceeded — but then in one go
+        # down to the low-water mark, instead of a little each round. This causes
+        # cache invalidation only RARELY instead of on every iteration.
         system = [m for m in self.messages if m.get("role") == "system"]
         others = [m for m in self.messages if m.get("role") != "system"]
 
-        # B1: nur wenn der Schalter an ist, die entfernten Runden mitschneiden,
-        # um sie zu summarizen + zu archivieren. AUS = leerer Pfad, kein Overhead.
+        # B1: only when the switch is on, record the removed rounds
+        # to summarize + archive them. OFF = empty path, no overhead.
         track = SUMMARIZE_EVICTED
         evicted: List[Dict] = []
 
-        # In ganzen "Runden" kürzen, damit assistant.tool_calls und die
-        # zugehörigen tool-Antworten zusammenbleiben (API-Invariante).
+        # Trim in whole "rounds", so assistant.tool_calls and the
+        # associated tool responses stay together (API invariant).
         while total_len(others) > TRIM_TARGET_CHARS and len(others) > 1:
             cut = 1
             while cut < len(others) and others[cut].get("role") != "user":
                 cut += 1
-            # Safety: keine zweite User-Message → nicht weiter kürzen.
-            # Sonst würde die einzige User-Message gelöscht → API 400
-            # "No user query found in messages" (passiert z.B. bei Autoplan
-            # wenn nur ein User-Turn im Kontext liegt aber viele Tool-Results).
+            # Safety: no second user message → stop trimming.
+            # Otherwise the only user message would be deleted → API 400
+            # "No user query found in messages" (happens e.g. with autoplan
+            # when only one user turn is in the context but many tool results).
             if cut >= len(others):
                 break
             if track:
                 evicted.extend(others[:cut])
             del others[:cut]
 
-        # B1: evict'ete Runden in den Summary-Block rollen + nach Cold archivieren.
-        # _roll_summary mutiert `system` in place (Summary-Message direkt unter dem
-        # Prompt) — AUS oder ohne Eviction bleibt `system` unberührt → die Reassign
-        # unten ist dann byte-identisch zum heutigen Trim. Fail-soft: jeder Fehler
-        # degradiert auf den reinen Drop (Runden sind oben bereits entfernt).
+        # B1: roll the evicted rounds into the summary block + archive to cold.
+        # _roll_summary mutates `system` in place (summary message directly below the
+        # prompt) — OFF or without eviction `system` stays untouched → the reassign
+        # below is then byte-identical to today's trim. Fail-soft: any error
+        # degrades to a plain drop (the rounds are already removed above).
         if track and evicted:
             self._roll_summary(system, evicted)
 
@@ -2821,7 +2849,7 @@ class GX10:
     # ── B1: rolling summarization on eviction (flag-gated, fail-soft) ──
     @staticmethod
     def _find_summary(system: List[Dict]) -> Optional[Dict]:
-        """Die bestehende Summary-Message in der System-Partition (oder None)."""
+        """The existing summary message in the system partition (or None)."""
         for m in system:
             if str(m.get("content") or "").startswith(_SUMMARY_MARKER):
                 return m
@@ -2829,8 +2857,8 @@ class GX10:
 
     @staticmethod
     def _render_rounds(msgs: List[Dict]) -> str:
-        """Evict'ete Nachrichten kompakt als Transkript rendern (Rohtext fürs Summary +
-        die verlustfreie Cold-Archivierung). Tool-Calls ohne Content werden benannt."""
+        """Render evicted messages compactly as a transcript (raw text for the summary +
+        the lossless cold archive). Tool calls without content are named."""
         parts: List[str] = []
         for m in msgs:
             role = m.get("role", "?")
@@ -2845,10 +2873,10 @@ class GX10:
         return "\n\n".join(parts)
 
     def _summarize(self, prev_summary: str, raw: str) -> str:
-        """Ein gedeckelter, nicht-denkender Completion-Call, der das vorige Summary mit dem
-        neuen Transkript zu EINEM konsolidierten Summary verschmilzt (hierarchisch — das neue
-        subsumiert das alte, der Block bleibt beschränkt). Wirft bei Fehler → Caller fällt
-        auf den reinen Drop zurück. Ohne Tools, off der normalen Generierung."""
+        """A capped, non-thinking completion call that merges the previous summary with the
+        new transcript into ONE consolidated summary (hierarchical — the new one
+        subsumes the old, the block stays bounded). Raises on error → the caller falls
+        back to the plain drop. No tools, off the normal generation path."""
         instr = (
             "You maintain a running summary of an ongoing agent session so older turns can be "
             "dropped from the context window without losing essential state. Merge the PREVIOUS "
@@ -2859,7 +2887,7 @@ class GX10:
         user = ""
         prev_body = ""
         if prev_summary.strip():
-            # die Marker-Zeile vor dem Re-Feed entfernen (nur der Inhalt zählt)
+            # remove the marker line before re-feeding (only the content matters)
             prev_body = prev_summary.split("\n", 1)[1].strip() if "\n" in prev_summary else ""
         if prev_body:
             user += "PREVIOUS SUMMARY:\n" + prev_body + "\n\n"
@@ -2875,46 +2903,46 @@ class GX10:
         return (resp.choices[0].message.content or "").strip()
 
     def _roll_summary(self, system: List[Dict], evicted: List[Dict]) -> None:
-        """Evict'ete Runden in den Summary-Block (direkt unter dem System-Prompt) rollen und
-        den Rohtext verlustfrei nach Cold archivieren. Fail-soft: jeder Fehler lässt `system`
-        unverändert → es bleibt beim heutigen reinen Drop (die Runden sind bereits entfernt)."""
+        """Roll the evicted rounds into the summary block (directly below the system prompt) and
+        archive the raw text losslessly to cold. Fail-soft: any error leaves `system`
+        unchanged → it stays with today's plain drop (the rounds are already removed)."""
         raw = self._render_rounds(evicted)
-        # 1) Verlustfreies Cold-Archiv (fire-and-forget, vektor-only) — nichts geht verloren.
+        # 1) Lossless cold archive (fire-and-forget, vector-only) — nothing is lost.
         if _MEMORY is not None:
             try:
                 if _MEMORY.is_available():
                     _MEMORY.add_bulk(raw, {"source": "context_eviction"})
-            except Exception:  # noqa: BLE001 — Archiv ist best effort
+            except Exception:  # noqa: BLE001 — the archive is best effort
                 pass
-        # 2) In-Window Rolling Summary (synchroner, gedeckelter Modell-Call, fail-soft).
+        # 2) In-window rolling summary (synchronous, capped model call, fail-soft).
         prev = self._find_summary(system)
         try:
             new_summary = self._summarize(prev["content"] if prev else "", raw)
-        except Exception as e:  # noqa: BLE001 — Summary scheitern darf den Turn nicht kippen
+        except Exception as e:  # noqa: BLE001 — a failed summary must not tip the turn
             _ui_print(col(f"[WARN] context summary skipped: {e}", C.YELLOW))
             return
         if not new_summary.strip():
             return
         content = _SUMMARY_MARKER + "\n" + new_summary.strip()
         if prev is not None:
-            prev["content"] = content          # find-and-update (kein Duplikat)
+            prev["content"] = content          # find-and-update (no duplicate)
         else:
-            system.append({"role": "system", "content": content})   # direkt unter dem Prompt
-        # §3c: den Rolling-Summary auch in den Warm-Tier spiegeln — überlebt Orchestrator-Restart
-        # und ist von den Fan-out-Workern als shared Floor lesbar. Fail-soft; no-op ohne Warm-Tier.
+            system.append({"role": "system", "content": content})   # directly below the prompt
+        # §3c: also mirror the rolling summary into the warm tier — survives an orchestrator restart
+        # and is readable by the fan-out workers as a shared floor. Fail-soft; no-op without a warm tier.
         if _WARM is not None:
             try:
                 _WARM.set_session(WARM_SESSION_ID, "summary", new_summary.strip())
-            except Exception:  # noqa: BLE001 — Warm-Spiegel ist best effort
+            except Exception:  # noqa: BLE001 — the warm mirror is best effort
                 pass
 
     # ── B2: per-turn retrieval assembly (flag-gated, fail-soft, cache-aside) ──
     def _retrieve_context(self, query: str) -> str:
-        """Eine vektor-only Retrieval auf *query*, dedupliziert gegen das Live-Fenster und
-        token-budgetiert, als ``## Relevant context (retrieved)``-Block (oder "" bei Miss /
-        unavailable / Flag-AUS). Cache-aside über den optionalen Warm-Tier; fail-soft
-        end-to-end — jeder Fehler → "". FLAG-AUS gibt sofort "" zurück (kein Memory-Touch,
-        kein Netz) → die User-Message wird verbatim angehängt = byte-identisch zu heute."""
+        """A vector-only retrieval on *query*, deduplicated against the live window and
+        token-budgeted, as a ``## Relevant context (retrieved)`` block (or "" on miss /
+        unavailable / flag OFF). Cache-aside via the optional warm tier; fail-soft
+        end-to-end — any error → "". FLAG OFF returns "" immediately (no memory touch,
+        no network) → the user message is appended verbatim = byte-identical to today."""
         if not RAG_ENABLED or not (query or "").strip() or _MEMORY is None:
             return ""
         try:
@@ -2925,12 +2953,12 @@ class GX10:
         hits = _retrieve_hits(query, RAG_TOP_K)
         if not hits:
             return ""
-        # gegen das, was das Modell ohnehin schon sieht, deduplizieren (nicht doppelt injizieren)
+        # dedup against what the model already sees anyway (don't inject twice)
         in_window = "\n".join(str(m.get("content") or "") for m in self.messages)
         return _rag_block(hits, RAG_MAX_TOKENS, in_window)
 
     def _ensure_dirs(self):
-        # Engine-Maschinerie (versteckt): state_root + lokaler Warm-Cache.
+        # Engine machinery (hidden): state_root + local warm cache.
         state_root().mkdir(parents=True, exist_ok=True)
         (state_root() / "memory").mkdir(parents=True, exist_ok=True)
         for d in WORKSPACE_DIRS:
@@ -2942,37 +2970,37 @@ class GX10:
         if self.thinking_mode == "all":
             return True
         if self.thinking_mode == "auto":
-            # Thinking ist front-loaded → nur Iteration 0, und nur wenn die
-            # Turn-Klassifikation es für nötig hält (sonst direkt ausführen).
+            # Thinking is front-loaded → only iteration 0, and only when the
+            # turn classification deems it necessary (otherwise execute directly).
             return iteration == 0 and self._turn_think
-        return iteration == 0   # "first": immer nur die Planungs-Runde denkt
+        return iteration == 0   # "first": only the planning round ever thinks
 
     @staticmethod
     def _classify_thinking(text: str) -> bool:
-        """auto-Modus: True = Iteration 0 MIT Thinking.
-        Sicherer Fehlermodus: im Zweifel True (denken). Nur bei klarer Routine
-        (Status/Lookup/`done`) OHNE Planungs-Verb → False."""
+        """auto mode: True = iteration 0 WITH thinking.
+        Safe failure mode: when in doubt, True (think). Only for clear routine
+        (status/lookup/`done`) WITHOUT a planning verb → False."""
         t = (text or "").lower().strip()
         if not t:
             return False
         if any(k in t for k in _PLANNING_KW):
-            return True                      # Planung erkannt → denken
+            return True                      # planning detected → think
         if t == "done" or any(k in t for k in _ROUTINE_KW):
-            return False                     # klare Routine → kein Thinking
+            return False                     # clear routine → no thinking
         if len(t.split()) <= 8 and any(k in t for k in _SMALLTALK_KW):
-            return False                     # kurzer Smalltalk/Identität → kein Thinking
-        return True                          # Zweifel → denken
+            return False                     # short smalltalk/identity → no thinking
+        return True                          # doubt → think
 
-    # ── Generierung: Streaming (PERF-01) ──────────────────────
+    # ── Generation: streaming (PERF-01) ──────────────────────
     def _generate(self, think: bool) -> Tuple[str, List[Dict], bool, Optional[Exception], Dict[str, Any]]:
-        """Liefert (content, tool_calls, cancelled, err, metrics).
-        Streaming-Pfad zeigt Inhalt live (Thinking herausgefiltert)."""
+        """Returns (content, tool_calls, cancelled, err, metrics).
+        The streaming path shows content live (thinking filtered out)."""
         if not self.stream:
             return self._generate_plain(think)
 
         chunk_q: _q.Queue = _q.Queue()
         err     = [None]
-        usage   = [None]          # OPT-3: Usage aus dem letzten Chunk
+        usage   = [None]          # OPT-3: usage from the last chunk
         done    = threading.Event()
 
         def _worker():
@@ -2997,7 +3025,7 @@ class GX10:
                 done.set()
 
         t0 = time.time()
-        t_first = [None]          # OPT-3: Zeitpunkt erstes Token
+        t_first = [None]          # OPT-3: time of the first token
         th = threading.Thread(target=_worker, daemon=True)
         th.start()
 
@@ -3005,7 +3033,7 @@ class GX10:
         parts: List[str] = []
         tool_acc: Dict[int, Dict[str, str]] = {}
         prefix    = [False]
-        tool_note = [False]   # B: einmaliger Live-Hinweis bei Tool-Generierung
+        tool_note = [False]   # B: one-time live hint during tool generation
 
         def _emit_line(line: str):
             if not prefix[0]:
@@ -3032,8 +3060,8 @@ class GX10:
                 renderer.feed(tf.feed(delta.content))
 
             if getattr(delta, "tool_calls", None):
-                # B: Tote-Zeit füllen — sobald Tool-Tokens kommen (und noch kein
-                # sichtbarer Text), einmal anzeigen, dass gearbeitet wird.
+                # B: fill dead time — as soon as tool tokens arrive (and no
+                # visible text yet), show once that work is happening.
                 if not prefix[0] and not tool_note[0]:
                     tool_note[0] = True
                     _ui_print(col("  ⋯ Qwen erzeugt Tool-Aufruf …", C.GRAY))
@@ -3052,7 +3080,7 @@ class GX10:
         renderer.feed(tf.flush())
         renderer.flush()
         if prefix[0]:
-            _ui_print("")   # Abschluss-Zeilenumbruch nach gestreamtem Inhalt
+            _ui_print("")   # closing newline after streamed content
 
         t_end   = time.time()
         ttft    = (t_first[0] - t0) if t_first[0] else None
@@ -3066,7 +3094,7 @@ class GX10:
         tool_calls = [tool_acc[i] for i in sorted(tool_acc)]
         return "".join(parts), tool_calls, cancelled, err[0], metrics
 
-    # ── Generierung: ohne Streaming (Vergleich/Fallback) ──────
+    # ── Generation: without streaming (comparison/fallback) ──────
     def _generate_plain(self, think: bool) -> Tuple[str, List[Dict], bool, Optional[Exception], Dict[str, Any]]:
         err  = [None]
         res  = [None]
@@ -3119,11 +3147,11 @@ class GX10:
         return content, tool_calls, False, None, metrics
 
     def _print_turn_end(self, turn: Dict[str, Any], outcome: Dict[str, Any]):
-        """#3: EIN deterministischer Abschluss-Marker am Turn-Ende — auf JEDEM
-        Ausstiegspfad (Erfolg, Abbruch, Fehler, Max-Iter, interner Crash).
-        Garantiert per try/finally in run(), damit „bereit für Eingabe" nie
-        ausbleibt. WICHTIG: kein \\n INNERHALB von col() — sonst wird der
-        Farbcode beim Zeilen-Split abgetrennt; daher Leerzeile separat."""
+        """#3: ONE deterministic completion marker at the turn end — on EVERY
+        exit path (success, abort, error, max-iter, internal crash).
+        Guaranteed via try/finally in run(), so "ready for input" never
+        fails to appear. IMPORTANT: no \\n INSIDE col() — otherwise the
+        color code is cut off on the line split; hence the blank line separately."""
         dt   = time.time() - turn["t0"]
         kind = outcome.get("kind", "done")
         marks = {
@@ -3143,25 +3171,25 @@ class GX10:
             f"{turn['gens']} gen · {dt:.0f}s · {turn['completion']} tok{detail} ========",
             color))
 
-    # ── Agent Loop ────────────────────────────────────────────
+    # ── Agent loop ────────────────────────────────────────────
     def run(self, user_input: str):
         global _TURN_DID_ADVANCE
         _CANCEL_EVENT.clear()
-        # B2: per-Turn-Retrieval VOR dem Append (Query = User-Message, dedup gegen das bisherige
-        # Fenster). FLAG-AUS → "" → die User-Message wird verbatim angehängt (byte-identisch).
+        # B2: per-turn retrieval BEFORE the append (query = user message, dedup against the existing
+        # window). FLAG OFF → "" → the user message is appended verbatim (byte-identical).
         rag = self._retrieve_context(user_input)
         self.messages.append({"role": "user",
                               "content": (rag + "\n\n" + user_input) if rag else user_input})
-        # Neuer Operator-Turn → Auto-Plan-Guard zurücksetzen. Ein advance_pipeline
-        # in DIESEM Turn setzt ihn wieder; ein darauffolgendes stage_handover im
-        # selben Turn wird dann blockiert (solange autoplan aus).
+        # New operator turn → reset the auto-plan guard. An advance_pipeline
+        # in THIS turn sets it again; a following stage_handover in the
+        # same turn is then blocked (as long as autoplan is off).
         _TURN_DID_ADVANCE = False
 
-        # auto-Modus: einmal pro Turn entscheiden, ob Iteration 0 denkt
+        # auto mode: decide once per turn whether iteration 0 thinks
         self._turn_think = self._classify_thinking(user_input)
 
         turn = {"t0": time.time(), "gens": 0, "prompt": 0, "completion": 0}
-        # Turn-Ausgang — wird in finally IMMER als Statuszeile gedruckt.
+        # Turn outcome — ALWAYS printed as a status line in finally.
         outcome: Dict[str, Any] = {"kind": "max"}
 
         try:
@@ -3198,7 +3226,7 @@ class GX10:
                     tool_calls = recovered
                     recovered_from_text = True
 
-            # OPT-3: Perf-Zeile + Kumulierung (Session + dieser Turn)
+            # OPT-3: perf line + accumulation (session + this turn)
             if metrics:
                 self._perf["gens"]       += 1
                 self._perf["prompt"]     += metrics.get("prompt_tokens") or 0
@@ -3210,9 +3238,9 @@ class GX10:
                 turn["completion"] += metrics.get("completion_tokens") or 0
                 _ui_print(col("  " + self._perf["last"], C.GRAY))
 
-            # PERF-02: NUR den bereinigten Inhalt persistieren (kein <think>). Wenn der
-            # Tool-Call aus dem Text geborgen wurde, ist `content` die Call-Markierung
-            # selbst — nicht als assistant.content doppeln (verwirrt manche Templates).
+            # PERF-02: persist ONLY the cleaned content (no <think>). When the
+            # tool call was recovered from the text, `content` is the call marker
+            # itself — don't duplicate it as assistant.content (confuses some templates).
             cleaned = "" if recovered_from_text else clean(content)
             msg_dict: Dict[str, Any] = {"role": "assistant", "content": cleaned or None}
             if tool_calls:
@@ -3272,16 +3300,16 @@ class GX10:
                     "tool_call_id": tcid,
                     "content":      result_t
                 })
-          # Schleife regulär durchlaufen → Max-Iterationen (outcome bleibt "max")
+          # Loop ran through normally → max iterations (outcome stays "max")
         except Exception as e:
-            # Fängt unerwartete Fehler ab, damit der Agent-Thread NICHT stirbt
-            # und der Turn trotzdem einen Abschluss-Marker bekommt.
+            # Catches unexpected errors so the agent thread does NOT die
+            # and the turn still gets a completion marker.
             outcome = {"kind": "crash", "detail": repr(e)}
         finally:
-            _status["thinking"] = False   # Toolbar zurück auf idle (auch bei Crash)
+            _status["thinking"] = False   # toolbar back to idle (even on crash)
             self._print_turn_end(turn, outcome)
 
-    # ── Manuelle Befehle ──────────────────────────────────────
+    # ── Manual commands ──────────────────────────────────────
     def manual_read(self, path: str) -> str:
         result = run_tool("read_file", {"path": path})
         if result.startswith("ERROR"):
@@ -3382,8 +3410,8 @@ HELP = """
                               (on|off|true|false|num|str; e.g. mpr.enabled on)
     tool <name> <args|text>   run a tool DIRECTLY/deterministically (no model election, no RAG);
                               text → first required arg, or {json}. e.g. tool mpr_research <frage>
-    vorhaben new <name> --typ mpr|software   create + activate a vorhaben (artefact home)
-    vorhaben list | use <slug> | active | reconcile [slug]
+    initiative new <name> --type mpr|software   create + activate a initiative (artefact home)
+    initiative list | use <slug> | active | reconcile [slug]
     reload           reload gx10.py (the session stays)
     watcher on|off        enable / disable the feedback watcher
     autopilot on|off      toggle autopilot (auto-launch of Claude)
@@ -3395,10 +3423,10 @@ HELP = """
   Everything else → agent loop
 """
 
-# ─── `config`-Befehl: autoritative, effektiv geladene Konfiguration ──
+# ─── `config` command: authoritative, effectively loaded configuration ──
 def _render_config() -> str:
-    """Zeigt die EFFEKTIV geladene Config (echte Werte, nicht Doku/Prompt) +
-    Quelle. Deterministisch, ohne LLM. Secrets werden nicht ausgegeben."""
+    """Shows the EFFECTIVELY loaded config (real values, not docs/prompt) +
+    source. Deterministic, no LLM. Secrets are not printed."""
     c = _EFFECTIVE_CFG or _code_defaults()
     conn = c["connection"]; gen = c["generation"]; ctx = c["context"]
     pl = c["platform"]; pa = c["paths"]; ta = c["thinking_auto"]
@@ -3433,10 +3461,10 @@ def _render_config() -> str:
 #
 # Frozen keys are BOOT-ONLY: they wire something at startup (e.g. the offload runner for `setup.type`),
 # so a runtime mutation would be incoherent. `/config set` refuses them; `/config get` still reads them.
-# Boot-only keys: read once at startup to wire the runner/topology (setup.type) bzw. die Trust-Policy
-# + den effektiven Bind-Host (security.profile, z. B. sealed→loopback). Eine Laufzeit-Änderung würde
-# den schon gebauten Dispatcher/die Policy/den Socket NICHT neu verdrahten → `/config set` lehnt sie
-# mit der boot-only-Meldung ab. In der Deploy-Config setzen + neu starten. Siehe config-runtime.md.
+# Boot-only keys: read once at startup to wire the runner/topology (setup.type) or the trust policy
+# + the effective bind host (security.profile, e.g. sealed→loopback). A runtime change would
+# NOT re-wire the already-built dispatcher/policy/socket → `/config set` refuses it
+# with the boot-only message. Set it in the deploy config + restart. See config-runtime.md.
 _FROZEN_CONFIG_KEYS = frozenset({"setup.type", "security.profile"})
 
 
@@ -3531,54 +3559,62 @@ def resolve_offload_topology(cfg: Dict[str, Any], *, cli_available: bool = True)
 
 
 # ─── Dispatcher ───────────────────────────────────────────────
-def _vorhaben_command(arg_str: str) -> str:
-    """`/vorhaben new|list|use|active|reconcile` — deterministische CLI-Steuerung des
-    vorhaben-zentrischen vault. Reines Bookkeeping (kein Modell-Call). Fehler (unbekannter Typ,
-    kein aktives/bekanntes Vorhaben) werden als klare, fail-closed Meldung zurückgegeben."""
+def _initiative_command(arg_str: str) -> str:
+    """`/initiative new|list|use|active|reconcile` — deterministic CLI control of the
+    initiative-centric vault. Pure bookkeeping (no model call). Errors (unknown type,
+    no active/known initiative) are returned as a clear, fail-closed message."""
     parts = arg_str.split()
     sub = parts[0].lower() if parts else "list"
     rest = arg_str[len(parts[0]):].strip() if parts else ""
     try:
         if sub == "new":
-            m = re.search(r"--typ[=\s]+(\S+)", rest)   # --typ X oder --typ=X (positions-unabhängig)
+            m = re.search(r"--type[=\s]+(\S+)", rest)   # --type X or --type=X (position-independent)
             if not m:
-                return "usage: /vorhaben new <name> --typ mpr|software"
+                return "usage: /initiative new <name> --type mpr|software"
             name = (rest[:m.start()] + rest[m.end():]).strip()
-            v = vorhaben_new(name, m.group(1))
-            return (f"[vorhaben] angelegt + aktiv: {v.slug} (typ {v.typ}) → {v.path.as_posix()}/\n"
-                    f"  Artefakte (Tasks/Handovers/Decisions/MPR-Runs) landen jetzt hier; "
-                    f"INDEX.md wird automatisch gepflegt.")
+            v = initiative_new(name, m.group(1))
+            # Name the artefacts ACTUALLY seeded for this type (derived from the skeleton, so the
+            # message can never drift from reality) — mpr has no tasks/handovers.
+            visible = ", ".join(sorted(
+                {d.split("/")[0] for d in _INITIATIVE_SKELETON[v.type] if not d.startswith(WORKFLOW_DIR)}
+            ))
+            out = (f"[initiative] angelegt + active: {v.slug} (type {v.type}) → {v.path.as_posix()}/\n"
+                   f"  Artefakte ({visible}) landen jetzt hier; INDEX.md wird automatisch gepflegt.")
+            _cfg = _EFFECTIVE_CFG if _EFFECTIVE_CFG is not None else _code_defaults()
+            if v.type == "mpr" and not _cfg_get(_cfg, "mpr.enabled"):
+                out += "\n  Hinweis: MPR ist noch nicht active — `/config set mpr.enabled on`."
+            return out
         if sub == "use":
             if not rest:
-                return "usage: /vorhaben use <slug>"
-            v = vorhaben_use(rest)
-            return f"[vorhaben] aktiv: {v.slug} (typ {v.typ}) → {v.path.as_posix()}/"
+                return "usage: /initiative use <slug>"
+            v = initiative_use(rest)
+            return f"[initiative] active: {v.slug} (type {v.type}) → {v.path.as_posix()}/"
         if sub == "list":
-            vs = vorhaben_list()
+            vs = initiative_list()
             if not vs:
-                return "[vorhaben] keine — `/vorhaben new <name> --typ mpr|software`"
+                return "[initiative] keine — `/initiative new <name> --type mpr|software`"
             cur = active_slug()
-            lines = ["[vorhaben]  (* = aktiv)"]
+            lines = ["[initiative]  (* = active)"]
             for v in vs:
                 mark = "*" if v.slug == cur else " "
-                lines.append(f"  {mark} {v.slug}  ·  typ {v.typ} · status {v.status} · {v.erstellt}")
+                lines.append(f"  {mark} {v.slug}  ·  type {v.type} · status {v.status} · {v.created}")
             return "\n".join(lines)
         if sub == "active":
-            v = vorhaben_active()
-            return (f"[vorhaben] aktiv: {v.slug} (typ {v.typ}) → {v.path.as_posix()}/"
-                    if v else "[vorhaben] keins aktiv — `/vorhaben new …` oder `/vorhaben use <slug>`")
+            v = initiative_active()
+            return (f"[initiative] active: {v.slug} (type {v.type}) → {v.path.as_posix()}/"
+                    if v else "[initiative] keins active — `/initiative new …` oder `/initiative use <slug>`")
         if sub == "reconcile":
-            fn = globals().get("reconcile_vault")          # Unit C liefert die Funktion
+            fn = globals().get("reconcile_vault")          # Unit C provides the function
             if fn is None:
-                return "[vorhaben] reconcile kommt mit Unit C (INDEX.md + [[links]])"
+                return "[initiative] reconcile kommt mit Unit C (INDEX.md + [[links]])"
             slug = rest.strip() or active_slug()
             if not slug:
-                return "[vorhaben] reconcile: kein Vorhaben angegeben/aktiv"
-            return f"[vorhaben] reconcile {slug}: {fn(slug)}"
-        return ("usage: /vorhaben new <name> --typ mpr|software | list | use <slug> | "
+                return "[initiative] reconcile: kein Initiative angegeben/active"
+            return f"[initiative] reconcile {slug}: {fn(slug)}"
+        return ("usage: /initiative new <name> --type mpr|software | list | use <slug> | "
                 "active | reconcile [slug]")
     except (ValueError, RuntimeError) as e:
-        return f"[vorhaben] {e}"
+        return f"[initiative] {e}"
 
 
 def _dispatch(agent: GX10, user_input: str):
@@ -3658,7 +3694,7 @@ def _dispatch(agent: GX10, user_input: str):
         arg   = parts[1] if len(parts) > 1 else ""
         n_arg = parts[2] if len(parts) > 2 else None
         if arg == "on":
-            # Optionale Anzahl: "autoplan on 5"
+            # Optional count: "autoplan on 5"
             if n_arg is not None:
                 try:
                     AUTOPILOT_MAX_TASKS = int(n_arg)
@@ -3666,7 +3702,7 @@ def _dispatch(agent: GX10, user_input: str):
                 except ValueError:
                     _ui_print(col(f"[AUTOPLAN] invalid number: {n_arg!r}", C.RED))
                     return  # type: ignore
-            _AUTOPLAN_DONE     = 0   # Zähler immer auf null beim Aktivieren
+            _AUTOPLAN_DONE     = 0   # always reset the counter on activation
             AUTOPILOT_AUTOPLAN = True
             if _EFFECTIVE_CFG: _EFFECTIVE_CFG["autopilot"]["autoplan"] = True
             if AUTOPILOT_MAX_TASKS > 0:
@@ -3725,8 +3761,8 @@ def _dispatch(agent: GX10, user_input: str):
             _ui_print(f"  per-turn retrieval (RAG): {state}  |  rag on / rag off")
     elif cmd == "context":
         _ui_print(agent.context_report())
-    elif cmd == "vorhaben" or cmd.startswith("vorhaben "):
-        _ui_print(col(_vorhaben_command(user_input[len("vorhaben"):].strip()), C.CYAN))
+    elif cmd == "initiative" or cmd.startswith("initiative "):
+        _ui_print(col(_initiative_command(user_input[len("initiative"):].strip()), C.CYAN))
     elif cmd.startswith("tool "):
         # Deterministic, model-free tool call: `/tool <name> <json|text>`. Runs run_tool() DIRECTLY, so a
         # tool (e.g. the mpr_research panel) fires WITHOUT depending on the model electing it AND without the
@@ -3763,7 +3799,7 @@ def _dispatch(agent: GX10, user_input: str):
         # exit); load_session() runs on boot (server.py) but nothing wrote the file. Silent save.
         agent.save_session()
 
-# ─── Autopilot: Handover → Claude starten (API-frei) ─────────
+# ─── Autopilot: handover → start Claude (API-free) ─────────
 _HO_AGENT_RE = re.compile(r"_([A-Za-z]+)\.md$")
 
 def _autopilot_active() -> int:
@@ -3781,9 +3817,9 @@ def _autopilot_release():
         _AUTOPILOT_ACTIVE = max(0, _AUTOPILOT_ACTIVE - 1)
 
 def _terminate_autopilot(task_id: str):
-    """Beendet die für task_id gestartete claude-Session (inkl. Kindprozesse),
-    falls noch aktiv. FAIL-SAFE: jeder Fehler wird geschluckt — der advance darf
-    NIE daran scheitern. Der Monitor-Thread gibt Slot + Registry frei."""
+    """Terminates the claude session started for task_id (incl. child processes),
+    if still active. FAIL-SAFE: any error is swallowed — the advance must
+    NEVER fail because of this. The monitor thread frees the slot + registry."""
     with _AUTOPILOT_LOCK:
         proc = _AUTOPILOT_PROCS.get(task_id)
     if proc is None or proc.poll() is not None:
@@ -3803,7 +3839,7 @@ def _terminate_autopilot(task_id: str):
         _ui_print(col(f"  [AUTO] could not terminate the session for {task_id}: {e!r}", C.YELLOW))
 
 def _find_handover(task_id: str) -> Optional[Path]:
-    d = handovers_dir(soft=True)          # B3: <vorhaben>/.work/handovers (soft → Daemon-sicher)
+    d = handovers_dir(soft=True)          # B3: <initiative>/.work/handovers (soft → daemon-safe)
     if d is None or not d.exists():
         return None
     hits = sorted(d.glob(f"{task_id}_*.md"))
@@ -3814,22 +3850,22 @@ def _agent_from_handover(name: str) -> str:
     if not m:
         return ""
     agent = m.group(1).upper()
-    return "SONNET" if agent == "KIMI" else agent   # Legacy _KIMI.md → Sonnet
+    return "SONNET" if agent == "KIMI" else agent   # legacy _KIMI.md → Sonnet
 
 def _task_agent(task: Dict[str, Any]) -> str:
-    """Der dem Task ZUGEWIESENE Agent (OPUS/SONNET) — aus assigned_to, sonst
-    aus dem vorhandenen Handover. Verhindert, dass ein fremdes Agenten-Feedback
-    einen OPUS-Task abschließt. "kimi" (Legacy) wird auf SONNET normalisiert."""
+    """The agent ASSIGNED to the task (OPUS/SONNET) — from assigned_to, otherwise
+    from the existing handover. Prevents a foreign agent's feedback from
+    completing an OPUS task. "kimi" (legacy) is normalized to SONNET."""
     a = (task.get("assigned_to") or "").lower()
     if "opus" in a:
         return "OPUS"
-    if "sonnet" in a or "kimi" in a:          # Kimi → Sonnet (Legacy-Alias, 2026-06-15)
+    if "sonnet" in a or "kimi" in a:          # Kimi → Sonnet (legacy alias, 2026-06-15)
         return "SONNET"
     ho = _find_handover(task.get("id", ""))
     return _agent_from_handover(ho.name) if ho else ""
 
 def _parse_handover_meta(path: Path) -> Tuple[Optional[str], Optional[str]]:
-    """Liest (model, effort) aus dem Handover-Frontmatter (`to:` / `effort:`)."""
+    """Reads (model, effort) from the handover frontmatter (`to:` / `effort:`)."""
     try:
         text = path.read_text(encoding="utf-8")
     except Exception:
@@ -3847,10 +3883,10 @@ def _parse_handover_meta(path: Path) -> Tuple[Optional[str], Optional[str]]:
     return model, effort
 
 def _do_launch(task_id: str, agent: str):
-    """Startet `claude --print` für einen Handover und schaltet den Task auf
-    in_progress. Subprozess läuft detached; ein Monitor-Thread gibt den
-    Nebenläufigkeits-Slot beim Exit frei. Bei Fehler wird der Slot sofort
-    freigegeben. (Der Reconciler hat den Slot bereits reserviert.)"""
+    """Starts `claude --print` for a handover and moves the task to
+    in_progress. The subprocess runs detached; a monitor thread frees the
+    concurrency slot on exit. On error the slot is freed
+    immediately. (The reconciler has already reserved the slot.)"""
     ho = _find_handover(task_id)
     if not ho:
         _autopilot_release()
@@ -3858,34 +3894,34 @@ def _do_launch(task_id: str, agent: str):
         return
     model, effort = _parse_handover_meta(ho)
     effort = effort or AUTOPILOT_DEFAULT_EFFORT
-    # Kimi wurde durch Sonnet ersetzt (2026-06-15): jede Rest-Referenz läuft als Sonnet.
+    # Kimi was replaced by Sonnet (2026-06-15): any remaining reference runs as Sonnet.
     if agent == "KIMI":
         agent = "SONNET"
     prompt = (f"Lies und bearbeite autonom den Handover {ho.as_posix()}. "
               f"Folge den Anweisungen in .claude/CLAUDE.md.")
     if model and str(model).startswith("kimi"):
-        model = None                          # Legacy-Kimi-Modell → Default (Sonnet/Opus)
+        model = None                          # legacy Kimi model → default (Sonnet/Opus)
     model  = model or ("claude-opus-4-8" if agent == "OPUS" else "claude-sonnet-4-6")
     argv = [AUTOPILOT_CLAUDE_BIN, "--model", model, "--effort", effort]
     extra = list(AUTOPILOT_EXTRA_ARGS)
     if AUTOPILOT_STREAM:
-        # Live-Streaming: stream-json BRAUCHT --verbose (sonst bricht claude ab).
-        # Ausgabe geht weiter in die Log-DATEI (kein Pipe-Read) → kein Deadlock.
+        # Live streaming: stream-json NEEDS --verbose (otherwise claude aborts).
+        # Output still goes to the log FILE (no pipe read) → no deadlock.
         if "--verbose" not in extra:
             extra.append("--verbose")
         if "--output-format" not in extra:
             extra += ["--output-format", "stream-json"]
     argv += extra + ["--print", prompt]
-    # Autopilot-Logs sind Engine-Maschinerie (Subprozess-stdout), kein Vorhaben-Artefakt → unter
-    # state_root() (.ironclad/logs) statt verstreut im WORKDIR-Root. Absoluter Override bleibt.
+    # Autopilot logs are engine machinery (subprocess stdout), not an initiative artefact → under
+    # state_root() (.ironclad/logs) instead of scattered in the WORKDIR root. An absolute override stays.
     _ld = Path(AUTOPILOT_LOGS_DIR)
     logdir = _ld if _ld.is_absolute() else state_root() / _ld
     logdir.mkdir(parents=True, exist_ok=True)
     logfile = logdir / f"{task_id}_{agent}.log"
     try:
         lf = open(logfile, "w", encoding="utf-8")
-        # PYTHONIOENCODING=utf-8: verhindert cp1252-Crash bei Non-ASCII-Zeichen
-        # (z. B. → in Handover-Texten) auf Windows. Kimi und Claude erben beide.
+        # PYTHONIOENCODING=utf-8: prevents a cp1252 crash on non-ASCII characters
+        # (e.g. → in handover texts) on Windows. Kimi and Claude both inherit it.
         _launch_env = {**os.environ, "PYTHONIOENCODING": "utf-8"}
         proc = subprocess.Popen(argv, cwd=".", stdout=lf, stderr=subprocess.STDOUT,
                                 stdin=subprocess.DEVNULL, text=True, env=_launch_env)
@@ -3903,8 +3939,8 @@ def _do_launch(task_id: str, agent: str):
                   f"{task_id} ({agent}, {model}, effort={effort}) · PID {proc.pid} · log {logfile}",
                   C.MAGENTA))
 
-    # Log-Terminal: neues Konsolenfenster mit Get-Content -Wait öffnen (nur Windows).
-    # Versucht zuerst Windows Terminal (wt), fällt auf eigenständiges PowerShell zurück.
+    # Log terminal: open a new console window with Get-Content -Wait (Windows only).
+    # Tries Windows Terminal (wt) first, falls back to a standalone PowerShell.
     if AUTOPILOT_LOG_TERMINAL and PLATFORM == "windows":
         _cmd = (f"$host.UI.RawUI.WindowTitle='{task_id} {agent} live'; "
                 f"Write-Host '=== {task_id} {agent} live log ===' -ForegroundColor Cyan; "
@@ -3947,13 +3983,13 @@ def _do_launch(task_id: str, agent: str):
         ok = (rc == 0)
         _ui_print(col(f"  {'✓' if ok else '⚠'} [AUTO] claude beendet: {task_id} "
                       f"(exit {rc})", C.GREEN if ok else C.YELLOW))
-        # Feedback-Check: Warnung wenn Claude beendet hat ohne Feedback zu schreiben.
-        # Kein Alert wenn Task bereits done (Advance lief vor _wait → Feedback schon gelöscht).
+        # Feedback check: warn if Claude finished without writing feedback.
+        # No alert if the task is already done (advance ran before _wait → feedback already deleted).
         try:
-            fb_dir = feedback_dir(soft=True)     # B3: <vorhaben>/.work/feedback (soft)
+            fb_dir = feedback_dir(soft=True)     # B3: <initiative>/.work/feedback (soft)
             found = list(fb_dir.glob(f"{task_id}_*-feedback.md")) if (fb_dir and fb_dir.exists()) else []
             if not found:
-                # Task bereits abgeschlossen? → kein Alert (Advance hat Feedback korrekt gelöscht)
+                # Task already completed? → no alert (advance deleted the feedback correctly)
                 t = _store().get(task_id)
                 already_done = t is not None and t.get("status") == "done"
                 if not already_done:
@@ -3966,30 +4002,30 @@ def _do_launch(task_id: str, agent: str):
     threading.Thread(target=_wait, daemon=True).start()
 
 
-# ─── Feedback-Reconciler (Polling statt Event-Trigger) ───────
-# Liest jeden Tick den WAHREN Zustand: für jeden in_progress-Task wird eine
-# vollständige Feedback-Datei gesucht und der Abschluss DETERMINISTISCH (ohne
-# LLM) ausgelöst. Verpasst/dupliziert keine FS-Events, ist idempotent.
-# Autopilot-Seite (optional): pending-Task mit Handover → claude starten.
+# ─── Feedback reconciler (polling instead of event triggers) ───────
+# Reads the TRUE state every tick: for each in_progress task a
+# complete feedback file is sought and the completion is triggered DETERMINISTICALLY (without
+# an LLM). Misses/duplicates no FS events, is idempotent.
+# Autopilot side (optional): pending task with handover → start claude.
 _FB_RE = re.compile(r"_(\w+)-feedback\.md$")
 
 def _reconcile_once(store: "TaskStore", enqueue, seen_mtime: Dict[str, float],
                     enqueued: set, launch_enqueue=None, launched: Optional[set] = None):
-    """Ein Reconciler-Tick. seen_mtime/enqueued/launched sind über Ticks
-    persistent (Vollständigkeits- bzw. Dedup-Gate)."""
-    # ── Launch-Seite (Autopilot): pending + Handover → claude starten ──
+    """One reconciler tick. seen_mtime/enqueued/launched are persistent
+    across ticks (completeness or dedup gate)."""
+    # ── Launch side (autopilot): pending + handover → start claude ──
     if AUTOPILOT_ENABLED and launch_enqueue is not None and launched is not None:
         for task in sorted(store.list("pending"),
                            key=lambda t: (t.get("created_at", ""), t.get("id", ""))):
             tid = task.get("id") or ""
             ho = _find_handover(tid)
             if not ho:
-                continue                      # kein Handover → noch nicht startbar
-            # Launch-Dedup per (tid, Handover-mtime) statt nur tid: ein zurück-
-            # gezogener + unter GLEICHER ID re-stageter Task hat einen neuen
-            # Handover (neue mtime) → wird neu gelauncht. Sonst würde ein einmal
-            # gelaunchter (evtl. gecrashter) Task NIE wieder starten (Bug: KGC-387
-            # nach OPUS-Rate-Limit-Crash + Re-Stage als KIMI).
+                continue                      # no handover → not yet launchable
+            # Launch dedup by (tid, handover mtime) instead of just tid: a
+            # withdrawn + re-staged task under the SAME ID has a new
+            # handover (new mtime) → is relaunched. Otherwise a once-
+            # launched (possibly crashed) task would NEVER start again (bug: KGC-387
+            # after an OPUS rate-limit crash + re-stage as KIMI).
             try:
                 ho_key = (tid, ho.stat().st_mtime)
             except OSError:
@@ -3997,24 +4033,24 @@ def _reconcile_once(store: "TaskStore", enqueue, seen_mtime: Dict[str, float],
             if ho_key in launched:
                 continue
             if AUTOPILOT_MAX_CONCURRENT and _autopilot_active() >= AUTOPILOT_MAX_CONCURRENT:
-                break                         # kein Slot frei → später erneut
+                break                         # no free slot → retry later
             agent = _agent_from_handover(ho.name)
             if agent not in ("OPUS", "SONNET"):
                 continue
             launched.add(ho_key)
-            _autopilot_reserve()              # Slot reservieren (Worker startet, Monitor gibt frei)
+            _autopilot_reserve()              # reserve a slot (worker starts, monitor frees)
             launch_enqueue(tid, agent)
 
-    # ── Feedback-Seite: pending ODER in_progress + Feedback DES ZUGEWIESENEN
-    #    Agenten → advance. WICHTIG: auch `pending` scannen — ein Task, der
-    #    manuell (außerhalb autopilot) abgearbeitet wurde, bleibt in `pending`
-    #    (kein pending→in_progress-Launch). Würde nur `in_progress` gescannt,
-    #    bliebe so ein Task mit fertigem Feedback ewig liegen (Bug: KGC-387).
-    d = feedback_dir(soft=True)          # B3: <vorhaben>/.work/feedback (soft → kein aktives Vorhaben = nichts zu tun)
+    # ── Feedback side: pending OR in_progress + feedback OF THE ASSIGNED
+    #    agent → advance. IMPORTANT: also scan `pending` — a task processed
+    #    manually (outside autopilot) stays in `pending`
+    #    (no pending→in_progress launch). If only `in_progress` were scanned,
+    #    such a task with finished feedback would sit there forever (bug: KGC-387).
+    d = feedback_dir(soft=True)          # B3: <initiative>/.work/feedback (soft → no active initiative = nothing to do)
     if d is None or not d.exists():
         return
-    # Warnung für Dateien die nicht dem Muster {task_id}_{agent}-feedback.md entsprechen
-    # (z.B. Analyse-Dokumente die Qwen fälschlicherweise in den Feedback-Inbox schreibt)
+    # Warning for files that don't match the pattern {task_id}_{agent}-feedback.md
+    # (e.g. analysis documents that Qwen mistakenly writes into the feedback inbox)
     for orphan in d.iterdir():
         if orphan.is_file() and not _FB_RE.search(orphan.name):
             warn_key = f"__orphan_{orphan.name}"
@@ -4027,10 +4063,10 @@ def _reconcile_once(store: "TaskStore", enqueue, seen_mtime: Dict[str, float],
                     C.YELLOW))
     for task in (store.list("pending") + store.list("in_progress")):
         tid = task.get("id") or ""
-        agent = _task_agent(task)            # erwarteter Agent (nicht aus beliebigem Dateinamen!)
+        agent = _task_agent(task)            # expected agent (not from an arbitrary filename!)
         if agent not in ("OPUS", "SONNET"):
             continue
-        fb = d / f"{tid}_{agent}-feedback.md"  # NUR das Feedback des zugewiesenen Agenten
+        fb = d / f"{tid}_{agent}-feedback.md"  # ONLY the assigned agent's feedback
         if not fb.exists():
             continue
         key = (tid, agent)
@@ -4040,7 +4076,7 @@ def _reconcile_once(store: "TaskStore", enqueue, seen_mtime: Dict[str, float],
             mt = fb.stat().st_mtime
         except OSError:
             continue
-        # Vollständigkeits-Gate: mtime über einen Tick stabil → fertig geschrieben
+        # Completeness gate: mtime stable across a tick → fully written
         if seen_mtime.get(str(fb)) != mt:
             seen_mtime[str(fb)] = mt
             continue
@@ -4133,7 +4169,7 @@ def _autoplan_tick(tid: str, enqueue) -> None:
 
 
 def _code_defaults() -> Dict[str, Any]:
-    """Schnappschuss der Modul-Konstanten als unterste Precedence-Stufe."""
+    """Snapshot of the module constants as the lowest precedence level."""
     return {
         "connection": {
             "base_url":    DEFAULT_BASE_URL,
@@ -4181,9 +4217,9 @@ def _code_defaults() -> Dict[str, Any]:
             "concurrency":      4,
             "max_tokens":       1024,
             "max_batch_tokens": 8192,
-            "memory_read":      WORKER_MEMORY,      # §3c MAP: per-item RAG + shared floor (Default AN, 06-18)
-            "memory_write":     WORKER_WRITE,       # §3c REDUCE: single-writer cold consolidation (Default AN, 06-18)
-            "write_mode":       WORKER_WRITE_MODE,  # "reducer" (Default) | "direct" (autonome Agenten)
+            "memory_read":      WORKER_MEMORY,      # §3c MAP: per-item RAG + shared floor (default ON, 06-18)
+            "memory_write":     WORKER_WRITE,       # §3c REDUCE: single-writer cold consolidation (default ON, 06-18)
+            "write_mode":       WORKER_WRITE_MODE,  # "reducer" (default) | "direct" (autonomous agents)
         },
         "providers": {
             # P0 provider router (engine/providers.py + router.py + dispatch.py). Default EMPTY/OFF →
@@ -4218,9 +4254,9 @@ def _code_defaults() -> Dict[str, Any]:
         "paths": {
             "system_prompt": DEFAULT_PROMPT,
             "workdir":       DEFAULT_WORKDIR,
-            "state_root":    STATE_ROOT,    # versteckte Engine-Maschinerie (session.json, memory/, …)
-            "vault_root":    VAULT_ROOT,    # sichtbare Wissens-Wurzel (vault/<slug>/ je Vorhaben)
-            "session_file":  SESSION_FILE,  # Basename, aufgelöst unter state_root
+            "state_root":    STATE_ROOT,    # hidden engine machinery (session.json, memory/, …)
+            "vault_root":    VAULT_ROOT,    # visible knowledge root (vault/<slug>/ per initiative)
+            "session_file":  SESSION_FILE,  # basename, resolved under state_root
             "code_root":     CODE_ROOT,
             # Open plugin surface: a dir scanned for `skills/*.py` plugins at startup
             # (GX10_PLUGINS_DIR). Empty = no plugins. See docs/plugin-api.md.
@@ -4238,13 +4274,13 @@ def _code_defaults() -> Dict[str, Any]:
             "max_iterations":     MAX_ITERATIONS,
             "max_ctx_chars":      MAX_CTX_CHARS,
             "trim_target_chars":  TRIM_TARGET_CHARS,
-            "max_model_len":      MAX_MODEL_LEN,    # MEM-9: hartes Token-Fenster (Budget-Quelle)
-            "token_budget":       TOKEN_BUDGET,     # MEM-9: Trim ans Fenster koppeln (Default AN)
+            "max_model_len":      MAX_MODEL_LEN,    # MEM-9: hard token window (budget source)
+            "token_budget":       TOKEN_BUDGET,     # MEM-9: couple the trim to the window (default ON)
             "max_file_chars":     MAX_FILE_CHARS,
             "list_dir_hard_cap":  LIST_DIR_HARD_CAP,
-            "summarize_evicted":  SUMMARIZE_EVICTED,   # B1: Default AN (06-18); aus → byte-identischer Trim
+            "summarize_evicted":  SUMMARIZE_EVICTED,   # B1: default ON (06-18); off → byte-identical trim
             "summary_max_tokens": SUMMARY_MAX_TOKENS,
-            "rag_enabled":        RAG_ENABLED,         # B2: Default AN (06-18); aus → User-Message verbatim
+            "rag_enabled":        RAG_ENABLED,         # B2: default ON (06-18); off → user message verbatim
             "rag_top_k":          RAG_TOP_K,
             "rag_max_tokens":     RAG_MAX_TOKENS,
         },
@@ -4270,8 +4306,8 @@ def _code_defaults() -> Dict[str, Any]:
 
 
 def _deep_merge(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
-    """Rekursives Merge: override gewinnt; verschachtelte Dicts werden
-    feldweise zusammengeführt statt ersetzt. Liefert eine frische Struktur."""
+    """Recursive merge: override wins; nested dicts are merged
+    field by field instead of replaced. Returns a fresh structure."""
     out = {k: (dict(v) if isinstance(v, dict) else v) for k, v in base.items()}
     for k, v in (override or {}).items():
         if isinstance(v, dict) and isinstance(out.get(k), dict):
@@ -4282,9 +4318,9 @@ def _deep_merge(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any
 
 
 def _resolve_config_source(cli_config: Optional[str]) -> Optional[Path]:
-    """Fundort-Precedence: --config (Datei ODER Verzeichnis) > Env GX10_CONFIG
+    """Location precedence: --config (file OR directory) > env GX10_CONFIG
     > ./conf/ > ./gx10.config.json > <SCRIPT_DIR>/conf/ > <SCRIPT_DIR>/gx10.config.json.
-    Ein Verzeichnis wird als entzerrte Domain-Config geladen (mit Includes)."""
+    A directory is loaded as a normalized domain config (with includes)."""
     for c in (cli_config, os.environ.get("GX10_CONFIG")):
         if c:
             p = Path(c).expanduser()
@@ -4309,21 +4345,21 @@ def _read_json_dict(p: Path) -> Dict[str, Any]:
 
 
 def _load_config_tree(source: Optional[Path], _seen: Optional[set] = None) -> Dict[str, Any]:
-    """Lädt eine Config aus Datei ODER Verzeichnis und merged Includes
-    rekursiv. Regeln:
-      • Verzeichnis mit `gx10.config.json` → diese Index-Datei laden.
-      • Verzeichnis ohne Index → alle `*.json` (sortiert) deep-mergen, DANN in
-        Unterverzeichnisse absteigen (jedes wieder als Tree; Subdirs übersteuern
-        die Top-Level-Dateien). So lädt z. B. `conf/connection/connection.json`.
-      • Datei mit `include: [...]` → Einträge (relativ zur Datei) zuerst
-        mergen, danach die eigenen Inline-Blöcke (Inline gewinnt).
-    Liefert denselben flachen cfg-Baum wie eine Einzeldatei."""
+    """Loads a config from a file OR directory and merges includes
+    recursively. Rules:
+      • Directory with `gx10.config.json` → load that index file.
+      • Directory without an index → deep-merge all `*.json` (sorted), THEN descend
+        into subdirectories (each again as a tree; subdirs override
+        the top-level files). This loads e.g. `conf/connection/connection.json`.
+      • File with `include: [...]` → merge the entries (relative to the file) first,
+        then the file's own inline blocks (inline wins).
+    Returns the same flat cfg tree as a single file."""
     if not source:
         return {}
     _seen = _seen if _seen is not None else set()
     p = Path(source)
     rp = str(p.resolve())
-    if rp in _seen:                      # Zyklusschutz
+    if rp in _seen:                      # cycle protection
         return {}
     _seen.add(rp)
 
@@ -4344,13 +4380,13 @@ def _load_config_tree(source: Optional[Path], _seen: Optional[set] = None) -> Di
     if p.is_file():
         data = _read_json_dict(p)
         includes = data.pop("include", [])
-        # Kommentar-/Meta-Keys (_-Präfix) nie in cfg übernehmen
+        # never carry comment/meta keys (_ prefix) into cfg
         data = {k: v for k, v in data.items() if not k.startswith("_")}
         merged = {}
         if isinstance(includes, list):
             for inc in includes:
                 merged = _deep_merge(merged, _load_config_tree(p.parent / inc, _seen))
-        # eigene Inline-Blöcke übersteuern die Includes
+        # the file's own inline blocks override the includes
         return _deep_merge(merged, data)
 
     print(col(f"  [WARN] config source is neither a file nor a directory: {p}", C.YELLOW))
@@ -4358,9 +4394,9 @@ def _load_config_tree(source: Optional[Path], _seen: Optional[set] = None) -> Di
 
 
 def _apply_env(cfg: Dict[str, Any]) -> Dict[str, Any]:
-    """Env-Override (Stufe 3). Nur explizit gesetzte GX10_*-Variablen.
-    Der API-Key selbst kommt NICHT hierher, sondern erst in main() aus
-    der via api_key_env benannten Variable."""
+    """Env override (level 3). Only explicitly set GX10_* variables.
+    The API key itself does NOT come from here, but only in main() from
+    the variable named via api_key_env."""
     env = os.environ
     def setif(name, section, key, transform=lambda x: x):
         v = env.get(name)
@@ -4385,27 +4421,27 @@ def _apply_env(cfg: Dict[str, Any]) -> Dict[str, Any]:
     setif("GX10_FANOUT_CONCURRENCY",     "workers", "concurrency",      int)
     setif("GX10_WORKERS_MAX_TOKENS",     "workers", "max_tokens",       int)
     setif("GX10_WORKERS_MAX_BATCH_TOKENS","workers", "max_batch_tokens", int)
-    _truthy = lambda v: v.strip().lower() in ("1", "true", "yes", "on", "an")
+    _truthy = lambda v: v.strip().lower() in ("1", "true", "yes", "on")
     setif("GX10_ONBOARDING", "onboarding", "enabled", _truthy)
     setif("GX10_PROVIDERS",              "providers", "enabled",   _truthy)   # P0 router on/off (A/B switch)
     setif("GX10_PROVIDERS_DEFAULT",      "providers", "default_id")           # default provider id
     setif("GX10_PROVIDERS_BUDGET_USD",   "providers", "budget", lambda v: {"usd_cap": float(v)})  # run budget
     setif("GX10_PROVIDERS_MAX_AGENTS",   "providers", "max_agents", int)      # server CLI-pool cap
     setif("GX10_PROVIDERS_CLI_TIMEOUT_S","providers", "cli_timeout_s", int)   # CLI spawn timeout
-    setif("GX10_CONTEXT_SUMMARY",    "context", "summarize_evicted",  _truthy)   # B1-Schalter
+    setif("GX10_CONTEXT_SUMMARY",    "context", "summarize_evicted",  _truthy)   # B1 switch
     setif("GX10_SUMMARY_MAX_TOKENS", "context", "summary_max_tokens", int)
-    setif("GX10_CONTEXT_RAG",        "context", "rag_enabled",        _truthy)   # B2-Schalter
+    setif("GX10_CONTEXT_RAG",        "context", "rag_enabled",        _truthy)   # B2 switch
     setif("GX10_RAG_TOP_K",          "context", "rag_top_k",          int)
     setif("GX10_RAG_MAX_TOKENS",     "context", "rag_max_tokens",     int)
-    setif("GX10_WORKER_MEMORY",      "workers", "memory_read",        _truthy)   # §3c MAP-Schalter
-    setif("GX10_WORKER_WRITE",       "workers", "memory_write",       _truthy)   # §3c REDUCE-Schalter
+    setif("GX10_WORKER_MEMORY",      "workers", "memory_read",        _truthy)   # §3c MAP switch
+    setif("GX10_WORKER_WRITE",       "workers", "memory_write",       _truthy)   # §3c REDUCE switch
     setif("GX10_WORKER_WRITE_MODE",  "workers", "write_mode")                    # reducer | direct
-    # B4: Trimm-Working-Set per Env retunebar (proportional zu einem angehobenen Modellfenster
-    # IRONCLAD_MAX_MODEL_LEN), ohne Config-Datei-Edit auf dem Spark. Unset → heutige Werte.
+    # B4: trim working set re-tunable via env (proportional to a raised model window
+    # IRONCLAD_MAX_MODEL_LEN), without a config-file edit on the Spark. Unset → today's values.
     setif("GX10_MAX_CTX_CHARS",      "context", "max_ctx_chars",      int)
     setif("GX10_TRIM_TARGET_CHARS",  "context", "trim_target_chars",  int)
-    # MEM-9: Modellfenster als Budget-Quelle. IRONCLAD_MAX_MODEL_LEN (Deploy/vLLM-Var) zuerst,
-    # GX10_MAX_MODEL_LEN überschreibt (spezifischer). GX10_TOKEN_BUDGET=0 → feste char-Schwellen.
+    # MEM-9: model window as the budget source. IRONCLAD_MAX_MODEL_LEN (deploy/vLLM var) first,
+    # GX10_MAX_MODEL_LEN overrides (more specific). GX10_TOKEN_BUDGET=0 → fixed char thresholds.
     setif("IRONCLAD_MAX_MODEL_LEN",  "context", "max_model_len",      int)
     setif("GX10_MAX_MODEL_LEN",      "context", "max_model_len",      int)
     setif("GX10_TOKEN_BUDGET",       "context", "token_budget",       _truthy)
@@ -4419,7 +4455,7 @@ def _apply_env(cfg: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _apply_cli(cfg: Dict[str, Any], args) -> Dict[str, Any]:
-    """CLI-Override (Stufe 4, stärkste). Nur tatsächlich gesetzte Flags."""
+    """CLI override (level 4, strongest). Only flags actually set."""
     if args.base_url   is not None: cfg["connection"]["base_url"]    = args.base_url
     if args.model      is not None: cfg["connection"]["model"]       = args.model
     if args.prompt     is not None: cfg["paths"]["system_prompt"]    = args.prompt
@@ -4434,9 +4470,9 @@ def _apply_cli(cfg: Dict[str, Any], args) -> Dict[str, Any]:
 
 
 def _apply_config(cfg: Dict[str, Any]):
-    """Schreibt die gemergte Config in die Modul-Globals zurück, sodass die
-    bestehenden Referenzen (run_tool, Makros, _trim_context, _classify_thinking,
-    Watcher, UI …) unverändert weiterlaufen."""
+    """Writes the merged config back into the module globals, so the
+    existing references (run_tool, macros, _trim_context, _classify_thinking,
+    watcher, UI …) keep running unchanged."""
     global DEFAULT_BASE_URL, DEFAULT_MODEL, API_KEY_ENV, STATE_ROOT, VAULT_ROOT, SESSION_FILE, CODE_ROOT
     global PLATFORM_MODE, PLATFORM, TASKS_DEDUP_THRESHOLD, ONBOARDING_MODE, TASK_PREFIX, _TASK_ID_RE, ACK_ENABLED, LODESTAR_ENABLED
     global AUTOPILOT_ENABLED, AUTOPILOT_CLAUDE_BIN, AUTOPILOT_EXTRA_ARGS
@@ -4464,7 +4500,7 @@ def _apply_config(cfg: Dict[str, Any]):
     CODE_ROOT        = paths.get("code_root", CODE_ROOT)
 
     PLATFORM_MODE = cfg["platform"]["mode"]
-    PLATFORM      = _resolve_platform(PLATFORM_MODE)   # einmalige Auflösung von 'auto'
+    PLATFORM      = _resolve_platform(PLATFORM_MODE)   # one-time resolution of 'auto'
 
     TASKS_DEDUP_THRESHOLD = float(cfg["tasks"]["dedup_threshold"])
     TASK_PREFIX           = str(cfg["tasks"].get("id_prefix", TASK_PREFIX))
@@ -4496,22 +4532,22 @@ def _apply_config(cfg: Dict[str, Any]):
     TRIM_TARGET_CHARS = int(ctx["trim_target_chars"])
     MAX_FILE_CHARS    = int(ctx["max_file_chars"])
     LIST_DIR_HARD_CAP = int(ctx["list_dir_hard_cap"])
-    SUMMARIZE_EVICTED  = bool(ctx.get("summarize_evicted", True))    # B1: Default AN (06-18)
+    SUMMARIZE_EVICTED  = bool(ctx.get("summarize_evicted", True))    # B1: default ON (06-18)
     SUMMARY_MAX_TOKENS = int(ctx.get("summary_max_tokens", SUMMARY_MAX_TOKENS))
-    RAG_ENABLED        = bool(ctx.get("rag_enabled", True))          # B2: Default AN (06-18)
+    RAG_ENABLED        = bool(ctx.get("rag_enabled", True))          # B2: default ON (06-18)
     RAG_TOP_K          = int(ctx.get("rag_top_k", RAG_TOP_K))
     RAG_MAX_TOKENS     = int(ctx.get("rag_max_tokens", RAG_MAX_TOKENS))
-    # MEM-9: Trim-Working-Set ans Modellfenster koppeln (nach Output/RAG/Summary-Reserve). AN →
-    # MAX_CTX_CHARS/TRIM_TARGET_CHARS aus MAX_MODEL_LEN ableiten (überschreibt die char-Defaults);
-    # AUS → die char-Schwellen oben bleiben (heutiges Verhalten, GX10_MAX_CTX_CHARS greift).
+    # MEM-9: couple the trim working set to the model window (after output/RAG/summary reserve). ON →
+    # derive MAX_CTX_CHARS/TRIM_TARGET_CHARS from MAX_MODEL_LEN (overrides the char defaults);
+    # OFF → the char thresholds above stay (today's behaviour, GX10_MAX_CTX_CHARS applies).
     MAX_MODEL_LEN      = int(ctx.get("max_model_len", MAX_MODEL_LEN))
     TOKEN_BUDGET       = bool(ctx.get("token_budget", True))
     if TOKEN_BUDGET:
         MAX_CTX_CHARS, TRIM_TARGET_CHARS = _derive_ctx_budget(
             MAX_MODEL_LEN, MAX_TOKENS, RAG_MAX_TOKENS, SUMMARY_MAX_TOKENS, CHARS_PER_TOKEN)
     _wcfg = cfg.get("workers", {})
-    WORKER_MEMORY      = bool(_wcfg.get("memory_read", True))    # §3c MAP: Default AN (06-18)
-    WORKER_WRITE       = bool(_wcfg.get("memory_write", True))   # §3c REDUCE: Default AN (06-18)
+    WORKER_MEMORY      = bool(_wcfg.get("memory_read", True))    # §3c MAP: default ON (06-18)
+    WORKER_WRITE       = bool(_wcfg.get("memory_write", True))   # §3c REDUCE: default ON (06-18)
     WORKER_WRITE_MODE  = (str(_wcfg.get("write_mode", "reducer")).strip().lower() or "reducer")
     WARM_SESSION_ID    = (os.environ.get("GX10_SESSION_ID", "").strip() or WARM_SESSION_ID)
 
@@ -4521,8 +4557,8 @@ def _apply_config(cfg: Dict[str, Any]):
     WORKSPACE_DIRS = list(ws["dirs"])
     _IDLE_ACTIVE   = ws["idle_marker"]
 
-    # Memory-Config: Datei (conf/memory/memory.json) ODER Env (GX10_MEMORY_URL).
-    # Optional — ohne base_url bleibt _MEMORY_CONFIG leer → Memory aus (Hooks inert).
+    # Memory config: file (conf/memory/memory.json) OR env (GX10_MEMORY_URL).
+    # Optional — without base_url _MEMORY_CONFIG stays empty → memory off (hooks inert).
     _mem_cfg_path = Path("conf/memory/memory.json")
     if _mem_cfg_path.exists():
         try:
@@ -4534,9 +4570,9 @@ def _apply_config(cfg: Dict[str, Any]):
         _MEMORY_CONFIG = {**(_MEMORY_CONFIG or {}), "base_url": _mem_url}
         _MEMORY_CONFIG.setdefault("enabled", True)
         _MEMORY_CONFIG.setdefault("agent_id", os.environ.get("GX10_MEMORY_AGENT", "ironclad"))
-    # B3-Schalter (optional; greifen nur mit konfiguriertem Memory): langes Feedback verlustfrei
-    # chunken statt truncaten + Recency-Tiebreak im Retrieval. Default AUS → heutiges Verhalten.
-    _mem_bool = lambda v: str(v).strip().lower() in ("1", "true", "yes", "on", "an")
+    # B3 switches (optional; only apply with configured memory): chunk long feedback losslessly
+    # instead of truncating + recency tiebreak in retrieval. Default OFF → today's behaviour.
+    _mem_bool = lambda v: str(v).strip().lower() in ("1", "true", "yes", "on")
     _mem_chunk = os.environ.get("GX10_MEMORY_CHUNKING")
     if _mem_chunk not in (None, ""):
         _MEMORY_CONFIG = {**(_MEMORY_CONFIG or {}), "chunk_long_artifacts": _mem_bool(_mem_chunk)}
@@ -4544,8 +4580,8 @@ def _apply_config(cfg: Dict[str, Any]):
     if _mem_rec not in (None, ""):
         _MEMORY_CONFIG = {**(_MEMORY_CONFIG or {}), "recency_tiebreak": _mem_bool(_mem_rec)}
 
-    # Warm-Tier-Config (B0): Datei (conf/warm/warm.json) ODER Env (GX10_WARM_URL).
-    # Optional — ohne url bleibt _WARM_CONFIG leer → Warm-Tier aus (no-op, fail-soft).
+    # Warm tier config (B0): file (conf/warm/warm.json) OR env (GX10_WARM_URL).
+    # Optional — without a url _WARM_CONFIG stays empty → warm tier off (no-op, fail-soft).
     _warm_cfg_path = Path("conf/warm/warm.json")
     if _warm_cfg_path.exists():
         try:

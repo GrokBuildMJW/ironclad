@@ -13,10 +13,11 @@ from typing import List, Literal, Optional, Tuple
 from pydantic import BaseModel, Field
 
 from ..conflicts import Conflict
+from .. import i18n
 from ._common import conflict_zones_md, extract_json, raw_with_conflicts, warnings_block
 
 _LEVEL = {"high": 2, "medium": 1, "low": 0}            # severity/likelihood ordinal (worst-first sort)
-_LEVEL_LABEL = {"high": "hoch", "medium": "mittel", "low": "niedrig"}
+_LEVEL_LABEL = {"high": "high", "medium": "medium", "low": "low"}  # English source; localized at render
 
 
 class Risk(BaseModel):
@@ -45,17 +46,18 @@ def render_risk(rr: RiskRegister, conflicts: List[Conflict], warnings: List[str]
     if warnings:
         lines += [warnings_block(warnings), ""]
     lines += [rr.summary.strip(), ""]
-    lines.append("| Risiko | Schwere | Eintritt | Mitigation | Owner |")
+    lines.append(i18n.t("| Risk | Severity | Likelihood | Mitigation | Owner |", "templates", "risk_header"))
     lines.append("|---|:--:|:--:|---|---|")
     for r in sorted(rr.risks, key=_exposure, reverse=True):
-        sev, lik = _LEVEL_LABEL[r.severity], _LEVEL_LABEL[r.likelihood]
+        sev = i18n.t(_LEVEL_LABEL[r.severity], "templates", f"level_{r.severity}")
+        lik = i18n.t(_LEVEL_LABEL[r.likelihood], "templates", f"level_{r.likelihood}")
         roles = f" _({', '.join(r.roles)})_" if r.roles else ""
         lines.append(f"| {r.risk}{roles} | {sev} | {lik} | {r.mitigation or '–'} | {r.owner or '–'} |")
     cz = conflict_zones_md(conflicts)
     if cz:
         lines += ["", cz]
     if rr.open_questions:
-        lines += ["", "### Offene Fragen"] + [f"- {q}" for q in rr.open_questions]
+        lines += ["", i18n.t("### Open questions", "templates", "open_questions")] + [f"- {q}" for q in rr.open_questions]
     return "\n".join(lines)
 
 
@@ -69,8 +71,8 @@ def validate_risk(body: str, conflicts: List[Conflict]) -> Tuple[str, bool]:
         return raw_with_conflicts(body, conflicts), False
     warnings: List[str] = []
     if not rr.risks:
-        warnings.append("Kein Risiko im Register")
+        warnings.append(i18n.t("No risk in the register", "templates", "warn_no_risk"))
     n_missing = sum(1 for r in rr.risks if not (r.mitigation or "").strip())
     if n_missing:
-        warnings.append(f"{n_missing} Risiko(en) ohne Mitigation")
+        warnings.append(i18n.t("{n} risk(s) without mitigation", "templates", "warn_risk_no_mitigation").format(n=n_missing))
     return render_risk(rr, conflicts, warnings), True  # soft warnings rendered inline, not degrade (LB-6)

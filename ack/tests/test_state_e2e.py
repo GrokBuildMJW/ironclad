@@ -1,8 +1,8 @@
 """STATE-Layout Unit D: end-to-end integration through the REAL entry points.
 
-Drives the actual operator/​model surface — `_dispatch` for the `/vorhaben` commands and the
+Drives the actual operator/​model surface — `_dispatch` for the `/initiative` commands and the
 deterministic macros (`_stage_handover` / `_advance_pipeline`) the orchestrator triggers — in a clean
-project directory, and asserts the whole-system invariant: every artifact under the active vorhaben,
+project directory, and asserts the whole-system invariant: every artifact under the active initiative,
 engine machinery hidden under `.ironclad/`, and **the project root stays clean** (the DoD). This is
 the model-free half of the D2 E2E; the model turns (`/chat`) are exercised on deploy.
 """
@@ -37,13 +37,13 @@ def test_e2e_full_lifecycle_keeps_project_root_clean(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     fake = _FakeAgent()
 
-    # 1. fail-closed before any vorhaben — an artifact macro refuses, writes nothing
+    # 1. fail-closed before any initiative — an artifact macro refuses, writes nothing
     out = gx10._stage_handover("KGC-1", "OPUS", "## Handover\nx")
     assert out.startswith("ERROR")
     assert not (tmp_path / ".work").exists() and not (tmp_path / "vault").exists()
 
-    # 2. operator creates a software vorhaben through the real dispatch
-    gx10._dispatch(fake, "vorhaben new Order Service --typ software")
+    # 2. operator creates a software initiative through the real dispatch
+    gx10._dispatch(fake, "initiative new Order Service --type software")
     assert fake.ran is None                       # handled as a command, not a model turn
     assert gx10.active_slug() == "order-service"
 
@@ -59,10 +59,10 @@ def test_e2e_full_lifecycle_keeps_project_root_clean(tmp_path, monkeypatch):
     assert out.startswith("OK")
 
     # 4. reconcile via the real command (MPR run routing/fail-closed is covered by the mpr suite)
-    gx10._dispatch(fake, "vorhaben reconcile")
+    gx10._dispatch(fake, "initiative reconcile")
 
     base = tmp_path / "vault" / "order-service"
-    # artifacts live under the active vorhaben
+    # artifacts live under the active initiative
     assert (base / "tasks" / "done" / f"{tid}.json").is_file()
     assert (base / ".work" / "active.md").is_file()
     assert (base / ".work" / "archive" / "feedback" / f"{tid}_OPUS-feedback.md").is_file()

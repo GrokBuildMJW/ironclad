@@ -30,8 +30,8 @@ class _Rng:                       # controlled blind-order flip (random() < 0.5 
 
 
 def _vote_json(s1, s2, pw="1"):
-    return json.dumps({"antwort_1": {d: {"score": s1, "rationale": "r", "cited_axes": ["x"]} for d in _DIMS},
-                       "antwort_2": {d: {"score": s2, "rationale": "r", "cited_axes": []} for d in _DIMS},
+    return json.dumps({"answer_1": {d: {"score": s1, "rationale": "r", "cited_axes": ["x"]} for d in _DIMS},
+                       "answer_2": {d: {"score": s2, "rationale": "r", "cited_axes": []} for d in _DIMS},
                        "pairwise": {d: pw for d in _DIMS}})
 
 
@@ -43,7 +43,7 @@ def _fixed(text):
 def test_judge_output_parses_to_schema():
     assert J.parse_judgement(_vote_json(4, 2)) is not None
     assert J.parse_judgement("kein json") is None
-    assert J.parse_judgement(json.dumps({"antwort_1": {"coverage": {"score": 9}}})) is None   # out of range
+    assert J.parse_judgement(json.dumps({"answer_1": {"coverage": {"score": 9}}})) is None   # out of range
     # one murks reply → exactly one repair re-ask → success
     seq = iter(["nicht json", _vote_json(4, 2)])
     call = lambda prompt, *, system, max_tokens: next(seq)               # noqa: E731

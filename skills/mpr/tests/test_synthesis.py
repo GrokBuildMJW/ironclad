@@ -69,7 +69,7 @@ def test_synthesize_decision_from_recorded():
     persp = [P("R1", "Gutachten eins"), P("R2", "Gutachten zwei"), P("R3", "Gutachten drei")]
     out = synthesize(_inp("decision", "decision-matrix", persp, cross_verify=False), llm_call=StubLLM(_DEC))
     assert out.status == "full" and out.template_valid is True
-    assert "Empfehlung" in out.body and "Rückzugsoption" in out.body and "Gewichteter Score" in out.body
+    assert "Recommendation" in out.body and "Fallback" in out.body and "Weighted score" in out.body
 
 
 def test_synthesize_evidence_tiers_demoted():
@@ -77,7 +77,7 @@ def test_synthesize_evidence_tiers_demoted():
     out = synthesize(_inp("evidence-research", "evidence-report", persp, cross_verify=False),
                      llm_call=StubLLM(_EV))
     assert out.status == "full"
-    low = out.body.index("### Niedrige Konfidenz")
+    low = out.body.index("### Low confidence")
     assert "Unbelegte Behauptung" in out.body[low:]   # demoted high→low
 
 
@@ -85,7 +85,7 @@ def test_synthesize_comparison_has_gaps_opportunities():
     persp = [P("A", "x"), P("B", "y")]
     out = synthesize(_inp("comparison", "comparison-matrix", persp, cross_verify=False),
                      llm_call=StubLLM(_CMP))
-    assert "### Lücken" in out.body and "### Chancen" in out.body and out.template_valid
+    assert "### Gaps" in out.body and "### Opportunities" in out.body and out.template_valid
 
 
 _RISK = json.dumps({
@@ -102,7 +102,7 @@ def test_synthesize_risk_register_end_to_end():
     out = synthesize(_inp("evidence-research", "risk-register", persp, cross_verify=False),
                      llm_call=StubLLM(_RISK))
     assert out.status == "full" and out.template_valid is True
-    assert "| Risiko | Schwere | Eintritt | Mitigation | Owner |" in out.body
+    assert "| Risk | Severity | Likelihood | Mitigation | Owner |" in out.body
     assert out.body.index("SPOF") < out.body.index("PR-Risiko")   # worst-first
 
 
@@ -118,7 +118,7 @@ def test_degraded_when_half_panel_fails():
              P("D", None, ok=False, error="empty")]
     out = synthesize(_inp("decision", "decision-matrix", persp, cross_verify=False), llm_call=StubLLM(_DEC))
     assert out.status == "degraded"
-    assert "Panel unvollständig" in out.body
+    assert "Panel incomplete" in out.body
     assert {d["role"] for d in out.dropped} == {"C", "D"}
 
 
@@ -127,7 +127,7 @@ def test_insufficient_quorum_no_pseudo_synthesis():
     persp = [P("A", "die einzige Sicht"), P("B", None, ok=False, error="x"), P("C", None, ok=False, error="y")]
     out = synthesize(_inp("decision", "decision-matrix", persp), llm_call=llm)
     assert out.status == "degraded"
-    assert "Zu wenige Perspektiven" in out.body and "die einzige Sicht" in out.body
+    assert "Too few perspectives" in out.body and "die einzige Sicht" in out.body
     assert llm.calls == 0   # no pseudo-synthesis call
 
 
@@ -136,14 +136,14 @@ def test_single_perspective_is_insufficient_no_call():
     llm = StubLLM(_DEC)
     out = synthesize(_inp("decision", "decision-matrix", [P("R1", "nur eine Sicht")]), llm_call=llm)
     assert out.status == "degraded"
-    assert "Zu wenige Perspektiven" in out.body and "nur eine Sicht" in out.body
+    assert "Too few perspectives" in out.body and "nur eine Sicht" in out.body
     assert llm.calls == 0   # no synthesis call for a single lens
 
 
 def test_synth_call_exception_degrades():
     persp = [P("A", "a"), P("B", "b"), P("C", "c")]
     out = synthesize(_inp("decision", "decision-matrix", persp, cross_verify=False), llm_call=_throwing)
-    assert out.status == "degraded" and "Synthese degradiert" in out.body  # no raise
+    assert out.status == "degraded" and "Synthesis degraded" in out.body  # no raise
 
 
 def test_template_parse_repair_then_success():

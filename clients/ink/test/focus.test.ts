@@ -98,6 +98,16 @@ test('handleFocusKey: Tab→next, Shift+Tab→prev, others ignored', () => {
   assert.equal(handleFocusKey(m, emptyKey({tab: true, ctrl: true})), false, 'Ctrl+Tab left for the app');
 });
 
+test('handleFocusKey: Tab is NOT consumed when nothing is focusable (#17 — falls through to useInput)', () => {
+  const m = new FocusManager(); // nothing registered → the slash-menu Tab-completion must receive Tab
+  assert.equal(m.hasFocusables(), false);
+  assert.equal(handleFocusKey(m, emptyKey({tab: true})), false, 'Tab left for the app when nothing is focusable');
+  const m2 = new FocusManager();
+  m2.register('a');
+  m2.disable(); // focus turned off → Tab again belongs to the app
+  assert.equal(handleFocusKey(m2, emptyKey({tab: true})), false, 'disabled focus → Tab not consumed');
+});
+
 test('useFocus registers/unregisters with the manager via the context', () => {
   const manager = new FocusManager();
   function Field(): React.ReactElement {

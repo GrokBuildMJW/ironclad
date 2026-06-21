@@ -12,6 +12,7 @@ import re
 from typing import List, Optional
 
 from ..conflicts import Conflict
+from .. import i18n
 
 _FENCE_RE = re.compile(r"```(?:json)?\s*(\{.*\})\s*```", re.DOTALL)
 
@@ -50,7 +51,7 @@ def conflict_zones_md(conflicts: List[Conflict]) -> str:
     """Render the conflict zones (blocking first, never trimmed). '' when there are none."""
     if not conflicts:
         return ""
-    lines = ["### Konfliktzonen"]
+    lines = [i18n.t("### Conflict zones", "templates", "conflict_zones")]
     for c in conflicts:
         label = _SEV_LABEL.get(c.severity, c.severity)
         sides = " ↔ ".join(f"[{', '.join(s.roles)}] {s.stance}" for s in c.sides)

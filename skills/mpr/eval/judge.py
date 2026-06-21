@@ -28,22 +28,22 @@ from rubric import JUDGED_DIMS, median_scores  # noqa: E402
 _FENCE_RE = re.compile(r"```(?:json)?\s*(\{.*\})\s*```", re.DOTALL)
 
 SYSTEM = (
-    "Du bist ein unparteiischer Gutachter. Dir liegen ZWEI anonymisierte Antworten auf dieselbe Frage "
-    "vor (Antwort 1, Antwort 2) plus eine Referenz-Achsenliste (Ground Truth). Du weißt NICHT, welches "
-    "System welche Antwort erzeugt hat — rate es NICHT. Bewerte jede Antwort je Dimension 0-5, belege "
-    "knapp und nenne die abgedeckten Referenz-Achsen. Emit NUR EINEN ```json-Block nach dem Schema."
+    "You are an impartial evaluator. You are given TWO anonymised answers to the same question "
+    "(Answer 1, Answer 2) plus a reference axis list (ground truth). You do NOT know which system "
+    "produced which answer — do NOT guess. Rate each answer per dimension 0-5, justify briefly and "
+    "name the covered reference axes. Emit ONLY ONE ```json block per the schema."
 )
 
 
 def build_prompt(answer_1: str, answer_2: str, axes: List[str]) -> str:
     dims = ", ".join(JUDGED_DIMS)
-    skel = ('{"antwort_1":{"<dim>":{"score":0-5,"rationale":"...","cited_axes":["..."]}},'
-            '"antwort_2":{"<dim>":{...}},"pairwise":{"<dim>":"1"|"2"}}')
+    skel = ('{"answer_1":{"<dim>":{"score":0-5,"rationale":"...","cited_axes":["..."]}},'
+            '"answer_2":{"<dim>":{...}},"pairwise":{"<dim>":"1"|"2"}}')
     return (
-        f"REFERENZ-ACHSEN (Ground Truth): {axes}\n\nDIMENSIONEN: {dims}\n\n"
-        f"--- Antwort 1 ---\n{answer_1}\n\n--- Antwort 2 ---\n{answer_2}\n\n"
-        f"Bewerte BEIDE Antworten je Dimension (0-5) + pairwise (welche je Dimension besser, '1' oder "
-        f"'2'). ZIEL-SCHEMA (```json zuerst):\n{skel}"
+        f"REFERENCE AXES (ground truth): {axes}\n\nDIMENSIONS: {dims}\n\n"
+        f"--- Answer 1 ---\n{answer_1}\n\n--- Answer 2 ---\n{answer_2}\n\n"
+        f"Rate BOTH answers per dimension (0-5) + pairwise (which is better per dimension, '1' or "
+        f"'2'). TARGET SCHEMA (```json first):\n{skel}"
     )
 
 
@@ -103,7 +103,7 @@ def parse_judgement(raw: str) -> Optional[dict]:
     obj = _extract_json(raw)
     if obj is None:
         return None
-    s1, s2 = _valid_side(obj.get("antwort_1")), _valid_side(obj.get("antwort_2"))
+    s1, s2 = _valid_side(obj.get("answer_1")), _valid_side(obj.get("answer_2"))
     if s1 is None or s2 is None:
         return None
     pw_in = obj.get("pairwise") or {}
@@ -119,7 +119,7 @@ def _run_vote(answer_a: str, answer_b: str, axes: List[str], *, call: Callable[.
     prompt = build_prompt(shown_1, shown_2, axes)
     parsed = parse_judgement(call(prompt, system=SYSTEM, max_tokens=max_tokens))
     if parsed is None:                                 # §5/§4.4: exactly ONE repair re-ask, then drop
-        reask = prompt + "\n\nDeine vorige Ausgabe war NICHT schema-valide. Emit NUR den ```json-Block."
+        reask = prompt + "\n\nYour previous output was NOT schema-valid. Emit ONLY the ```json block."
         parsed = parse_judgement(call(reask, system=SYSTEM, max_tokens=max_tokens))
     if parsed is None:
         return None
@@ -182,15 +182,15 @@ def judge_panel(answer_a: str, answer_b: str, axes: List[str], *,
 
 
 def _selftest() -> None:
-    """Pure parse/blind/aggregation checks, KEIN Netz (Gate §7 stufe 3)."""
+    """Pure parse/blind/aggregation checks, NO network (gate §7 stage 3)."""
     good = json.dumps({
-        "antwort_1": {d: {"score": 4, "rationale": "ok", "cited_axes": ["x"]} for d in JUDGED_DIMS},
-        "antwort_2": {d: {"score": 2, "rationale": "ok", "cited_axes": []} for d in JUDGED_DIMS},
+        "answer_1": {d: {"score": 4, "rationale": "ok", "cited_axes": ["x"]} for d in JUDGED_DIMS},
+        "answer_2": {d: {"score": 2, "rationale": "ok", "cited_axes": []} for d in JUDGED_DIMS},
         "pairwise": {d: "1" for d in JUDGED_DIMS}})
     p = parse_judgement(good)
     assert p and p["1"]["coverage"] == 4.0 and p["pairwise"]["coverage"] == "1"
     assert parse_judgement("kein json") is None
-    assert parse_judgement(json.dumps({"antwort_1": {"coverage": {"score": 9}}})) is None   # out of range
+    assert parse_judgement(json.dumps({"answer_1": {"coverage": {"score": 9}}})) is None   # out of range
     # de-blind: a fixed-flip rng must map slots back to a/b correctly
     fixed = lambda prompt, *, system, max_tokens: good                       # noqa: E731
 
@@ -206,8 +206,8 @@ def _selftest() -> None:
     def _unstable(prompt, *, system, max_tokens):
         flip["flag"] = not flip["flag"]
         sc = 5 if flip["flag"] else 0
-        return json.dumps({"antwort_1": {d: {"score": sc} for d in JUDGED_DIMS},
-                           "antwort_2": {d: {"score": 2} for d in JUDGED_DIMS},
+        return json.dumps({"answer_1": {d: {"score": sc} for d in JUDGED_DIMS},
+                           "answer_2": {d: {"score": 2} for d in JUDGED_DIMS},
                            "pairwise": {d: "1" for d in JUDGED_DIMS}})
     panel = judge_panel("A", "B", ["x"], voices=[stable, {"provider": "p2", "call": fixed},
                                                  {"provider": "bad", "call": _unstable}],
@@ -222,17 +222,17 @@ def _voice_from_spec(name: str):  # pragma: no cover - live wiring (operator)
 
 
 def main() -> None:  # pragma: no cover - operator/live path, not in the pytest gate
-    ap = argparse.ArgumentParser(description="MPR LLM-Judge-Panel über einen A/B-Report")
-    ap.add_argument("--report", help="report.json aus harness.py (enthält a/b-Antworten je query_id)")
-    ap.add_argument("--refs", default=None, help="Referenz-Achsen json je query_id")
-    ap.add_argument("--panel", default="sonnet,opus,spark", help="Provider-Panel (aus mpr.providers)")
-    ap.add_argument("--seed", type=int, default=0, help="Blind-Order-Seed (deterministisch/entblindbar)")
+    ap = argparse.ArgumentParser(description="MPR LLM judge panel over an A/B report")
+    ap.add_argument("--report", help="report.json from harness.py (holds a/b answers per query_id)")
+    ap.add_argument("--refs", default=None, help="reference-axes json per query_id")
+    ap.add_argument("--panel", default="sonnet,opus,spark", help="provider panel (from mpr.providers)")
+    ap.add_argument("--seed", type=int, default=0, help="blind-order seed (deterministic/de-blindable)")
     ap.add_argument("--selftest", action="store_true")
     args = ap.parse_args()
     if args.selftest:
         _selftest()
         return
-    ap.error("Live-Judge-Lauf braucht --report + verdrahtete Provider (mpr.providers); im Gate nur --selftest.")
+    ap.error("a live judge run needs --report + wired providers (mpr.providers); the gate uses --selftest only.")
 
 
 if __name__ == "__main__":

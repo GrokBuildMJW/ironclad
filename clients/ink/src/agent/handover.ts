@@ -134,7 +134,7 @@ export async function runHandover(
   const hoText = str(item['handover']);
 
   // Local agent scratch is kept OUT of the project root: a hidden .ironclad/agent/ drop zone
-  // (the handover round-trip is HTTP-mediated, so this path is independent of the server's vorhaben).
+  // (the handover round-trip is HTTP-mediated, so this path is independent of the server's initiative).
   const hoDir = path.join(codedir, '.ironclad', 'agent', 'handovers');
   await fs.mkdir(hoDir, {recursive: true});
   await fs.writeFile(path.join(hoDir, hoName), hoText, 'utf-8');

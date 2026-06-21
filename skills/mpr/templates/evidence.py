@@ -14,6 +14,7 @@ from pydantic import BaseModel, Field
 from typing import Literal
 
 from ..conflicts import Conflict
+from .. import i18n
 from ._common import conflict_zones_md, extract_json, raw_with_conflicts, warnings_block
 
 _TIER_ORDER = {"low": 0, "medium": 1, "high": 2}
@@ -83,8 +84,9 @@ def render_evidence(rep: EvidenceReport, conflicts: List[Conflict], warnings: Li
     if warnings:
         lines += [warnings_block(warnings), ""]
     lines += [rep.summary.strip(), ""]
-    for tier, head in (("high", "### Hohe Konfidenz"), ("medium", "### Mittlere Konfidenz"),
-                       ("low", "### Niedrige Konfidenz / unbelegt")):
+    for tier, head in (("high", i18n.t("### High confidence", "templates", "conf_high")),
+                       ("medium", i18n.t("### Medium confidence", "templates", "conf_medium")),
+                       ("low", i18n.t("### Low confidence / unsupported", "templates", "conf_low"))):
         group = [f for f in rep.findings if tiers[f.claim] == tier]
         if not group:
             continue
@@ -93,13 +95,13 @@ def render_evidence(rep: EvidenceReport, conflicts: List[Conflict], warnings: Li
             cites = "; ".join(f'{c.role}@{c.provider}: "{c.quote}"' for c in f.support)
             suffix = f"  [{cites}]" if cites else ""
             if f.dissent:
-                suffix += f"  (Dissens: {', '.join(f.dissent)})"
+                suffix += f"  ({i18n.t('dissent', 'templates', 'dissent')}: {', '.join(f.dissent)})"
             lines.append(f"- {f.claim}{suffix}")
     cz = conflict_zones_md(conflicts)
     if cz:
         lines += ["", cz]
     if rep.open_questions:
-        lines += ["", "### Offene Fragen"] + [f"- {q}" for q in rep.open_questions]
+        lines += ["", i18n.t("### Open questions", "templates", "open_questions")] + [f"- {q}" for q in rep.open_questions]
     return "\n".join(lines)
 
 
@@ -113,5 +115,5 @@ def validate_evidence(body: str, conflicts: List[Conflict]) -> Tuple[str, bool]:
         return raw_with_conflicts(body, conflicts), False
     warnings: List[str] = []
     if not rep.findings:
-        warnings.append("Keine Findings im Report")
+        warnings.append(i18n.t("No findings in the report", "templates", "warn_no_findings"))
     return render_evidence(rep, conflicts, warnings), True  # soft warnings rendered inline, not degrade (LB-6)

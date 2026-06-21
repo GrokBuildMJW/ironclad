@@ -22,6 +22,14 @@ test('route — DONE banner + role labels are dropped', () => {
   assert.equal(r.answer.length, 0);
 });
 
+test('route — MPR report sentinels are dropped (raw + indented/glued END)', () => {
+  const r = createRouter();
+  r.route('<<<MPR_REPORT>>>');
+  r.route('| Kriterium | A | B |');
+  r.route('        <<<END>>>'); // the model often indents it or glues it to the last bullet
+  assert.deepEqual(r.answer, ['| Kriterium | A | B |']);
+});
+
 test('route — prose accumulates, blank runs collapse to one', () => {
   const r = createRouter();
   r.route('Ich bin Ironclad.');

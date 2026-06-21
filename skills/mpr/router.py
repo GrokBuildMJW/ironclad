@@ -7,8 +7,8 @@ LLM call (§3.1). Everything before/after the call is deterministic → snapshot
 Reiten, nicht duplizieren: the router brings no client, no fan-out, no store. It consumes the schema
 (``.schema``) and the registry layer (panels/resolve/guards/synthesis). The ONE LLM call goes through
 the injected ``ClassifierLLM`` port. Adhoc panels come straight from that one call's output (NOT a
-second ``generate_adhoc_panel`` call — that would break the one-call invariant; §3.1 + §8 "Panel kommt
-voll vom Klassifikator"), so ``classify`` stays fully synchronous.
+second ``generate_adhoc_panel`` call — that would break the one-call invariant; §3.1 + §8 "panel comes
+wholly from the classifier"), so ``classify`` stays fully synchronous.
 
 Every error degrades to **decline** (the safe default), never to an uncontrolled fan-out (§7).
 """
@@ -37,7 +37,7 @@ from .schema import (
 )
 
 # ── Tunables (module defaults; R-9 makes them config-overridable via mpr.router.*) ────────────────
-MIN_PANEL = 3                 # editorial floor of distinct roles (kippt auf decline, §6.3)
+MIN_PANEL = 3                 # editorial floor of distinct roles (falls back to decline, §6.3)
 MAX_PANEL = 7                 # cap (distinctness, §6.1)
 DISTINCT_MAX_SIM = 0.6        # jaccard clone threshold (§6.1)
 MIN_QUERY_CHARS = 12          # pre-check R1 (§4.1)

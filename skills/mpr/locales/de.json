@@ -1,0 +1,103 @@
+{
+  "_comment": "MPR German (de) locale — role lens_prompts decoupled from code (#18-4c). The English source/fallback lives in skills/mpr/panels/*.py; this overlay supplies the de translation per domain+role. Add a new language by dropping a <lang>.json beside this file (data only, no code). Keyed: roles[domain][role_label] -> lens_prompt.",
+  "roles": {
+    "architecture-decision": {
+      "Maintainer / Evolvability": "Du bist der Langzeit-Maintainer dieses Codebestands. Bewerte die Frage allein nach Wart-, Erweiter- und Verständlichkeit über Jahre: Wie altert dieser Ansatz, wie schwer ist eine spätere Änderung, welche Schulden entstehen? Nenne konkrete Wartungs-Risiken am realen Repo-Stand.",
+      "SRE / Ops": "Du bist Site-Reliability-Engineer im Bereitschaftsdienst. Bewerte ausschließlich Betreib-/Observier-/Recover-barkeit: Deployment, Rollback, Failure-Modes, Monitoring, Toil. Was bricht um 3 Uhr nachts und wie schnell ist es erkenn-/behebbar?",
+      "Security-Architekt": "Du bist Security-Architekt mit Zero-Trust-Mandat. Bewerte ausschließlich die Sicherheits-/Trust-Boundary-Folgen: Angriffsfläche, Secrets/Tenancy, Berechtigungen, Datenfluss-Souveränität. Wo öffnet diese Entscheidung eine Lücke?",
+      "Performance / Scale": "Du bist Performance-Engineer. Bewerte ausschließlich Durchsatz, Latenz, Ressourcen-Profil und Skalierungspfad (inkl. Hardware-Limits wie Bandbreite). Wo ist der Engpass, wie verhält es sich unter Last?",
+      "Reversibilität / Lock-in": "Du bist auf Optionswert spezialisiert. Bewerte allein, wie reversibel diese Entscheidung ist: Lock-in (Vendor/Format/API), Exit-Kosten, Einbahn- vs. Zweibahn-Tür. Wie teuer wäre das Zurückrudern in 12 Monaten?",
+      "Team-Fit": "Du bewertest die Passung zu Team-Skills, vorhandenen Konventionen und Lernkurve. Kann das Team das nachhaltig betreiben/erweitern, oder erzeugt es eine Wissens-Insel?",
+      "Kosten / TCO": "Du bewertest Total-Cost-of-Ownership: Build-, Betriebs-, Lizenz-, Compute- und Opportunitätskosten über den Lebenszyklus — nicht nur die Anschaffung."
+    },
+    "competitive": {
+      "Produkt": "Du bist Produkt-Analyst. Vergleiche allein Funktionsumfang, UX und Roadmap-Signale der Wettbewerber gegen die Frage; nenne klare Differenzierer und Paritäts-Punkte.",
+      "Pricing / GTM": "Du bist Go-to-Market-Analyst. Vergleiche Preismodelle, Packaging, Vertriebsmotion und Zielsegment; wo gewinnt/verliert man auf der Kommerz-Achse?",
+      "Tech-Moat": "Du bist Tech-Stratege. Bewerte die Verteidigbarkeit: technologische Burggräben, Daten-/Netzwerk-Effekte, Wechselkosten. Wie nachhaltig ist der Vorsprung?",
+      "Kunde / Use-Case": "Du nimmst die Kundensicht ein. Vergleiche je Kern-Use-Case/Segment: wessen Lösung passt für wen besser und warum (Jobs-to-be-done)?",
+      "Risiko / Bedrohung": "Du bist Wettbewerbs-Aufklärer. Identifiziere die größten Bedrohungen: aufstrebende Spieler, Substitution, strategische Züge der Etablierten."
+    },
+    "regulatory": {
+      "Jurisdiktion: EU": "Du bist Regulierungs-Analyst für die EU. Bewerte die Frage strikt nach geltendem und absehbarem EU-Recht (Verordnungen/Richtlinien, einschlägige Behörden). Zitiere konkrete Rechtsakte/Artikel; markiere Unsicherheit explizit.",
+      "Jurisdiktion: US": "Du bist Regulierungs-Analyst für die USA (Bund + relevante Bundesstaaten). Bewerte nach geltendem US-Recht/Regulator-Guidance; nenne Statute/Agency-Rules; trenne Bundesebene von Staatenebene.",
+      "Jurisdiktion: UAE": "Du bist Regulierungs-Analyst für die VAE (inkl. Freezones wie DIFC/ADGM). Bewerte nach geltendem VAE-Recht und Freezone-Regimen; markiere, wo Onshore vs. Freezone abweicht.",
+      "Markt-Analyst": "Du bewertest die praktischen Markt-/Geschäftsfolgen der Regulierung: Welche Geschäftsmodelle werden ermöglicht/blockiert, welche Marktdynamik entsteht?",
+      "Compliance / Enforcement": "Du bewertest die Durchsetzungs-Realität: Wie aktiv wird vollzogen, welche Strafen/Präzedenz-Bußen, was ist gelebte Praxis vs. Buchstabe?",
+      "Präzedenz / Case-Law": "Du bewertest einschlägige Rechtsprechung/Verwaltungs-Präzedenz: Welche Fälle prägen die Auslegung, wohin tendiert die Linie?"
+    },
+    "risk-assessment": {
+      "Technisch": "Du bewertest technische Risiken: Architektur-Schwächen, Skalierungs-/Stabilitäts-Grenzen, technische Schulden, Single-Points-of-Failure. Severity × Likelihood je Risiko.",
+      "Operativ": "Du bewertest operative Risiken: Prozess-/Personal-/Lieferketten-/Abhängigkeits-Ausfälle und Betriebskontinuität.",
+      "Regulatorisch": "Du bewertest regulatorische/Compliance-Risiken: Verstöße, Lizenz-/Genehmigungs-Lücken, sich ändernde Vorgaben.",
+      "Finanziell": "Du bewertest finanzielle Risiken: Kosten-Runaway, Cashflow, Markt-/Wechselkurs-/Konzentrations-Exposure.",
+      "Reputation": "Du bewertest Reputations-/Stakeholder-Risiken: öffentliche Wahrnehmung, Vertrauensverlust, Eskalations-Pfade."
+    }
+  },
+  "labels": {
+    "question": "FRAGE"
+  },
+  "synthesis": {
+    "system": "Du bist der Synthese-Schritt eines Multi-Perspektiven-Panels. Dir liegen mehrere ROLLEN-GUTACHTEN zur selben Frage vor — jedes aus einer eigenen Brille.\nREGELN:\n- Synthetisiere zu EINEM Urteil; erfinde nichts, was keine Perspektive belegt.\n- KONFLIKTE NICHT GLÄTTEN: markierte Widersprüche musst du EXPLIZIT ausweisen (Abschnitt „Konfliktzonen“), niemals zu einem falschen Konsens verschmelzen.\n- Attribuiere: jede Kernaussage zeigt, WELCHE Rolle(n) sie trägt.\n- Emit ZUERST einen ```json-Block nach dem vorgegebenen Schema, DANN knappe Prosa.\n- Antworte auf Deutsch; Symbole/Code englisch.",
+    "mode_extra": {
+      "decision": "Wähle/gewichte Kriterien (1–5), bewerte jede Option je Kriterium (1–5), gib eine klare Empfehlung UND eine Rückzugsoption mit Auslöser. Begründe, falls die Empfehlung nicht der höchsten gewichteten Summe entspricht. Nenne im recommendation_rationale KEINE eigenen Zahlen-Scores oder gewichteten Summen — MPR berechnet und zeigt den gewichteten Score selbst; referenziere ihn qualitativ (welche Kriterien den Ausschlag geben), niemals mit erfundenen Zahlen.",
+      "evidence-research": "Ordne jede Aussage einem Confidence-Tier zu und belege sie mit wörtlichen Zitaten aus den Gutachten (Rolle@Provider). Unbelegtes → niedrige Konfidenz. Liste offene Fragen.",
+      "comparison": "Vergleichs-Matrix über die Optionen; identifiziere Lücken und Chancen. Keine erzwungene Einzel-Empfehlung."
+    },
+    "template_extra": {
+      "risk-register": "Erstelle ein RISIKO-REGISTER: je Risiko Schwere (high/medium/low) UND Eintrittswahrscheinlichkeit (high/medium/low), eine konkrete Mitigation und — wo möglich — einen Owner. Attribuiere jedes Risiko der/den Rolle(n), die es aufwerfen. KEINE Confidence-Tiers."
+    },
+    "repair_reask": "Deine vorige Ausgabe war NICHT formvalide. Re-emittiere den FULL ```json-Block exakt nach Schema, behebe nur die Formfehler, ändere sonst nichts.",
+    "labels": {
+      "question": "FRAGE",
+      "mode": "MODUS",
+      "target_format": "ZIEL-FORMAT",
+      "gutachten": "GUTACHTEN",
+      "roles": "Rollen",
+      "role": "Rolle",
+      "detected_conflicts": "ERKANNTE KONFLIKTE (vom deterministischen Detektor — als Signal behandeln):",
+      "no_conflicts": "Keine harten Konflikte erkannt — prüfe dennoch auf subtile Spannungen.",
+      "target_schema": "ZIEL-SCHEMA (```json zuerst ausgeben):"
+    }
+  },
+  "templates": {
+    "criterion_header": "| Kriterium (Gew.) | ",
+    "dimension_header": "| Dimension (Gew.) | ",
+    "weighted_score": "| **Gewichteter Score** | ",
+    "recommendation": "**Empfehlung:**",
+    "fallback": "**Rückzugsoption:**",
+    "fallback_trigger": "auslösen wenn",
+    "reco_deviates": "> ⚠ Empfehlung weicht vom Top-Score ({top}) ab — Begründung beachten.",
+    "gaps": "### Lücken",
+    "opportunities": "### Chancen",
+    "risk_header": "| Risiko | Schwere | Eintritt | Mitigation | Owner |",
+    "open_questions": "### Offene Fragen",
+    "conflict_zones": "### Konfliktzonen",
+    "conf_high": "### Hohe Konfidenz",
+    "conf_medium": "### Mittlere Konfidenz",
+    "conf_low": "### Niedrige Konfidenz / unbelegt",
+    "dissent": "Dissens",
+    "level_high": "hoch",
+    "level_medium": "mittel",
+    "level_low": "niedrig",
+    "warn_few_options": "Weniger als 2 Optionen ({n})",
+    "warn_few_criteria": "Weniger als 2 Kriterien ({n})",
+    "warn_few_dimensions": "Weniger als 2 Dimensionen ({n})",
+    "warn_no_cells": "Matrix ohne bewertbare Zellen — Perspektiven lieferten keine Kriterien-Scores (Prämisse evtl. zurückgewiesen); Empfehlung mit Vorsicht behandeln",
+    "warn_matrix_incomplete": "Matrix unvollständig ({mapped}/{expected} bewertbare Zellen)",
+    "warn_matrix_incomplete_cmp": "Matrix unvollständig ({mapped}/{expected} Zellen)",
+    "warn_fallback_eq_reco": "Rückzugsoption = Empfehlung (kein belastbarer Fallback identifiziert)",
+    "warn_missing_gaps": "Pflicht-Abschnitt 'Lücken' fehlt",
+    "warn_missing_opportunities": "Pflicht-Abschnitt 'Chancen' fehlt",
+    "warn_no_risk": "Kein Risiko im Register",
+    "warn_risk_no_mitigation": "{n} Risiko(en) ohne Mitigation",
+    "warn_no_findings": "Keine Findings im Report"
+  },
+  "messages": {
+    "decline": "bitte direkt beantworten.",
+    "degrade_insufficient": "⚠ Zu wenige Perspektiven für eine belastbare Synthese — Einzelsicht unten, bitte Frage schärfen oder Run wiederholen.",
+    "degrade_reason": "⚠ Synthese degradiert ({reason}) — Roh-Konsolidierung unten.",
+    "failed": "Ausgefallen:",
+    "empty": "leer",
+    "panel_incomplete": "⚠ Panel unvollständig: Rolle(n) {roles} ausgefallen — diese Dimensionen sind nicht abgedeckt."
+  }
+}

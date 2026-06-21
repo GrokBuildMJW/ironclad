@@ -113,7 +113,7 @@
   "synthesis": {
     "input": [],
     "conflicts": [],
-    "output": null,
+    "output": "| Criterion (wt.) | Modulith behalten | In Microservices aufteilen |\n|---|--:|--:|\n| Evolvierbarkeit (×3) | 3 | 4 |\n| Betriebslast (×2) | 5 | 2 |\n| TCO (×2) | 5 | 2 |\n| **Weighted score** | **29** | **20** |\n\n**Recommendation:** **Modulith behalten** — Bis fünf Teams überwiegen niedrigere Betriebslast und TCO; die Evolvierbarkeits-Lücke ist mit einem modularen Schnitt schließbar.\n**Fallback:** In Microservices aufteilen — trigger when klare, stabile Domänengrenzen ODER >5 Teams mit Deploy-Konflikten.",
     "synthesis_provider": null,
     "synthesis_model": null,
     "synthesis_tokens": {
@@ -123,7 +123,7 @@
     },
     "synthesis_latency_s": null
   },
-  "final_answer": "| Kriterium (Gew.) | Modulith behalten | In Microservices aufteilen |\n|---|--:|--:|\n| Evolvierbarkeit (×3) | 3 | 4 |\n| Betriebslast (×2) | 5 | 2 |\n| TCO (×2) | 5 | 2 |\n| **Gewichteter Score** | **29** | **20** |\n\n**Empfehlung:** **Modulith behalten** — Bis fünf Teams überwiegen niedrigere Betriebslast und TCO; die Evolvierbarkeits-Lücke ist mit einem modularen Schnitt schließbar.\n**Rückzugsoption:** In Microservices aufteilen — auslösen wenn klare, stabile Domänengrenzen ODER >5 Teams mit Deploy-Konflikten.",
+  "final_answer": "| Criterion (wt.) | Modulith behalten | In Microservices aufteilen |\n|---|--:|--:|\n| Evolvierbarkeit (×3) | 3 | 4 |\n| Betriebslast (×2) | 5 | 2 |\n| TCO (×2) | 5 | 2 |\n| **Weighted score** | **29** | **20** |\n\n**Recommendation:** **Modulith behalten** — Bis fünf Teams überwiegen niedrigere Betriebslast und TCO; die Evolvierbarkeits-Lücke ist mit einem modularen Schnitt schließbar.\n**Fallback:** In Microservices aufteilen — trigger when klare, stabile Domänengrenzen ODER >5 Teams mit Deploy-Konflikten.",
   "inputs": {
     "seed": "mpr-seed-1",
     "rendered_prompts": [],

@@ -14,6 +14,10 @@
 const ANSI = new RegExp(String.fromCharCode(27) + '\\[[0-9;]*m', 'g');
 const TOK = /(\d+)\s*tok/;
 const PERF = '[perf]';
+// MPR report sentinels (skills/mpr/entry.py REPORT_OPEN/CLOSE) — machine delimiters that mark the
+// verbatim report block; they must never reach the rendered chat (#50).
+const REPORT_OPEN = '<<<MPR_REPORT>>>';
+const REPORT_CLOSE = '<<<END>>>';
 
 export interface Router {
   route: (line: string) => void;
@@ -48,7 +52,9 @@ export function createRouter(): Router {
       if (m) state.tokens = parseInt(m[1] ?? '0', 10);
       return;
     }
-    if (st.includes('===') && (st.includes('DONE') || st.includes('FERTIG') || st.includes('✓'))) return;
+    if (st.includes('===') && (st.includes('DONE') || st.includes('✓'))) return;
+    // MPR sentinels on their own line (trim() also catches the model's indented/glued `<<<END>>>`).
+    if (st === REPORT_OPEN || st === REPORT_CLOSE) return;
     if (
       st === '[GX10]' ||
       (st.startsWith('[Qwen') && st.endsWith(']')) ||

@@ -246,7 +246,7 @@ def _worker(srv: Server, codedir: Path, q: "Queue[str]", app: "Application",
                     log(gx10.col(f"  [AUTO] {'AN' if auto.get('stop') else 'AUS'}  |  /auto on / /auto off",
                                  gx10.C.GRAY))
             continue
-        # kind in ("server", "turn") → an den Orchestrator streamen (Befehl ohne / bzw. Turn).
+        # kind in ("server", "turn") → stream to the orchestrator (command without / or a turn).
         _stream(payload)
 
 
@@ -412,7 +412,7 @@ def _build_app(q: "Queue[str]", srv: Server) -> "Application":
         _insert_paste(event.current_buffer, event.data)
 
     @kb.add("c-v")
-    def _paste_clip(event):                       # Strg+V -> OS-Clipboard direkt lesen
+    def _paste_clip(event):                       # Ctrl+V -> read the OS clipboard directly
         data = _read_clipboard()
         if data:
             _insert_paste(event.current_buffer, data)
@@ -437,7 +437,7 @@ def _build_app(q: "Queue[str]", srv: Server) -> "Application":
             gx10._ui_print(gx10.col("  ⨯ cancel requested …", gx10.C.YELLOW))
             # non-blocking: cancel the running server turn
             threading.Thread(target=_cancel_fn, daemon=True).start()
-        # sonst: ignorieren (exit zum Beenden)
+        # otherwise: ignore (use exit to quit)
 
     @kb.add("c-d")
     def _ctrl_d(event):

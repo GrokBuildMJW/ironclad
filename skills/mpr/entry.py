@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, List, Optional
 
-from . import audit
+from . import audit, i18n
 from .registry.resolve import EFFORT_MAX_TOKENS
 from .router import classify
 from .schema import RouterInput
@@ -80,6 +80,9 @@ class Deps:
     routing: dict = field(default_factory=dict)
     default_offload: str = "claude-sonnet"
     sovereignty: dict = field(default_factory=dict)
+    language: str = "en"                          # #18-4c: active output language (en source; de/… via locale overlay)
+    index_runs: bool = True                       # #52: register the run in the TaskStore? off when #15 blocks the
+                                                  # pipeline (mpr initiative) — runs/manifest+INDEX.md are the record there
 
 
 _MPR_ROOT = Path(__file__).resolve().parent   # skills/mpr/ — panel discovery root
@@ -104,6 +107,21 @@ class _ClassifierAdapter:
         return resp.choices[0].message.content or ""
 
 
+def _resolve_store(mod: Any) -> Any:
+    """Bind ironclad's single shared TaskStore. The engine exposes it as the lazy accessor ``_store()``
+    (gx10.py:1965) — calling it returns/creates the one shared instance; ``STORE`` is the underlying
+    global (None until first access). NB: ``getattr(mod, "_store")`` yields the FUNCTION, so it must be
+    CALLED — binding the function object instead made ``index_in_taskstore`` hit ``store.create`` on a
+    non-store and silently no-op (task_id stayed None). Returns None on a minimal/old engine stub."""
+    fn = getattr(mod, "_store", None)
+    if callable(fn):
+        try:
+            return fn()
+        except Exception:  # noqa: BLE001 — store build fault → no indexing (fail-soft)
+            return None
+    return getattr(mod, "STORE", None)
+
+
 def _engine_deps() -> Deps:
     """Bind the real engine handles (Spec 04 §2 Weg 1) — lazy + fail-soft. Engine absent → minimal Deps
     (run_mpr then degrades to a clear ERROR string). Server-side glue; the orchestration is tested with
@@ -123,10 +141,11 @@ def _engine_deps() -> Deps:
             _apply_mpr_env(tree)
         cfg = load_mpr_config(tree if isinstance(tree, dict) else {})
         d.runs_dir, d.audit_level, d.panel_mode = cfg.runs_dir, cfg.audit_level, cfg.panel_mode
-        # B3 (STATE-Layout): MPR-Runs sind Vorhaben-Artefakte → unter das AKTIVE Vorhaben routen
-        # (vault/<slug>/runs) statt in den WORKDIR-Root. Ohne aktives Vorhaben bleibt der Config-
-        # Default; mpr_research_run gated den Lauf dann ohnehin fail-closed, bevor etwas entsteht.
-        # getattr (fail-soft wie die übrigen Bindings) — ein minimaler/alter Engine-Stub hat die Fn evtl. nicht.
+        d.language = getattr(gx10, "LANGUAGE", "en") or "en"   # #18-4c: role lens_prompts localize to this
+        # B3 (STATE layout): MPR runs are initiative artifacts → route them under the ACTIVE initiative
+        # (vault/<slug>/runs) instead of the WORKDIR root. Without an active initiative the config
+        # default stays; mpr_research_run then gates the run fail-closed anyway, before anything is created.
+        # getattr (fail-soft like the other bindings) — a minimal/old engine stub may not have the fn.
         _arootsoft = getattr(gx10, "artifact_root_soft", None)
         _vp = _arootsoft() if callable(_arootsoft) else None
         if _vp is not None:
@@ -138,7 +157,12 @@ def _engine_deps() -> Deps:
         d.sovereignty = cfg.sovereignty.model_dump()
         d.reducer = getattr(gx10, "_reduce_worker_results", None)
         d.writer = getattr(gx10, "_atomic_write", None)
-        d.store = getattr(gx10, "_STORE", None) or getattr(gx10, "_store", None)
+        d.store = _resolve_store(gx10)
+        # #52: only index the run in the TaskStore when the #15 contract allows the task pipeline in the
+        # ACTIVE initiative — i.e. NOT in a reasoning-only mpr initiative (there the gate would refuse
+        # create and task_id would silently stay None). #15 is the single source of truth; fail-soft → True.
+        _blk = getattr(gx10, "_mpr_blocks_tasks", None)
+        d.index_runs = not (callable(_blk) and _blk())
         d.registry = get_registry(_MPR_ROOT)
         workers = getattr(gx10, "_WORKERS", None)
         if workers is not None and getattr(workers, "client", None) is not None:
@@ -171,20 +195,20 @@ def mpr_research_run(query: str, *, route_hint: str = "", domain_hint: str = "",
                      files: Optional[List[str]] = None, audit_level: str = "") -> str:
     """The public ``run`` (§4 signature → drives the tool schema via derive_tool_schema). Sync, never
     raises. Binds the engine handles and delegates to run_mpr."""
-    # B3 fail-closed: ein MPR-Run erzeugt Artefakte (runs/<id>/…) → verlangt ein aktives Vorhaben,
-    # sonst würde in den Projekt-Root geschrieben. Klarer Hinweis statt Schreiben in den Root.
+    # B3 fail-closed: an MPR run creates artifacts (runs/<id>/…) → requires an active initiative,
+    # otherwise it would write into the project root. A clear note instead of writing to the root.
     _gx = None
     try:
         import gx10 as _gx  # type: ignore
         if _gx.artifact_root_soft() is None:
-            return ("ERROR: mpr_research: kein aktives Vorhaben — Artefakte hätten kein Zuhause. "
-                    "`/vorhaben new <name> --typ mpr` (oder `--typ software`) zuerst.")
-    except Exception:  # noqa: BLE001 — kein Engine-Kontext (standalone) → normaler Lauf
+            return ("ERROR: mpr_research: kein aktives Initiative — Artefakte hätten kein Zuhause. "
+                    "`/initiative new <name> --type mpr` (oder `--type software`) zuerst.")
+    except Exception:  # noqa: BLE001 — no engine context (standalone) → normal run
         _gx = None
     out = run_mpr(query, route_hint=route_hint, domain_hint=domain_hint, mode_hint=mode_hint,
                   files=files, audit_level=audit_level, deps=_engine_deps())
-    # C2: nach einem echten Run das INDEX.md des aktiven Vorhabens frisch halten (fail-soft, nur Index;
-    # nicht bei ERROR/decline/disabled — da entstand kein Artefakt).
+    # C2: after a real run, keep the active initiative's INDEX.md fresh (fail-soft, index only;
+    # not on ERROR/decline/disabled — no artifact was created there).
     if _gx is not None and out and not out.startswith(("ERROR", "MPR declined", "MPR ist deaktiviert")):
         try:
             _slug = _gx.active_slug()
@@ -195,8 +219,8 @@ def mpr_research_run(query: str, *, route_hint: str = "", domain_hint: str = "",
     return out
 
 
-def _render_lens(role: str, lens_prompt: str, query: str) -> dict:
-    user = f"{lens_prompt}\n\nFRAGE: {query}"
+def _render_lens(role: str, lens_prompt: str, query: str, lang: str = "en") -> dict:
+    user = f"{lens_prompt}\n\n{i18n.label('question', lang)}: {query}"
     return {"system": None, "user": user}
 
 
@@ -271,7 +295,8 @@ def run_mpr(query: str, *, route_hint: str = "", domain_hint: str = "", mode_hin
 
     if decision.decision.value == "decline":
         # direct-answer signal — no fan-out, no report (a slim decline note, no sentinels).
-        return f"MPR declined ({decision.decline_reason}): bitte direkt beantworten."
+        return (f"MPR declined ({decision.decline_reason}): "
+                f"{i18n.localized('please answer directly.', deps.language, 'messages', 'decline')}")
 
     # audit_level is exposed as a tool param (Spec 10 §6), so the model can fill it — and it does so
     # WRONGLY (e.g. "high", confusing it with effort). An unrecognised value would silently fall through
@@ -284,7 +309,12 @@ def run_mpr(query: str, *, route_hint: str = "", domain_hint: str = "", mode_hin
     # 2. dispatch each perspective (sovereignty chokepoint → in-engine fanout MVP) -----------------
     try:
         perspectives = decision.perspectives
-        rendered = [_render_lens(p.role, p.lens_prompt, query) for p in perspectives]
+        # #18-4c: localize each role's lens_prompt to the active language (en source in panels;
+        # de/… from locales/<lang>.json; missing → English fallback, so a run never breaks).
+        rendered = [_render_lens(p.role,
+                                 i18n.role_lens(decision.domain or "", p.role, p.lens_prompt, deps.language),
+                                 query, deps.language)
+                    for p in perspectives]
         choices = []
         for p in perspectives:
             try:
@@ -325,7 +355,7 @@ def run_mpr(query: str, *, route_hint: str = "", domain_hint: str = "", mode_hin
             evidence_source=(decision.evidence_source.value if decision.evidence_source else "mixed"),
             perspectives=presults,
         )
-        out = synthesize(synth_inp, llm_call=deps.synth_llm) if deps.synth_llm else None
+        out = synthesize(synth_inp, llm_call=deps.synth_llm, lang=deps.language) if deps.synth_llm else None
     except Exception as exc:  # noqa: BLE001
         return f"ERROR: mpr_research: synthesis: {exc!r}"
     if out is None:
@@ -413,7 +443,9 @@ def _write_audit(run_dir, run_id, query, decision, perspectives, choices, render
             violations=len(prov.violations)),
     )
     audit.write_manifest(run_dir, manifest, writer=deps.writer)
-    if deps.store is not None:
+    # #52: skip TaskStore indexing when #15 blocks the pipeline (mpr initiative) — don't attempt create()
+    # only to have the gate raise + get swallowed; the run's record is runs/<id>/manifest.json + INDEX.md.
+    if deps.store is not None and deps.index_runs:
         tid = audit.index_in_taskstore(run_id, manifest.query.text, manifest.router_decision.domain or "",
                                        status, store=deps.store)
         if tid:

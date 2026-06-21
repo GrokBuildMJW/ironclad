@@ -241,7 +241,7 @@ class IroncladApp(App):
                 self._status["perf"] = c[idx:].replace("[perf]", "").strip()
                 self._safe_call(self._refresh_status)
                 return
-            if "===" in c and ("DONE" in c or "FERTIG" in c):
+            if "===" in c and "DONE" in c:
                 return
             if _is_scaffold(c):
                 return

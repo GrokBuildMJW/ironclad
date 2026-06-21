@@ -11,6 +11,7 @@ from typing import List, Tuple
 from pydantic import BaseModel, Field
 
 from ..conflicts import Conflict
+from .. import i18n
 from ._common import conflict_zones_md, extract_json, raw_with_conflicts, warnings_block
 from .decision import Cell, Criterion
 
@@ -39,15 +40,16 @@ def render_comparison(cm: ComparisonMatrix, conflicts: List[Conflict], warnings:
     lines: List[str] = []
     if warnings:
         lines += [warnings_block(warnings), ""]
-    lines.append("| Dimension (Gew.) | " + " | ".join(cm.options) + " |")
+    lines.append(i18n.t("| Dimension (wt.) | ", "templates", "dimension_header")
+                 + " | ".join(cm.options) + " |")
     lines.append("|---|" + "|".join("--:" for _ in cm.options) + "|")
     for crit in cm.criteria:
         row = " | ".join(str(cellmap.get((o, crit.name), "–")) for o in cm.options)
         lines.append(f"| {crit.name} (×{crit.weight}) | {row} |")
-    lines.append("| **Gewichteter Score** | "
+    lines.append(i18n.t("| **Weighted score** | ", "templates", "weighted_score")
                  + " | ".join(f"**{scores[o]}**" for o in cm.options) + " |")
-    lines += ["", "### Lücken"] + [f"- {g}" for g in cm.gaps]
-    lines += ["", "### Chancen"] + [f"- {o}" for o in cm.opportunities]
+    lines += ["", i18n.t("### Gaps", "templates", "gaps")] + [f"- {g}" for g in cm.gaps]
+    lines += ["", i18n.t("### Opportunities", "templates", "opportunities")] + [f"- {o}" for o in cm.opportunities]
     cz = conflict_zones_md(conflicts)
     if cz:
         lines += ["", cz]
@@ -64,14 +66,15 @@ def validate_comparison(body: str, conflicts: List[Conflict]) -> Tuple[str, bool
         return raw_with_conflicts(body, conflicts), False
     warnings: List[str] = []
     if len(cm.options) < 2:
-        warnings.append(f"Weniger als 2 Optionen ({len(cm.options)})")
+        warnings.append(i18n.t("Fewer than 2 options ({n})", "templates", "warn_few_options").format(n=len(cm.options)))
     if len(cm.criteria) < 2:
-        warnings.append(f"Weniger als 2 Dimensionen ({len(cm.criteria)})")
+        warnings.append(i18n.t("Fewer than 2 dimensions ({n})", "templates", "warn_few_dimensions").format(n=len(cm.criteria)))
     expected = len(cm.options) * len(cm.criteria)
     if len(cm.cells) != expected:
-        warnings.append(f"Matrix unvollständig ({len(cm.cells)}/{expected} Zellen)")
+        warnings.append(i18n.t("Matrix incomplete ({mapped}/{expected} cells)", "templates",
+                               "warn_matrix_incomplete_cmp").format(mapped=len(cm.cells), expected=expected))
     if not cm.gaps:
-        warnings.append("Pflicht-Abschnitt 'Lücken' fehlt")
+        warnings.append(i18n.t("Required section 'Gaps' missing", "templates", "warn_missing_gaps"))
     if not cm.opportunities:
-        warnings.append("Pflicht-Abschnitt 'Chancen' fehlt")
+        warnings.append(i18n.t("Required section 'Opportunities' missing", "templates", "warn_missing_opportunities"))
     return render_comparison(cm, conflicts, warnings), True  # soft warnings rendered inline, not degrade (LB-6)

@@ -20,34 +20,34 @@ PANEL = Panel(
     roles=[
         {
             "role": "Technisch",
-            "lens_prompt": "Du bewertest technische Risiken: Architektur-Schwächen, Skalierungs-/"
-                           "Stabilitäts-Grenzen, technische Schulden, Single-Points-of-Failure. "
-                           "Severity × Likelihood je Risiko.",
+            "lens_prompt": "You judge technical risks: architecture weaknesses, scaling/stability "
+                           "limits, technical debt, single points of failure. Severity × likelihood "
+                           "per risk.",
             "effort": "high",
             "provider_policy": "local-only",  # inspects internal code → never offloaded
         },
         {
             "role": "Operativ",
-            "lens_prompt": "Du bewertest operative Risiken: Prozess-/Personal-/Lieferketten-/"
-                           "Abhängigkeits-Ausfälle und Betriebskontinuität.",
+            "lens_prompt": "You judge operational risks: process/staffing/supply-chain/dependency "
+                           "failures and business continuity.",
             "effort": "medium",
         },
         {
             "role": "Regulatorisch",
-            "lens_prompt": "Du bewertest regulatorische/Compliance-Risiken: Verstöße, Lizenz-/"
-                           "Genehmigungs-Lücken, sich ändernde Vorgaben.",
+            "lens_prompt": "You judge regulatory/compliance risks: violations, licensing/permit gaps, "
+                           "changing requirements.",
             "effort": "medium",
         },
         {
             "role": "Finanziell",
-            "lens_prompt": "Du bewertest finanzielle Risiken: Kosten-Runaway, Cashflow, Markt-/"
-                           "Wechselkurs-/Konzentrations-Exposure.",
+            "lens_prompt": "You judge financial risks: cost runaway, cashflow, market/exchange-rate/"
+                           "concentration exposure.",
             "effort": "medium",
         },
         {
             "role": "Reputation",
-            "lens_prompt": "Du bewertest Reputations-/Stakeholder-Risiken: öffentliche Wahrnehmung, "
-                           "Vertrauensverlust, Eskalations-Pfade.",
+            "lens_prompt": "You judge reputation/stakeholder risks: public perception, loss of trust, "
+                           "escalation paths.",
             "effort": "low",
         },
     ],

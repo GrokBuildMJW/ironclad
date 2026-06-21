@@ -150,7 +150,7 @@ def test_full_pipeline_sentinels_manifest_sovereign(tmp_path):
     out = run_mpr("Sollen wir von Modulith auf Microservices umstellen?", deps=deps)
     # §8-E: report between sentinels
     assert out.startswith("<<<MPR_REPORT>>>") and out.rstrip().endswith("<<<END>>>")
-    assert "Empfehlung" in out
+    assert "Recommendation" in out
     # §11e: manifest written + sovereign (architecture-decision is internal → all local, 0 egress)
     mf = tmp_path / "mpr-test-0001" / "manifest.json"
     assert mf.is_file()
@@ -283,7 +283,8 @@ def test_synth_llm_binding_disables_thinking(monkeypatch):
         cap["think"] = think
         return [{"ok": True, "content": "{}"} for _ in prompts]
     fake_gx10 = SimpleNamespace(
-        _EFFECTIVE_CFG=None, _reduce_worker_results=None, _atomic_write=None, _STORE=None, _DISPATCHER=None,
+        _EFFECTIVE_CFG=None, _reduce_worker_results=None, _atomic_write=None,
+        _store=lambda: None, _DISPATCHER=None,   # engine exposes the lazy accessor, not a _STORE global (#51)
         _WORKERS=SimpleNamespace(client=object(), model="m", fanout=_fanout))
     monkeypatch.setitem(sys.modules, "gx10", fake_gx10)
     from mpr.entry import _engine_deps
@@ -291,3 +292,63 @@ def test_synth_llm_binding_disables_thinking(monkeypatch):
     assert d.synth_llm is not None                      # binding ran
     d.synth_llm("p", system=None, max_tokens=512)
     assert cap.get("think") is False                    # structured emission → thinking OFF
+
+
+def test_resolve_store_calls_lazy_accessor():
+    # #51: the engine exposes the shared TaskStore via the lazy accessor _store() (gx10.py:1965), NOT a
+    # _STORE global. The binding must CALL it (binding the function object made index_in_taskstore no-op →
+    # task_id stayed None). This drives the real seam the stub-injecting pipeline tests bypass.
+    from types import SimpleNamespace
+    from mpr.entry import _resolve_store
+
+    class _Store:
+        def create(self, fields, *, force=False, now_iso=None):
+            return {**fields, "id": "KGC-001"}
+
+    inst = _Store()
+    bound = _resolve_store(SimpleNamespace(_store=lambda: inst))
+    assert bound is inst and hasattr(bound, "create")    # the INSTANCE, not the function object
+    assert _resolve_store(SimpleNamespace(STORE=inst)) is inst   # fallback to the global when no accessor
+    assert _resolve_store(object()) is None               # minimal/old engine stub → None (fail-soft)
+
+    def _boom():
+        raise RuntimeError("store down")
+    assert _resolve_store(SimpleNamespace(_store=_boom)) is None  # build fault degrades, never raises
+
+
+def test_full_pipeline_indexes_taskstore_and_backfills_task_id(tmp_path):
+    # #51 end-to-end: with a real (stub) store bound, the run is registered and the manifest carries the id.
+    store = _FakeStore()
+    llm = FakeClassifierLLM(run_panel(domain="architecture-decision", route="wide", mode="decision"))
+    deps = _deps(tmp_path, llm, store=store, run_id="mpr-idx-0001")
+    out = run_mpr("Sollen wir von Modulith auf Microservices umstellen?", deps=deps)
+    assert out.startswith("<<<MPR_REPORT>>>")
+    m = json.loads((tmp_path / "mpr-idx-0001" / "manifest.json").read_text(encoding="utf-8"))
+    assert m["task_id"] == "KGC-001" and store.created       # indexed + id backfilled (not None)
+
+
+def test_engine_deps_index_runs_follows_mpr_gate(monkeypatch):
+    # #52: index_runs mirrors the #15 contract (single source of truth) — off when _mpr_blocks_tasks()
+    # refuses (reasoning-only mpr initiative), on otherwise (software). Drives the real _engine_deps seam.
+    import sys
+    from types import SimpleNamespace
+    from mpr.entry import _engine_deps
+    base = dict(_EFFECTIVE_CFG=None, _reduce_worker_results=None, _atomic_write=None,
+                _store=lambda: None, _DISPATCHER=None, _WORKERS=None)
+    monkeypatch.setitem(sys.modules, "gx10", SimpleNamespace(_mpr_blocks_tasks=lambda: "blocked: mpr", **base))
+    assert _engine_deps().index_runs is False                # #15 blocks the pipeline → don't index
+    monkeypatch.setitem(sys.modules, "gx10", SimpleNamespace(_mpr_blocks_tasks=lambda: None, **base))
+    assert _engine_deps().index_runs is True                 # pipeline allowed (software) → index
+
+
+def test_mpr_initiative_run_skips_taskstore_index(tmp_path):
+    # #52: with index_runs off (mpr initiative), the run writes its manifest but creates NO TaskStore
+    # entry and task_id stays None — no create() attempt, so no swallowed #15-gate exception.
+    store = _FakeStore()
+    llm = FakeClassifierLLM(run_panel(domain="architecture-decision", route="wide", mode="decision"))
+    deps = _deps(tmp_path, llm, store=store, run_id="mpr-noidx")
+    deps.index_runs = False
+    out = run_mpr("Sollen wir von Modulith auf Microservices umstellen?", deps=deps)
+    assert out.startswith("<<<MPR_REPORT>>>")
+    m = json.loads((tmp_path / "mpr-noidx" / "manifest.json").read_text(encoding="utf-8"))
+    assert m["task_id"] is None and store.created == []      # no TaskStore entry in a reasoning-only initiative

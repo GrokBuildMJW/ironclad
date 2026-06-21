@@ -100,6 +100,30 @@ def test_infer_subjects_query_anchored():
     assert "Modulith" in naive and "Kosten" in naive          # no anchor → the noise comes back
 
 
+def test_infer_subjects_excludes_meta_question_and_criteria():
+    # #55: the query carries a question word (Sollte), MPR meta (Entscheidungsmatrix/Empfehlung/
+    # Rückzugsoption) and criteria (Sicherheit/Wartbarkeit). None are decision subjects — only the real
+    # option (Docker), named in the QUESTION, must survive; criteria sit in the instruction tail (after '?').
+    ok = [P("A", "Sollte man wechseln? Ich empfehle Docker klar. Die Entscheidungsmatrix zeigt das. "
+                 "Meine Empfehlung steht. Sicherheit und Wartbarkeit sind ok."),
+          P("B", "Sollte Docker gewählt werden? Docker sollte man vermeiden. Die Entscheidungsmatrix ist da. "
+                 "Meine Empfehlung folgt. Sicherheit und Wartbarkeit zählen.")]
+    q = ("Sollte Ironclad in Docker-Containern oder auf Hyper-V laufen? Erstelle eine Entscheidungsmatrix "
+         "entlang Sicherheit und Wartbarkeit mit klarer Empfehlung und Rückzugsoption.")
+    topics = {c.topic for c in detect_conflicts(ok, subjects=None, mode="decision", query=q)}
+    assert "Docker" in topics                              # the real option still conflicts
+    noise = {"Sollte", "Entscheidungsmatrix", "Empfehlung", "Rückzugsoption", "Sicherheit", "Wartbarkeit"}
+    assert not (noise & topics)                            # #55: no meta/question/criteria noise subjects
+
+
+def test_dedupe_substrings_keeps_specific():
+    # #55: a fragment ("Containern") that is contained in a more specific subject ("Docker-Containern")
+    # must not raise its own conflict zone — keep only the specific one.
+    from mpr.conflicts import _dedupe_substrings
+    out = [s.lower() for s in _dedupe_substrings(["Containern", "Docker-Containern"])]
+    assert out == ["docker-containern"]
+
+
 def test_detect_claim_negation_overlap():
     ok = [P("A", "Das System ist sicher genug."), P("B", "Das System ist nicht sicher genug.")]
     out = detect_conflicts(ok, subjects=[])

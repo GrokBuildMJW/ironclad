@@ -17,53 +17,51 @@ PANEL = Panel(
     roles=[
         {
             "role": "Maintainer / Evolvability",
-            "lens_prompt": "Du bist der Langzeit-Maintainer dieses Codebestands. Bewerte die Frage "
-                           "allein nach Wart-, Erweiter- und Verständlichkeit über Jahre: Wie altert "
-                           "dieser Ansatz, wie schwer ist eine spätere Änderung, welche Schulden "
-                           "entstehen? Nenne konkrete Wartungs-Risiken am realen Repo-Stand.",
+            "lens_prompt": "You are the long-term maintainer of this codebase. Judge the question solely "
+                           "by maintainability, extensibility and comprehensibility over years: how does "
+                           "this approach age, how hard is a later change, what debt accrues? Name "
+                           "concrete maintenance risks against the real repo state.",
             "effort": "high",
         },
         {
             "role": "SRE / Ops",
-            "lens_prompt": "Du bist Site-Reliability-Engineer im Bereitschaftsdienst. Bewerte "
-                           "ausschließlich Betreib-/Observier-/Recover-barkeit: Deployment, Rollback, "
-                           "Failure-Modes, Monitoring, Toil. Was bricht um 3 Uhr nachts und wie "
-                           "schnell ist es erkenn-/behebbar?",
+            "lens_prompt": "You are a site-reliability engineer on call. Judge exclusively operability, "
+                           "observability and recoverability: deployment, rollback, failure modes, "
+                           "monitoring, toil. What breaks at 3am and how fast is it detectable/fixable?",
             "effort": "high",
         },
         {
             "role": "Security-Architekt",
-            "lens_prompt": "Du bist Security-Architekt mit Zero-Trust-Mandat. Bewerte ausschließlich "
-                           "die Sicherheits-/Trust-Boundary-Folgen: Angriffsfläche, Secrets/Tenancy, "
-                           "Berechtigungen, Datenfluss-Souveränität. Wo öffnet diese Entscheidung "
-                           "eine Lücke?",
+            "lens_prompt": "You are a security architect with a zero-trust mandate. Judge exclusively the "
+                           "security/trust-boundary consequences: attack surface, secrets/tenancy, "
+                           "permissions, data-flow sovereignty. Where does this decision open a gap?",
             "effort": "high",
         },
         {
             "role": "Performance / Scale",
-            "lens_prompt": "Du bist Performance-Engineer. Bewerte ausschließlich Durchsatz, Latenz, "
-                           "Ressourcen-Profil und Skalierungspfad (inkl. Hardware-Limits wie "
-                           "Bandbreite). Wo ist der Engpass, wie verhält es sich unter Last?",
+            "lens_prompt": "You are a performance engineer. Judge exclusively throughput, latency, "
+                           "resource profile and scaling path (including hardware limits like bandwidth). "
+                           "Where is the bottleneck, how does it behave under load?",
             "effort": "high",
         },
         {
             "role": "Reversibilität / Lock-in",
-            "lens_prompt": "Du bist auf Optionswert spezialisiert. Bewerte allein, wie reversibel "
-                           "diese Entscheidung ist: Lock-in (Vendor/Format/API), Exit-Kosten, "
-                           "Einbahn- vs. Zweibahn-Tür. Wie teuer wäre das Zurückrudern in 12 Monaten?",
+            "lens_prompt": "You specialise in option value. Judge solely how reversible this decision is: "
+                           "lock-in (vendor/format/API), exit costs, one-way vs. two-way door. How "
+                           "expensive would backing out be in 12 months?",
             "effort": "medium",
         },
         {
             "role": "Team-Fit",
-            "lens_prompt": "Du bewertest die Passung zu Team-Skills, vorhandenen Konventionen und "
-                           "Lernkurve. Kann das Team das nachhaltig betreiben/erweitern, oder erzeugt "
-                           "es eine Wissens-Insel?",
+            "lens_prompt": "You judge the fit to team skills, existing conventions and learning curve. "
+                           "Can the team sustainably operate/extend this, or does it create a "
+                           "knowledge island?",
             "effort": "medium",
         },
         {
             "role": "Kosten / TCO",
-            "lens_prompt": "Du bewertest Total-Cost-of-Ownership: Build-, Betriebs-, Lizenz-, Compute- "
-                           "und Opportunitätskosten über den Lebenszyklus — nicht nur die Anschaffung.",
+            "lens_prompt": "You judge total cost of ownership: build, operations, licensing, compute and "
+                           "opportunity cost across the lifecycle — not just acquisition.",
             "effort": "medium",
         },
     ],

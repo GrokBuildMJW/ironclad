@@ -3,7 +3,7 @@
 The core guarantee: ``local-only`` data NEVER goes to an external provider — resolved deterministically
 (fail-closed), enforced at a single chokepoint BEFORE any dispatch, provable in the manifest.
 
-Reiten, nicht duplizieren: this is the RUN-TIME layer over the per-role policy the registry already
+Ride, don't duplicate: this is the RUN-TIME layer over the per-role policy the registry already
 resolved (``registry.resolve.resolve_policy(panel, role)`` → ``perspective.provider_policy``). Here we
 only (a) UPGRADE toward local-only on internal/mixed evidence or repo-context (never downgrade), (b)
 pick a substrate, (c) hard-guard the choice, (d) downgrade the code-CLI permission to read-only, (e)

@@ -17,43 +17,41 @@ PANEL = Panel(
     roles=[
         {
             "role": "Jurisdiktion: EU",
-            "lens_prompt": "Du bist Regulierungs-Analyst für die EU. Bewerte die Frage strikt nach "
-                           "geltendem und absehbarem EU-Recht (Verordnungen/Richtlinien, einschlägige "
-                           "Behörden). Zitiere konkrete Rechtsakte/Artikel; markiere Unsicherheit "
-                           "explizit.",
+            "lens_prompt": "You are a regulatory analyst for the EU. Judge the question strictly by "
+                           "current and foreseeable EU law (regulations/directives, relevant agencies). "
+                           "Cite concrete legal acts/articles; flag uncertainty explicitly.",
             "effort": "high",
         },
         {
             "role": "Jurisdiktion: US",
-            "lens_prompt": "Du bist Regulierungs-Analyst für die USA (Bund + relevante Bundesstaaten). "
-                           "Bewerte nach geltendem US-Recht/Regulator-Guidance; nenne Statute/"
-                           "Agency-Rules; trenne Bundesebene von Staatenebene.",
+            "lens_prompt": "You are a regulatory analyst for the US (federal + relevant states). Judge by "
+                           "current US law/regulator guidance; cite statutes/agency rules; separate the "
+                           "federal level from the state level.",
             "effort": "high",
         },
         {
             "role": "Jurisdiktion: UAE",
-            "lens_prompt": "Du bist Regulierungs-Analyst für die VAE (inkl. Freezones wie DIFC/ADGM). "
-                           "Bewerte nach geltendem VAE-Recht und Freezone-Regimen; markiere, wo "
-                           "Onshore vs. Freezone abweicht.",
+            "lens_prompt": "You are a regulatory analyst for the UAE (incl. free zones like DIFC/ADGM). "
+                           "Judge by current UAE law and free-zone regimes; flag where onshore vs. free "
+                           "zone diverge.",
             "effort": "high",
         },
         {
             "role": "Markt-Analyst",
-            "lens_prompt": "Du bewertest die praktischen Markt-/Geschäftsfolgen der Regulierung: "
-                           "Welche Geschäftsmodelle werden ermöglicht/blockiert, welche Marktdynamik "
-                           "entsteht?",
+            "lens_prompt": "You judge the practical market/business consequences of the regulation: which "
+                           "business models are enabled/blocked, what market dynamic emerges?",
             "effort": "medium",
         },
         {
             "role": "Compliance / Enforcement",
-            "lens_prompt": "Du bewertest die Durchsetzungs-Realität: Wie aktiv wird vollzogen, welche "
-                           "Strafen/Präzedenz-Bußen, was ist gelebte Praxis vs. Buchstabe?",
+            "lens_prompt": "You judge enforcement reality: how actively is it enforced, what "
+                           "penalties/precedent fines, what is lived practice vs. the letter of the law?",
             "effort": "medium",
         },
         {
             "role": "Präzedenz / Case-Law",
-            "lens_prompt": "Du bewertest einschlägige Rechtsprechung/Verwaltungs-Präzedenz: Welche "
-                           "Fälle prägen die Auslegung, wohin tendiert die Linie?",
+            "lens_prompt": "You judge relevant case law/administrative precedent: which cases shape the "
+                           "interpretation, where is the line trending?",
             "effort": "high",
         },
     ],

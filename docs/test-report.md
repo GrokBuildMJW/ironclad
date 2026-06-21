@@ -44,7 +44,7 @@ the **462** total (453 offline + 9 live).
 | **Provider-router / dispatch (P0)** (backend registry, routing policy, artifact routing, spill/fallback, setup-types) | `dispatch`, `router`, `providers`, `providers_config`, `artifact_routing`, `offload_topology` | 69 |
 | **Memory & context** (Mem0 client, chunking, RAG, summary, deep query, vault reconcile, warm tier) | `memory`, `memory_chunking`, `worker_memory`, `context_rag`, `context_summary`, `deep_query`, `reconcile_vault`, `warm` | 77 |
 | **Open plugin surface** (discover + expose `skills/*` plugins, no core patch) | `plugins` | 7 |
-| **Orchestration state** (TaskStore lifecycle/dedup, vorhaben, autoplan, state e2e) | `taskstore`, `vorhaben`, `autoplan`, `state_e2e` | 40 |
+| **Orchestration state** (TaskStore lifecycle/dedup, initiative, autoplan, state e2e) | `taskstore`, `initiative`, `autoplan`, `state_e2e` | 40 |
 | **Parallelism** (governed fan-out, in-engine tool, single-writer reduce, parallel router) | `workers`, `parallel_tool`, `worker_reduce`, `parallel_router` | 29 |
 | **Thin client + BYO code-agent** (agent pool, `GX10_AGENT_CMD` template, managed transport) | `client_pool`, `client_transport` | 14 |
 | **Runtime-aware output & language** (encoding safety, color gating, reply language) | `output`, `language` | 14 |

@@ -64,6 +64,11 @@ export class FocusManager {
     return this.enabled ? this.activeId : null;
   }
 
+  /** True when at least one active focusable is registered — Tab only navigates focus then. */
+  hasFocusables(): boolean {
+    return this.enabled && this.focusables.some((f) => f.isActive);
+  }
+
   focus(id: string): void {
     if (this.focusables.some((f) => f.id === id && f.isActive)) {
       this.activeId = id;
@@ -159,9 +164,14 @@ export function useFocusManager(): {
   );
 }
 
-/** Turn a Tab / Shift+Tab keypress into a focus move. Returns true if it consumed the key. */
+/** Turn a Tab / Shift+Tab keypress into a focus move. Returns true if it consumed the key.
+ *
+ * Only consumes Tab when there is actually something to focus (>=1 active focusable). Without that
+ * guard the manager swallowed EVERY Tab even with zero focusables, so it never reached the app's
+ * useInput — and the slash-command menu's Tab-completion silently did nothing (#17). When the app
+ * registers no focusables (the current TUI), Tab now falls through to useInput. */
 export function handleFocusKey(manager: FocusManager, key: Key): boolean {
-  if (key.tab && !key.ctrl && !key.meta) {
+  if (key.tab && !key.ctrl && !key.meta && manager.hasFocusables()) {
     if (key.shift) manager.focusPrevious();
     else manager.focusNext();
     return true;

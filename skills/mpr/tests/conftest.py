@@ -14,6 +14,8 @@ lives in the standalone entry ``skills/mpr/skills/mpr_research.py``.
 import sys
 from pathlib import Path
 
+import pytest
+
 # skills/mpr/tests/conftest.py → parents: [0]=tests [1]=mpr [2]=skills [3]=repo-root
 _SKILLS = Path(__file__).resolve().parents[2]            # skills/   → import mpr.*
 _ROOT = Path(__file__).resolve().parents[3]              # repo root
@@ -26,3 +28,14 @@ _CORE = (_ROOT / "core") if (_ROOT / "core").is_dir() else _ROOT
 for _p in (_SKILLS, _ENGINE, _CORE):
     if str(_p) not in sys.path:
         sys.path.insert(0, str(_p))
+
+
+@pytest.fixture(autouse=True)
+def _reset_render_language():
+    """The template renderers read a module-global render language (i18n._ACTIVE_LANG, set by
+    synthesize()). A test that synthesizes in ``de`` would otherwise leak that into later
+    template-direct tests. Reset to the English default before AND after each test (#44)."""
+    from mpr import i18n
+    i18n.use_language("en")
+    yield
+    i18n.use_language("en")

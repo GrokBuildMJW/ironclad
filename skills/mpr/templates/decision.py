@@ -7,11 +7,13 @@ machine-guaranteed; only the rationales/notes are LLM prose.
 """
 from __future__ import annotations
 
+import re
 from typing import List, Optional, Tuple
 
 from pydantic import BaseModel, Field
 
 from ..conflicts import Conflict
+from .. import i18n
 from ._common import conflict_zones_md, extract_json, raw_with_conflicts, warnings_block
 
 
@@ -55,20 +57,31 @@ def render_decision(dm: DecisionMatrix, conflicts: List[Conflict], warnings: Lis
     lines: List[str] = []
     if warnings:
         lines += [warnings_block(warnings), ""]
-    lines.append("| Kriterium (Gew.) | " + " | ".join(dm.options) + " |")
+    lines.append(i18n.t("| Criterion (wt.) | ", "templates", "criterion_header")
+                 + " | ".join(dm.options) + " |")
     lines.append("|---|" + "|".join("--:" for _ in dm.options) + "|")
     for crit in dm.criteria:
         row = " | ".join(str(cellmap.get((o, crit.name), "–")) for o in dm.options)
         lines.append(f"| {crit.name} (×{crit.weight}) | {row} |")
-    lines.append("| **Gewichteter Score** | "
+    lines.append(i18n.t("| **Weighted score** | ", "templates", "weighted_score")
                  + " | ".join(f"**{scores[o]}**" for o in dm.options) + " |")
     lines.append("")
-    lines.append(f"**Empfehlung:** **{dm.recommendation}** — {dm.recommendation_rationale}")
+    lines.append(f"{i18n.t('**Recommendation:**', 'templates', 'recommendation')} "
+                 f"**{dm.recommendation}** — {dm.recommendation_rationale}")
     if scores:
         top = max(dm.options, key=lambda o: scores[o])
         if top != dm.recommendation:
-            lines.append(f"> ⚠ Empfehlung weicht vom Top-Score ({top}) ab — Begründung beachten.")
-    lines.append(f"**Rückzugsoption:** {dm.fallback} — auslösen wenn {dm.fallback_trigger}.")
+            lines.append(i18n.t("> ⚠ Recommendation deviates from the top score ({top}) — see rationale.",
+                                "templates", "reco_deviates").format(top=top))
+    # The label already says "trigger when"/"auslösen wenn"; the model often restates the conjunction
+    # ("Wenn …"/"When …") and ends its trigger with a period → "auslösen wenn Wenn … sind.." (#49).
+    # Strip a leading conjunction and emit exactly one terminal period.
+    trigger = re.sub(r"^(wenn|falls|when|if)\s+", "", (dm.fallback_trigger or "").strip(), flags=re.IGNORECASE)
+    fb_line = (f"{i18n.t('**Fallback:**', 'templates', 'fallback')} {dm.fallback} — "
+               f"{i18n.t('trigger when', 'templates', 'fallback_trigger')} {trigger}").rstrip()
+    if not fb_line.endswith((".", "!", "?")):
+        fb_line += "."
+    lines.append(fb_line)
     cz = conflict_zones_md(conflicts)
     if cz:
         lines += ["", cz]
@@ -86,9 +99,9 @@ def validate_decision(body: str, conflicts: List[Conflict]) -> Tuple[str, bool]:
 
     warnings: List[str] = []
     if len(dm.options) < 2:
-        warnings.append(f"Weniger als 2 Optionen ({len(dm.options)})")
+        warnings.append(i18n.t("Fewer than 2 options ({n})", "templates", "warn_few_options").format(n=len(dm.options)))
     if len(dm.criteria) < 2:
-        warnings.append(f"Weniger als 2 Kriterien ({len(dm.criteria)})")
+        warnings.append(i18n.t("Fewer than 2 criteria ({n})", "templates", "warn_few_criteria").format(n=len(dm.criteria)))
     expected = len(dm.options) * len(dm.criteria)
     # Count UNIQUE cells that actually map onto a declared (option, criterion) pair — not just
     # len(cells). The LLM sometimes emits cells whose option/criterion strings don't match the lists
@@ -99,15 +112,18 @@ def validate_decision(body: str, conflicts: List[Conflict]) -> Tuple[str, bool]:
     mapped = len({(c.option, c.criterion) for c in dm.cells
                   if c.option in opt_set and c.criterion in crit_set})
     if expected and mapped == 0:
-        warnings.append("Matrix ohne bewertbare Zellen — Perspektiven lieferten keine Kriterien-Scores "
-                        "(Prämisse evtl. zurückgewiesen); Empfehlung mit Vorsicht behandeln")
+        warnings.append(i18n.t("Matrix has no scorable cells — perspectives gave no criterion scores "
+                               "(premise possibly rejected); treat the recommendation with caution",
+                               "templates", "warn_no_cells"))
     elif mapped < expected:
-        warnings.append(f"Matrix unvollständig ({mapped}/{expected} bewertbare Zellen)")
+        warnings.append(i18n.t("Matrix incomplete ({mapped}/{expected} scorable cells)",
+                               "templates", "warn_matrix_incomplete").format(mapped=mapped, expected=expected))
     if dm.fallback.strip().lower() == dm.recommendation.strip().lower():
-        warnings.append("Rückzugsoption = Empfehlung (kein belastbarer Fallback identifiziert)")
+        warnings.append(i18n.t("Fallback = recommendation (no robust fallback identified)",
+                               "templates", "warn_fallback_eq_reco"))
     # NOTE (LB-7): we deliberately do NOT warn when a blocking conflict isn't mirrored in conflict_notes.
     # That was internal bookkeeping that leaked into the reader-facing report — and it is redundant: the
-    # conflict is rendered in its own "Konfliktzonen" section AND recorded in the manifest's conflicts list.
+    # conflict is rendered in its own "Conflict zones" section AND recorded in the manifest's conflicts list.
     # Reader-relevant caveats (fallback==recommendation, incomplete matrix) DO stay as warnings.
 
     # The JSON parsed + the schema validated → the rendered matrix is USABLE. Soft quality warnings are

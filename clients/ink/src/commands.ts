@@ -49,7 +49,7 @@ export const COMMANDS: readonly Command[] = [
   {name: 'autopilot', scope: 'server', usage: 'on|off', desc: 'autopilot'},
   {name: 'autoplan', scope: 'server', usage: 'on|off [N]', desc: 'auto-plan the next tasks'},
   {name: 'log-terminal', scope: 'server', usage: 'on|off', desc: 'live autopilot log window'},
-  {name: 'vorhaben', scope: 'server', usage: 'new <name> --typ mpr|software | list | use <slug> | active | reconcile', desc: 'manage the vorhaben-centric vault (artefact home)'},
+  {name: 'initiative', scope: 'server', usage: 'new <name> --type mpr|software | list | use <slug> | active | reconcile', desc: 'manage the initiative-centric vault (artefact home)'},
   {name: 'doctor', scope: 'server', desc: 'read-only preflight report'},
 ];
 

@@ -43,7 +43,7 @@ def test_fallback_must_differ_from_recommendation():
     # validated, so it's usable; only a hard parse/schema failure degrades.
     rendered, valid = validate_template("decision-matrix", _decision_body(rec="A", fallback="A"), [])
     assert valid is True
-    assert "Rückzugsoption = Empfehlung" in rendered  # visible warning, still rendered
+    assert "Fallback = recommendation" in rendered  # visible warning, still rendered
 
 
 def test_blocking_conflict_appears_in_body():
@@ -52,7 +52,7 @@ def test_blocking_conflict_appears_in_body():
                           sides=[ConflictSide(roles=["A"], stance="top: X"),
                                  ConflictSide(roles=["B"], stance="top: Y")])]
     rendered, _ = validate_template("decision-matrix", _decision_body(), conflicts)
-    assert "Konfliktzonen" in rendered
+    assert "Conflict zones" in rendered
     assert "blocking" in rendered and "top recommendation" in rendered
 
 
@@ -66,21 +66,32 @@ def test_unreferenced_blocking_conflict_is_valid_not_degraded():
                                  ConflictSide(roles=["B"], stance="top: Y")])]
     rendered, valid = validate_template("decision-matrix", _decision_body(), conflicts)  # conflict_notes=[]
     assert valid is True                                          # NOT degraded
-    assert "nicht in conflict_notes referenziert" not in rendered # LB-7: internal note suppressed
-    assert "Konfliktzonen" in rendered and "top recommendation" in rendered  # conflict still surfaced
+    assert "not referenced in conflict_notes" not in rendered     # LB-7: internal note suppressed
+    assert "Conflict zones" in rendered and "top recommendation" in rendered  # conflict still surfaced
     assert "**14**" in rendered and "**17**" in rendered          # the real matrix is there
 
 
 def test_recommendation_deviation_from_top_score_warns():
     # recommend A (score 14) while B (17) tops → a deviation note must appear.
     rendered, _ = validate_template("decision-matrix", _decision_body(rec="A", fallback="B"), [])
-    assert "weicht vom Top-Score" in rendered
+    assert "deviates from the top score" in rendered
+
+
+def test_fallback_trigger_no_double_conjunction_or_period():
+    # #49: the label already prepends "trigger when"; the model restates "When …" and ends with "." →
+    # would render "trigger when When … rises.." . Normalize: strip the leading conjunction + single period.
+    body = json.loads(_decision_body())
+    body["fallback_trigger"] = "When the load rises sharply."
+    rendered, _ = validate_template("decision-matrix", json.dumps(body), [])
+    assert "trigger when When" not in rendered            # no doubled conjunction
+    assert "rises sharply.." not in rendered              # no doubled period
+    assert "trigger when the load rises sharply." in rendered
 
 
 def test_decision_degenerate_matrix_warns_not_evaluable():
     # LOK-13: the LLM emitted cells whose option/criterion strings don't match the declared lists →
     # the matrix maps NOTHING (all "–", score 0) yet is "complete" by count. Must flag honestly
-    # ("ohne bewertbare Zellen") instead of presenting an empty matrix with an invented recommendation.
+    # ("no scorable cells") instead of presenting an empty matrix with an invented recommendation.
     body = json.dumps({
         "options": ["A", "B"],
         "criteria": [{"name": "Wartbarkeit", "weight": 2}, {"name": "Kosten", "weight": 3}],
@@ -93,7 +104,7 @@ def test_decision_degenerate_matrix_warns_not_evaluable():
     })
     rendered, valid = validate_template("decision-matrix", body, [])
     assert valid is True                          # parses → usable form, soft warning (LB-6)
-    assert "ohne bewertbare Zellen" in rendered   # honest degenerate-matrix flag
+    assert "no scorable cells" in rendered        # honest degenerate-matrix flag
     assert "**0**" in rendered                    # scores really are 0 (nothing mapped)
 
 
@@ -108,8 +119,8 @@ def test_evidence_tier_demoted_conservatively():
         ],
     })
     rendered, valid = validate_template("evidence-report", body, [])
-    low_idx = rendered.index("### Niedrige Konfidenz")
-    high_idx = rendered.index("### Hohe Konfidenz")          # the well-supported claim stays high
+    low_idx = rendered.index("### Low confidence")
+    high_idx = rendered.index("### High confidence")        # the well-supported claim stays high
     high_block = rendered[high_idx:low_idx]                  # sections render high → medium → low
     assert "Gut belegt" in high_block
     assert "Unbelegte Behauptung" not in high_block          # demoted out of high
@@ -136,7 +147,7 @@ def test_comparison_has_gaps_opportunities():
         "gaps": ["UX hinkt hinterher"], "opportunities": ["Preis-Differenzierung"],
     })
     rendered, valid = validate_template("comparison-matrix", body, [])
-    assert "### Lücken" in rendered and "### Chancen" in rendered
+    assert "### Gaps" in rendered and "### Opportunities" in rendered
     assert "UX hinkt hinterher" in rendered and valid is True
 
 
@@ -171,16 +182,16 @@ def _risk_body(mitig="Backup-Strategie"):
 def test_risk_register_renders_table_worst_first():
     rendered, valid = validate_template("risk-register", _risk_body(), [])
     assert valid is True
-    assert "| Risiko | Schwere | Eintritt | Mitigation | Owner |" in rendered
+    assert "| Risk | Severity | Likelihood | Mitigation | Owner |" in rendered
     # worst exposure (high/high) must lead the low/low risk.
     assert rendered.index("Single Point of Failure") < rendered.index("Geringes Reputationsrisiko")
-    assert "hoch" in rendered and "Wer trägt das Restrisiko?" in rendered
+    assert "high" in rendered and "Wer trägt das Restrisiko?" in rendered
 
 
 def test_risk_register_warns_on_missing_mitigation():
     # LB-6: soft warning rendered inline but valid stays True (the register parsed + validated).
     rendered, valid = validate_template("risk-register", _risk_body(mitig=""), [])
-    assert valid is True and "ohne Mitigation" in rendered
+    assert valid is True and "without mitigation" in rendered
 
 
 def test_risk_register_keeps_conflict_zones_on_parse_fail():
@@ -189,3 +200,32 @@ def test_risk_register_keeps_conflict_zones_on_parse_fail():
                                  ConflictSide(roles=["Finanziell"], stance="fragil")])]
     rendered, valid = validate_template("risk-register", "kein json", conflicts)
     assert valid is False and "lieferkette" in rendered
+
+
+# ── #44 i18n: English is the source/default; ``de`` is a shipped locale overlay ───────────────────────
+def test_render_language_default_is_english():
+    # No use_language() call → the renderers must emit the English source headings.
+    rendered, _ = validate_template("decision-matrix", _decision_body(), [])
+    assert "| Criterion (wt.) |" in rendered and "| **Weighted score** |" in rendered
+    assert "**Recommendation:**" in rendered and "**Fallback:**" in rendered
+
+
+def test_render_language_de_overlay_round_trip():
+    # The autouse _reset_render_language fixture restores "en" afterward, so this can't leak.
+    from mpr import i18n
+    i18n.use_language("de")
+    dec, _ = validate_template("decision-matrix", _decision_body(), [])
+    assert "| Kriterium (Gew.) |" in dec and "**Empfehlung:**" in dec and "**Rückzugsoption:**" in dec
+    risk, _ = validate_template("risk-register", _risk_body(), [])
+    assert "| Risiko | Schwere | Eintritt | Mitigation | Owner |" in risk and "hoch" in risk
+
+
+def test_decision_rationale_prompt_forbids_invented_sums():
+    # #48: the decision synthesis instruction must forbid the model from stating its own numeric sums in
+    # recommendation_rationale (MPR computes the weighted score) — en source + de overlay both carry it.
+    from mpr.templates.prompts import _MODE_EXTRA
+    from mpr import i18n
+    en = _MODE_EXTRA["decision"]
+    assert "recommendation_rationale" in en and "numeric" in en.lower()
+    de = i18n.localized(en, "de", "synthesis", "mode_extra", "decision")
+    assert de != en and "recommendation_rationale" in de and "erfundenen Zahlen" in de

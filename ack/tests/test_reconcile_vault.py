@@ -27,16 +27,16 @@ def _in_project(tmp_path, monkeypatch):
     return tmp_path
 
 
-def _decision(slug: str, name: str, title: str, datum: str, tags: str, body: str = "") -> None:
+def _decision(slug: str, name: str, title: str, date: str, tags: str, body: str = "") -> None:
     p = Path("vault") / slug / "decisions" / f"{name}.md"
     p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(f"---\ntyp: decision\ntitel: {title}\nerstellt: {datum}\ntags: {tags}\n---\n\n"
+    p.write_text(f"---\ntype: decision\ntitle: {title}\ncreated: {date}\ntags: {tags}\n---\n\n"
                  f"# {title}\n\n{body}\n", encoding="utf-8")
 
 
 # ── INDEX.md generation ───────────────────────────────────────
 def test_index_lists_docs_grouped_with_wikilinks(tmp_path):
-    gx10.vorhaben_new("Proj", "software")
+    gx10.initiative_new("Proj", "software")
     _decision("proj", "db", "Datenbank-Wahl", "2026-06-20", "[db, infra]", "Postgres.")
     _decision("proj", "cache", "Cache-Wahl", "2026-06-19", "[infra, cache]", "Valkey.")
     gx10.reconcile_vault("proj")
@@ -50,7 +50,7 @@ def test_index_lists_docs_grouped_with_wikilinks(tmp_path):
 
 
 def test_index_excludes_work_plumbing_and_self(tmp_path):
-    gx10.vorhaben_new("Proj", "software")
+    gx10.initiative_new("Proj", "software")
     (Path("vault/proj/.work/handovers")).mkdir(parents=True, exist_ok=True)
     (Path("vault/proj/.work/handovers/KGC-1_OPUS.md")).write_text("handover", encoding="utf-8")
     gx10.reconcile_vault("proj")
@@ -60,7 +60,7 @@ def test_index_excludes_work_plumbing_and_self(tmp_path):
 
 
 def test_index_preserves_manual_content_outside_block(tmp_path):
-    gx10.vorhaben_new("Proj", "software")
+    gx10.initiative_new("Proj", "software")
     idxp = tmp_path / "vault" / "proj" / "INDEX.md"
     idxp.write_text("# Proj — INDEX\n\nHANDNOTE keep me\n", encoding="utf-8")
     gx10.reconcile_vault("proj")
@@ -70,7 +70,7 @@ def test_index_preserves_manual_content_outside_block(tmp_path):
 
 
 def test_index_idempotent(tmp_path):
-    gx10.vorhaben_new("Proj", "software")
+    gx10.initiative_new("Proj", "software")
     _decision("proj", "db", "DB-Wahl", "2026-06-20", "[infra]")
     gx10.reconcile_vault("proj")
     idxp = tmp_path / "vault" / "proj" / "INDEX.md"
@@ -81,7 +81,7 @@ def test_index_idempotent(tmp_path):
 
 # ── [[links]] injection ───────────────────────────────────────
 def test_related_block_injected_on_shared_tag_and_title_ref(tmp_path):
-    gx10.vorhaben_new("Proj", "software")
+    gx10.initiative_new("Proj", "software")
     _decision("proj", "db", "Datenbank-Wahl", "2026-06-20", "[infra]", "Postgres.")
     _decision("proj", "cache", "Cache-Wahl", "2026-06-19", "[infra]", "Siehe Datenbank-Wahl. Valkey.")
     gx10.reconcile_vault("proj")
@@ -92,7 +92,7 @@ def test_related_block_injected_on_shared_tag_and_title_ref(tmp_path):
 
 
 def test_related_injection_idempotent(tmp_path):
-    gx10.vorhaben_new("Proj", "software")
+    gx10.initiative_new("Proj", "software")
     _decision("proj", "db", "DB-Wahl", "2026-06-20", "[infra]")
     _decision("proj", "cache", "Cache-Wahl", "2026-06-19", "[infra]")
     gx10.reconcile_vault("proj")
@@ -104,7 +104,7 @@ def test_related_injection_idempotent(tmp_path):
 
 
 def test_related_block_removed_when_no_longer_related(tmp_path):
-    gx10.vorhaben_new("Proj", "software")
+    gx10.initiative_new("Proj", "software")
     _decision("proj", "db", "DB-Wahl", "2026-06-20", "[infra]")
     _decision("proj", "cache", "Cache-Wahl", "2026-06-19", "[infra]")
     gx10.reconcile_vault("proj")
@@ -116,7 +116,7 @@ def test_related_block_removed_when_no_longer_related(tmp_path):
 
 
 def test_meta_and_links_false_do_not_touch_bodies(tmp_path):
-    gx10.vorhaben_new("Proj", "software")
+    gx10.initiative_new("Proj", "software")
     _decision("proj", "db", "DB-Wahl", "2026-06-20", "[infra]")
     _decision("proj", "cache", "Cache-Wahl", "2026-06-19", "[infra]")
     before_db = (tmp_path / "vault" / "proj" / "decisions" / "db.md").read_text(encoding="utf-8")
@@ -129,27 +129,34 @@ def test_meta_and_links_false_do_not_touch_bodies(tmp_path):
 
 
 def test_reconcile_unknown_slug_is_friendly():
-    assert "kein Vorhaben" in gx10.reconcile_vault("does-not-exist")
+    assert "kein Initiative" in gx10.reconcile_vault("does-not-exist")
 
 
-# ── /vorhaben reconcile command now wired ─────────────────────
+# ── /initiative reconcile command now wired ─────────────────────
 def test_cmd_reconcile_runs_now(tmp_path):
-    gx10.vorhaben_new("Proj", "software")
+    gx10.initiative_new("Proj", "software")
     _decision("proj", "db", "DB-Wahl", "2026-06-20", "[infra]")
-    out = gx10._vorhaben_command("reconcile")
+    out = gx10._initiative_command("reconcile")
     assert "Unit C" not in out                               # no longer the pending placeholder
     assert "indiziert" in out
     assert (tmp_path / "vault" / "proj" / "INDEX.md").is_file()
 
 
 # ── C2: auto-trigger keeps the index fresh after writes ───────
-def test_new_vorhaben_seeds_index(tmp_path):
-    gx10.vorhaben_new("Proj", "software")
+def test_new_initiative_seeds_index(tmp_path):
+    gx10.initiative_new("Proj", "software")
     assert (tmp_path / "vault" / "proj" / "INDEX.md").is_file()   # navigable from creation
 
 
+def test_index_seed_h1_uses_title_not_slug(tmp_path):
+    # #11: the seeded INDEX H1 must use the title (consistent with meta.md/wikilink), not the slug
+    gx10.initiative_new("Mein Projekt", "mpr")
+    idx = (tmp_path / "vault" / "mein-projekt" / "INDEX.md").read_text(encoding="utf-8")
+    assert idx.splitlines()[0] == "# Mein Projekt — INDEX"
+
+
 def test_stage_handover_autoreconciles_index(tmp_path):
-    gx10.vorhaben_new("Proj", "software")
+    gx10.initiative_new("Proj", "software")
     idxp = tmp_path / "vault" / "proj" / "INDEX.md"
     idxp.unlink()                                            # prove the macro re-creates it
     tid = gx10._store().create(
@@ -160,7 +167,7 @@ def test_stage_handover_autoreconciles_index(tmp_path):
 
 def test_autoreconcile_is_index_only_no_body_edits(tmp_path):
     # the auto-trigger must NOT inject Related blocks (links=False) — doc bodies stay untouched
-    gx10.vorhaben_new("Proj", "software")
+    gx10.initiative_new("Proj", "software")
     _decision("proj", "db", "DB-Wahl", "2026-06-20", "[infra]")
     _decision("proj", "cache", "Cache-Wahl", "2026-06-19", "[infra]")
     before = (tmp_path / "vault" / "proj" / "decisions" / "db.md").read_text(encoding="utf-8")

@@ -45,7 +45,7 @@ export GX10_BASE_URL=http://localhost:8000/v1 GX10_MODEL=your-model   # your mod
 
 python engine/server.py &              # 1) the orchestrator (the agent + state)
 python engine/client.py --codedir .    # 2) the client — drives it; type what you want
-#   /vorhaben new demo --typ software   ← create a workspace first (artefacts live under vault/<slug>/)
+#   /initiative new demo --type software   ← create a workspace first (artefacts live under vault/<slug>/)
 #   Read README.md and summarise it.   /   Build add(a,b) in calc.py with a pytest test, and run it.
 ```
 
@@ -56,10 +56,10 @@ write the code, write the test, and run it** — you describe, they build; no pr
 needed.
 
 > **One step first:** any work that produces artefacts (a task, a handover, an MPR run)
-> needs an active **vorhaben** — `/vorhaben new <name> --typ software|mpr`. It is
+> needs an active **initiative** — `/initiative new <name> --type software|mpr`. It is
 > fail-closed: without one the macros refuse rather than scatter state into your project
-> root. Plain Q&A turns need no vorhaben. See
-> [`docs/state-and-vorhaben.md`](docs/state-and-vorhaben.md).
+> root. Plain Q&A turns need no initiative. See
+> [`docs/state-and-initiative.md`](docs/state-and-initiative.md).
 
 ## What you get
 
@@ -82,7 +82,7 @@ needed.
   `sealed`) with an explicit session that seals on disconnect (single-operator).
 - **An open extension surface** — a versioned **[plugin API](docs/plugin-api.md)** (no core
   fork), a **[bring-your-own code-agent CLI](docs/code-agents.md)**, and the **MPR
-  multi-perspective reasoner** (expert role panel → synthesis, `--typ mpr`) built on it.
+  multi-perspective reasoner** (expert role panel → synthesis, `--type mpr`) built on it.
 
 It's a natural reliability layer for **regional open models** too — point it at Falcon,
 Jais or K2 Think via vLLM ([running on other models](docs/models/)) and get fail-closed
@@ -197,7 +197,7 @@ export GX10_API_KEY=...                           # only if your endpoint needs 
 python engine/server.py &
 ( cd clients/ink && npm install && npm install -g . )    # global `ironclad`, like claude / kimi
 ironclad --server http://localhost:8100                  # runs in the current folder (codedir = cwd)
-# then, before the first build/task:  /vorhaben new myproject --typ software
+# then, before the first build/task:  /initiative new myproject --type software
 # zero-Node alternative: python engine/client.py --codedir .   (legacy TUI: engine/tui.py)
 ```
 
@@ -221,9 +221,9 @@ docs/  LICENSE  NOTICE  # guides + Apache-2.0
 ```
 
 At runtime, in your **workdir**, state stays out of the project root: engine machinery is
-hidden under `.ironclad/` (session, warm-cache, the active-vorhaben marker) and every
+hidden under `.ironclad/` (session, warm-cache, the active-initiative marker) and every
 produced artefact lives under `vault/<slug>/` — see
-[`docs/state-and-vorhaben.md`](docs/state-and-vorhaben.md).
+[`docs/state-and-initiative.md`](docs/state-and-initiative.md).
 
 ## Roadmap
 
