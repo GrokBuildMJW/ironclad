@@ -7,6 +7,17 @@ $proj = (Get-Location).Path
 $cfgPath = Join-Path $proj ".ironclad\config.json"
 if (-not (Test-Path $cfgPath)) { Say "no .ironclad in '$proj' — run install\ironclad-install.ps1 in this project first."; exit 2 }
 $cfg = Get-Content $cfgPath -Raw | ConvertFrom-Json
+$type = if ($cfg.type) { "$($cfg.type)".Trim().ToLower() } else { "desktop" }
+
+# spark: thin client → a remote orchestrator (no local engine/venv). 'desktop' (default) runs the engine locally.
+if ($type -eq 'spark') {
+  $server = if ($env:GX10_SERVER_URL) { $env:GX10_SERVER_URL } elseif ($cfg.serverUrl) { $cfg.serverUrl } else { "" }
+  if (-not $server) { Say "(spark) no serverUrl in config — re-install."; exit 2 }
+  if (-not ($cfg.clientCli -and (Get-Command node -ErrorAction SilentlyContinue))) { Say "(spark) needs the Node client — re-install with Node present."; exit 2 }
+  Say "(spark) client -> $server  (codedir $proj)"
+  node "$($cfg.clientCli)" --server $server --codedir $proj
+  exit 0
+}
 
 $port      = if ($cfg.port) { [int]$cfg.port } else { 8100 }
 $base      = "http://127.0.0.1:$port"
@@ -43,10 +54,16 @@ if (-not $reuse) {
   $env:GX10_MPR        = "1"
   $env:GX10_LANGUAGE   = if ($cfg.language) { $cfg.language } else { "en" }
   $env:GX10_ORCHESTRATOR_VERSION = $stamp
+  # optional, config-driven tuning (absent in a default install → engine defaults; a deployment may set them)
+  if ($cfg.warmUrl)               { $env:GX10_WARM_URL = $cfg.warmUrl }
+  if ($cfg.claudeBin)             { $env:GX10_CLAUDE_BIN = $cfg.claudeBin }
+  if ($cfg.fanoutConcurrency)     { $env:GX10_FANOUT_CONCURRENCY = "$($cfg.fanoutConcurrency)" }
+  if ($cfg.workersMaxTokens)      { $env:GX10_WORKERS_MAX_TOKENS = "$($cfg.workersMaxTokens)" }
+  if ($cfg.workersMaxBatchTokens) { $env:GX10_WORKERS_MAX_BATCH_TOKENS = "$($cfg.workersMaxBatchTokens)" }
   Say "starting the engine ($base, version $stamp) ..."
-  $started = Start-Process -FilePath $venvPy `
-    -ArgumentList @("$engineDir\server.py","--host","127.0.0.1","--port","$port") `
-    -WindowStyle Hidden -PassThru
+  $svArgs = @("$engineDir\server.py","--host","127.0.0.1","--port","$port")
+  if ($cfg.engineConfig -and (Test-Path $cfg.engineConfig)) { $svArgs += @("--config","$($cfg.engineConfig)") }
+  $started = Start-Process -FilePath $venvPy -ArgumentList $svArgs -WindowStyle Hidden -PassThru
   for ($i=0; $i -lt 30; $i++) { if (Probe "$base/health") { break }; Start-Sleep -Milliseconds 700 }
   if (-not (Probe "$base/health")) { Say "ERROR: engine did not become healthy."; if ($started) { Stop-Process -Id $started.Id -Force -ErrorAction SilentlyContinue }; exit 1 }
 }

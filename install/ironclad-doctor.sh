@@ -8,11 +8,11 @@ CFG="$PROJ/.ironclad/config.json"
 [ -f "$CFG" ] || { say "no .ironclad in '$PROJ' — run install/ironclad-install.sh in this project first."; exit 2; }
 
 # unit-separator (\x1f) so empty fields + spaced paths survive (Tab is IFS-whitespace → read collapses them)
-IFS=$'\x1f' read -r ROOT VENV ENGINE_DIR CLIENT_CLI BASE_URL MEMORY_URL MODEL PORT LANGUAGE < <(python3 - "$CFG" <<'PY'
+IFS=$'\x1f' read -r ROOT VENV ENGINE_DIR CLIENT_CLI BASE_URL MEMORY_URL MODEL PORT LANGUAGE TYPE SERVER_URL < <(python3 - "$CFG" <<'PY'
 import json, sys
 c = json.load(open(sys.argv[1], encoding="utf-8"))
 keys = [("root",""),("venv",""),("engineDir",""),("clientCli",""),("baseUrl",""),
-        ("memoryUrl",""),("model",""),("port","8100"),("language","en")]
+        ("memoryUrl",""),("model",""),("port","8100"),("language","en"),("type","desktop"),("serverUrl","")]
 print("\x1f".join(str(c.get(k, d)) for k, d in keys))
 PY
 )
@@ -27,6 +27,14 @@ except urllib.error.HTTPError: print("reachable")          # 4xx still means the
 except Exception: print("NOT reachable")
 PY
 }
+
+if [ "$TYPE" = "spark" ]; then
+  SERVER="${GX10_SERVER_URL:-$SERVER_URL}"
+  say "type=spark (thin client, no local engine)."
+  if [ -n "$SERVER" ]; then say "orchestrator ($SERVER): $(reach "$SERVER/health")"
+  else say "no serverUrl in config — re-install."; fi
+  exit 0
+fi
 
 STAMP="unknown"; [ -f "$ENGINE_DIR/VERSION" ] && STAMP="$(tr -d '[:space:]' < "$ENGINE_DIR/VERSION")"
 say "type=desktop  local engine version=$STAMP  model=$MODEL  language=$LANGUAGE"

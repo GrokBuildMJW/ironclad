@@ -9,6 +9,15 @@ Released versions are listed below; upcoming work accumulates under *Unreleased*
 
 ## [Unreleased]
 
+## [0.0.7] - 2026-06-21
+
+### Changed
+- **Installer is type-aware + config-driven.** The `ironclad`/`ironclad-doctor` launchers now support both a
+  local engine (`type: desktop`, default) and a thin client against a remote orchestrator (`type: spark`),
+  and read optional tuning (`engineConfig`, `warmUrl`, `claudeBin`, `fanoutConcurrency`, `workersMaxTokens`,
+  `workersMaxBatchTokens`) from the project config — absent → engine defaults, so a deployment can tune
+  without editing scripts. Adds `install/ironclad-commands.ps1` (profile shim). All still secret-free.
+
 ## [0.0.6] - 2026-06-21
 
 ### Added

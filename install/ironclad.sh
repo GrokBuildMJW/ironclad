@@ -10,14 +10,25 @@ CFG="$PROJ/.ironclad/config.json"
 
 # read the (install-written) config — unit-separator (\x1f) so empty fields (e.g. clientCli) and paths
 # with spaces both survive (a Tab is IFS-whitespace → read would collapse empty fields and shift values).
-IFS=$'\x1f' read -r ROOT VENV ENGINE_DIR CLIENT_CLI BASE_URL MEMORY_URL MODEL PORT LANGUAGE < <(python3 - "$CFG" <<'PY'
+IFS=$'\x1f' read -r ROOT VENV ENGINE_DIR CLIENT_CLI BASE_URL MEMORY_URL MODEL PORT LANGUAGE ENGINE_CONFIG WARM_URL TYPE SERVER_URL < <(python3 - "$CFG" <<'PY'
 import json, sys
 c = json.load(open(sys.argv[1], encoding="utf-8"))
 keys = [("root",""),("venv",""),("engineDir",""),("clientCli",""),("baseUrl",""),
-        ("memoryUrl",""),("model",""),("port","8100"),("language","en")]
+        ("memoryUrl",""),("model",""),("port","8100"),("language","en"),("engineConfig",""),
+        ("warmUrl",""),("type","desktop"),("serverUrl","")]
 print("\x1f".join(str(c.get(k, d)) for k, d in keys))
 PY
 )
+
+# spark: thin client → a remote orchestrator (no local engine/venv). 'desktop' (default) runs it locally.
+if [ "$TYPE" = "spark" ]; then
+  SERVER="${GX10_SERVER_URL:-$SERVER_URL}"
+  [ -n "$SERVER" ] || { say "(spark) no serverUrl in config — re-install."; exit 2; }
+  [ -n "$CLIENT_CLI" ] && command -v node >/dev/null 2>&1 || { say "(spark) needs the Node client — re-install with Node present."; exit 2; }
+  say "(spark) client -> $SERVER  (codedir $PROJ)"
+  exec node "$CLIENT_CLI" --server "$SERVER" --codedir "$PROJ"
+fi
+
 BASE="http://127.0.0.1:${PORT}"
 # venv interpreter: bin/python (POSIX) or Scripts/python.exe (venv made under Git-Bash on Windows)
 PY=""; for p in "$VENV/bin/python" "$VENV/Scripts/python.exe"; do [ -x "$p" ] && { PY="$p"; break; }; done
@@ -58,10 +69,12 @@ fi
 
 if [ "$REUSE" -eq 0 ]; then
   say "starting the engine ($BASE, version $STAMP) ..."
+  SV_ARGS=( "$ENGINE_DIR/server.py" --host 127.0.0.1 --port "$PORT" )
+  [ -n "$ENGINE_CONFIG" ] && [ -f "$ENGINE_CONFIG" ] && SV_ARGS+=( --config "$ENGINE_CONFIG" )
   GX10_SETUP_TYPE=local GX10_BASE_URL="$BASE_URL" GX10_MEMORY_URL="$MEMORY_URL" GX10_MODEL="$MODEL" \
   GX10_WORKDIR="$PROJ" GX10_PLUGINS_DIR="$ROOT/skills" GX10_MPR=1 GX10_LANGUAGE="$LANGUAGE" \
-  GX10_ORCHESTRATOR_VERSION="$STAMP" \
-    nohup "$PY" "$ENGINE_DIR/server.py" --host 127.0.0.1 --port "$PORT" >"$PROJ/.ironclad/engine.log" 2>&1 &
+  GX10_ORCHESTRATOR_VERSION="$STAMP" ${WARM_URL:+GX10_WARM_URL="$WARM_URL"} \
+    nohup "$PY" "${SV_ARGS[@]}" >"$PROJ/.ironclad/engine.log" 2>&1 &
   STARTED_PID=$!
   for _ in $(seq 1 30); do [ -n "$(probe "$BASE/health")" ] && break; sleep 0.7; done
   [ -n "$(probe "$BASE/health")" ] || { say "ERROR: engine did not become healthy — see $PROJ/.ironclad/engine.log"; [ -n "$STARTED_PID" ] && kill "$STARTED_PID" 2>/dev/null; exit 1; }
