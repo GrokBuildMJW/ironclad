@@ -9,6 +9,21 @@ Released versions are listed below; upcoming work accumulates under *Unreleased*
 
 ## [Unreleased]
 
+## [0.0.6] - 2026-06-21
+
+### Added
+- **One-shot desktop installer** (`install/`, cross-platform, secret-free). Run `install/ironclad-install.sh`
+  (Linux/macOS) or `install\ironclad-install.ps1` (Windows) once from a clone to build a venv, install the
+  engine, build the optional TypeScript client, write a per-project config and wire an `ironclad` command —
+  plus `ironclad` (launcher: engine-ensure + client, version-aware) and `ironclad-doctor` (status). All
+  endpoints default to localhost and are overridable via flags / `GX10_*` env; nothing about a deployment is
+  baked in. See [`install/README.md`](install/README.md), the *One-shot install* block in
+  [`SETUP.md`](SETUP.md), and **Track D** in [`AGENTS.md`](AGENTS.md) (AI-agent install runbook).
+
+### Changed
+- The boundary check (`scripts/ci/check_core_boundary.py`) now also literal-scans `.ps1`/`.sh`, so the
+  installers are held to the same secret-free contract as the rest of `core/`.
+
 ## [0.0.5] - 2026-06-21
 
 ### Changed

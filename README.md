@@ -180,7 +180,18 @@ pip install ironclad-ai             # the ACK library (import ack)
 pip install "ironclad-ai[engine]"  # + the orchestration engine deps
 ```
 
-**Or clone for the full engine + clients** (recommended while pre-release):
+**Or clone + one-shot install** (recommended while pre-release) — builds the venv, engine, client, config
+and an `ironclad` command in a single command (cross-platform, secret-free; endpoints default to localhost):
+
+```bash
+git clone https://github.com/GrokBuildMJW/ironclad.git && cd ironclad
+bash install/ironclad-install.sh        # Windows: install\ironclad-install.ps1   (override: --base-url/--model)
+source ~/.bashrc && ironclad            # Windows: . $PROFILE ; ironclad
+```
+
+See [`install/README.md`](install/README.md) for flags + the doctor.
+
+**Or wire it manually:**
 
 ```bash
 git clone https://github.com/GrokBuildMJW/ironclad.git

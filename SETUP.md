@@ -12,7 +12,32 @@ Prefer to have an AI coding agent do this for you? See **[`AGENTS.md`](AGENTS.md
 
 ## Quick start (copy-paste)
 
-Have **Python 3.10+** and a running **model endpoint**? Install in three commands:
+### One-shot install (recommended)
+
+Have **Python 3.10+**? Clone, then run the bundled installer **once** from the folder you want to drive. It
+builds the venv, installs the engine, builds the optional TypeScript client, writes a project config, and
+wires an `ironclad` command. Endpoints default to localhost — override with a flag or `GX10_*` env.
+
+```bash
+git clone https://github.com/GrokBuildMJW/ironclad.git && cd ironclad
+bash install/ironclad-install.sh                         # or: --base-url http://HOST:8000/v1 --model MODEL
+source ~/.bashrc                                         # activate the `ironclad` command (or ~/.zshrc)
+ironclad                                                 # ensure the engine is up, open the client
+```
+
+```powershell
+# Windows (PowerShell):
+git clone https://github.com/GrokBuildMJW/ironclad.git; cd ironclad
+install\ironclad-install.ps1                             # or: -BaseUrl http://HOST:8000/v1 -Model MODEL
+. $PROFILE ; ironclad
+```
+
+`ironclad-doctor` reports engine version + endpoint reachability. Details: [`install/README.md`](install/README.md).
+No endpoint yet? See §3 / [`docs/dgx-spark.md`](docs/dgx-spark.md).
+
+### Manual (three commands)
+
+Prefer to wire it yourself? Have **Python 3.10+** and a running **model endpoint**:
 
 ```bash
 git clone https://github.com/GrokBuildMJW/ironclad.git && cd ironclad

@@ -17,6 +17,9 @@ a failed check — report the exact error and stop (fail-closed).
   command + its output. Do not mark setup "done" with a failing test.
 - **Don't push or publish** unless explicitly asked.
 
+> Just installing to **use** Ironclad (not develop it)? The fastest path is the bundled one-shot
+> installer — see **Track D**. Track A below is the manual/developer setup.
+
 ## Track A — local development setup
 
 1. **Python ≥ 3.10.** `python --version`. Stop if lower.
@@ -92,6 +95,30 @@ bash scripts/spark-bootstrap.sh \
   missing → report the path; port already in use → report.
 
 Done-C: `/v1/models` and (if requested) `/health` both respond.
+
+## Track D — one-shot desktop install (the bundled installer)
+
+If the task is "install Ironclad on this machine" and the user wants the single-command path, use the
+bundled installer instead of hand-running Track A.6–7. It is **cross-platform and secret-free** — pass the
+endpoint, never bake it in.
+
+1. **From the repo clone, in the project folder to drive**, run the installer for the OS:
+   - macOS / Linux: `bash install/ironclad-install.sh` (add `--base-url http://<host>:8000/v1 --model <name>`
+     if the endpoint is not the localhost default).
+   - Windows / PowerShell: `install\ironclad-install.ps1` (add `-BaseUrl … -Model …`).
+   - Check: it prints `done. Desktop install in <root>` and writes `<project>/.ironclad/config.json`.
+     Stop on any prereq/venv/pip error and report it.
+2. **Activate the command** in the current shell: `source ~/.bashrc` (or `~/.zshrc`) / `. $PROFILE`.
+   - Check: `command -v ironclad` (POSIX) / `Get-Command ironclad` (PowerShell) resolves.
+3. **Verify** with the read-only doctor: `ironclad-doctor`.
+   - Check: it prints the engine version and `engine … reachable` once the engine has been started
+     (the launcher starts it on first `ironclad`). Stop if the model endpoint shows `NOT reachable` —
+     fix the endpoint (Track B/C) before declaring done.
+4. **Smoke a turn:** run `ironclad`, ask a short question, confirm a coherent answer. (An artefact-producing
+   build task first needs `/initiative new <name> --type software`.)
+
+Done-D: the installer completed, `ironclad-doctor` is green, and a turn returns. Never edit the scripts to
+inject a host — pass `--base-url`/`-BaseUrl` or `GX10_BASE_URL`; the repo stays secret-free.
 
 ## Definition of done
 
