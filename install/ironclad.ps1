@@ -51,7 +51,6 @@ if (-not $reuse) {
   $env:GX10_MODEL      = $cfg.model
   $env:GX10_WORKDIR    = $proj
   $env:GX10_PLUGINS_DIR= "$($cfg.root)\skills"
-  $env:GX10_MPR        = "1"
   $env:GX10_LANGUAGE   = if ($cfg.language) { $cfg.language } else { "en" }
   $env:GX10_ORCHESTRATOR_VERSION = $stamp
   # optional, config-driven tuning (absent in a default install → engine defaults; a deployment may set them)

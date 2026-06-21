@@ -75,6 +75,10 @@ them — turning a described capability into a working, tested plugin.
 Design: [ADR-0001](adr/0001-skill-engine-and-library.md) + [`skill-packaging.md`](skill-packaging.md)
 (two skill kinds — typed `CASE`+`run` tools and `SKILL.md` playbooks; doctor+tests gate,
 behavioral eval opt-in; manifest catalogue; `skills/mpr` migrated as the reference built-in).
+Evolving (design): [ADR-0002](adr/0002-core-always-on-skills.md) — the skill/prompt engine + MPR
+become **core, always-on** built-ins (loaded from a fixed core dir, independent of
+`GX10_PLUGINS_DIR`); the plugin surface stays for 3rd-party skills; MPR de-plugined (runtime
+`mpr.enabled`, default on).
 
 ## 4. Broader model & data reach
 

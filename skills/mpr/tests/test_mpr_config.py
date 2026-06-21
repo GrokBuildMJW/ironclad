@@ -21,9 +21,9 @@ from mpr.mpr_config import (
 
 
 # ── §9.1 config ───────────────────────────────────────────────────────────────────────────────────
-def test_default_block_present_and_disabled():
+def test_default_block_present_and_enabled():
     cfg = load_mpr_config(None)
-    assert cfg.enabled is False                         # A/B-gate off by default
+    assert cfg.enabled is True                          # core built-in: runtime toggle default ON (#115)
     assert cfg.audit_level == "full-per-perspective" and cfg.runs_dir == "runs/mpr"
     assert cfg.sovereignty.fail_closed is True and cfg.sovereignty.default_policy == "offloadable"
     assert "spark-vllm" in cfg.providers.pool and cfg.providers.default_offload == "claude-sonnet"
@@ -54,12 +54,13 @@ def test_env_override_enables_and_nested():
     assert cfg.budget.max_cost_usd_per_run == 0.5           # nested env override
 
 
-def test_gx10_mpr_is_load_gate_not_runtime_enable():
-    # GX10_MPR registers the tool (LOAD gate, read by mpr_enabled) — it must NOT flip the runtime
-    # mpr.enabled flag (the in-session /config set toggle, default off). Decoupled load vs runtime.
+def test_legacy_gx10_mpr_load_flag_is_inert():
+    # ADR-0002 #115: the GX10_MPR load gate is removed (MPR is a core built-in, always loaded).
+    # The legacy var is now inert — it does not change the runtime config (default ON; use
+    # GX10_MPR_ENABLED / `mpr.enabled` to toggle live).
     tree = {}
-    _apply_mpr_env(tree, env={"GX10_MPR": "1"})
-    assert load_mpr_config(tree).enabled is False
+    _apply_mpr_env(tree, env={"GX10_MPR": "0"})
+    assert load_mpr_config(tree).enabled is True    # legacy load var ignored; default ON stands
 
 
 def test_provider_pool_no_private_literals():

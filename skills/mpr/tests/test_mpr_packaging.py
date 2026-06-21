@@ -17,7 +17,7 @@ from pathlib import Path
 from _router_fakes import FakeClassifierLLM, persp, registry, run_panel
 from ack.registry import derive_tool_schema
 
-from mpr.entry import Deps, build_case, mpr_enabled, mpr_research_run, run_mpr
+from mpr.entry import Deps, build_case, mpr_research_run, run_mpr
 from mpr.mpr_config import DEFAULT_POOL, DEFAULT_ROUTING
 from mpr.registry.resolve import EFFORT_MAX_TOKENS
 
@@ -84,32 +84,17 @@ def test_run_is_sync():
     assert not inspect.iscoroutinefunction(mpr_research_run)
 
 
-# ── §5 A/B flag gate ──────────────────────────────────────────────────────────────────────────────
-def test_mpr_enabled_gate():
-    assert mpr_enabled({}) is False and mpr_enabled({"GX10_MPR": "0"}) is False
-    assert mpr_enabled({"GX10_MPR": "1"}) is True and mpr_enabled({"GX10_MPR": "true"}) is True
-
-
-def _load_standalone(env):
-    """Load the standalone entry, forcing the A/B gate via a patched mpr_enabled, to check exports."""
+# ── core built-in: always exports the tool (ADR-0002 #115 — no load gate) ──────────────────────────
+def test_standalone_always_exports_tool():
+    """MPR is a core built-in now: the standalone entry ALWAYS exports CASE + run (no GX10_MPR
+    load gate). The live on/off is the runtime config `mpr.enabled` (tested via run() below)."""
     import mpr.entry as E
     path = Path(E.__file__).resolve().parent / "skills" / "mpr_research.py"
-    orig = E.mpr_enabled
-    E.mpr_enabled = lambda _e=None: bool(env.get("GX10_MPR"))
-    try:
-        spec = importlib.util.spec_from_file_location("_mpr_standalone_probe", path)
-        mod = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(mod)
-        return mod
-    finally:
-        E.mpr_enabled = orig
-
-
-def test_standalone_exports_tool_only_when_enabled():
-    on = _load_standalone({"GX10_MPR": "1"})
-    assert hasattr(on, "CASE") and hasattr(on, "run") and on.CASE["capability"] == "mpr_research"
-    off = _load_standalone({})
-    assert not hasattr(off, "CASE") and not hasattr(off, "run")   # off → no tool (byte-identical)
+    spec = importlib.util.spec_from_file_location("_mpr_standalone_probe", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    assert hasattr(mod, "CASE") and hasattr(mod, "run")
+    assert mod.CASE["capability"] == "mpr_research"
 
 
 # ── §4 fail-soft + decline ────────────────────────────────────────────────────────────────────────

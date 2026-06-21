@@ -2173,40 +2173,51 @@ def _extract_tool_calls_from_text(content: str, tool_names: set) -> List[Dict[st
     return []
 
 
-def _load_plugins(plugins_dir: Optional[str]) -> int:
-    """Discover plugins under *plugins_dir* and expose each as an agent tool — the open
-    extension surface. A plugin is a ``.py`` in a ``skills/`` directory with a module-level
-    ``CASE`` dict (carrying ``name``/``description``/``capability``) and a ``run(...)``
-    function (the stable contract; see docs/plugin-api.md). Fail-soft: a broken plugin is
-    skipped, never aborts startup. Returns the number of tools loaded."""
-    _PLUGIN_TOOLS.clear()
-    if not plugins_dir:
-        return 0
+#: Fixed core location for **built-in** skills/prompts — always scanned at startup, independent
+#: of ``GX10_PLUGINS_DIR`` (which stays the additive surface for 3rd-party skills). ADR-0002 #114.
+_BUILTIN_DIR = Path(__file__).resolve().parents[1] / "skills"   # skills/
+
+
+def _discover_tools_into(root: str) -> int:
+    """Discover typed ``CASE``+``run`` skills under *root* and ADD them to _PLUGIN_TOOLS
+    (no clear — additive). Returns how many this root contributed. Fail-soft."""
     try:
         from ack.registry import Registry, derive_tool_schema
-    except Exception as e:  # noqa: BLE001 — no registry → no plugins, never fatal
-        _ui_print(col(f"  [plugins] registry unavailable: {e!r}", C.YELLOW))
+    except Exception as e:  # noqa: BLE001 — no registry → no tools, never fatal
+        _ui_print(col(f"  [skills] registry unavailable: {e!r}", C.YELLOW))
         return 0
     try:
-        added = Registry().discover_skills(plugins_dir)
+        added = Registry().discover_skills(root)
     except Exception as e:  # noqa: BLE001
-        _ui_print(col(f"  [plugins] discovery failed in {plugins_dir!r}: {e!r}", C.YELLOW))
+        _ui_print(col(f"  [skills] tool discovery failed in {root!r}: {e!r}", C.YELLOW))
         return 0
+    n = 0
     for r in added:
         if r.handler is None:
             continue
         name = str(r.name)
         if name in _PLUGIN_TOOLS:        # tool names must be unique — otherwise silent shadowing
-            _ui_print(col(f"  [plugins] doppelter Tool-Name {name!r} — erster bleibt, weitere übersprungen", C.YELLOW))
+            _ui_print(col(f"  [skills] duplicate tool name {name!r} — first kept, rest skipped", C.YELLOW))
             continue
         _PLUGIN_TOOLS[name] = {
             "schema": {"type": "function", "function": {
                 "name": name,
-                "description": str(r.description or f"plugin skill {name}"),
+                "description": str(r.description or f"skill {name}"),
                 "parameters": derive_tool_schema(r.handler),
             }},
             "handler": r.handler,
         }
+        n += 1
+    return n
+
+
+def _load_plugins(plugins_dir: Optional[str]) -> int:
+    """Load typed-tool skills from a single dir (clears first). Back-compat single-dir entry;
+    startup uses :func:`_load_skills` (built-ins always + plugins additive)."""
+    _PLUGIN_TOOLS.clear()
+    if not plugins_dir:
+        return 0
+    _discover_tools_into(plugins_dir)
     if _PLUGIN_TOOLS:
         _ui_print(col(f"  [plugins] {len(_PLUGIN_TOOLS)} tool(s) from {plugins_dir}: "
                       f"{', '.join(sorted(_PLUGIN_TOOLS))}", C.GRAY))
@@ -2235,25 +2246,51 @@ USE_SKILL_TOOL = {
 }
 
 
+def _discover_playbooks_into(root: str) -> int:
+    """Discover ``SKILL.md`` playbooks under *root* and ADD them to _PLAYBOOKS (no clear —
+    additive; first capability wins). Returns how many this root contributed. Fail-soft."""
+    try:
+        from ack.registry import Registry
+        found = Registry.discover_playbooks(root)
+    except Exception as e:  # noqa: BLE001 — no registry/discovery → no playbooks, never fatal
+        _ui_print(col(f"  [skills] playbook discovery failed in {root!r}: {e!r}", C.YELLOW))
+        return 0
+    n = 0
+    for pb in found:
+        if pb.capability in _PLAYBOOKS:
+            continue
+        _PLAYBOOKS[pb.capability] = pb
+        n += 1
+    return n
+
+
 def _load_playbooks(plugins_dir: Optional[str]) -> int:
-    """Discover ``SKILL.md`` playbook skills under *plugins_dir* (the second skill kind,
-    ADR-0001) and make them available via the ``use_skill`` tool. Fail-soft: a broken
-    package is skipped, never aborts startup. Returns the number of playbooks loaded."""
+    """Load playbook skills from a single dir (clears first). Back-compat single-dir entry;
+    startup uses :func:`_load_skills`."""
     _PLAYBOOKS.clear()
     if not plugins_dir:
         return 0
-    try:
-        from ack.registry import Registry
-        found = Registry.discover_playbooks(plugins_dir)
-    except Exception as e:  # noqa: BLE001 — no registry/discovery → no playbooks, never fatal
-        _ui_print(col(f"  [skills] playbook discovery failed in {plugins_dir!r}: {e!r}", C.YELLOW))
-        return 0
-    for pb in found:
-        _PLAYBOOKS[pb.capability] = pb
+    _discover_playbooks_into(plugins_dir)
     if _PLAYBOOKS:
         _ui_print(col(f"  [skills] {len(_PLAYBOOKS)} playbook(s) from {plugins_dir}: "
                       f"{', '.join(sorted(_PLAYBOOKS))}", C.GRAY))
     return len(_PLAYBOOKS)
+
+
+def _load_skills(plugins_dir: Optional[str] = None) -> tuple[int, int]:
+    """Startup loader (ADR-0002 #114): **always** load core built-ins from ``_BUILTIN_DIR``,
+    then **additively** load 3rd-party skills from *plugins_dir* if set. Clears once. Returns
+    (n_tools, n_playbooks)."""
+    _PLUGIN_TOOLS.clear()
+    _PLAYBOOKS.clear()
+    roots = [str(_BUILTIN_DIR)] + ([plugins_dir] if plugins_dir else [])
+    for root in roots:
+        _discover_tools_into(root)
+        _discover_playbooks_into(root)
+    if _PLUGIN_TOOLS or _PLAYBOOKS:
+        _ui_print(col(f"  [skills] {len(_PLUGIN_TOOLS)} tool(s) + {len(_PLAYBOOKS)} playbook(s) "
+                      f"(built-ins{' + ' + plugins_dir if plugins_dir else ''})", C.GRAY))
+    return len(_PLUGIN_TOOLS), len(_PLAYBOOKS)
 
 
 def _use_skill(capability: str = "", reference: str = "") -> str:

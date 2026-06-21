@@ -32,11 +32,16 @@ python engine/client.py --codedir .    # then: greet Ada → the model calls gre
 
 That's the whole contract. The core never changed.
 
+> **Built-ins vs 3rd-party.** Ironclad's **built-in** skills/prompts (and MPR) load
+> automatically from a fixed core dir at startup — you don't need `GX10_PLUGINS_DIR` for them
+> (ADR-0002). This page is the **3rd-party/user** extension surface: your skills load
+> *additively* via `GX10_PLUGINS_DIR`, with no core change.
+
 ## The contract (what's stable)
 
-- **Discovery.** At startup the engine scans `GX10_PLUGINS_DIR` (or `paths.plugins_dir`)
-  for `**/skills/*.py`. Files starting with `_` are ignored. A broken plugin is skipped,
-  never fatal.
+- **Discovery.** At startup the engine scans the core built-in dir (always) **and**
+  `GX10_PLUGINS_DIR` (or `paths.plugins_dir`, additive for your skills) for `**/skills/*.py`.
+  Files starting with `_` are ignored. A broken plugin is skipped, never fatal.
 - **`CASE` (a dict).** Required: `capability` (unique). Used: `name` (the tool name;
   defaults to `capability`), `description`. Optional: `domain`, and any metadata you add.
   The **tool `name` must also be unique** across loaded plugins — on a name clash the first

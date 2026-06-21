@@ -13,22 +13,18 @@ keine zusätzlichen Tools, kein Memory-Schreibpfad, voller Audit-Trail pro Run.
 
 ## Gates — Laden vs. Aktiv (WICHTIG)
 
-Es gibt **zwei entkoppelte Schalter**. Das ist Absicht: das Plugin kann *geladen* sein (das Tool ist
-registriert, die Engine bleibt aber byte-identisch) und trotzdem *pausiert* (jeder Aufruf gibt einen
-Hinweis zurück), bis ein Operator es zur Laufzeit scharf schaltet.
+MPR is a **core built-in** (ADR-0002 #115) — **always loaded**, no load gate. A single **runtime**
+switch controls whether it runs; the tool is always registered, but it can be paused live.
 
-| Gate | Quelle | Default | Wirkung wenn AUS | Umschalten |
-|------|--------|---------|------------------|------------|
-| **LOAD** | Env `GX10_MPR` (gelesen von `mpr_enabled()`) | **aus** (im Deploy `=1`) | Tool wird **nicht** registriert → Engine **byte-identisch** (A/B-Gate) | nur per Deploy/Env + Neustart |
-| **RUNTIME** | `mpr.enabled` im Config-Tree | **aus** | `run_mpr` antwortet `„MPR ist deaktiviert …"` (0 LLM-Calls, kein Run-Verzeichnis) | **im CLI: `/config set mpr.enabled on`** (kein Redeploy) |
+| Gate | Source | Default | Effect when OFF | Toggle |
+|------|--------|---------|-----------------|--------|
+| **RUNTIME** | `mpr.enabled` in the config tree | **on** | `run_mpr` returns a short "MPR is disabled" note (0 LLM calls, no run dir) | **in the CLI: `/config set mpr.enabled off`** (no redeploy) |
 
-- **LOAD aus** → als gäbe es das Plugin nicht (für saubere A/B-Vergleiche, Spec 09 §9).
-- **LOAD an, RUNTIME aus** → geladen, aber pausiert; der Operator entscheidet pro Session.
-- **LOAD an, RUNTIME an** → Panel läuft.
+- `mpr.enabled` **on** (default) → the panel runs. **off** → loaded but paused (each call returns the note).
+- Deploy override: set `GX10_MPR_ENABLED=0` to make the runtime default off at boot.
 
-> `GX10_MPR` setzt **nicht** automatisch `mpr.enabled`. Wer beim Deploy schon scharf starten will,
-> setzt zusätzlich `GX10_MPR_ENABLED=1` (siehe unten) — sonst bleibt es aus und wird per
-> `/config set` zugeschaltet (empfohlener Weg: Default aus, bewusst an).
+> **Deprecation:** the legacy `GX10_MPR` *load* gate was removed (MPR is a core built-in now). Use
+> the runtime `mpr.enabled` (`/config set mpr.enabled on|off`) or `GX10_MPR_ENABLED` at deploy.
 
 ---
 

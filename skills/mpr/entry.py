@@ -50,12 +50,8 @@ def build_case() -> dict:
             "description": _DESCRIPTION}
 
 
-def mpr_enabled(env: Optional[dict] = None) -> bool:
-    """A/B gate (§5): MPR registers a tool only when GX10_MPR is truthy (the env mirror of mpr.enabled).
-    Off → the standalone entry exports no CASE/run → no tool → byte-identical single-pass turn."""
-    import os
-    env = env if env is not None else os.environ
-    return str(env.get("GX10_MPR", "")).strip().lower() in ("1", "true", "yes", "on")
+# (Removed: the `GX10_MPR` load gate / `mpr_enabled()`. MPR is now a core built-in, always
+#  loaded; the live on/off is the runtime config `mpr.enabled` (default ON). ADR-0002 #115.)
 
 
 def _wrap(body: str) -> str:
@@ -278,9 +274,9 @@ def run_mpr(query: str, *, route_hint: str = "", domain_hint: str = "", mode_hin
     if not (query or "").strip():
         return "ERROR: mpr_research: 'query' darf nicht leer sein."
 
-    # Runtime active-gate (§ feature flag): the plugin is LOADED (GX10_MPR) but can be paused live. Off →
-    # a clear, sentinel-free note (the model answers directly). The load-time A/B gate (GX10_MPR off → no
-    # tool at all = byte-identical) is separate; this is the in-session toggle via `/config set mpr.enabled`.
+    # Runtime active-gate (the only gate now): MPR is a core built-in, always loaded; this pauses it
+    # live (default ON). Off → a clear, sentinel-free note (the model answers directly). Toggle via
+    # `/config set mpr.enabled on|off` (no redeploy). ADR-0002 #115.
     if not deps.enabled:
         return "MPR ist deaktiviert — aktivieren mit:  /config set mpr.enabled on"
 

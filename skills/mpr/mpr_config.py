@@ -75,7 +75,7 @@ class MprConfig(BaseModel):
     same ``mpr`` section (read by their own loaders) don't trip validation."""
 
     model_config = ConfigDict(extra="ignore")
-    enabled: bool = False                    # A/B-gate — off = byte-identical single-pass
+    enabled: bool = True                     # runtime active-gate (default ON; mpr.enabled off pauses live)
     audit_level: str = "full-per-perspective"
     runs_dir: str = "runs/mpr"
     # in-engine panel execution mode (the two switchable best paths; non-"deep" → "direct"):
@@ -122,10 +122,9 @@ def _apply_mpr_env(cfg_tree: dict, env: Optional[dict] = None) -> dict:
     edit. Nested sections (sovereignty/budget) handled explicitly. Mutates + returns *cfg_tree*."""
     env = env if env is not None else os.environ
     mpr = cfg_tree.setdefault("mpr", {})
-    # NOTE: GX10_MPR is the LOAD gate (registers the tool; off = no tool = byte-identical) and is read
-    # directly by mpr_enabled() — it deliberately does NOT set mpr.enabled here. mpr.enabled is the
-    # RUNTIME active-gate (default off), toggled in-session via `/config set mpr.enabled on|off`, so the
-    # plugin can be loaded yet paused. (Decoupled load vs runtime — see skills/mpr/README.md.)
+    # NOTE: MPR is a core built-in (always loaded, no GX10_MPR load gate — ADR-0002 #115). mpr.enabled
+    # is the RUNTIME active-gate (default ON), toggled in-session via `/config set mpr.enabled on|off`.
+    # GX10_MPR_ENABLED is the optional deploy-time override of that runtime default (below).
     if "GX10_MPR_ENABLED" in env:
         mpr["enabled"] = _truthy(env["GX10_MPR_ENABLED"])   # optional deploy-time runtime default
     if "GX10_MPR_AUDIT_LEVEL" in env:

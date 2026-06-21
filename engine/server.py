@@ -184,8 +184,7 @@ def bootstrap(config_path: Optional[str] = None) -> Tuple[gx10.GX10, Dict[str, A
     cfg = gx10._apply_env(cfg)
     gx10._apply_config(cfg)
     gx10._EFFECTIVE_CFG = cfg
-    gx10._load_plugins(cfg["paths"].get("plugins_dir"))   # open extension surface (typed tools)
-    gx10._load_playbooks(cfg["paths"].get("plugins_dir"))  # playbook skills (SKILL.md, ADR-0001)
+    gx10._load_skills(cfg["paths"].get("plugins_dir"))    # core built-ins (always) + 3rd-party (plugins_dir)
     gx10._CFG_SOURCE = cfg_path
 
     # Resolve the prompt absolutely before chdir (relative → SCRIPT_DIR), like main().

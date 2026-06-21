@@ -30,7 +30,7 @@ The research patterns are **mapped onto**, not copied into, this model: *Trigger
 
 **D4 — Library = manifest-based, self-hosted catalogue over discovery.** Each library directory carries a manifest/index per skill (`capability`, `kind` ∈ {tool, playbook}, `version` semver, `type`, `domain`, `provenance`, `source`); built-in vs user libraries; discover / install / update from your own library; **no mandatory external marketplace** (provenance recorded). The catalogue layers over the existing `discover_skills` (tools) + the new playbook loader.
 
-**D5 — mpr is migrated as the reference built-in** (operator decision A, C0). The generalized format must be a **superset mpr already satisfies**; mpr gains a manifest+semver+provenance and registers through the new catalogue. Hard back-compat: mpr stays byte-identical when gated off and its tests stay green (**382** after migration). If mpr does not fit the format, the format is wrong (#90).
+**D5 — mpr is migrated as the reference built-in** (operator decision A, C0). The generalized format must be a **superset mpr already satisfies**; mpr gains a manifest+semver+provenance and registers through the new catalogue. Hard back-compat: mpr stays byte-identical when gated off and its tests stay green (**381** in the unified core suite). If mpr does not fit the format, the format is wrong (#90).
 
 ## Mapping: research pattern → Ironclad realization
 

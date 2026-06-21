@@ -20,8 +20,8 @@ def test_case_has_manifest_fields_and_is_backcompat():
     assert c["provenance"] == "built-in"
 
 
-def test_catalogue_indexes_mpr_as_builtin(monkeypatch):
-    monkeypatch.setenv("GX10_MPR", "1")   # the A/B gate must be on for the CASE to be exposed
+def test_catalogue_indexes_mpr_as_builtin():
+    # MPR is a core built-in now (#115): always exports its CASE — no GX10_MPR load gate needed.
     from ack import catalogue as cat
 
     mpr_root = Path(__file__).resolve().parents[1]   # skills/mpr

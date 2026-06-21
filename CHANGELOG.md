@@ -9,6 +9,35 @@ Released versions are listed below; upcoming work accumulates under *Unreleased*
 
 ## [Unreleased]
 
+## [0.0.10] - 2026-06-21
+
+### Changed
+- **Export/deploy/docs aligned to core MPR** (#116): `export_core.py` drops the separate MPR
+  bundling (MPR ships via the core/ copy + is covered by the core boundary check); the install
+  launchers no longer set `GX10_MPR`; the installer no longer copies a separate `skills/mpr`; the
+  MPR README documents the single runtime `mpr.enabled` gate. Finalizes the `GX10_MPR` deprecation.
+- **MPR is now a core, always-on built-in** (#115): moved `skills/mpr` → `skills/mpr`;
+  removed the `GX10_MPR` load gate (MPR is always loaded) — the live on/off is the runtime
+  config **`mpr.enabled` (default ON)**. MPR consumes the core registry + `ack.i18n` + catalogue
+  + gate. Back-compatible (behavior unchanged when enabled); its suite (381) is now part of the
+  core `pytest` run, so the private CI gates it too. **Deprecation:** `GX10_MPR` is gone — use
+  `mpr.enabled` (or `GX10_MPR_ENABLED`) instead.
+
+### Added
+- **Always-on core built-in loader** (#114): built-in skills/prompts load at startup from a
+  fixed core dir (`skills/`), scanned **unconditionally** — independent of
+  `GX10_PLUGINS_DIR`, which stays the **additive** surface for 3rd-party/user skills
+  (`_load_skills`). Built-ins now work out of the box with no config. 4 tests.
+- **Shared content i18n `ack.i18n`** (#107): the file-overlay locale loader is promoted to core as
+  `Localizer(locales_dir)` — flag-independent (always importable, no `GX10_MPR`/plugin coupling),
+  parameterized locales dir, English fallback. MPR migrated onto it (`skills/mpr/i18n.py` is now a
+  thin shim; 382 tests green, behavior unchanged). Distinct from `engine/messages.py` (engine
+  chrome). 6 tests. Part of the core-always-on rebuild (ADR-0002).
+- **Design: skill/prompt/MPR as core always-on** ([ADR-0002](docs/adr/0002-core-always-on-skills.md),
+  epic #112) — built-ins load from a fixed core dir independent of `GX10_PLUGINS_DIR`; the plugin
+  surface stays for 3rd-party skills; MPR de-plugined into core (runtime `mpr.enabled`, default on,
+  replacing the `GX10_MPR` boot flag). Design only — implemented under epic #112.
+
 ## [0.0.9] - 2026-06-21
 
 ### Added
