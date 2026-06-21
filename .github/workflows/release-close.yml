@@ -1,0 +1,34 @@
+name: release close-out
+
+# On a published release, close every open `resolved` issue with a `released` label +
+# thank-you comment — the delivery-time close of the upstream round-trip
+# (done-means-deployed). Uses the built-in token (issues:write on this repo only).
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  issues: write
+
+jobs:
+  close-resolved:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ github.event.release.tag_name || github.ref_name }}
+    steps:
+      - name: Close resolved issues as released
+        run: |
+          set -eu
+          nums=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --label resolved \
+                   --limit 100 --json number --jq '.[].number')
+          if [ -z "$nums" ]; then echo "no resolved issues to close."; exit 0; fi
+          for n in $nums; do
+            gh issue edit "$n" --repo "$GITHUB_REPOSITORY" --add-label released || true
+            gh issue comment "$n" --repo "$GITHUB_REPOSITORY" \
+              --body "Released and available now in ${TAG} — thanks for the report!" || true
+            gh issue close "$n" --repo "$GITHUB_REPOSITORY" --reason completed || true
+            echo "closed #$n"
+          done
