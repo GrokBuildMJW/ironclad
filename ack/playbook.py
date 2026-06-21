@@ -187,6 +187,12 @@ def discover_playbooks(root: str | Path) -> list[Playbook]:
     seen: set[str] = set()
     for skill_md in sorted(base.glob("**/SKILL.md")):
         try:
+            pre_meta, _ = parse_frontmatter(skill_md.read_text(encoding="utf-8"))
+            if pre_meta.get("kind") == "prompt":
+                continue   # prompt items belong to ack.prompt, not the playbook surface
+        except (PlaybookError, OSError):
+            pass           # let parse_playbook below emit the canonical warning
+        try:
             pb = parse_playbook(skill_md)
         except (PlaybookError, OSError) as exc:
             logger.warning("playbook: skipping unloadable %s: %s", skill_md, exc)

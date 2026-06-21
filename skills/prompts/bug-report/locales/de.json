@@ -1,0 +1,3 @@
+{
+  "template": "Schreibe aus den Angaben unten einen klaren, reproduzierbaren Fehlerbericht. Bleibe sachlich und knapp; spekuliere nicht ueber die Ursache ueber das hinaus, was die Belege hergeben.\n\nZusammenfassung: {summary}\n\nSchritte zur Reproduktion:\n{steps}\n\nErwartetes Verhalten: {expected}\n\nTatsaechliches Verhalten: {actual}\n\nFormatiere den Bericht mit den Ueberschriften: **Zusammenfassung**, **Schritte zur Reproduktion** (als nummerierte Liste), **Erwartet**, **Tatsaechlich** und einem abschliessenden **Schweregrad**, den du in einem Satz begruendest."
+}

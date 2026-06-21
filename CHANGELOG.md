@@ -9,6 +9,36 @@ Released versions are listed below; upcoming work accumulates under *Unreleased*
 
 ## [Unreleased]
 
+## [0.0.11] - 2026-06-21
+
+### Added
+- **Curated multilingual starter prompt library + eval gate** (#111): four built-in `kind: prompt`
+  items ship under `skills/prompts/` — `code-review`, `commit-message`, `bug-report`,
+  `explain-code` (EN + DE, each loaded at startup and offered via `use_prompt`). New
+  `ack.gate.gate_prompt` is the registration/eval gate for prompt items (required vars must appear
+  in the template; every declared language must assemble cleanly; present locale overlays validated)
+  and `ack.gate.gate()` auto-routes `kind: prompt` SKILL.md here. `discover_playbooks` now skips
+  prompt items cleanly. **A new prompt = drop an MD file, no engine change.** 20 tests.
+- **Prompt slash surface & guided elicitation** (`use_prompt`, #110): a discovered `kind: prompt`
+  item is exposed as an engine tool — call with no capability to **list**, or with a capability +
+  a `values` JSON of what's collected so far to drive **guided elicitation** (the tool returns the
+  next missing required variable's question, one at a time) and, once complete, the **assembled**
+  prompt in the target `lang` (preview). Wired through `_load_skills`/`_effective_tools`/dispatch;
+  the state machine is `ack.promptgen.run_prompt` (deterministic, LLM-free). 9 tests.
+- **Multilingual prompt assembly** (`ack.promptgen`, #109): `assemble(prompt, values, lang)`
+  renders a `kind: prompt` template + collected values into a finished prompt in a target
+  language via `ack.i18n` (per-item `locales/`, source/target + fallback); `missing_required()`
+  drives the elicitation loop. Deterministic, LLM-free. 6 tests.
+- **Prompt-library item format** (`ack.prompt`, `kind: prompt`, #108): parse/validate/discover a
+  declarative prompt item (variables + languages + per-variable elicitation), reusing the shared
+  `ack.playbook` frontmatter parser (one parser, no parallel infra). A prompt is a core built-in,
+  distinct from `kind: playbook`. 7 tests.
+- **Design: prompt library & generator** ([ADR-0003](docs/adr/0003-prompt-library.md) +
+  [`prompt-packaging.md`](docs/prompt-packaging.md), epic #105) — a curated, multilingual prompt
+  library on the core base: a prompt is a declarative `kind: prompt` core built-in (variables +
+  languages + guided elicitation), reusing `ack.playbook`/`ack.catalogue`/`ack.gate`/`ack.i18n`;
+  `/<prompt-name>` → elicit → multilingual assembly → preview. Design only — built under epic #105.
+
 ## [0.0.10] - 2026-06-21
 
 ### Changed

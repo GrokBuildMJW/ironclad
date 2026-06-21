@@ -9,9 +9,9 @@
 
 | | |
 |---|---|
-| Automated tests (offline, no model) | **888 passed** |
+| Automated tests (offline, no model) | **930 passed** |
 | Live smoke tests (skipped without a model) | **9** |
-| **Total Python** | **897** |
+| **Total Python** | **939** |
 | TypeScript client tests (`node:test`) | **333 passed** (337 total, 4 skipped) |
 | Full agentic loop, end to end, with a **real** code-agent | **verified** |
 | Issues found during the campaign | **1 functional gap + 5 review findings — all found and fixed** (see below) |
@@ -24,7 +24,7 @@ default** and only runs when pointed at a real server.
 
 ```bash
 # 1) offline suite — deterministic, no model needed
-pytest -q                                   # from core/  → 888 passed, 9 skipped
+pytest -q                                   # from core/  → 930 passed, 9 skipped
 
 # 2) live smoke — against your own running orchestrator
 GX10_LIVE_URL=http://<your-host>:8100 pytest -k live -q     # 9 passed
@@ -34,7 +34,7 @@ GX10_LIVE_URL=http://<your-host>:8100 pytest -k live -q     # 9 passed
 ## Coverage by area
 
 Counts below are reproduced from `pytest --collect-only` (2026-06-21) and sum to
-the **897** total (888 offline + 9 live) — now includes the MPR core built-in suite.
+the **939** total (930 offline + 9 live) — now includes the MPR core built-in suite.
 
 | Area | Test files | Tests |
 |------|-----------|-------|
@@ -47,11 +47,15 @@ the **897** total (888 offline + 9 live) — now includes the MPR core built-in 
 | **Playbook skill kind** (SKILL.md parse/validate/discover, progressive disclosure, `use_skill`) | `playbook` | 15 |
 | **Skill generator** (spec → scaffold both kinds, schema-valid by construction) | `skillgen` | 7 |
 | **Skill library catalogue** (manifest index, semver, provenance, install/update) | `catalogue` | 6 |
-| **Skill registration gate** (tool doctor-preflight / playbook schema+check, no unchecked code) | `gate` | 7 |
+| **Skill registration gate** (tool doctor-preflight / playbook schema+check / prompt eval-gate, no unchecked code) | `gate` | 12 |
 | **Skill lifecycle end-to-end** (generate → gate → register → load → invoke, both kinds) | `skill_e2e` | 3 |
 | **Shared content i18n** (`ack.i18n` overlay loader, parameterized dir, fallback) | `i18n` | 6 |
 | **Core built-in loader** (always-on built-ins from a fixed dir; plugins additive) | `builtin_loader` | 4 |
 | **MPR core built-in** (router/registry/synthesis/audit/panels/templates/eval/packaging) | `skills/mpr/tests/*` | 381 |
+| **Prompt-library item** (`kind: prompt` parse/validate/discover + variable build) | `prompt` | 7 |
+| **Multilingual prompt assembly** (template + values → target language via ack.i18n) | `promptgen` | 6 |
+| **Prompt slash surface & elicitation** (`use_prompt` list → guided ask-next → assemble + lang) | `prompt_cmd` | 9 |
+| **Curated prompt library** (shipped starter prompts discover + gate + assemble EN/DE, drop-MD adds) | `prompt_library` | 15 |
 | **Orchestration state** (TaskStore lifecycle/dedup, initiative, autoplan, state e2e) | `taskstore`, `initiative`, `autoplan`, `state_e2e` | 45 |
 | **Parallelism** (governed fan-out, in-engine tool, single-writer reduce, parallel router) | `workers`, `parallel_tool`, `worker_reduce`, `parallel_router` | 29 |
 | **Thin client + BYO code-agent** (agent pool, `GX10_AGENT_CMD` template, managed transport) | `client_pool`, `client_transport` | 14 |

@@ -79,6 +79,10 @@ Evolving (design): [ADR-0002](adr/0002-core-always-on-skills.md) — the skill/p
 become **core, always-on** built-ins (loaded from a fixed core dir, independent of
 `GX10_PLUGINS_DIR`); the plugin surface stays for 3rd-party skills; MPR de-plugined (runtime
 `mpr.enabled`, default on).
+Planned (design): [ADR-0003](adr/0003-prompt-library.md) + [`prompt-packaging.md`](prompt-packaging.md)
+— a curated, **multilingual prompt library** + generator: a prompt is a declarative `kind: prompt`
+core built-in (variables + languages + guided elicitation); `/<prompt-name>` → asked for inputs →
+finished prompt in the target language; add a prompt by dropping an MD file.
 
 ## 4. Broader model & data reach
 

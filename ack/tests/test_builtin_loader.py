@@ -25,6 +25,7 @@ def _clean():
     yield
     gx10._PLUGIN_TOOLS.clear()
     gx10._PLAYBOOKS.clear()
+    gx10._PROMPTS.clear()
 
 
 def _tool(root: Path, cap: str):
@@ -42,7 +43,7 @@ def test_builtins_load_without_plugins_dir(tmp_path, monkeypatch):
     _tool(builtin, "core-tool")
     _playbook(builtin, "core-pb")
     monkeypatch.setattr(gx10, "_BUILTIN_DIR", builtin)
-    n_tools, n_pb = gx10._load_skills(None)          # no plugins_dir at all
+    n_tools, n_pb, n_prompts = gx10._load_skills(None)   # no plugins_dir at all
     assert n_tools >= 1 and n_pb >= 1
     assert "core-tool" in gx10._PLUGIN_TOOLS
     assert "core-pb" in gx10._PLAYBOOKS
@@ -62,8 +63,8 @@ def test_plugins_dir_is_additive_to_builtins(tmp_path, monkeypatch):
 
 def test_empty_builtin_dir_is_fine(tmp_path, monkeypatch):
     monkeypatch.setattr(gx10, "_BUILTIN_DIR", tmp_path / "nonexistent")
-    n_tools, n_pb = gx10._load_skills(None)
-    assert n_tools == 0 and n_pb == 0           # fail-soft, no crash
+    n_tools, n_pb, n_prompts = gx10._load_skills(None)
+    assert n_tools == 0 and n_pb == 0 and n_prompts == 0   # fail-soft, no crash
 
 
 def test_single_dir_loaders_still_work(tmp_path):

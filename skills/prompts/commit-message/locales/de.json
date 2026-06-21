@@ -1,0 +1,3 @@
+{
+  "template": "Schreibe eine einzelne Conventional-Commits-Nachricht fuer die folgenden Aenderungen. Bevorzuge Typ \"{type}\" und Scope \"{scope}\", falls angegeben; andernfalls leite sie ab.\n\nAenderungen:\n{changes}\n\nGib genau einen Commit aus: eine `type(scope): subject`-Kopfzeile im Imperativ unter 72 Zeichen, eine Leerzeile, dann einen Rumpf, der das Was und das Warum (nicht das Wie) in kurzen umbrochenen Zeilen erklaert. Erfinde keine Aenderungen, die oben nicht beschrieben sind."
+}

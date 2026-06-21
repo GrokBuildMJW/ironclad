@@ -112,9 +112,69 @@ def gate_playbook(skill_md: str | Path, *, run_check: bool = True) -> GateResult
     return GateResult(not reasons, "playbook", reasons)
 
 
+def gate_prompt(skill_md: str | Path) -> GateResult:
+    """Eval/registration gate for a ``kind: prompt`` item (#111).
+
+    A prompt passes iff: its frontmatter validates (``ack.prompt`` schema), every **required**
+    variable actually appears as a ``{placeholder}`` in the template (a required input that can't
+    affect the output is a defect), and it **assembles cleanly in every declared language** —
+    proving the `locales/<lang>.json` overlays are readable and well-formed (a missing overlay is
+    fine: it falls back to source). Deterministic, model-free.
+    """
+    from ack.prompt import PromptError, parse_prompt
+    from ack.promptgen import _PLACEHOLDER, assemble
+
+    p = Path(skill_md)
+    if p.is_dir():
+        p = p / "SKILL.md"
+    if not p.is_file():
+        return GateResult(False, "prompt", [f"no SKILL.md at {p}"])
+    try:
+        prompt = parse_prompt(p)
+    except PromptError as e:
+        return GateResult(False, "prompt", [f"frontmatter invalid: {e}"])
+
+    import json
+
+    reasons: list[str] = []
+    placeholders = set(_PLACEHOLDER.findall(prompt.template))
+    for v in prompt.variables:
+        if v.required and v.name not in placeholders:
+            reasons.append(f"required variable {v.name!r} is never used in the template")
+
+    sample = {v.name: f"<{v.name}>" for v in prompt.variables}
+    for lang in prompt.languages:
+        # A *missing* overlay is fine (intentional English fallback); a *present* one that is
+        # malformed is a defect — the runtime would silently fall back, masking a broken
+        # translation. The gate is where "assemblable in DE+EN" must actually mean DE works.
+        if lang != "en":
+            overlay = prompt.locales_dir() / f"{lang}.json"
+            if overlay.is_file():
+                try:
+                    data = json.loads(overlay.read_text(encoding="utf-8"))
+                    if not isinstance(data, dict):
+                        reasons.append(f"{lang!r} overlay {overlay.name} is not a JSON object")
+                    elif not str(data.get("template", "")).strip():
+                        reasons.append(f"{lang!r} overlay {overlay.name} has no 'template' string")
+                except (OSError, ValueError) as e:
+                    reasons.append(f"{lang!r} overlay {overlay.name} is unreadable/invalid JSON: {e}")
+        try:
+            assemble(prompt, sample, lang=lang)   # all vars provided → strict is fine
+        except Exception as e:  # noqa: BLE001 — any assembly failure is a gate failure, surfaced
+            reasons.append(f"not assemblable in {lang!r}: {e!r}")
+
+    return GateResult(not reasons, "prompt", reasons)
+
+
 def gate(path: str | Path, **kw) -> GateResult:
-    """Dispatch to the right gate by path shape (SKILL.md/dir → playbook; .py → tool)."""
+    """Dispatch to the right gate by item kind/path shape: ``kind: prompt`` SKILL.md → prompt;
+    other SKILL.md/dir → playbook; ``.py`` → tool."""
+    from ack.prompt import is_prompt_item
+
     p = Path(path)
     if p.is_dir() or p.name == "SKILL.md":
+        md = p / "SKILL.md" if p.is_dir() else p
+        if md.is_file() and is_prompt_item(md):
+            return gate_prompt(md)
         return gate_playbook(p, **kw)
     return gate_tool(p)

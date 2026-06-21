@@ -709,6 +709,10 @@ _PLUGIN_TOOLS: Dict[str, Dict[str, Any]] = {}
 #: (list metadata → load body → load a reference on demand). capability → Playbook. Empty
 #: unless playbooks are present. See docs/skill-packaging.md.
 _PLAYBOOKS: Dict[str, Any] = {}
+#: Prompt-library items (``kind: prompt``, ADR-0003): declarative MD prompts discovered as core
+#: built-ins, exposed via the ``use_prompt`` tool (list → guided elicitation → multilingual
+#: assemble). capability → ack.prompt.Prompt. Empty unless prompts are present.
+_PROMPTS: Dict[str, Any] = {}
 
 # ─── Colors ──────────────────────────────────────────────────
 class C:
@@ -1399,7 +1403,8 @@ def _effective_tools() -> List[Dict[str, Any]]:
     par = [PARALLEL_TOOL] if _WORKERS is not None else []
     plug = [t["schema"] for t in _PLUGIN_TOOLS.values()]
     skl = [USE_SKILL_TOOL] if _PLAYBOOKS else []
-    return TOOLS + mem + par + plug + skl + (ONBOARDING_TOOLS if ONBOARDING_MODE else [])
+    prm = [USE_PROMPT_TOOL] if _PROMPTS else []
+    return TOOLS + mem + par + plug + skl + prm + (ONBOARDING_TOOLS if ONBOARDING_MODE else [])
 
 # ─── Macro tool: deterministic pipeline (HV-A) ─────────────
 _TASK_ID_RE = re.compile(rf"^{re.escape(TASK_PREFIX)}-[A-Za-z0-9_]+$")
@@ -2277,20 +2282,40 @@ def _load_playbooks(plugins_dir: Optional[str]) -> int:
     return len(_PLAYBOOKS)
 
 
-def _load_skills(plugins_dir: Optional[str] = None) -> tuple[int, int]:
+def _discover_prompts_into(root: str) -> int:
+    """Discover ``kind: prompt`` items under *root* and ADD them to _PROMPTS (no clear —
+    additive; first capability wins). Returns how many this root contributed. Fail-soft."""
+    try:
+        from ack.prompt import discover_prompts
+        found = discover_prompts(root)
+    except Exception as e:  # noqa: BLE001 — no discovery → no prompts, never fatal
+        _ui_print(col(f"  [skills] prompt discovery failed in {root!r}: {e!r}", C.YELLOW))
+        return 0
+    n = 0
+    for p in found:
+        if p.capability in _PROMPTS:
+            continue
+        _PROMPTS[p.capability] = p
+        n += 1
+    return n
+
+
+def _load_skills(plugins_dir: Optional[str] = None) -> tuple[int, int, int]:
     """Startup loader (ADR-0002 #114): **always** load core built-ins from ``_BUILTIN_DIR``,
     then **additively** load 3rd-party skills from *plugins_dir* if set. Clears once. Returns
-    (n_tools, n_playbooks)."""
+    (n_tools, n_playbooks, n_prompts)."""
     _PLUGIN_TOOLS.clear()
     _PLAYBOOKS.clear()
+    _PROMPTS.clear()
     roots = [str(_BUILTIN_DIR)] + ([plugins_dir] if plugins_dir else [])
     for root in roots:
         _discover_tools_into(root)
         _discover_playbooks_into(root)
-    if _PLUGIN_TOOLS or _PLAYBOOKS:
+        _discover_prompts_into(root)
+    if _PLUGIN_TOOLS or _PLAYBOOKS or _PROMPTS:
         _ui_print(col(f"  [skills] {len(_PLUGIN_TOOLS)} tool(s) + {len(_PLAYBOOKS)} playbook(s) "
-                      f"(built-ins{' + ' + plugins_dir if plugins_dir else ''})", C.GRAY))
-    return len(_PLUGIN_TOOLS), len(_PLAYBOOKS)
+                      f"+ {len(_PROMPTS)} prompt(s) (built-ins{' + ' + plugins_dir if plugins_dir else ''})", C.GRAY))
+    return len(_PLUGIN_TOOLS), len(_PLAYBOOKS), len(_PROMPTS)
 
 
 def _use_skill(capability: str = "", reference: str = "") -> str:
@@ -2316,6 +2341,56 @@ def _use_skill(capability: str = "", reference: str = "") -> str:
     refs = pb.references()
     suffix = f"\n\nReferences (load with use_skill('{capability}', '<name>')): {', '.join(refs)}" if refs else ""
     return pb.body + suffix
+
+
+#: Prompt-library tool (ADR-0003 #110): list prompts → guided elicitation → multilingual assemble.
+USE_PROMPT_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "use_prompt",
+        "description": ("Use a prompt-library item to produce a finished prompt. Call with no "
+                        "capability to LIST prompts. Call with a capability + a `values` JSON of "
+                        "the variables collected so far: if a required variable is still missing, "
+                        "the tool returns the next question to ASK the user; once all required "
+                        "values are present it returns the assembled prompt. `lang` picks the "
+                        "target language."),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "capability": {"type": "string", "description": "Prompt id (omit to list all)."},
+                "values": {"type": "string", "description": "JSON object of variable→value collected so far."},
+                "lang": {"type": "string", "description": "Target language code (e.g. en, de)."},
+            },
+        },
+    },
+}
+
+
+def _use_prompt(capability: str = "", values: str = "", lang: str = "") -> str:
+    """Dispatch for ``use_prompt`` — list → guided elicitation → multilingual assemble (#110)."""
+    if not capability:
+        if not _PROMPTS:
+            return "No prompt-library items are available."
+        lines = ["Available prompts (call use_prompt with a capability + values JSON):"]
+        for cap in sorted(_PROMPTS):
+            lines.append(f"- {cap}: {_PROMPTS[cap].description}")
+        return "\n".join(lines)
+    p = _PROMPTS.get(capability)
+    if p is None:
+        return (f"ERROR: no prompt {capability!r}. Call use_prompt with no capability to list.")
+    try:
+        vals = json.loads(values) if values.strip() else {}
+        if not isinstance(vals, dict):
+            return "ERROR: `values` must be a JSON object of variable→value."
+    except ValueError as e:
+        return f"ERROR: `values` is not valid JSON: {e}"
+    from ack.promptgen import run_prompt
+    step = run_prompt(p, {k: str(v) for k, v in vals.items()}, lang=(lang or None))
+    if step["status"] == "ask":
+        return (f"NEXT QUESTION (variable '{step['variable']}'): {step['question']}\n"
+                f"(still needed: {', '.join(step['missing'])}) — ask the user, then call use_prompt "
+                f"again with this value added to `values`.")
+    return f"ASSEMBLED PROMPT ({step['lang']}):\n\n{step['prompt']}"
 
 
 def _format_parallel(results: List[Dict[str, Any]]) -> str:
@@ -2725,6 +2800,12 @@ def run_tool(name: str, args: Dict[str, Any]) -> str:
             # Playbook skill kind (ADR-0001): progressive-disclosure access to SKILL.md skills.
             return _use_skill(str(args.get("capability", "") or ""),
                               str(args.get("reference", "") or ""))
+
+        elif name == "use_prompt":
+            # Prompt skill kind (ADR-0003): list → guided elicitation → multilingual assemble.
+            return _use_prompt(str(args.get("capability", "") or ""),
+                               str(args.get("values", "") or ""),
+                               str(args.get("lang", "") or ""))
 
         elif name in _PLUGIN_TOOLS:
             # Open extension surface: dispatch to a discovered plugin skill's run().
