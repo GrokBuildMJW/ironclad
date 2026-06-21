@@ -113,11 +113,11 @@ def test_already_claimed_not_resubmitted(monkeypatch, tmp_path):
     calls = []
     monkeypatch.setattr(client, "_run_handover",
                         lambda item, codedir, log=print: calls.append(item["id"]) or "fb")
-    claimed = {"KGC-1"}  # bereits in Arbeit
+    claimed = {"KGC-1"}  # already in progress
     with ThreadPoolExecutor(max_workers=2) as pool:
         futs = client.dispatch_pending(srv, tmp_path, pool, claimed)
         wait(futs)
-    assert futs == [] and calls == []  # nichts neu gestartet
+    assert futs == [] and calls == []  # nothing newly started
 
 
 def test_runs_concurrently(monkeypatch, tmp_path):
@@ -127,7 +127,7 @@ def test_runs_concurrently(monkeypatch, tmp_path):
 
     def _blocking(item, codedir, log=print):
         started.append(item["id"])
-        barrier.wait()  # alle drei müssen hier zusammentreffen → echte Parallelität
+        barrier.wait()  # all three must meet here -> real parallelism
         return f"fb-{item['id']}"
 
     monkeypatch.setattr(client, "_run_handover", _blocking)
@@ -137,17 +137,17 @@ def test_runs_concurrently(monkeypatch, tmp_path):
         futs = client.dispatch_pending(srv, tmp_path, pool, claimed)
         done, _ = wait(futs, timeout=8)
     assert len(done) == 3
-    assert len(srv.uploaded) == 3  # barrier nur erreichbar wenn alle gleichzeitig liefen
+    assert len(srv.uploaded) == 3  # barrier only reachable if all ran concurrently
 
 
 def test_failure_unclaims_for_retry(monkeypatch, tmp_path):
     srv = _FakeServer(_items("KGC-1"))
-    monkeypatch.setattr(client, "_run_handover", lambda item, codedir, log=print: None)  # kein Feedback
+    monkeypatch.setattr(client, "_run_handover", lambda item, codedir, log=print: None)  # no feedback
     claimed: set = set()
     with ThreadPoolExecutor(max_workers=1) as pool:
         wait(client.dispatch_pending(srv, tmp_path, pool, claimed))
-    assert claimed == set()       # freigegeben → nächster Poll versucht erneut
-    assert srv.uploaded == []     # nichts hochgeladen
+    assert claimed == set()       # released -> next poll retries
+    assert srv.uploaded == []     # nothing uploaded
 
 
 def test_exception_unclaims(monkeypatch, tmp_path):
@@ -161,5 +161,5 @@ def test_exception_unclaims(monkeypatch, tmp_path):
     with ThreadPoolExecutor(max_workers=1) as pool:
         results = wait(client.dispatch_pending(srv, tmp_path, pool, claimed))
     assert claimed == set()
-    # der Job darf NICHT die ganze Schleife killen — _process_one fängt ab
+    # the job must NOT kill the whole loop — _process_one catches it
     assert all(f.result() is False for f in results.done)

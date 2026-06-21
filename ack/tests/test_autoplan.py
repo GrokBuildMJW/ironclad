@@ -60,7 +60,7 @@ def test_non_empty_pipeline_does_not_enqueue(monkeypatch):
     monkeypatch.setattr(gx10, "_store", lambda: _FakeStore(pending=["KGC-2"]))
     box, enq = _enqueue_capture()
     gx10._autoplan_tick("KGC-1", enq)
-    assert box == []                       # noch Arbeit offen → nichts planen
+    assert box == []                       # work still open -> plan nothing
 
 
 def test_max_tasks_limit_stops(monkeypatch):
@@ -73,7 +73,7 @@ def test_max_tasks_limit_stops(monkeypatch):
 
 def test_no_backlog_disables(monkeypatch):
     monkeypatch.setattr(gx10, "_store", lambda: _FakeStore())
-    gx10._EFFECTIVE_CFG = {"paths": {}, "autopilot": {}}   # kein Backlog
+    gx10._EFFECTIVE_CFG = {"paths": {}, "autopilot": {}}   # no backlog
     box, enq = _enqueue_capture()
     gx10._autoplan_tick("KGC-1", enq)
     assert box == [] and gx10.AUTOPILOT_AUTOPLAN is False

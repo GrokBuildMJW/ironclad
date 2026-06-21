@@ -89,7 +89,7 @@ def test_runs_concurrently():
     res = w.fanout([str(i) for i in range(6)])
     elapsed = time.monotonic() - t0
     assert len(res) == 6 and all(r["ok"] for r in res)
-    assert client.max_live == 6        # alle gleichzeitig in-flight
+    assert client.max_live == 6        # all in-flight at once
     assert elapsed < 0.8               # weit unter 6 * 0.2 = 1.2s
 
 
@@ -97,7 +97,7 @@ def test_concurrency_is_bounded():
     client = _StubClient(delay=0.1)
     w = ReasoningWorkers(client, "m", max_concurrency=2)
     w.fanout([str(i) for i in range(6)])
-    assert client.max_live <= 2        # nie mehr als der Cap gleichzeitig
+    assert client.max_live <= 2        # never more than the cap concurrently
 
 
 def test_error_isolation_keeps_order():

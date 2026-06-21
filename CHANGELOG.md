@@ -31,6 +31,10 @@ Released versions are listed below; upcoming work accumulates under *Unreleased*
   release". Test counts regenerated from `pytest --collect-only`: **468** Python
   (459 offline + 9 live) and **337** TypeScript client tests; `docs/test-report.md` area
   table updated to match.
+- **English-only hygiene**: translated the remaining German code comments in the bundled
+  test suite (`ack/tests/test_autoplan.py`, `test_client_pool.py`, `test_workers.py`) to
+  English (#78). Deliberate `language=de` user-facing output and the German query-classifier
+  keywords are intentionally kept.
 
 ## [0.0.7] - 2026-06-21
 
