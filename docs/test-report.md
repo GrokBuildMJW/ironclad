@@ -1,7 +1,7 @@
 # Test report
 
 > Maximum transparency: this is the actual state of testing, including issues found
-> **and fixed** during the campaign. Counts re-confirmed **2026-06-20** (offline suite; live
+> **and fixed** during the campaign. Counts re-confirmed **2026-06-21** (offline suite; live
 > verification 2026-06-17). For per-component wiring status see
 > [`status.md`](status.md); for what's planned see [`roadmap.md`](roadmap.md).
 
@@ -9,10 +9,10 @@
 
 | | |
 |---|---|
-| Automated tests (offline, no model) | **453 passed** |
+| Automated tests (offline, no model) | **459 passed** |
 | Live smoke tests (skipped without a model) | **9** |
-| **Total Python** | **462** |
-| TypeScript client tests (`node:test`) | **328 passed** (332 total, 4 live-skipped) |
+| **Total Python** | **468** |
+| TypeScript client tests (`node:test`) | **333 passed** (337 total, 4 skipped) |
 | Full agentic loop, end to end, with a **real** code-agent | **verified** |
 | Issues found during the campaign | **1 functional gap + 5 review findings — all found and fixed** (see below) |
 
@@ -24,7 +24,7 @@ default** and only runs when pointed at a real server.
 
 ```bash
 # 1) offline suite — deterministic, no model needed
-pytest -q                                   # from core/  → 453 passed, 9 skipped
+pytest -q                                   # from core/  → 459 passed, 9 skipped
 
 # 2) live smoke — against your own running orchestrator
 GX10_LIVE_URL=http://<your-host>:8100 pytest -k live -q     # 9 passed

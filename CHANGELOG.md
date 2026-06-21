@@ -9,6 +9,8 @@ Released versions are listed below; upcoming work accumulates under *Unreleased*
 
 ## [Unreleased]
 
+## [0.0.8] - 2026-06-21
+
 ### Added
 - **Public-release clean-room gate** (`.github/workflows/clean-room.yml`, #58). Before any
   publish, the package is proven installable + runnable **from the published sources in
