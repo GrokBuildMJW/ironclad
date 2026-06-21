@@ -379,6 +379,17 @@ class Registry:
                 added.append(reg)
         return added
 
+    @staticmethod
+    def discover_playbooks(root: Union[str, Path]) -> list:
+        """Discover ``SKILL.md`` playbook skills under *root* (the second skill kind, ADR-0001).
+
+        Sits alongside :meth:`discover_skills` (typed ``.py`` tools). Returns a list of
+        :class:`ack.playbook.Playbook` (metadata eager, body/references lazy). Fail-soft:
+        a broken package is skipped, missing root → ``[]``.
+        """
+        from ack.playbook import discover_playbooks as _discover
+        return _discover(root)
+
     def _ensure_skills_scanned(self) -> None:
         if self._skills_scanned:
             return

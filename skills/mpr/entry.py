@@ -42,7 +42,11 @@ _DESCRIPTION = (
 
 
 def build_case() -> dict:
+    # The catalogue manifest fields (type/version/provenance, #90) ride on CASE so mpr — the
+    # reference built-in — appears in ack.catalogue. Extra keys are ignored by the tool path
+    # (discover_skills / derive_tool_schema), so this is additive + back-compatible.
     return {"name": "mpr_research", "capability": "mpr_research", "domain": "reasoning",
+            "type": "capability", "version": "0.1.0", "provenance": "built-in",
             "description": _DESCRIPTION}
 
 

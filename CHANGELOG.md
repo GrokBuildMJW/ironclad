@@ -9,6 +9,48 @@ Released versions are listed below; upcoming work accumulates under *Unreleased*
 
 ## [Unreleased]
 
+## [0.0.9] - 2026-06-21
+
+### Added
+- **Skill lifecycle verified end-to-end** (#88): a model-free integration test drives the full
+  pipeline for both kinds — `ack.skillgen` generate → `ack.gate` registration gate →
+  `ack.catalogue` install/register → engine load (`_load_plugins`/`_load_playbooks`) → invoke
+  (a typed tool returns a real result; a playbook loads via `use_skill`). This is the epic #22
+  C2 runnable scenario. 3 tests.
+
+### Changed
+- **`mpr` migrated as the reference built-in** (#90): its `CASE` now carries the catalogue
+  manifest fields (`type`/`version`/`provenance`), so `ack.catalogue` indexes it as a built-in
+  skill — proving the generalized format is a superset of the real flagship. Additive +
+  back-compatible (byte-identical when gated off; mpr suite 382 green).
+
+### Added
+- **Skill registration gate** (`ack.gate`, #34): no unchecked skill enters the toolset. A tool
+  must pass a doctor preflight (loadable, `CASE`+`capability`, synchronous `run`, derivable tool
+  schema) and ship an auto-generated test; a playbook must have valid `SKILL.md` frontmatter +
+  readable references + a passing `scripts/check`. Behavioral `eval/` stays opt-in. 7 tests. Also
+  made the scaffolded playbook `scripts/check` self-contained (no import path assumptions).
+- **Skill library catalogue** (`ack.catalogue`, #35): a self-hosted, versioned index over both
+  skill kinds, reading each skill's own metadata as its manifest (`capability`/`kind`/`version`/
+  `type`/`domain`/`provenance`/`source`). Discover, install (copy into the active `skills/`),
+  and update-when-newer (semver), with provenance and built-in vs user libraries — no external
+  marketplace. Zero new deps; 6 tests.
+- **Skill generator** (`ack.skillgen`, #33): `spec → schema-valid scaffold` for both skill
+  kinds — a typed `CASE`+`run` `.py` (signature → tool schema) with an auto-test stub, or a
+  `SKILL.md` playbook package + `references/` + `scripts/check`. Contract-correct by
+  construction; the body is a marked stub for an author/LLM to fill. CLI `python -m ack.skillgen`.
+  Zero new deps; 7 tests.
+- **Playbook skill kind** (`SKILL.md` packages, ADR-0001 / #89): a second skill kind alongside
+  the typed `CASE`+`run` tool. `ack.playbook` parses + validates `SKILL.md` frontmatter and
+  `Registry.discover_playbooks` discovers packages; the engine exposes them via the new
+  **`use_skill`** tool with **progressive disclosure** (list metadata → load body → load a
+  reference on demand). Zero new dependencies; 15 deterministic tests (`test_playbook.py`).
+- **Skill-engine design**: [ADR-0001](docs/adr/0001-skill-engine-and-library.md) +
+  [`skill-packaging.md`](docs/skill-packaging.md) — the design for the skill-generation engine
+  & self-hosted library (two skill kinds: typed `CASE`+`run` tools and `SKILL.md` playbooks;
+  doctor+tests registration gate with opt-in behavioral eval; manifest catalogue with semver +
+  provenance; `skills/mpr` as the reference built-in). Design only — built under epic #22.
+
 ## [0.0.8] - 2026-06-21
 
 ### Added

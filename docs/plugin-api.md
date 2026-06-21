@@ -74,6 +74,10 @@ python -m ack.generator --help      # all options (--phase, --tier, --dry-run, �
   available if you embed the kernel directly.
 - **MCP tools** integrate via `bind_mcp_provider` (the kernel binds an external MCP
   provider rather than re-implementing it).
+- **Beyond this typed-tool contract** (available today), a second **playbook** skill kind
+  (`SKILL.md` + progressive disclosure), a spec→skill **generator**, and a self-hosted
+  **catalogue** (semver + provenance) are designed in [`skill-packaging.md`](skill-packaging.md) /
+  [ADR-0001](adr/0001-skill-engine-and-library.md) and built under epic #22.
 - **Two ways to use this** (see [`self-maintenance.md`](self-maintenance.md)): extend with
   plugins and keep our updates (Mode A), or fork and change anything in your own copy
   (Mode B) — it's Apache-2.0.

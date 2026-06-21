@@ -704,6 +704,11 @@ _LOCAL_TOOL_BRIDGE: Optional[Any] = None
 #: ``CASE`` dict + a ``run(...)`` function) becomes an agent tool — no core change. Empty
 #: unless ``paths.plugins_dir`` / ``GX10_PLUGINS_DIR`` is set. See docs/plugin-api.md.
 _PLUGIN_TOOLS: Dict[str, Dict[str, Any]] = {}
+#: Playbook skills (the second kind, ADR-0001): ``SKILL.md`` packages discovered from the
+#: plugins dir, exposed to the model via the ``use_skill`` tool with progressive disclosure
+#: (list metadata → load body → load a reference on demand). capability → Playbook. Empty
+#: unless playbooks are present. See docs/skill-packaging.md.
+_PLAYBOOKS: Dict[str, Any] = {}
 
 # ─── Colors ──────────────────────────────────────────────────
 class C:
@@ -1393,7 +1398,8 @@ def _effective_tools() -> List[Dict[str, Any]]:
     mem = [MEMORY_TOOL, DEEP_MEMORY_TOOL] if _MEMORY is not None else []
     par = [PARALLEL_TOOL] if _WORKERS is not None else []
     plug = [t["schema"] for t in _PLUGIN_TOOLS.values()]
-    return TOOLS + mem + par + plug + (ONBOARDING_TOOLS if ONBOARDING_MODE else [])
+    skl = [USE_SKILL_TOOL] if _PLAYBOOKS else []
+    return TOOLS + mem + par + plug + skl + (ONBOARDING_TOOLS if ONBOARDING_MODE else [])
 
 # ─── Macro tool: deterministic pipeline (HV-A) ─────────────
 _TASK_ID_RE = re.compile(rf"^{re.escape(TASK_PREFIX)}-[A-Za-z0-9_]+$")
@@ -2207,6 +2213,74 @@ def _load_plugins(plugins_dir: Optional[str]) -> int:
     return len(_PLUGIN_TOOLS)
 
 
+#: The single tool that exposes playbook skills with progressive disclosure: no/empty
+#: capability → the metadata catalogue; capability → that playbook's body; capability+reference
+#: → one reference doc. Offered only when playbooks are discovered (see _effective_tools).
+USE_SKILL_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "use_skill",
+        "description": ("Access a playbook skill (SKILL.md). Call with no capability to LIST "
+                        "available skills (metadata only); with a capability to load that "
+                        "skill's instructions; add a reference name to load one reference doc. "
+                        "Progressive disclosure — list first, then load only what you need."),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "capability": {"type": "string", "description": "Skill capability id (omit to list all)."},
+                "reference": {"type": "string", "description": "Optional reference doc name to load."},
+            },
+        },
+    },
+}
+
+
+def _load_playbooks(plugins_dir: Optional[str]) -> int:
+    """Discover ``SKILL.md`` playbook skills under *plugins_dir* (the second skill kind,
+    ADR-0001) and make them available via the ``use_skill`` tool. Fail-soft: a broken
+    package is skipped, never aborts startup. Returns the number of playbooks loaded."""
+    _PLAYBOOKS.clear()
+    if not plugins_dir:
+        return 0
+    try:
+        from ack.registry import Registry
+        found = Registry.discover_playbooks(plugins_dir)
+    except Exception as e:  # noqa: BLE001 — no registry/discovery → no playbooks, never fatal
+        _ui_print(col(f"  [skills] playbook discovery failed in {plugins_dir!r}: {e!r}", C.YELLOW))
+        return 0
+    for pb in found:
+        _PLAYBOOKS[pb.capability] = pb
+    if _PLAYBOOKS:
+        _ui_print(col(f"  [skills] {len(_PLAYBOOKS)} playbook(s) from {plugins_dir}: "
+                      f"{', '.join(sorted(_PLAYBOOKS))}", C.GRAY))
+    return len(_PLAYBOOKS)
+
+
+def _use_skill(capability: str = "", reference: str = "") -> str:
+    """Dispatch for the ``use_skill`` tool — progressive disclosure over _PLAYBOOKS."""
+    if not capability:
+        if not _PLAYBOOKS:
+            return "No playbook skills are available."
+        lines = ["Available playbook skills (call use_skill with a capability to load one):"]
+        for cap in sorted(_PLAYBOOKS):
+            pb = _PLAYBOOKS[cap]
+            lines.append(f"- {cap}: {pb.description}")
+        return "\n".join(lines)
+    pb = _PLAYBOOKS.get(capability)
+    if pb is None:
+        return (f"ERROR: no playbook skill {capability!r}. "
+                f"Call use_skill with no capability to list available skills.")
+    if reference:
+        try:
+            return pb.reference(reference)
+        except Exception as e:  # noqa: BLE001 — surfaced as a tool result, never raises
+            avail = ", ".join(pb.references()) or "(none)"
+            return f"ERROR: {e}. Available references: {avail}."
+    refs = pb.references()
+    suffix = f"\n\nReferences (load with use_skill('{capability}', '<name>')): {', '.join(refs)}" if refs else ""
+    return pb.body + suffix
+
+
 def _format_parallel(results: List[Dict[str, Any]]) -> str:
     """Render governed fan-out results back into the turn — numbered, in input order,
     failures isolated so a single bad item never sinks the batch."""
@@ -2609,6 +2683,11 @@ def run_tool(name: str, args: Dict[str, Any]) -> str:
             # (flag-gated, fail-soft, fire-and-forget) — no parallel-write races. Off ⇒ no-op.
             _reduce_worker_results(results, topic=(instruction or ""))
             return _format_parallel(results)
+
+        elif name == "use_skill":
+            # Playbook skill kind (ADR-0001): progressive-disclosure access to SKILL.md skills.
+            return _use_skill(str(args.get("capability", "") or ""),
+                              str(args.get("reference", "") or ""))
 
         elif name in _PLUGIN_TOOLS:
             # Open extension surface: dispatch to a discovered plugin skill's run().

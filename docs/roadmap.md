@@ -72,6 +72,10 @@ them — turning a described capability into a working, tested plugin.
   discover, install and update from your own library (no mandatory external
   marketplace), with provenance so you stay in control of what runs.
 
+Design: [ADR-0001](adr/0001-skill-engine-and-library.md) + [`skill-packaging.md`](skill-packaging.md)
+(two skill kinds — typed `CASE`+`run` tools and `SKILL.md` playbooks; doctor+tests gate,
+behavioral eval opt-in; manifest catalogue; `skills/mpr` migrated as the reference built-in).
+
 ## 4. Broader model & data reach
 
 Staying independent means running on more of *your* models and *your* data.
