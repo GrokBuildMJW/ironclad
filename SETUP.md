@@ -1,7 +1,7 @@
 # Setup
 
-> **Status: pre-release / in active development.** No tagged release yet; expect
-> change. Ironclad is developed and tested on an **NVIDIA DGX Spark** (GB10,
+> **Status: pre-release / in active development** (`0.0.x` alpha; tagged previews on
+> PyPI `ironclad-ai` + GitHub Releases, no stable 1.0 yet); expect change. Ironclad is developed and tested on an **NVIDIA DGX Spark** (GB10,
 > Blackwell `sm_121`, 128 GB unified memory) with a local **vLLM** server running
 > **Qwen3.6-35B-A3B-NVFP4**. Any OpenAI-compatible endpoint works; the defaults just
 > match that reference box.

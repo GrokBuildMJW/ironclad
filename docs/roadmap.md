@@ -93,6 +93,7 @@ Maturing the project itself toward a dependable, versioned release.
 - **Automated release pipeline.** Formalising the internal DEV → Prod → Public
   promote path (today a manual gated path: boundary + tests + docs + review +
   export) into an automated, gated flow; the core stays inbound-closed.
-- **First tagged release** once the APIs settle.
+- **A stable (1.0) release** once the APIs settle (today: tagged `0.0.x` alpha previews
+  on PyPI `ironclad-ai` + GitHub Releases).
 
 Issues and discussions are welcome — this is an early, openly-developed project.

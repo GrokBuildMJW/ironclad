@@ -9,7 +9,7 @@ model-emitted `task_json` is validated against the ACK contract at the
 ## Modules
 
 > **The recommended interactive client is now the TypeScript terminal client in
-> [`clients/ink/`](../../clients/ink/)** (purpose-built renderer: ghost-free resize, smooth
+> [`clients/ink/`](../clients/ink/)** (purpose-built renderer: ghost-free resize, smooth
 > streaming, native scrollback/selection/copy). The Python clients below — `client.py`,
 > `tui.py`, `cli.py` — are **legacy**: kept as zero-dependency references and headless
 > fallbacks, still maintained but no longer the primary UI.

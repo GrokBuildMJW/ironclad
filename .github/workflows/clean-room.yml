@@ -1,0 +1,89 @@
+name: clean-room
+
+# Public-release gate (#58). Prove the package installs and runs **from the published
+# sources in isolation** — catching forgotten runtime deps / missing files before a user
+# trips over them. Never trust "works in the monorepo".
+#
+#   PRE-publish  (PRs / pushes): build the wheel from THIS repo, install it into a fresh
+#                venv (NOT `-e`, not the source tree), import-smoke from a neutral dir, and
+#                resolve the optional extras; plus a fresh `clients/ink` build + test.
+#   POST-publish (on a published GitHub Release): install the REAL package from PyPI and
+#                import-smoke — proves what users actually get.
+#
+# Rollback runbook (manual, if POST-publish fails): yank the bad version on PyPI
+# (`pip`-side) and mark the GitHub Release as a draft/pre-release; the previous version
+# stays installable. See PROJECT_SETUP.md → release model.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  pre-publish-python:
+    if: github.event_name != 'release'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build the wheel from the published sources
+        run: |
+          python -m pip install --upgrade pip build
+          python -m build --wheel
+      - name: Install the wheel into a fresh venv (not -e, not the repo)
+        run: |
+          python -m venv /tmp/cr
+          /tmp/cr/bin/python -m pip install --upgrade pip
+          /tmp/cr/bin/python -m pip install dist/*.whl
+      - name: Import-smoke from a neutral dir (installed package, not the source tree)
+        run: cd /tmp && /tmp/cr/bin/python -c "import ack, ack.lodestar; print('import OK ->', ack.__file__)"
+      - name: Optional extras resolve (catch forgotten dependency declarations)
+        run: /tmp/cr/bin/python -m pip install "ironclad-ai[engine,memory]" --find-links dist
+
+  pre-publish-ink:
+    if: github.event_name != 'release'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: clients/ink
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Fresh install + build + test (catch missing npm deps / build artifacts)
+        run: |
+          npm ci
+          npm run build
+          npm test
+
+  post-publish-smoke:
+    if: github.event_name == 'release'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install the published package from PyPI + import-smoke (with propagation retry)
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          python -m pip install --upgrade pip
+          version="${TAG#v}"
+          for attempt in $(seq 1 10); do
+            if python -m pip install "ironclad-ai==${version}"; then
+              ok=1; break
+            fi
+            echo "PyPI not propagated yet (attempt ${attempt}/10) — waiting 30s..."
+            sleep 30
+          done
+          [ "${ok:-0}" = "1" ] || { echo "::error::ironclad-ai==${version} never appeared on PyPI"; exit 1; }
+          cd /tmp && python -c "import ack, ack.lodestar; print('PyPI install OK ->', ack.__file__)"

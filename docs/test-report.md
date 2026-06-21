@@ -33,8 +33,8 @@ GX10_LIVE_URL=http://<your-host>:8100 pytest -k live -q     # 9 passed
 
 ## Coverage by area
 
-Counts below are reproduced from `pytest --collect-only` (2026-06-20) and sum to
-the **462** total (453 offline + 9 live).
+Counts below are reproduced from `pytest --collect-only` (2026-06-21) and sum to
+the **468** total (459 offline + 9 live).
 
 | Area | Test files | Tests |
 |------|-----------|-------|
@@ -42,9 +42,9 @@ the **462** total (453 offline + 9 live).
 | **Function-calling robustness** (tool-arg validate→reask, model-agnostic recovery) | `tool_args`, `tool_extract` | 24 |
 | **Server / client split & security** (HTTP surface, trust profiles, sessions, sealing, config tree + runtime config, command router, doctor, server-side tool bridge) | `server_split`, `security`, `config_tree`, `config_runtime`, `commands`, `doctor_endpoint`, `tool_bridge`, `session_persist` | 76 |
 | **Provider-router / dispatch (P0)** (backend registry, routing policy, artifact routing, spill/fallback, setup-types) | `dispatch`, `router`, `providers`, `providers_config`, `artifact_routing`, `offload_topology` | 69 |
-| **Memory & context** (Mem0 client, chunking, RAG, summary, deep query, vault reconcile, warm tier) | `memory`, `memory_chunking`, `worker_memory`, `context_rag`, `context_summary`, `deep_query`, `reconcile_vault`, `warm` | 77 |
+| **Memory & context** (Mem0 client, chunking, RAG, summary, deep query, vault reconcile, warm tier) | `memory`, `memory_chunking`, `worker_memory`, `context_rag`, `context_summary`, `deep_query`, `reconcile_vault`, `warm` | 78 |
 | **Open plugin surface** (discover + expose `skills/*` plugins, no core patch) | `plugins` | 7 |
-| **Orchestration state** (TaskStore lifecycle/dedup, initiative, autoplan, state e2e) | `taskstore`, `initiative`, `autoplan`, `state_e2e` | 40 |
+| **Orchestration state** (TaskStore lifecycle/dedup, initiative, autoplan, state e2e) | `taskstore`, `initiative`, `autoplan`, `state_e2e` | 45 |
 | **Parallelism** (governed fan-out, in-engine tool, single-writer reduce, parallel router) | `workers`, `parallel_tool`, `worker_reduce`, `parallel_router` | 29 |
 | **Thin client + BYO code-agent** (agent pool, `GX10_AGENT_CMD` template, managed transport) | `client_pool`, `client_transport` | 14 |
 | **Runtime-aware output & language** (encoding safety, color gating, reply language) | `output`, `language` | 14 |

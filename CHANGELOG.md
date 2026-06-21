@@ -9,6 +9,29 @@ Released versions are listed below; upcoming work accumulates under *Unreleased*
 
 ## [Unreleased]
 
+### Added
+- **Public-release clean-room gate** (`.github/workflows/clean-room.yml`, #58). Before any
+  publish, the package is proven installable + runnable **from the published sources in
+  isolation**: PRE-publish builds the wheel, installs it into a fresh venv (not `-e`),
+  import-smokes from a neutral dir and resolves the `[engine]`/`[memory]` extras, and does a
+  fresh `clients/ink` build + test; POST-publish installs the real package from PyPI and
+  import-smokes. Catches forgotten dependencies/files before a user hits them.
+
+### Fixed
+- **Published doc link** (`engine/README.md` → the bundled `clients/ink/` client) now
+  resolves in the released tree; the export now normalizes the `../` depth of links to the
+  bundled siblings (`clients/ink`, `skills/mpr`), and a deterministic doc-reality audit gate
+  guards against dead links/anchors, version drift, and stale claims going forward (#41).
+
+### Changed
+- **Docs: release-status & test counts reconciled to reality** (#59). The status/honesty
+  sections (`README.md`, `docs/status.md`, `docs/roadmap.md`, `SETUP.md`) now state the
+  actual release model — pre-release `0.0.x` alpha, tagged releases on PyPI (`ironclad-ai`)
+  **and** GitHub Releases (`v0.0.7`), no stable 1.0 — instead of the stale "no tagged
+  release". Test counts regenerated from `pytest --collect-only`: **468** Python
+  (459 offline + 9 live) and **337** TypeScript client tests; `docs/test-report.md` area
+  table updated to match.
+
 ## [0.0.7] - 2026-06-21
 
 ### Changed
