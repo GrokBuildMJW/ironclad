@@ -84,6 +84,14 @@ Planned (design): [ADR-0003](adr/0003-prompt-library.md) + [`prompt-packaging.md
 core built-in (variables + languages + guided elicitation); `/<prompt-name>` → asked for inputs →
 finished prompt in the target language; add a prompt by dropping an MD file.
 
+**Extension SDK — build plugins in a separate repo.** A **curated, versioned** extension surface
+(`ack.sdk`) so a plugin can be developed in its **own repository** against published `ironclad-ai`
+and loaded without forking the core — `ack.sdk.__all__` is the public contract (tool/playbook/
+prompt kinds, the registration gate, schema derivation, i18n, catalogue), provisional while `0.0.x`
+and semver from 1.0. A packaged-plugin **entry-point** loading seam (`ironclad.plugins`) gives
+dependency-inverted discovery — install a plugin and the engine finds it, no path config, no core
+change. Design: [ADR-0004](adr/0004-extension-sdk.md) + [`plugin-api.md`](plugin-api.md).
+
 ## 4. Broader model & data reach
 
 Staying independent means running on more of *your* models and *your* data.

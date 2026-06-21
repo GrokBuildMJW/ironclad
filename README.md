@@ -94,11 +94,11 @@ Ironclad's engine comes from a **proven, in-production orchestrator**, now **reb
 the server + client architecture above and **wired and tested**. It is still
 **pre-release** (0.0.x, alpha): single-tenant by design (no multi-user auth yet) and
 APIs/layout/config may change. Tagged releases ship on **PyPI** (`ironclad-ai`) and as
-**GitHub Releases** (currently `v0.0.11`) — treat them as early previews and `main` as a
+**GitHub Releases** (currently `v0.0.12`) — treat them as early previews and `main` as a
 development snapshot. The internal DEV → Prod → Public **promote pipeline** that hardens our
 releases is in development (today a manual gated path).
 
-Verified by **939 Python tests** (930 offline + 9 live) plus **337 TypeScript client
+Verified by **963 Python tests** (954 offline + 9 live) plus **337 TypeScript client
 tests**, and a **full end-to-end run with a real code-agent**. Read these before relying on
 anything:
 
@@ -151,7 +151,9 @@ built in.
 
 Ironclad is a **foundation, not a finished product**. You extend it over one open, versioned
 contract — the **[plugin API](docs/plugin-api.md)**: drop a tool into a `skills/` directory,
-point `GX10_PLUGINS_DIR` at it, and the agent picks it up **without forking the core**.
+point `GX10_PLUGINS_DIR` at it, and the agent picks it up **without forking the core**. Building
+in your **own repo**? `pip install ironclad-ai` and import the curated **[Extension SDK](docs/adr/0004-extension-sdk.md)**
+(`ack.sdk`) to validate and ship plugins against a versioned surface.
 Concrete use cases dock on as **vessels** (see
 [`examples/demo-vessel/`](examples/demo-vessel/); a generator scaffolds new ones), so you
 build domain agents on a reliable, self-hosted base instead of starting from scratch. The

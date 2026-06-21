@@ -15,7 +15,7 @@
 This document is the single source of truth for **what actually works right now**.
 
 > **Release model.** Ironclad is **pre-release** (`0.0.x`, alpha). Tagged releases are
-> published on **PyPI** as `ironclad-ai` and as **GitHub Releases** (latest `v0.0.11`);
+> published on **PyPI** as `ironclad-ai` and as **GitHub Releases** (latest `v0.0.12`);
 > the importable wheel is the Agent-Contract-Kernel (`ack` + `ack.lodestar`), while the
 > orchestration engine ships as runnable scripts until its API stabilizes. There is **no
 > stable/1.0 release yet** — APIs, layout, and config may change between `0.0.x` versions.
@@ -64,6 +64,8 @@ This document is the single source of truth for **what actually works right now*
 | **Security / trust model (Phase d)** | **wired + tested (single-tenant)** | Selectable trust profiles (`security.profile`): `open` (default — no auth, LAN bind, mount allowed), `token` (deployment secret over the LAN), `sealed` (loopback bind behind a client-managed tunnel + secret + session heartbeat; client-facing endpoints refuse and autoplan pauses when no session is live). The token is a **deployment secret, not a user login**. Fail-closed: an auth profile refuses to boot without a secret. Unit-tested end-to-end (no vLLM) **and live-verified** over a real SSH tunnel on the reference GPU (loopback bind, gated routes 401, session open→live→close, a real model turn through the sealed channel — see below). **No multi-user identity/authorization** — single principal only; see the [roadmap](roadmap.md). Config/env: `security.profile`/`GX10_PROFILE` (boot-only/frozen), the secret in `GX10_SERVER_TOKEN` (env named by `security.token_env`), `security.session_heartbeat_s`/`GX10_SESSION_HEARTBEAT`, and `security.code_locality`/`GX10_CODE_LOCALITY` (`mount`\|`local` — honored under open/token, forced `local` under sealed, advertised on `/health`). The same gate applies in **`token`** (401 without the Bearer secret, no session needed) and **`sealed`** (also needs a live session). Operator how-to: [`security.md`](security.md). |
 | **Core built-in loader** (always-on) | **wired + tested** | Built-in skills/prompts load at startup from a **fixed core dir (`skills/`)**, scanned **unconditionally** — independent of `GX10_PLUGINS_DIR` (`_load_skills`). Built-ins work out of the box, no config. Covered by `test_builtin_loader.py` (4). ADR-0002 #114. |
 | **Open plugin surface** (`GX10_PLUGINS_DIR`) — 3rd-party | **wired + tested** | The open, versioned extension contract for **3rd-party/user** skills: drop a Python file with a module-level `CASE` dict + `run(...)` (or a `SKILL.md` playbook) into a `skills/` directory, point `GX10_PLUGINS_DIR` at it, and the engine **discovers it additively — with no core change** (built-ins are no longer routed through it). The CI boundary check keeps `core/` standalone + secret-free; it does **not** sandbox plugins — a plugin runs in-process. See [`plugin-api.md`](plugin-api.md). |
+| **Extension SDK** (`ack.sdk`) — separate-repo authoring | **wired + tested** | The **curated, versioned import surface** a plugin builds against from its **own repo** (`pip install ironclad-ai`): `ack.sdk` re-exports the tool/playbook/prompt kinds, the registration/eval `gate`, `derive_tool_schema`, `Localizer`, and the `catalogue` — `ack.sdk.__all__` **is** the public API (everything else under `ack.*`/`engine.*` is internal). Provisional while `0.0.x`, semver from 1.0. A shipped **example plugin** ([`examples/example-plugin/`](../examples/example-plugin/)) shows the separate-repo shape, and the **clean-room builds it against the freshly-installed wheel** (proving a separate repo can build against the published artifact). Covered by `test_sdk.py` (7) + `test_example_plugin.py` (3). [ADR-0004](adr/0004-extension-sdk.md), [`plugin-api.md`](plugin-api.md). |
+| **Packaged-plugin loading** (`ironclad.plugins` entry-point) | **wired + tested** | A *packaged* plugin (pip-installed into the deployment) is discovered at startup via the `ironclad.plugins` **entry-point group** — additively alongside built-ins + `GX10_PLUGINS_DIR`, with **no path config and no core change**. Dependency-inverted: the engine resolves each entry point to a plugins dir (package / callable / path) and scans it; it **never imports a concrete plugin** (only the generic group string couples them). Broken entry points are fail-soft. An **export-leak guard** (boundary + export forbidden-literals + `test_export_leak_guard.py`, 4) keeps any **internal** plugin out of `core/` and the public export — the coupling is only the generic group string. Covered by `test_entrypoint_loader.py` (10). [ADR-0004](adr/0004-extension-sdk.md). |
 | **Playbook skill kind** (`SKILL.md` + `use_skill`) | **wired + tested** | The second skill kind (ADR-0001): `ack.playbook` parses+validates `SKILL.md` packages and `Registry.discover_playbooks` finds them alongside the typed-tool `discover_skills`; the engine exposes them via the `use_skill` tool with **progressive disclosure** (list metadata → load body → load a reference on demand). Covered by `test_playbook.py` (15). See [`skill-packaging.md`](skill-packaging.md). |
 | **Skill generator** (`ack.skillgen`) | **wired + tested** | Spec → a schema-valid scaffold for **both** kinds (typed `CASE`+`run` `.py` with a derived tool schema + an auto-test stub; or a `SKILL.md` playbook package + `references/` + `scripts/check`). Contract-correct by construction; the body is a marked stub for an author/LLM to fill (ADR-0001 D3). The richer paved-road domain scaffold remains `ack.generator`. Covered by `test_skillgen.py` (7). |
 | **Skill library catalogue** (`ack.catalogue`) | **wired + tested** | Self-hosted manifest index over **both** kinds (reads the skill's own metadata — no separate registry file to drift): `capability`/`kind`/`version`/`type`/`domain`/`provenance`/`source`, semver compare, discover + install (copy) + update-when-newer, built-in vs user libraries. No external marketplace. Covered by `test_catalogue.py` (6). |
@@ -140,16 +142,17 @@ split. Honest split of that capability:
   all ship and are covered by tests (`test_plugins.py`, `test_client_pool.py`,
   `test_doctor_endpoint.py`). The extension model is *additive*: plugins dock onto a stable
   contract, the core is never *forked* — plugins dock through the stable contract and `core/` stays standalone + secret-free (boundary-check enforced; the check guards `core/`, it does not sandbox plugin code).
-- **In development — our internal release machinery.** The **three-stage DEV → Prod →
-  Public promote pipeline** (a private dev fork that builds+tests in Docker → merge into the
-  private source on a green artifact → gated public export) and its eventual **automated
-  evening sync** are core-maintainer machinery, not yet a one-command flow. Until it lands,
-  promotion is the existing **manual** gated path (boundary + tests + docs + review +
-  export). Downstream users never touch any of this — they pull the framework and extend it
+- **Mostly done — our internal release machinery.** The **DEV → Prod → Public promote** now
+  runs as a **single fail-closed gated command**: boundary (core + client) → the full test suite
+  (with a JUnit proof) → docs gate (CHANGELOG + doc-reality-audit) → export gates → a
+  **PRE-publish clean-room** (wheel → fresh venv → import-smoke → an example plugin builds against
+  the installed SDK) → a 2nd-instance review → publish → prod redeploy. It is **dry by default**
+  and stops before anything irreversible. The remaining step is **full automation** (a scheduled
+  evening sync). Downstream users never touch any of this — they pull the framework and extend it
   over the plugin API, or fork it freely (Apache-2.0).
 
-So the way you *extend* Ironclad is shipped and tested; the way *we harden our own
-releases* is partly manual and being formalized.
+So the way you *extend* Ironclad is shipped and tested; the way *we harden our own releases* is a
+single gated flow, with scheduled automation the last step.
 
 ## Reference load test
 

@@ -44,9 +44,27 @@ jobs:
           /tmp/cr/bin/python -m pip install --upgrade pip
           /tmp/cr/bin/python -m pip install dist/*.whl
       - name: Import-smoke from a neutral dir (installed package, not the source tree)
-        run: cd /tmp && /tmp/cr/bin/python -c "import ack, ack.lodestar; print('import OK ->', ack.__file__)"
+        run: cd /tmp && /tmp/cr/bin/python -c "import ack, ack.lodestar, ack.sdk; print('import OK ->', ack.__file__, '| sdk exports:', len(ack.sdk.__all__))"
       - name: Optional extras resolve (catch forgotten dependency declarations)
         run: /tmp/cr/bin/python -m pip install "ironclad-ai[engine,memory]" --find-links dist
+      - name: Build the example plugin against the installed SDK + verify discovery (#138)
+        run: |
+          /tmp/cr/bin/python -m pip install --no-deps ./examples/example-plugin
+          cd /tmp && /tmp/cr/bin/python - <<'PY'
+          import ack.sdk
+          from importlib.metadata import entry_points
+          from pathlib import Path
+          import importlib.util as u
+          eps = [e for e in entry_points(group="ironclad.plugins") if e.name == "example"]
+          assert eps, "example plugin did not register the ironclad.plugins entry point"
+          import ironclad_example_plugin as p
+          skill = Path(p.__path__[0]) / "skills" / "reverse.py"
+          spec = u.spec_from_file_location("rev", skill); m = u.module_from_spec(spec); spec.loader.exec_module(m)
+          assert m.run("hello") == "olleh"
+          schema = ack.sdk.derive_tool_schema(m.run)
+          assert "text" in schema["properties"], schema
+          print("example plugin builds against the SDK, registers its entry point, runs, schema OK")
+          PY
 
   pre-publish-ink:
     if: github.event_name != 'release'
@@ -86,4 +104,4 @@ jobs:
             sleep 30
           done
           [ "${ok:-0}" = "1" ] || { echo "::error::ironclad-ai==${version} never appeared on PyPI"; exit 1; }
-          cd /tmp && python -c "import ack, ack.lodestar; print('PyPI install OK ->', ack.__file__)"
+          cd /tmp && python -c "import ack, ack.lodestar, ack.sdk; print('PyPI install OK ->', ack.__file__, '| sdk exports:', len(ack.sdk.__all__))"

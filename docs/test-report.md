@@ -9,9 +9,9 @@
 
 | | |
 |---|---|
-| Automated tests (offline, no model) | **930 passed** |
+| Automated tests (offline, no model) | **954 passed** |
 | Live smoke tests (skipped without a model) | **9** |
-| **Total Python** | **939** |
+| **Total Python** | **963** |
 | TypeScript client tests (`node:test`) | **333 passed** (337 total, 4 skipped) |
 | Full agentic loop, end to end, with a **real** code-agent | **verified** |
 | Issues found during the campaign | **1 functional gap + 5 review findings — all found and fixed** (see below) |
@@ -24,7 +24,7 @@ default** and only runs when pointed at a real server.
 
 ```bash
 # 1) offline suite — deterministic, no model needed
-pytest -q                                   # from core/  → 930 passed, 9 skipped
+pytest -q                                   # from core/  → 954 passed, 9 skipped
 
 # 2) live smoke — against your own running orchestrator
 GX10_LIVE_URL=http://<your-host>:8100 pytest -k live -q     # 9 passed
@@ -33,8 +33,8 @@ GX10_LIVE_URL=http://<your-host>:8100 pytest -k live -q     # 9 passed
 
 ## Coverage by area
 
-Counts below are reproduced from `pytest --collect-only` (2026-06-21) and sum to
-the **939** total (930 offline + 9 live) — now includes the MPR core built-in suite.
+Counts below are reproduced from `pytest --collect-only` (2026-06-22) and sum to
+the **963** total (954 offline + 9 live) — now includes the MPR core built-in suite.
 
 | Area | Test files | Tests |
 |------|-----------|-------|
@@ -44,6 +44,10 @@ the **939** total (930 offline + 9 live) — now includes the MPR core built-in 
 | **Provider-router / dispatch (P0)** (backend registry, routing policy, artifact routing, spill/fallback, setup-types) | `dispatch`, `router`, `providers`, `providers_config`, `artifact_routing`, `offload_topology` | 69 |
 | **Memory & context** (Mem0 client, chunking, RAG, summary, deep query, vault reconcile, warm tier) | `memory`, `memory_chunking`, `worker_memory`, `context_rag`, `context_summary`, `deep_query`, `reconcile_vault`, `warm` | 78 |
 | **Open plugin surface** (discover + expose `skills/*` plugins, no core patch) | `plugins` | 7 |
+| **Extension SDK** (`ack.sdk` curated surface: `__all__` contract, re-export identity, gate/schema/assemble via SDK) | `sdk` | 7 |
+| **Packaged-plugin loading** (`ironclad.plugins` entry-point: root resolution, additive load, fail-soft) | `entrypoint_loader` | 10 |
+| **Export-leak guard** (internal plugin repo forbidden in boundary+export; synthetic-leak flagged; real tree clean) | `export_leak_guard` | 4 |
+| **Example plugin** (shipped separate-repo example: discovers+runs via loader, schema matches SDK) | `example_plugin` | 3 |
 | **Playbook skill kind** (SKILL.md parse/validate/discover, progressive disclosure, `use_skill`) | `playbook` | 15 |
 | **Skill generator** (spec → scaffold both kinds, schema-valid by construction) | `skillgen` | 7 |
 | **Skill library catalogue** (manifest index, semver, provenance, install/update) | `catalogue` | 6 |

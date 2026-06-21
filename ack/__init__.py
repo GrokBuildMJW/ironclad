@@ -4,13 +4,14 @@ Generic, model-agnostic reliability layer for LLM agents: schema-as-SSOT,
 validate→reask→retry, registry, doctor, generator. Standalone and secret-free —
 imports nothing from a private deployment.
 
-Public surface (assembled as the package lands, phase c):
-  - case_spec     : generic Pydantic-SSOT task contract + schema machinery
-  - lodestar      : opt-in capability/gap → backlog plugin (default off)
-  - validated_emit: bounded re-ask loop (soft path) with injectable transport
-  - registry      : task-type / tool / skill discovery
-  - doctor        : workspace preflight
-  - generator     : paved-road case scaffolding
+Kernel-level exports (imported eagerly here):
+  - case_spec        : generic Pydantic-SSOT task contract + schema machinery
+  - constrained_emission : hard-floor constrained tool emission
+  - validated_emit   : bounded re-ask loop (soft path) with injectable transport
+
+The **plugin/extension contract** (registry, playbook, prompt, gate, catalogue, i18n) is the
+curated, versioned **Extension SDK** — import it from :mod:`ack.sdk` (see ADR-0004 +
+``docs/plugin-api.md``). The opt-in ``lodestar`` plugin lives under :mod:`ack.lodestar`.
 """
 from __future__ import annotations
 

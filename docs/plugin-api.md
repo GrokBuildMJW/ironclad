@@ -59,6 +59,45 @@ That's the whole contract. The core never changed.
 These are the surfaces we keep **semver-stable**. We maintain the core ourselves; your
 plugins live outside it.
 
+## Build in a separate repo — the SDK (`ack.sdk`)
+
+You don't need the monorepo. `pip install ironclad-ai` ships the whole contract, and
+**`ack.sdk`** is the one curated import surface to build a plugin in its **own repository**:
+
+```python
+# your-plugin-repo/ — pyproject pins ironclad-ai>=0.0.12
+from ack.sdk import gate, derive_tool_schema   # the SDK surface (ADR-0004)
+
+# validate your plugin against the SAME gate Ironclad runs, before you ship it:
+assert gate("myplugins/skills/greet.py")       # doctor preflight + schema + sibling test
+```
+
+`ack.sdk.__all__` **is** the public API — the tool kind (`Registry`, `derive_tool_schema`,
+`tool`, `task_type`), the **playbook** kind (`Playbook`, `parse_playbook`, `discover_playbooks`),
+the **prompt** kind (`Prompt`, `parse_prompt`, `assemble`, `run_prompt`), the registration/eval
+**gate** (`gate`/`gate_tool`/`gate_playbook`/`gate_prompt`), shared **i18n** (`Localizer`), and the
+self-hosted **catalogue** (`build_catalogue`, `install`, `update`). Everything else under `ack.*` /
+`engine.*` is internal and may change. **Pin the version** and import only from `ack.sdk`.
+
+**Stability:** while Ironclad is `0.0.x` this surface is **provisional** (additive change expected,
+breaks noted in `CHANGELOG.md`); from **1.0** it follows **semver** with a one-minor deprecation
+window. See [ADR-0004](adr/0004-extension-sdk.md).
+
+**Loading a packaged plugin.** A dir of skills loads via `GX10_PLUGINS_DIR` (above). A *packaged*
+plugin (installed into the deployment) is discovered through the `ironclad.plugins` **entry-point
+group** — no path config, no core change. Advertise the group in your plugin's `pyproject.toml`,
+pointing at your package (or a callable / dir path):
+
+```toml
+# your-plugin-repo/pyproject.toml
+[project.entry-points."ironclad.plugins"]
+myplugin = "myplugin"     # a package containing a skills/ dir (or a callable returning a dir)
+```
+
+Install it into the same environment as Ironclad and the engine discovers it at startup, additively
+alongside built-ins and `GX10_PLUGINS_DIR` — the engine **never imports your plugin by name**
+(dependency inversion; the only coupling is the group string). See [ADR-0004](adr/0004-extension-sdk.md).
+
 ## Scaffold one (don't hand-write it)
 
 The generator lays down a complete, correctly-shaped case/domain skeleton from a template —

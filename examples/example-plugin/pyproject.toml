@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ironclad-example-plugin"
+version = "0.1.0"
+description = "A minimal Ironclad plugin built against the published Extension SDK (ADR-0004)."
+requires-python = ">=3.10"
+# Build against the published framework — pin the version whose ack.sdk you target.
+dependencies = ["ironclad-ai>=0.0.12"]
+
+# This is the whole integration: advertise the package on the ironclad.plugins entry-point
+# group. Install this distribution into the same environment as Ironclad and the engine
+# discovers it at startup — no path config, no core change (ADR-0004 / docs/plugin-api.md).
+[project.entry-points."ironclad.plugins"]
+example = "ironclad_example_plugin"
+
+[tool.setuptools]
+packages = ["ironclad_example_plugin", "ironclad_example_plugin.skills"]

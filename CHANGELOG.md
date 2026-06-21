@@ -9,6 +9,44 @@ Released versions are listed below; upcoming work accumulates under *Unreleased*
 
 ## [Unreleased]
 
+## [0.0.12] - 2026-06-22
+
+### Changed
+- **Internal DEV→Prod→Public promote finalized** (#40, epic #132): the release pipeline now runs as
+  a single fail-closed gated flow — boundary → **full** test suite (incl. the MPR built-in, which
+  the previous step missed) → docs gate (CHANGELOG + doc-reality-audit) → export gates →
+  **PRE-publish clean-room** (wheel → fresh venv → import-smoke incl. `ack.sdk` → an example plugin
+  builds against the installed SDK) → review → publish → prod redeploy; dry by default. Full
+  automation (scheduled sync) deferred. (Core-maintainer machinery; downstream users never touch it.)
+
+### Added
+- **Example plugin + SDK clean-room guarantee** (#138, epic #132): a standalone example plugin
+  (`examples/example-plugin/`) shows the separate-repo authoring shape — a package with a `skills/`
+  dir + an `ironclad.plugins` entry point, built against `ironclad-ai`. The clean-room now
+  import-smokes `ack.sdk` and **builds the example against the freshly-installed wheel**, asserting
+  it registers its entry point, runs, and matches the SDK schema — proving a separate repo can build
+  against the published artifact. 3 tests (skip in installed trees; the workflow covers that path).
+- **Export-leak guard for internal plugins** (#137, epic #132): the boundary check + export
+  secret-sweep now forbid the internal plugin repo name, and a leak-guard test pins the guarantee
+  (the guards flag a synthetic leak; the real `core/` + `clients/ink` tree is clean). `core/`
+  couples to plugins only via the generic `ironclad.plugins` entry-point group — never a concrete
+  private plugin. (The guards live in `scripts/ci/`, private; the test skips in installed/clean-room
+  trees where they're absent.) 4 tests.
+- **Packaged-plugin loading via entry points** (#136, epic #132): a pip-installed plugin
+  (3rd-party or internal) is discovered at startup through the `ironclad.plugins` **entry-point
+  group** — additively alongside built-ins + `GX10_PLUGINS_DIR`, with no path config and no core
+  change. Dependency-inverted: the engine resolves each entry point to a plugins dir
+  (package / callable / path) and scans it; it **never imports a concrete plugin**. Broken entry
+  points are fail-soft. [ADR-0004](docs/adr/0004-extension-sdk.md), `plugin-api.md`. 10 tests.
+- **Extension SDK (`ack.sdk`)** (#72, epic #132): a curated, versioned import surface to build a
+  plugin in a **separate repo** against `pip install ironclad-ai` — re-exports the tool/playbook/
+  prompt kinds, the registration/eval `gate`, `derive_tool_schema`, `Localizer`, and the
+  `catalogue`. `ack.sdk.__all__` **is** the public API; everything else under `ack.*`/`engine.*`
+  is internal. Provisional while `0.0.x`, semver from 1.0. [ADR-0004](docs/adr/0004-extension-sdk.md)
+  + `plugin-api.md` (separate-repo workflow). 7 tests. *(The contract modules already shipped in
+  the `ironclad-ai` wheel; this adds the curated surface, the stability policy, and the docs — no
+  distribution change. The packaged-plugin `ironclad.plugins` entry-point seam is in development, #136.)*
+
 ## [0.0.11] - 2026-06-21
 
 ### Added

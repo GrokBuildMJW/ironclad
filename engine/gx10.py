@@ -2300,21 +2300,80 @@ def _discover_prompts_into(root: str) -> int:
     return n
 
 
+#: Entry-point group a *packaged* plugin advertises (ADR-0004 #136). A pip-installed plugin
+#: (3rd-party or internal) is discovered by this group name alone — dependency inversion: the
+#: engine never imports a concrete plugin, and the only coupling is this generic string.
+_PLUGIN_ENTRYPOINT_GROUP = "ironclad.plugins"
+
+
+def _iter_plugin_entry_points() -> list[Any]:
+    """The entry points in the ``ironclad.plugins`` group (fail-soft; isolated for testing)."""
+    try:
+        from importlib.metadata import entry_points
+    except Exception:  # noqa: BLE001 — no metadata API → no entry-point plugins
+        return []
+    try:
+        return list(entry_points(group=_PLUGIN_ENTRYPOINT_GROUP))   # selectable API (py3.10+)
+    except TypeError:  # pragma: no cover — very old API shape
+        return list(entry_points().get(_PLUGIN_ENTRYPOINT_GROUP, []))
+
+
+def _resolve_plugin_root(obj: Any) -> Optional[str]:
+    """Resolve an entry-point target to a discoverable plugins **root dir**. Accepts a dir path
+    (str/Path), a package/module (its dir), or a zero-arg callable returning one of those."""
+    if callable(obj) and not hasattr(obj, "__path__") and not hasattr(obj, "__file__"):
+        try:
+            obj = obj()
+        except Exception:  # noqa: BLE001
+            return None
+    if isinstance(obj, (str, Path)):
+        p = Path(obj)
+        return str(p) if p.is_dir() else None
+    path = getattr(obj, "__path__", None)        # a package
+    if path:
+        return next(iter(path), None)
+    f = getattr(obj, "__file__", None)           # a module
+    if f:
+        return str(Path(f).parent)
+    return None
+
+
+def _entrypoint_plugin_roots() -> list[str]:
+    """Discover plugin root dirs advertised via the ``ironclad.plugins`` entry-point group.
+    Each entry point is loaded + resolved independently; a bad one is skipped, never fatal."""
+    roots: list[str] = []
+    for ep in _iter_plugin_entry_points():
+        name = getattr(ep, "name", "?")
+        try:
+            root = _resolve_plugin_root(ep.load())
+        except Exception as e:  # noqa: BLE001 — a broken plugin entry point never aborts startup
+            _ui_print(col(f"  [skills] entry-point plugin {name!r} failed to load: {e!r}", C.YELLOW))
+            continue
+        if root:
+            roots.append(root)
+        else:
+            _ui_print(col(f"  [skills] entry-point plugin {name!r} resolved to no plugins dir", C.YELLOW))
+    return roots
+
+
 def _load_skills(plugins_dir: Optional[str] = None) -> tuple[int, int, int]:
     """Startup loader (ADR-0002 #114): **always** load core built-ins from ``_BUILTIN_DIR``,
-    then **additively** load 3rd-party skills from *plugins_dir* if set. Clears once. Returns
-    (n_tools, n_playbooks, n_prompts)."""
+    then **additively** load 3rd-party/internal skills — from *plugins_dir* (a dir, dev) **and**
+    from packaged plugins advertised via the ``ironclad.plugins`` entry-point group (ADR-0004
+    #136). Clears once. Returns (n_tools, n_playbooks, n_prompts)."""
     _PLUGIN_TOOLS.clear()
     _PLAYBOOKS.clear()
     _PROMPTS.clear()
-    roots = [str(_BUILTIN_DIR)] + ([plugins_dir] if plugins_dir else [])
+    ep_roots = _entrypoint_plugin_roots()
+    roots = [str(_BUILTIN_DIR)] + ([plugins_dir] if plugins_dir else []) + ep_roots
     for root in roots:
         _discover_tools_into(root)
         _discover_playbooks_into(root)
         _discover_prompts_into(root)
     if _PLUGIN_TOOLS or _PLAYBOOKS or _PROMPTS:
+        srcs = "built-ins" + (f" + {plugins_dir}" if plugins_dir else "") + (f" + {len(ep_roots)} entry-point(s)" if ep_roots else "")
         _ui_print(col(f"  [skills] {len(_PLUGIN_TOOLS)} tool(s) + {len(_PLAYBOOKS)} playbook(s) "
-                      f"+ {len(_PROMPTS)} prompt(s) (built-ins{' + ' + plugins_dir if plugins_dir else ''})", C.GRAY))
+                      f"+ {len(_PROMPTS)} prompt(s) ({srcs})", C.GRAY))
     return len(_PLUGIN_TOOLS), len(_PLAYBOOKS), len(_PROMPTS)
 
 
