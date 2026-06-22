@@ -15,7 +15,7 @@
 This document is the single source of truth for **what actually works right now**.
 
 > **Release model.** Ironclad is **pre-release** (`0.0.x`, alpha). Tagged releases are
-> published on **PyPI** as `ironclad-ai` and as **GitHub Releases** (latest `v0.0.14`);
+> published on **PyPI** as `ironclad-ai` and as **GitHub Releases** (latest `v0.0.15`);
 > the importable wheel is the Agent-Contract-Kernel (`ack` + `ack.lodestar`), while the
 > orchestration engine ships as runnable scripts until its API stabilizes. There is **no
 > stable/1.0 release yet** — APIs, layout, and config may change between `0.0.x` versions.

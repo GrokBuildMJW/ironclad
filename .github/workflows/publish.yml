@@ -21,6 +21,23 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - name: Release preflight (fail-closed before the irreversible PyPI upload)
+        # The three views must agree before publishing: the release tag, pyproject.version, and a
+        # non-empty CHANGELOG section for that version. A duplicate version is backstopped by the
+        # non-skip upload below (PyPI rejects re-uploads). See scripts/ci/release_preflight.py.
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          set -eu
+          VER=$(grep -m1 -E '^[[:space:]]*version[[:space:]]*=' pyproject.toml | sed -E 's/.*"([^"]+)".*/\1/')
+          echo "pyproject version: ${VER} ; release tag: ${TAG:-<none>}"
+          if [ -n "${TAG:-}" ] && [ "${TAG#v}" != "${VER}" ]; then
+            echo "::error::release tag '${TAG}' != pyproject version '${VER}'"; exit 1
+          fi
+          if ! grep -qE "^##[[:space:]]*\[${VER}\]" CHANGELOG.md; then
+            echo "::error::CHANGELOG.md has no '## [${VER}]' section — refusing to publish ${VER}"; exit 1
+          fi
+          echo "preflight OK — tag/pyproject/CHANGELOG agree on ${VER}"
       - name: Build sdist + wheel
         run: |
           python -m pip install --upgrade pip build

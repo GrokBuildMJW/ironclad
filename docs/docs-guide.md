@@ -35,5 +35,7 @@ a description (and open an epic for the concrete work); to retire a phase, close
 
 `scripts/ci/doc_reality_audit.py` gates the machine-checkable slice: internal links/anchors,
 version consistency, banned stale phrases, cross-doc number agreement, required docs present, and
-the **per-doc responsibility lint** above (roadmap-forward-only + status-now-only). The full audit
-procedure (the human, semantic part) lives in `vault/Plan/doc-reality-audit.md` (private).
+the **per-doc responsibility lint** above (roadmap-forward-only + status-now-only). Plus `scripts/ci/process_doctor.py` asserts the live-state invariants (incl. an open milestone with
+work but no description -> invisible on the roadmap, warned), and the release gate (`promote.sh`) runs
+`gen_roadmap.py --check` so a release can never ship a stale roadmap. The full audit procedure (the
+human, semantic part) lives in `vault/Plan/doc-reality-audit.md` (private).

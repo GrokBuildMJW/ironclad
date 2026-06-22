@@ -1,12 +1,16 @@
 name: release close-out
 
-# On a published release, close every open `resolved` issue with a `released` label +
-# thank-you comment — the delivery-time close of the upstream round-trip
-# (done-means-deployed). Uses the built-in token (issues:write on this repo only).
+# Close every open `resolved` issue with a `released` label + thank-you comment — the delivery-time
+# close of the upstream round-trip (done-means-deployed). Uses the built-in token (issues:write here).
+#
+# GATED ON PUBLISH SUCCESS (#198): triggered by the "Publish to PyPI" workflow COMPLETING, and runs
+# only if it concluded `success`. Closing a reporter's issue as "released and available now" before
+# the package is actually on PyPI would be a done-means-deployed lie — so the upload must win first.
 
 on:
-  release:
-    types: [published]
+  workflow_run:
+    workflows: ["Publish to PyPI"]
+    types: [completed]
   workflow_dispatch:
 
 permissions:
@@ -15,13 +19,17 @@ permissions:
 jobs:
   close-resolved:
     runs-on: ubuntu-latest
+    # workflow_run fires on success AND failure → guard on the conclusion (manual dispatch always runs).
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
     env:
       GH_TOKEN: ${{ github.token }}
-      TAG: ${{ github.event.release.tag_name || github.ref_name }}
     steps:
       - name: Close resolved issues as released
         run: |
           set -eu
+          # workflow_run carries no release tag → resolve the just-published (latest) release.
+          TAG=$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName --jq .tagName 2>/dev/null || echo "")
+          [ -n "$TAG" ] || { echo "no published release found — nothing to close."; exit 0; }
           nums=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --label resolved \
                    --limit 100 --json number --jq '.[].number')
           if [ -z "$nums" ]; then echo "no resolved issues to close."; exit 0; fi

@@ -9,6 +9,81 @@ Released versions are listed below; upcoming work accumulates under *Unreleased*
 
 ## [Unreleased]
 
+## [0.0.15] - 2026-06-22
+
+### Added
+- **Release-version invariant + release-aware CHANGELOG gate** (#198, folds #177, epic #188): a release
+  is an irreversible publish (ADR-0007). `publish.yml` now runs a **fail-closed preflight before the
+  PyPI upload** — the release tag, `pyproject.version` and a non-empty `## [X.Y.Z]` CHANGELOG section
+  must all agree (a duplicate version is backstopped by the non-skip upload). `release-close.yml` is
+  **gated on publish success** (triggered by the Publish workflow completing `success`) so a reporter's
+  issue is never closed "released and available now" before the package is actually live. New
+  `scripts/ci/release_preflight.py` carries the pure logic (`release_preflight`, `changelog_release_state`)
+  and a `--preflight` CLI that also checks PyPI. **Fixes #177:** promote.sh gate 3 demanded a non-empty
+  `[Unreleased]`, which was mutually exclusive with the post-bump state doc-reality-audit demands
+  (`pyproject == newest CHANGELOG`); the gate now classifies pending-dev and cut-release as valid and
+  only genuine drift as fail, so the whole release flow runs. `test_release_preflight.py` (9).
+- **Upstream round-trip + board reconcilers** (#194, epic #188): four invariants on the cross-repo
+  and board derived views (ADR-0007). `upstream-closed-is-released` — a public `ironclad` issue that
+  reached `resolved` may only be closed via delivery (which stamps `released`); a closed-without-
+  `released` issue is drift and is healed (fixed the stranded `ironclad#5`). `open-assigned-in-progress`
+  — an open + **assigned** issue must be at least In Progress on the board, healed by adding it and
+  setting the column (closes the gap that left the *active epic* invisible while its sub-issues moved).
+  `upstream-triaged-has-mirror` + `mirror-wiring-live` (warn) detect a stranded triage and a rotted
+  intake. `mirror-from-public.yml` is hardened to **create the mirror before** labelling `triaged`
+  (a partial failure can no longer strand a report), and `reconcile.yml` routes the upstream heals via
+  `UPSTREAM_TOKEN` and board heals via `PROJECTS_TOKEN`. `test_process_doctor.py` (+7). 
+- **Secret scan un-degraded** (#196, epic #188): the export secret-gate could pass **degraded** when
+  gitleaks was absent (fail-open). `export_core.py --require-scanner` (+ `EXPORT_REQUIRE_SCANNER=1`)
+  now **fail-closes** if no scanner ran; a new private CI `secret-scan` job installs gitleaks and
+  exports with that flag, and the **public** `ironclad` CI gains a `gitleaks` job so a secret pushed
+  straight to the public repo is caught too (the private gate can't see a public hand-push).
+  `test_export_secret_gate.py` (2). Per ADR-0007.
+- **Export↔public byte-equality check** (#195, epic #188): `scripts/ci/export_sync_check.py` +
+  `export-sync-check.yml` (scheduled + on core/ push) assert the public `ironclad` repo is a faithful
+  export of `core/` — LF-normalised (a CRLF-only diff is never drift). A file present in public that
+  the export does not produce (a hand-edit) is always drift; when public's `.export-source` stamp ==
+  HEAD the trees must be byte-identical. `publish_core.sh` now writes that source stamp on push so
+  drift is distinguishable from the normal "main ahead of the published release" state.
+  `test_export_sync_check.py` (5). Per ADR-0007.
+- **DEV_LOOP self-consistency lint** (#197, epic #188): the binding control prompt is itself a
+  derived view — process-doctor `devloop-self-consistent` asserts every `*.yml` it cites resolves to
+  a real file and every `aktuell v<X>` equals the pyproject version. Fixed the live drift it caught:
+  the ghost `mirror-to-dev.yml` ref (real one is `mirror-from-public.yml`), the stale `v0.0.7`
+  pointers (→ v0.0.14), and the drifty hard-coded test counts (→ point to test-report.md).
+  `test_process_doctor.py` (+3 = 15). Per ADR-0007.
+- **Doc-lint coverage** (#193, epic #188): a process-doctor warn `open-milestone-has-description`
+  (an open milestone with work but no description is invisible on the generated roadmap); the release
+  gate (`promote.sh`) now runs `gen_roadmap.py --check` so a release can never ship a stale roadmap.
+  docs-guide records the enforcement. `test_process_doctor.py` (+1 = 12). Per ADR-0007.
+- **Issue/milestone invariants in process-doctor** (#192, epic #188): `delivered-milestone-closed`
+  (a milestone with work done + 0 open issues must be closed so the generated roadmap drops it —
+  assert + heal) and `open-epic-has-milestone` (an open `type/feature` epic with no milestone is
+  invisible to the roadmap — **warn**, surfaced for operator triage; picking the milestone is a
+  product call). Adds a `warn` tier to the check framework. `test_process_doctor.py` (+3 = 11).
+  (Live: #75 surfaced for milestone triage.) Per ADR-0007.
+- **Board invariant: closed issue ⇒ board Done** (#191, epic #188): the Projects-board card race
+  (#176) is now structurally closed. `project-status.yml` gains a **closed-guard** that re-queries
+  **live** issue state (not the event payload) and refuses to set In Progress on a closed issue;
+  process-doctor gains a `board-closed-is-done` check (assert + heal) so the **scheduled** reconciler
+  is the load-bearing healer that returns any stuck card to Done regardless of Action-run ordering.
+  `test_process_doctor.py` (+3 = 8). Per ADR-0007.
+- **process-doctor + scheduled reconciler backbone** (#190, epic #188): `scripts/ci/process_doctor.py`
+  — an executable check registry that asserts the derived-view invariants against live GitHub state
+  (`--check`) and heals them idempotently (`--reconcile`), fail-closed (a gh **auth** failure
+  hard-fails, never soft-skips). Seed invariant: *a closed issue carries no `status/*` label* (assert
+  + heal; the 12 live stale labels were reconciled). A scheduled `.github/workflows/reconcile.yml`
+  runs the healer daily — the load-bearing leg that catches metadata-only mutations (Gap C: a
+  milestone/label change triggers no path-gated push check). `gen_roadmap.py --check` now hard-fails
+  on a gh auth failure (distinct from a network soft-skip). `test_process_doctor.py` (5). Per ADR-0007.
+- **ADR-0007 — reconcilers + invariants over every derived view** (#189, epic #188): generalises
+  ADR-0006 from the roadmap to the whole "derived view drifts from reality" class (board, issue/label/
+  milestone metadata, mirror/upstream, public export, secret gate, DEV_LOOP). Each view gets an
+  invariant + on-event guard (re-queried live state) + a **scheduled reconciler** (the load-bearing
+  healer; idempotent, fail-closed), all asserted by an executable `process-doctor` with a negative
+  test per invariant. Records the Wave-1 scope + the deferred follow-ups (deep CI required-checks,
+  deploy/spark prod).
+
 ## [0.0.14] - 2026-06-22
 
 ### Changed
