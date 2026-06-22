@@ -63,6 +63,16 @@ def test_dangling_script_refs():
     assert len(v) == 1 and "deploy/spark/gone.sh" in v[0]
 
 
+def test_dangling_repo_path_refs_flags_a_moved_path():
+    cdc = _load()
+    scripts = {"deploy/spark/sync.sh": 'tar czf x "$REPO_ROOT/skills/mpr"\nls "$REPO_ROOT/core/engine"\n'}
+    refs = cdc.repo_path_refs(scripts)
+    assert ("deploy/spark/sync.sh", "skills/mpr") in refs
+    assert ("deploy/spark/sync.sh", "core/engine") in refs
+    v = cdc.dangling_repo_path_refs(refs, {"core/engine"})              # only core/engine exists
+    assert len(v) == 1 and "skills/mpr" in v[0]                         # the moved path is flagged
+
+
 def test_live_deploy_tree_is_consistent():
     cdc = _load()
     scripts = cdc._scripts()
@@ -72,3 +82,6 @@ def test_live_deploy_tree_is_consistent():
                 for p in cdc.DEPLOY.rglob("*") if p.suffix in (".sh", ".ps1")}
     assert cdc.bad_setup_types(cdc.referenced_setup_types(scripts), valid) == []
     assert cdc.dangling_script_refs(scripts, existing) == []
+    refs = cdc.repo_path_refs(scripts)                                  # F-K-01: reference-drag guard
+    real = {rel for _, rel in refs if (cdc.REPO_ROOT / rel).exists()}
+    assert cdc.dangling_repo_path_refs(refs, real) == []               # live tree has no stale $REPO_ROOT refs

@@ -34,8 +34,12 @@ jobs:
           if [ -n "${TAG:-}" ] && [ "${TAG#v}" != "${VER}" ]; then
             echo "::error::release tag '${TAG}' != pyproject version '${VER}'"; exit 1
           fi
-          if ! grep -qE "^##[[:space:]]*\[${VER}\]" CHANGELOG.md; then
-            echo "::error::CHANGELOG.md has no '## [${VER}]' section — refusing to publish ${VER}"; exit 1
+          # require the [VER] section to EXIST and be NON-EMPTY (a real '- '/'* ' entry, not just a header)
+          body=$(awk -v tag="[${VER}]" '
+            /^##[[:space:]]/ { if (insec) insec=0; if (index($0, tag)) { insec=1; next } }
+            insec { print }' CHANGELOG.md)
+          if ! printf '%s\n' "$body" | grep -qE '^[[:space:]]*[-*][[:space:]]'; then
+            echo "::error::CHANGELOG.md '## [${VER}]' section is missing or empty (no '- ' entry) — refusing to publish ${VER}"; exit 1
           fi
           echo "preflight OK — tag/pyproject/CHANGELOG agree on ${VER}"
       - name: Build sdist + wheel

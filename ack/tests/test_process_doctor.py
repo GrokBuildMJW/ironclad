@@ -499,3 +499,46 @@ def test_upstream_resolves_delivered_registered_warn_upstream_flag_only():
     pd = _load()
     c = {x.name: x for x in pd.registry()}["upstream-resolves-delivered"]
     assert c.warn is True and c.group == "upstream" and c.heal is None   # flag-only: no public-write heal
+
+
+# ── epic-form C2 parity (F-B-02, epic #244 wave-3 C2) ─────────────────────────
+def test_epic_form_c2_parity_flags_a_missing_gate():
+    pd = _load()
+    full = ("id: completion\n    value: |\n"
+            "      - [ ] **Complete**\n      - [ ] **End-to-end runnable**\n"
+            "      - [ ] **Feature coverage met**\n      - [ ] **Tests current**\n"
+            "      - [ ] **Docs public-grade**\n      - [ ] **Prune-on-close**\n"
+            "      - [ ] **Release (public)**\n      - [ ] **Post-publish verified**\n")
+    assert pd.epic_form_c2_parity(full) == []                       # all 8 gates present
+    v = pd.epic_form_c2_parity(full.replace("      - [ ] **Prune-on-close**\n", ""))
+    assert len(v) == 1 and "Prune-on-close" in v[0]                 # missing box flagged
+
+
+def test_epic_form_c2_parity_registered_fail_closed():
+    pd = _load()
+    c = {x.name: x for x in pd.registry()}["epic-form-c2-parity"]
+    assert c.warn is False and c.group == "repo" and c.heal is None
+
+
+def test_real_epic_form_carries_all_c2_gates():
+    pd = _load()
+    txt = (_REPO / ".github" / "ISSUE_TEMPLATE" / "epic.yml").read_text(encoding="utf-8")
+    assert pd.epic_form_c2_parity(txt) == []                        # the shipped form is complete
+
+
+# ── upstream released-but-open reconciler (F-F-03, epic #244 wave-3 C4) ───────
+def test_upstream_released_but_still_open_is_flagged():
+    pd = _load()
+    issues = [
+        {"number": 8, "state": "OPEN", "labels": ["released", "resolved"]},   # stuck: delivered, not closed
+        {"number": 9, "state": "CLOSED", "labels": ["released"]},             # closed -> fine
+        {"number": 10, "state": "OPEN", "labels": ["resolved"]},              # pending, no released -> fine
+    ]
+    v = pd.upstream_released_not_closed(issues)
+    assert len(v) == 1 and "#8" in v[0]                                       # only the OPEN+released one
+
+
+def test_upstream_released_not_closed_registered_warn_flag_only():
+    pd = _load()
+    c = {x.name: x for x in pd.registry()}["upstream-released-not-closed"]
+    assert c.warn is True and c.group == "upstream" and c.heal is None        # flag-only: no public-write

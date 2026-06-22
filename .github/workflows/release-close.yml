@@ -6,6 +6,10 @@ name: release close-out
 # GATED ON PUBLISH SUCCESS (#198): triggered by the "Publish to PyPI" workflow COMPLETING, and runs
 # only if it concluded `success`. Closing a reporter's issue as "released and available now" before
 # the package is actually on PyPI would be a done-means-deployed lie — so the upload must win first.
+# (The trigger is deliberately NOT `release: published` for the same reason — it would race the PyPI
+# upload.) RESILIENCE NET (audit F-F-02/F-F-03): if a run only partially completes (the close step is
+# swallowed), the `upstream-released-not-closed` process-doctor invariant flags the stuck OPEN+released
+# issue, and the `workflow_dispatch` below re-runs the close-out by hand.
 
 on:
   workflow_run:
