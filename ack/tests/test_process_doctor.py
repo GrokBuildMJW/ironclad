@@ -296,6 +296,141 @@ def test_open_assigned_heal_moves_only_stranded_cards():
     assert moved == ["u1"] and len(acted) == 1
 
 
+# ── label taxonomy + anchor hygiene (#215) ────────────────────────────────────
+def test_parse_taxonomy_includes_mklabels_and_area_loop():
+    pd = _load()
+    text = (
+        'mklabel "type/bug" d73a4a "A defect"\n'
+        'mklabel "status/ready" 0e8a16 "ready"\n'
+        '          for a in engine ack ci docs; do\n'
+        '            mklabel "area/$a" c5def5 "Area: $a"\n'
+        '          done\n'
+    )
+    tax = pd.parse_taxonomy(text)
+    assert "type/bug" in tax and "status/ready" in tax
+    assert {"area/engine", "area/ack", "area/ci", "area/docs"} <= tax
+    assert "area/$a" not in tax     # the loop template is not a real label
+
+
+def test_labels_match_taxonomy_flags_rogue_and_missing():
+    pd = _load()
+    taxonomy = {"type/bug", "type/feature", "area/ci"}
+    defined = {"type/bug", "type/feature", "wontfix"}    # missing area/ci; rogue wontfix
+    v = pd.labels_match_taxonomy(defined, taxonomy)
+    assert any("wontfix" in x and "rogue" in x for x in v)
+    assert any("area/ci" in x and "missing" in x for x in v)
+    assert len(v) == 2
+    assert pd.labels_match_taxonomy(taxonomy, taxonomy) == []   # in sync → clean
+
+
+def test_issue_missing_type_label_warns():
+    pd = _load()
+    issues = [
+        {"number": 1, "state": "OPEN", "labels": ["area/ci"]},                 # 0 type/* -> warn
+        {"number": 2, "state": "OPEN", "labels": ["type/bug", "type/task"]},   # 2 type/* -> warn
+        {"number": 3, "state": "OPEN", "labels": ["type/feature"]},            # exactly 1 -> fine
+        {"number": 4, "state": "CLOSED", "labels": []},                        # closed -> ignored
+    ]
+    v = pd.issue_missing_type_label(issues)
+    assert any("#1" in x for x in v) and any("#2" in x for x in v)
+    assert not any("#3" in x or "#4" in x for x in v)
+    assert len(v) == 2
+
+
+def test_merged_pr_without_issue_excludes_release_prs():
+    pd = _load()
+    prs = [
+        {"number": 10, "title": "fix: a bug", "closes": 0},          # unanchored -> warn
+        {"number": 11, "title": "feat: x", "closes": 1},             # anchored -> fine
+        {"number": 12, "title": "release: v0.0.15", "closes": 0},    # release -> excluded
+    ]
+    v = pd.merged_pr_without_issue(prs)
+    assert len(v) == 1 and "#10" in v[0]
+
+
+def test_label_hygiene_checks_registered_as_warn():
+    pd = _load()
+    names = {c.name: c for c in pd.registry()}
+    for n in ("labels-match-taxonomy", "issue-has-type-label", "merged-pr-anchored"):
+        assert names[n].warn is True
+
+
+# ── required-checks live ⟺ SSOT (#214) ────────────────────────────────────────
+def test_required_checks_live_flags_dropped_and_stale():
+    pd = _load()
+    data = {"repo": "GrokBuildMJW/ironclad",
+            "ssot": ["test (3.10)", "secret-scan"], "live": ["test (3.10)", "extra-thing"]}
+    v = pd.required_checks_live_match(data)
+    assert any("secret-scan" in x and "gate dropped" in x for x in v)        # in SSOT, not live
+    assert any("extra-thing" in x and "undocumented" in x for x in v)        # live, not in SSOT
+    assert len(v) == 2
+
+
+def test_required_checks_live_clean_and_failsoft():
+    pd = _load()
+    same = ["test (3.10)", "secret-scan"]
+    assert pd.required_checks_live_match({"repo": "r", "ssot": same, "live": list(same)}) == []
+    assert pd.required_checks_live_match({"repo": "r", "ssot": same, "live": None}) == []   # unreadable → inert
+    assert pd.registry() and any(c.name == "required-checks-live" for c in pd.registry())
+
+
+# ── plugin-mirror parity (#213) ───────────────────────────────────────────────
+def test_plugin_triaged_without_mirror_is_warned():
+    pd = _load()
+    plugin_open = [
+        {"number": 3, "labels": ["needs/framework", "triaged"]},   # triaged, no mirror -> warn
+        {"number": 4, "labels": ["needs/framework", "triaged"]},   # triaged, mirror exists -> fine
+        {"number": 5, "labels": ["needs/framework"]},              # not triaged yet -> fine
+    ]
+    v = pd.plugin_triaged_has_mirror(plugin_open, {4})
+    assert len(v) == 1 and "#3" in v[0]
+
+
+def test_plugin_triaged_inert_when_repo_unreachable():
+    pd = _load()
+    assert pd.plugin_triaged_has_mirror([], {7}) == []   # fail-soft: no plugin issues -> no findings
+
+
+def test_plugin_checks_registered_as_warn_upstream_group():
+    pd = _load()
+    names = {c.name: c for c in pd.registry()}
+    assert names["plugin-triaged-has-mirror"].warn is True and names["plugin-triaged-has-mirror"].group == "upstream"
+    assert names["plugin-mirror-live"].warn is True and names["plugin-mirror-live"].group == "upstream"
+
+
+# ── release tag <-> CHANGELOG <-> pyproject coupling (#212) ────────────────────
+def test_release_tag_without_changelog_is_an_orphan():
+    pd = _load()
+    data = {"tags": ["0.0.15", "0.0.2", "0.0.1"], "changelog": ["0.0.15"], "version": "0.0.15"}
+    v = pd.release_tag_has_changelog(data)
+    assert any("v0.0.2" in x for x in v) and any("v0.0.1" in x for x in v)
+    assert not any("v0.0.15" in x for x in v)
+    assert len(v) == 2
+
+
+def test_changelog_without_tag_warns_excluding_current_version():
+    pd = _load()
+    # 0.0.14 lost its tag (drift → warn); 0.0.16 is the current pyproject cut-but-unreleased (excluded)
+    data = {"tags": ["0.0.15"], "changelog": ["0.0.16", "0.0.15", "0.0.14"], "version": "0.0.16"}
+    v = pd.changelog_has_release_tag(data)
+    assert any("0.0.14" in x for x in v)
+    assert not any("0.0.16" in x for x in v)   # current version is allowed to be untagged (pending release)
+    assert not any("0.0.15" in x for x in v)
+    assert len(v) == 1
+
+
+def test_norm_ver_strips_leading_v():
+    pd = _load()
+    assert pd._norm_ver("v0.0.15") == "0.0.15" and pd._norm_ver("0.0.15") == "0.0.15"
+
+
+def test_release_coupling_checks_registered():
+    pd = _load()
+    names = {c.name: c for c in pd.registry()}
+    assert "release-tag-has-changelog" in names and names["release-tag-has-changelog"].warn is False
+    assert names["changelog-has-release-tag"].warn is True
+
+
 def test_upstream_checks_grouped_for_token_routing():
     pd = _load()
     names = {c.name: c for c in pd.registry()}

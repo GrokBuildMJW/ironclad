@@ -9,6 +9,51 @@ Released versions are listed below; upcoming work accumulates under *Unreleased*
 
 ## [Unreleased]
 
+### Added
+- **Deploy/spark consistency** (#216, epic #210): the deployed Spark topology is a derived view of the
+  released artifact. CI-runnable (no SSH): `scripts/ci/check_deploy_consistency.py` asserts every literal
+  `setup.type` value in the deploy scripts is one the engine accepts (`_VALID_SETUP_TYPES`) and that no
+  script references a missing `deploy/…` script — caught + fixed a terminology drift (two scripts said
+  `setup.type=desktop`, an install-type name the engine rejects). Operator (SSH + local): `deploy/spark/
+  verify-deployment.sh [--reconcile]` checks the live deployment — **topology- AND location-aware**: the
+  model is probed on the Spark, and the orchestrator is verified **where it actually runs** — on the
+  **desktop** (`localhost:8100`) for `setup.type=local`, on the Spark for `server` — asserting `/health`
+  `ok`, `memory=up`, and (local) that `base_url` points at the Spark over the LAN. Verified live: the
+  current `setup.type=local` deployment is consistent (Spark model up; desktop orchestrator up, memory up,
+  wired to the Spark). `test_deploy_consistency.py` (5). Per ADR-0007.
+- **Label taxonomy + anchor-hygiene invariants** (#215, epic #210): three warn-tier process-doctor
+  checks surfacing governance drift for triage — `labels-match-taxonomy` (the repo's defined labels
+  equal the bootstrap taxonomy: a rogue or a deleted label), `issue-has-type-label` (every open issue
+  carries exactly one `type/*`), and `merged-pr-anchored` (every merged PR links an issue, release/
+  export PRs excluded). `test_process_doctor.py` (+5). Per ADR-0007.
+- **Required-status-checks SSOT + audit** (#214, epic #210): the branch-protection required checks were
+  invisible to version control, and the #196 `secret-scan` job was **not** required — a secret leak
+  wouldn't block a merge. Added `.github/required-status-checks.yml` (SSOT) + `check_required_checks.py`
+  (asserts every required name maps to a real workflow job, matrix names expanded — CI-gated, no API) +
+  process-doctor `required-checks-live` (asserts the live protection equals the SSOT; fail-soft without
+  an admin read). One-shot: added `secret-scan` to the live ironclad required checks. `test_required_checks.py`
+  (5) + `test_process_doctor.py` (+2). Per ADR-0007.
+- **Plugin-mirror parity** (#213, epic #210): the plugin round-trip (`mirror-from-plugin.yml`) lacked
+  the back-link + liveness invariants the upstream one got, and labelled `triaged` BEFORE creating the
+  dev mirror (a partial failure stranded a framework-gap report). Hardened the workflow to
+  create-before-triage (parity with #194) and added two scheduled process-doctor warn checks —
+  `plugin-triaged-has-mirror` (a triaged plugin issue with no dev mirror) + `plugin-mirror-live` (the
+  intake's last run failed). Both fail-soft when the operator-gated plugin repo is unreachable.
+  `test_process_doctor.py` (+3 = 29). Per ADR-0007.
+- **Release tag ↔ CHANGELOG ↔ pyproject coupling** (#212, epic #210): `release_preflight` (#198) only
+  guards PRE-publish; a post-release metadata mutation (a deleted tag, a reverted CHANGELOG section)
+  is seen by no path-gated CI. Two scheduled process-doctor checks close it: `release-tag-has-changelog`
+  (every published ironclad release tag has a `## [X.Y.Z]` section — fail) and `changelog-has-release-tag`
+  (every released section has a tag — warn, excluding the cut-but-unreleased current version). Healed the
+  drift it found: backfilled the missing `[0.0.1]` + `[0.0.2]` sections (early pre-releases predating the
+  CHANGELOG). `test_process_doctor.py` (+4). Per ADR-0007.
+- **Test counts are generated, not hand-maintained** (#211, epic #210): the Python test counts in
+  README + `docs/test-report.md` are a derived view of the suite (they drifted every PR). New
+  `scripts/ci/gen_test_counts.py` runs the offline suite and `--check` fails on any drift / `--write`
+  regenerates; it also asserts the per-area breakdown is a true partition (the area rows sum to the
+  total) and that every offline skip is a live-smoke test (so the offline/live split is honest). A CI
+  `test-counts` job enforces it. `test_gen_test_counts.py` (9). Per ADR-0007.
+
 ## [0.0.15] - 2026-06-22
 
 ### Added
@@ -487,3 +532,22 @@ Released versions are listed below; upcoming work accumulates under *Unreleased*
 ### Notes
 - Single-tenant by design; multi-user identity/authorization is not built (see
   `docs/roadmap.md`). Treat `main` as a development snapshot.
+
+## [0.0.2] - 2026-06-18
+
+### Added
+- Bundled **TypeScript terminal client** (`clients/ink`): purpose-built renderer (ghost-free resize,
+  native scrollback/selection/copy, live-streaming markdown, Ctrl+F search), global install
+  (`npm install -g .` → `ironclad`), JSON config file (file < env < flags), Esc/Ctrl+C turn-cancel.
+
+### Changed
+- Docs reconciled to the recommended-client + global-install flow; onboarding paths made
+  export-relative. The Python ACK + orchestration engine are unchanged in behaviour (version bump only).
+
+## [0.0.1] - 2026-06-17
+
+### Added
+- First public pre-release: reliability for LLM agents through enforcement, not model size — the
+  Agent-Contract-Kernel + a fail-closed orchestration engine, server/client split, full-screen TUI,
+  reasoning-worker fan-out, optional Mem0 memory, and a one-command compose. Model-agnostic (any
+  OpenAI-compatible endpoint); PyPI name `ironclad-ai`. See `docs/status.md` for per-component wiring.
