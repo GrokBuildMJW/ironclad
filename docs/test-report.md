@@ -9,9 +9,9 @@
 
 | | |
 |---|---|
-| Automated tests (offline, no model) | **1071 passed** |
+| Automated tests (offline, no model) | **1076 passed** |
 | Live smoke tests (skipped without a model) | **9** |
-| **Total Python** | **1080** |
+| **Total Python** | **1085** |
 | TypeScript client tests (`node:test`) | **340 passed** (344 total, 4 skipped) |
 | Full agentic loop, end to end, with a **real** code-agent | **verified** |
 | Issues found during the campaign | **1 functional gap + 5 review findings — all found and fixed** (see below) |
@@ -24,7 +24,7 @@ default** and only runs when pointed at a real server.
 
 ```bash
 # 1) offline suite — deterministic, no model needed
-pytest -q                                   # from core/  → 1071 passed, 9 skipped
+pytest -q                                   # from core/  → 1076 passed, 9 skipped
 
 # 2) live smoke — against your own running orchestrator
 GX10_LIVE_URL=http://<your-host>:8100 pytest -k live -q     # 9 passed
@@ -34,7 +34,7 @@ GX10_LIVE_URL=http://<your-host>:8100 pytest -k live -q     # 9 passed
 ## Coverage by area
 
 Counts below are reproduced from `pytest --collect-only` (2026-06-22) and sum to
-the **1080** total (1071 offline + 9 live) — now includes the MPR core built-in suite.
+the **1085** total (1076 offline + 9 live) — now includes the MPR core built-in suite.
 
 | Area | Test files | Tests |
 |------|-----------|-------|
@@ -69,7 +69,7 @@ the **1080** total (1071 offline + 9 live) — now includes the MPR core built-i
 | **Token budget / context trimming** | `token_budget` | 8 |
 | **Misc** (manual cat tool, orchestrator version) | `manual_cat`, `version` | 7 |
 | **Demo vessel** (example workspace doctor preflight) | `demo_vessel` | 1 |
-| **Docs & process** (doc-reality-audit + roadmap generator + process-doctor invariants + export-sync + test-count generator, negative tests) | `doc_audit`, `gen_roadmap`, `process_doctor`, `export_sync_check`, `export_secret_gate`, `release_preflight`, `gen_test_counts`, `required_checks`, `deploy_consistency` | 85 |
+| **Docs & process** (doc-reality-audit + roadmap generator + process-doctor invariants + export-sync + test-count generator, negative tests) | `doc_audit`, `gen_roadmap`, `process_doctor`, `export_sync_check`, `export_secret_gate`, `release_preflight`, `gen_test_counts`, `required_checks`, `deploy_consistency` | 90 |
 | **Live smoke** (real model, all endpoints) | `live_smoke` | 9 |
 
 ## Live end-to-end verification

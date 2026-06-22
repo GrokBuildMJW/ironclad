@@ -440,3 +440,62 @@ def test_upstream_checks_grouped_for_token_routing():
     assert names["mirror-wiring-live"].warn is True
     assert names["open-assigned-in-progress"].group == "repo"      # board write -> PROJECTS_TOKEN
     assert names["open-assigned-in-progress"].heal is not None
+
+
+# ── audit S2 follow-ups: epic completeness (F-I-01) + upstream delivery (F-F-01), epic #223 ──────
+def test_closed_epic_without_native_subissues_is_a_violation():
+    pd = _load()
+    gf = pd._PRE_NATIVE_SUBISSUE_EPICS
+    epics = [
+        {"number": 300, "parent": None, "sub_total": 0, "sub_open": 0},   # new epic, no tracking -> FAIL
+        {"number": 301, "parent": None, "sub_total": 3, "sub_open": 1},   # new epic, an open sub -> FAIL
+        {"number": 302, "parent": None, "sub_total": 2, "sub_open": 0},   # new epic, fully tracked -> fine
+    ]
+    v = pd.closed_epic_untracked(epics, gf)
+    assert any("#300" in x and "NO native sub-issues" in x for x in v)
+    assert any("#301" in x and "still-OPEN" in x for x in v)
+    assert not any("#302" in x for x in v)
+    assert len(v) == 2
+
+
+def test_closed_epic_grandfathered_and_leaf_are_exempt():
+    pd = _load()
+    gf = pd._PRE_NATIVE_SUBISSUE_EPICS
+    epics = [
+        {"number": 210, "parent": None, "sub_total": 0, "sub_open": 0},   # grandfathered (< #223) -> exempt
+        {"number": 303, "parent": 188, "sub_total": 0, "sub_open": 0},    # itself a sub-issue (leaf) -> exempt
+    ]
+    assert pd.closed_epic_untracked(epics, gf) == []
+    assert 210 in gf and 188 in gf and 223 not in gf   # #223 stays a live positive control
+
+
+def test_closed_epic_tracked_registered_fail_closed_repo_no_heal():
+    pd = _load()
+    c = {x.name: x for x in pd.registry()}["closed-epic-tracked"]
+    assert c.warn is False and c.group == "repo" and c.heal is None
+
+
+def test_upstream_resolves_unstamped_is_flagged():
+    pd = _load()
+    data = {
+        "prs": [
+            {"number": 1, "body": "fix\n\nResolves upstream: ironclad#5"},   # #5 open, no resolved -> flag
+            {"number": 2, "body": "Resolves upstream: ironclad#6"},          # #6 resolved -> fine
+            {"number": 3, "body": "Resolves upstream: ironclad#7"},          # #7 closed -> fine
+            {"number": 4, "body": "no upstream reference here"},             # no ref -> ignored
+            {"number": 5, "body": "Resolves upstream: ironclad#999"},        # not in fetched set -> can't assert
+        ],
+        "public": [
+            {"number": 5, "state": "OPEN", "labels": ["triaged"]},
+            {"number": 6, "state": "OPEN", "labels": ["triaged", "resolved"]},
+            {"number": 7, "state": "CLOSED", "labels": ["resolved", "released"]},
+        ],
+    }
+    v = pd.upstream_resolves_delivered(data)
+    assert len(v) == 1 and "#1" in v[0] and "ironclad#5" in v[0]
+
+
+def test_upstream_resolves_delivered_registered_warn_upstream_flag_only():
+    pd = _load()
+    c = {x.name: x for x in pd.registry()}["upstream-resolves-delivered"]
+    assert c.warn is True and c.group == "upstream" and c.heal is None   # flag-only: no public-write heal
