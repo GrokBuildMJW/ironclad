@@ -62,3 +62,11 @@ def test_resolve_plugin_root_finds_the_example_package():
     assert root == str(_PKG)
     gx10._discover_tools_into(root)
     assert "reverse" in gx10._PLUGIN_TOOLS                # entry-point path → same discovery
+
+
+def test_example_passes_the_sdk_gate():
+    # the example ships its sibling tests/test_reverse.py, so it passes the same gate Ironclad runs
+    # before trusting a skill — the example must not fail its own documented validate step (#260)
+    res = sdk.gate(str(_PKG / "skills" / "reverse.py"))
+    assert res, f"gate failed: {res.reasons}"
+    assert res.kind == "tool"

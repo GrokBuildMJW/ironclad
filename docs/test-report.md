@@ -9,9 +9,9 @@
 
 | | |
 |---|---|
-| Automated tests (offline, no model) | **1082 passed** |
+| Automated tests (offline, no model) | **1085 passed** |
 | Live smoke tests (skipped without a model) | **9** |
-| **Total Python** | **1091** |
+| **Total Python** | **1094** |
 | TypeScript client tests (`node:test`) | **340 passed** (344 total, 4 skipped) |
 | Full agentic loop, end to end, with a **real** code-agent | **verified** |
 | Issues found during the campaign | **1 functional gap + 5 review findings — all found and fixed** (see below) |
@@ -24,7 +24,7 @@ default** and only runs when pointed at a real server.
 
 ```bash
 # 1) offline suite — deterministic, no model needed
-pytest -q                                   # from core/  → 1082 passed, 9 skipped
+pytest -q                                   # from core/  → 1085 passed, 9 skipped
 
 # 2) live smoke — against your own running orchestrator
 GX10_LIVE_URL=http://<your-host>:8100 pytest -k live -q     # 9 passed
@@ -34,7 +34,7 @@ GX10_LIVE_URL=http://<your-host>:8100 pytest -k live -q     # 9 passed
 ## Coverage by area
 
 Counts below are reproduced from `pytest --collect-only` (2026-06-22) and sum to
-the **1091** total (1082 offline + 9 live) — now includes the MPR core built-in suite.
+the **1094** total (1085 offline + 9 live) — now includes the MPR core built-in suite.
 
 | Area | Test files | Tests |
 |------|-----------|-------|
@@ -47,7 +47,7 @@ the **1091** total (1082 offline + 9 live) — now includes the MPR core built-i
 | **Extension SDK** (`ack.sdk` curated surface: `__all__` contract, re-export identity, gate/schema/assemble via SDK) | `sdk` | 7 |
 | **Packaged-plugin loading** (`ironclad.plugins` entry-point: root resolution, additive load, fail-soft) | `entrypoint_loader` | 10 |
 | **Export-leak guard** (internal plugin repo forbidden in boundary+export; synthetic-leak flagged; real tree clean) | `export_leak_guard` | 4 |
-| **Example plugin** (shipped separate-repo example: discovers+runs via loader, schema matches SDK) | `example_plugin` | 3 |
+| **Example plugin** (shipped separate-repo example: discovers+runs via loader, schema matches SDK, passes its own `ack.sdk.gate` via a sibling test) | `example_plugin`, `reverse` | 6 |
 | **Playbook skill kind** (SKILL.md parse/validate/discover, progressive disclosure, `use_skill`) | `playbook` | 15 |
 | **Skill generator** (spec → scaffold both kinds, schema-valid by construction) | `skillgen` | 7 |
 | **Skill library catalogue** (manifest index, semver, provenance, install/update) | `catalogue` | 6 |

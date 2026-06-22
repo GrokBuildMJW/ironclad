@@ -13,6 +13,8 @@ example-plugin/
     __init__.py
     skills/
       reverse.py                     # a tool skill: CASE + run
+    tests/
+      test_reverse.py                # the skill's unit test (also satisfies ack.sdk.gate)
 ```
 
 ## Build + install + run
@@ -34,6 +36,6 @@ For local development without packaging, point `GX10_PLUGINS_DIR` at a directory
 ```python
 from ack.sdk import gate, derive_tool_schema
 from ironclad_example_plugin.skills import reverse
-print(derive_tool_schema(reverse.run))    # the auto-derived tool schema
-# gate("ironclad_example_plugin/skills/reverse.py")  # add a sibling tests/ file to pass the tool gate
+print(derive_tool_schema(reverse.run))                       # the auto-derived tool schema
+assert gate("ironclad_example_plugin/skills/reverse.py")     # passes: ships a sibling tests/test_reverse.py
 ```

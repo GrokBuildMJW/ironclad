@@ -21,7 +21,11 @@ from ack import skillgen  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
-def _clean():
+def _clean(monkeypatch):
+    # isolate from any ambient installed `ironclad.plugins` entry point (e.g. a locally-built example
+    # whose egg-info lands on sys.path): these tests assert built-in / explicit-dir loading, not what
+    # happens to be pip-installed in the dev env. Mirrors test_entrypoint_loader.py.
+    monkeypatch.setattr(gx10, "_iter_plugin_entry_points", lambda: [])
     yield
     gx10._PLUGIN_TOOLS.clear()
     gx10._PLAYBOOKS.clear()

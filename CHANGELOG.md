@@ -62,6 +62,11 @@ Released versions are listed below; upcoming work accumulates under *Unreleased*
   start), and `orchestrator_version` is frozen at boot. The doctor now also reads the running engine's
   `/health.orchestrator_version` and prints `installed engine version=X` plus the running version,
   warning `running 'Y' != installed 'X' — run 'ironclad' to restart` on a mismatch.
+- **Example plugin passes its own documented `ack.sdk.gate`** (#260): `examples/example-plugin` shipped
+  no sibling test, so the validate step it documents (`gate("…/reverse.py")`) failed out of the box —
+  the gate hard-requires `<package>/tests/test_<stem>.py` (`ack/gate.py`). It now ships
+  `ironclad_example_plugin/tests/test_reverse.py`; the README shows the gate as a passing `assert`, and
+  `test_example_plugin.py` asserts the gate passes (regression guard). Surfaced via the plugin round-trip.
 
 ## [0.0.15] - 2026-06-22
 
