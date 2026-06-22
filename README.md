@@ -94,18 +94,19 @@ Ironclad's engine comes from a **proven, in-production orchestrator**, now **reb
 the server + client architecture above and **wired and tested**. It is still
 **pre-release** (0.0.x, alpha): single-tenant by design (no multi-user auth yet) and
 APIs/layout/config may change. Tagged releases ship on **PyPI** (`ironclad-ai`) and as
-**GitHub Releases** (currently `v0.0.13`) — treat them as early previews and `main` as a
+**GitHub Releases** (currently `v0.0.14`) — treat them as early previews and `main` as a
 development snapshot. The internal DEV → Prod → Public **promote pipeline** that hardens our
 releases is in development (today a manual gated path).
 
-Verified by **995 Python tests** (986 offline + 9 live) plus **344 TypeScript client
+Verified by **1009 Python tests** (1000 offline + 9 live) plus **344 TypeScript client
 tests**, and a **full end-to-end run with a real code-agent**. Read these before relying on
 anything:
 
-- **[`docs/status.md`](docs/status.md)** — honest per-component **wiring status** + load tests.
+- **[`docs/status.md`](docs/status.md)** — honest per-component **wiring status** (what runs now) + load tests.
 - **[`docs/test-report.md`](docs/test-report.md)** — what was tested, results, and the
   issues found **and fixed** during the campaign.
-- **[`docs/roadmap.md`](docs/roadmap.md)** — what works today vs what's planned.
+- **[`docs/roadmap.md`](docs/roadmap.md)** — what's **planned or in progress** (future only).
+- **[`docs/docs-guide.md`](docs/docs-guide.md)** — how the docs are organised (one responsibility per doc).
 
 ## Reference environment & benchmarks
 
@@ -241,13 +242,11 @@ produced artefact lives under `vault/<slug>/` — see
 
 ## Roadmap
 
-An honest split of **what works today** vs **what is planned** lives in
-**[`docs/roadmap.md`](docs/roadmap.md)**; per-component wiring status is in
-**[`docs/status.md`](docs/status.md)**. In short: today is **single-tenant, home-LAN
-trust** (one operator, code stays on the client); the **secure session-gated channel** and
-**governed parallelism** are done; multi-tenant **identity & authorization (Phase g)** is
-planned and **does not exist yet** — until it lands, treat enterprise/government use as
-single-tenant on trusted infrastructure.
+What's **planned or in progress** lives in **[`docs/roadmap.md`](docs/roadmap.md)** (future
+only); what **runs today**, per component, is in **[`docs/status.md`](docs/status.md)**. In
+short: today is **single-tenant, home-LAN trust** (one operator, code stays on the client);
+multi-tenant **identity & authorization** does not exist yet — until it lands, treat
+enterprise/government use as single-tenant on trusted infrastructure.
 
 Issues and discussions are welcome — this is an early, openly-developed project.
 

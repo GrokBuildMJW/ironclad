@@ -9,6 +9,61 @@ Released versions are listed below; upcoming work accumulates under *Unreleased*
 
 ## [Unreleased]
 
+## [0.0.14] - 2026-06-22
+
+### Changed
+- **Roadmap rule: open-milestone (not open-epic)** (#185, epic #169): the generated roadmap now
+  renders one section per **open milestone** (its description = the phase narrative); a delivered
+  phase drops by **closing its milestone** (M3 + M6 closed). This refines #176's initial
+  "milestone with ≥1 open epic" rule, which would have erased an active phase the moment its current
+  epics merged (e.g. M5 vanishing when epic #169 itself closed). ADR-0006 D2/D3, `docs-guide.md`,
+  and the DEV_LOOP/NEW_EPIC C2 prune wording updated to match.
+
+### Added
+- **Generated, drift-proof roadmap** (#176, epic #169): `roadmap.md` is now produced by
+  `scripts/ci/gen_roadmap.py` from the **open roadmap phases** (open milestones with ≥1 open
+  `type/feature` epic) — a phase drops off automatically once its epics close, so realized work can
+  never linger (the structural fix). The per-phase narrative lives in the **milestone description**
+  (the single editable source); the generator only renders. A CI job (`roadmap-generated`)
+  regenerates and fails on drift (soft-skips if the GitHub API is unavailable; the offline per-doc
+  lint is the always-on guard). Pure `render_roadmap` is unit-tested; `test_gen_roadmap.py` (5).
+  Per ADR-0006.
+- **doc-reality-audit: per-doc responsibility lint** (#174, epic #169): a new fail-closed check —
+  `roadmap.md` must contain no realized markers (`shipped`/`delivered`/`wired + tested`/`now|generally
+  available`) and `status.md` no future markers (`coming soon`/`will ship`). File-scoped + tiny
+  marker lists so legitimate usage (status.md's own `wired + tested`, `see the roadmap` pointers) is
+  never flagged. Covered by `test_doc_audit.py` (9) incl. the **negative test** (a deliberately
+  "realized" roadmap item makes the audit FAIL) + a real-docs-pass regression. Per ADR-0006.
+
+### Changed
+- **README reconciled to the doc IA** (#173, epic #169): the `## Roadmap` section is now a clean
+  pointer (planned → roadmap.md, runs-now → status.md) instead of a duplicated, drift-prone
+  "done vs planned" list — fixing the stale claim that roadmap.md shows "what works today" and the
+  outdated "Phase g" reference. README stays intro/quickstart/value-prop; the per-component wiring
+  matrix lives only in status.md (no overlap). (Repo hygiene: the untracked root-level duplicate of
+  `vault/Plan/plan_skill_libary.md` — a byte-identical local stray — was removed; the tracked copy
+  is the canonical one.)
+- **roadmap.md is now future-only** (#172, epic #169): removed the realized content that violated the
+  "forward-looking only" contract — the delivered skill-generation engine (ADR-0001/0002), the
+  prompt library + discovery/invocation (ADR-0003/0005), and the shipped Extension SDK (ADR-0004),
+  plus the two fully-closed phases (skill-generation, prompt-library usability). That content lives in
+  `status.md` (wiring SSOT) + `CHANGELOG` history. Roadmap now carries only open themes (enterprise,
+  connectors, broader model/data, release maturity). Deferred-but-unscoped items (skill/prompt
+  curation, save-as-item) have no open epic yet → tracked in [ADR-0005](docs/adr/0005-prompt-skill-discovery-invocation.md), will reappear on the roadmap when epic'd. Per ADR-0006.
+
+### Added
+- **Documentation guide (`docs/docs-guide.md`)** (#171, epic #169): a contributor-facing
+  "where does this go?" reference — one responsibility per doc (README=intro, status=now/SSOT,
+  roadmap=future-only/generated, CHANGELOG=history, ADRs=decisions), a decision guide, and the
+  enforcement summary. Linked from README; README's roadmap pointer corrected ("what works today vs
+  planned" → "planned or in progress, future only"). Per [ADR-0006](docs/adr/0006-docs-ia-and-drift-proof-roadmap.md).
+- **ADR-0006 — documentation IA + drift-proof generated roadmap** (#170, epic #169): records the
+  root cause of recurring doc drift (the audit has no notion of "realized"; prune-on-close is a
+  manual, gateless step) and the fix — one responsibility per doc (README=intro, status=now/SSOT,
+  roadmap=future-only, CHANGELOG=history), a **generated** roadmap (from open top-level epics, so a
+  closed epic auto-drops), prune-on-close as a C2 gate, and a two-layer audit (offline
+  forward-only/per-doc lint + a generation check). Implementation follows in #171–#176.
+
 ## [0.0.13] - 2026-06-22
 
 ### Added
