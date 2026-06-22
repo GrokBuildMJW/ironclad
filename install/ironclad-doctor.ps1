@@ -25,7 +25,19 @@ if ($type -eq 'spark') {
 }
 
 $stamp = (Get-Content "$($cfg.engineDir)\VERSION" -Raw -ErrorAction SilentlyContinue); if ($stamp) { $stamp = $stamp.Trim() } else { $stamp = "unknown" }
-Say "type=desktop  local engine version=$stamp  model=$($cfg.model)  language=$($cfg.language)"
-Say "engine   (http://127.0.0.1:$port): $(if (Reach "http://127.0.0.1:$port/health") { 'reachable' } else { 'NOT reachable' })"
+Say "type=desktop  installed engine version=$stamp  model=$($cfg.model)  language=$($cfg.language)"
+# Report the RUNNING engine's version too, and flag an installed-vs-running drift (#255): ironclad-install
+# re-stamps the VERSION file + re-copies core/, but does NOT restart the live engine — the `ironclad`
+# launcher restarts a stale engine on next start. The on-disk stamp alone can therefore hide a still-running
+# old process; orchestrator_version is frozen at the engine's boot, so /health is the running truth.
+$base = "http://127.0.0.1:$port"
+$running = ""
+try { $sh = Invoke-RestMethod -Uri "$base/health" -TimeoutSec 5; if ($sh.orchestrator_version) { $running = "$($sh.orchestrator_version)".Trim() } } catch {}
+if ($running) {
+  if ($running -eq $stamp) { Say "engine   ($base): reachable — running version $running (matches installed)." }
+  else { Say "engine   ($base): reachable — WARN running version '$running' != installed '$stamp' — the live engine has NOT picked up this install; run 'ironclad' to restart it." }
+} else {
+  Say "engine   ($base): $(if (Reach "$base/health") { 'reachable (version unavailable)' } else { 'NOT reachable' })"
+}
 if ($cfg.baseUrl)   { Say "model    ($($cfg.baseUrl)): $(if (Reach "$($cfg.baseUrl)/models") { 'reachable' } else { 'NOT reachable' })" }
 if ($cfg.memoryUrl) { Say "memory   ($($cfg.memoryUrl)): $(if (Reach "$($cfg.memoryUrl)") { 'reachable' } else { 'NOT reachable' })" }

@@ -54,6 +54,15 @@ Released versions are listed below; upcoming work accumulates under *Unreleased*
   total) and that every offline skip is a live-smoke test (so the offline/live split is honest). A CI
   `test-counts` job enforces it. `test_gen_test_counts.py` (9). Per ADR-0007.
 
+### Fixed
+- **ironclad-doctor reports the running engine version, not just the install stamp** (#255): on a
+  desktop install the doctor printed `local engine version` straight from the on-disk `VERSION` file
+  (the *installed* stamp), so an installed-vs-running drift was invisible — `ironclad-install` re-stamps
+  and re-copies `core/` but does not restart the live engine (the `ironclad` launcher does, on next
+  start), and `orchestrator_version` is frozen at boot. The doctor now also reads the running engine's
+  `/health.orchestrator_version` and prints `installed engine version=X` plus the running version,
+  warning `running 'Y' != installed 'X' — run 'ironclad' to restart` on a mismatch.
+
 ## [0.0.15] - 2026-06-22
 
 ### Added
