@@ -1,0 +1,3 @@
+{
+  "template": "Entwirf einen fokussierten Testplan fuer die folgende Aenderung. Ziel-Framework: {framework}.\n\n{change}\n\nListe die Testfaelle als priorisierte Checkliste: Normalfall, Randfaelle, Fehler-/Ausnahmepfade und Regressionsrisiken. Gib fuer jeden Fall die Eingabe oder Bedingung und das erwartete Ergebnis an. Markiere, was ein neuer Test sein sollte und was ein bestehender, der erweitert wird, und nenne alles, was sich nicht deterministisch testen laesst (und wie man damit umgeht). Bleibe konkret — kein vages \"alles testen\"."
+}

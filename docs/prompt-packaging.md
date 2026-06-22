@@ -35,16 +35,25 @@ The body is the **template** (placeholders for the variables). It reuses the `ac
 parser; it is a distinct **kind** from `playbook` (instructions the model reads) — a prompt is a
 template the user fills to *produce* a prompt.
 
-## Generation flow — *available (#109/#110)*
+## Generation flow — *available (#109/#110/#148)*
 
-A discovered prompt is exposed as the engine tool **`use_prompt`** (`gx10._use_prompt`, surfaced in
-`_effective_tools` whenever any prompt is loaded). The flow: call with no capability → **list** the
-prompts; call with a capability + a `values` JSON of what's collected so far → **guided
-elicitation** returns the **next** missing required variable's question (one at a time, using its
-`ask.<name>` text); once all required values are present it **assembles** (render the template via
-`ack.i18n` in the **target** `lang`, source-language fallback) and returns a previewed prompt. The
-state machine is `ack.promptgen.run_prompt` (deterministic, LLM-free); the orchestrator drives the
-turn-by-turn Q&A. **Save** as a reusable library item is the curated-library step (#111).
+Two surfaces drive the **same** `ack.promptgen.run_prompt` state machine (deterministic, LLM-free):
+
+- **Direct, model-free** (`/<prompt-name>`, #148) — list items with `/prompts`; invoke one with
+  `/<name> [var=value …] [--lang xx]`. A single positional value (whole rest) fills the lone required
+  variable (so `/explain-code <code>` works, `=`/`--lang` inside the value preserved); explicit
+  `var=value` tokens set named variables. When all required values are present it **assembles** in
+  the target language and returns the finished prompt; otherwise it returns the guiding questions for
+  what is still missing.
+- **Model-guided** (the `use_prompt` engine tool, `gx10._use_prompt`, surfaced in `_effective_tools`
+  whenever any prompt is loaded) — call with no capability → **list**; call with a capability + a
+  `values` JSON of what's collected so far → **guided elicitation** returns the **next** missing
+  required variable's question (one at a time, using its `ask.<name>` text); once complete it
+  **assembles** (render via `ack.i18n` in the **target** `lang`, source-language fallback) and
+  returns a previewed prompt. The orchestrator drives the turn-by-turn Q&A.
+
+Both render through `ack.i18n` (target language, source-language fallback). **Save** as a reusable
+library item is the curated-library step (#111).
 
 ## Multilingual — *available (#109)*
 

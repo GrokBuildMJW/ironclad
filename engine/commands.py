@@ -43,6 +43,7 @@ LOCAL_COMMANDS = {"tasks", "pending", "work", "auto", "health", "help", "exit", 
 SERVER_COMMANDS = {
     "status", "config", "clear", "read", "write", "cat", "ls",
     "watcher", "autopilot", "autoplan", "log-terminal", "initiative",
+    "prompts", "skills",
 }
 
 HELP_TEXT = """\
@@ -59,6 +60,9 @@ Commands (with a / prefix) — plain text without / is sent to the orchestrator 
 
   orchestrator (server):
     /status            status (model, perf, tasks, tools)
+    /prompts           list the loaded prompt-library items (name, languages, description)
+    /<prompt-name>     run a prompt item directly, e.g. /code-review diff="…" [--lang de]
+    /skills            list the loaded skills (playbooks + typed tools, incl. MPR)
     /config            active configuration
     /config get <key>          read a dotted config key (e.g. mpr.enabled)
     /config set <key> <value>  override a config key at runtime

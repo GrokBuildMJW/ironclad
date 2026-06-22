@@ -24,6 +24,7 @@ Endpoints (all JSON; trust model = the configured security.profile — see secur
   GET  /tasks         → TaskStore snapshot (all statuses)
   GET  /pending       → tasks awaiting a local code-agent (pending + handover present)
   GET  /doctor        → runtime ACK/registry self-check (read-only)
+  GET  /catalogue     → loaded prompt/skill registry snapshot (for client autocomplete)
   POST /chat          → ``{"message": str}`` → run one orchestrator turn, return captured output
   POST /chat/stream   → streamed turn; passes local code-tool calls back over the wire as
                         ``\x00TR\x00`` frames (+ ``\x00HB\x00`` heartbeats) for the client tool-bridge
@@ -413,6 +414,13 @@ class _Handler(BaseHTTPRequestHandler):
                 if not self._guard():
                     return
                 self._send(200, _doctor_report())
+            elif self.path == "/catalogue":
+                # Read-only snapshot of the loaded prompt/skill registry — the source the
+                # TypeScript client merges into slash autocomplete (#149). Same `_catalogue_snapshot`
+                # that backs the `/prompts`/`/skills` commands (one surface, no re-scan).
+                if not self._guard():
+                    return
+                self._send(200, gx10._catalogue_snapshot())
             else:
                 self._send(404, {"ok": False, "error": f"no route {self.path}"})
         except Exception as e:  # noqa: BLE001

@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {classify, LOCAL_COMMANDS, COMMANDS, completions} from '../src/commands.js';
+import {classify, LOCAL_COMMANDS, COMMANDS, completions, HELP_TEXT} from '../src/commands.js';
 
 test('classify — empty / whitespace', () => {
   assert.deepEqual(classify(''), {kind: 'empty', name: '', payload: ''});
@@ -48,6 +48,20 @@ test('MEM-16: registry derives LOCAL_COMMANDS + powers completions', () => {
   assert.equal(completions('').length, COMMANDS.length); // empty → all
   assert.ok(completions('stat').some((c) => c.name === 'status' && c.scope === 'server'));
   assert.equal(completions('zzz').length, 0); // no match
+});
+
+test('#147: /prompts + /skills are server discovery commands, in completions + help', () => {
+  // forwarded to the orchestrator (slash stripped), like /status
+  assert.deepEqual(classify('/prompts'), {kind: 'server', name: 'prompts', payload: 'prompts'});
+  assert.deepEqual(classify('/skills'), {kind: 'server', name: 'skills', payload: 'skills'});
+  // autocomplete offers them
+  assert.ok(completions('prompt').some((c) => c.name === 'prompts' && c.scope === 'server'));
+  assert.ok(completions('skill').some((c) => c.name === 'skills' && c.scope === 'server'));
+  // /help advertises them (HELP_TEXT is generated from COMMANDS)
+  assert.ok(HELP_TEXT.includes('/prompts') && HELP_TEXT.includes('/skills'));
+  // they are repeatable commands, never a persisted turn
+  assert.notEqual(classify('/prompts').kind, 'turn');
+  assert.notEqual(classify('/skills').kind, 'turn');
 });
 
 test('classify — MEM-15: !cmd → local shell (payload = command, not a turn)', () => {

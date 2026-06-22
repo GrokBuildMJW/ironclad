@@ -12,7 +12,7 @@
 import React, {useEffect, useMemo, useRef, useState, type ReactNode} from 'react';
 import {Box, Spacer, Static, Text, useApp, useInput, useStdout} from '../render/ink-compat.js';
 import type {Server} from '../net/server.js';
-import {classify, completions, HELP_TEXT} from '../commands.js';
+import {classify, completions, catalogueToCommands, HELP_TEXT, type Command} from '../commands.js';
 import {chatStream} from '../net/stream.js';
 import {answerBody, createRouter} from '../stream/route.js';
 import {renderMarkdown, StreamMarkdown} from '../markdown.js';
@@ -54,6 +54,8 @@ export function App({
   const [buffer, setBuffer] = useState('');
   const [menuSel, setMenuSel] = useState(0); // MEM-16(2): selected slash-command suggestion
   const [menuDismissed, setMenuDismissed] = useState(false); // Esc closes the menu until buffer changes
+  const [catalogueCmds, setCatalogueCmds] = useState<Command[]>([]); // #149: server-fed prompt items
+  const catalogueFetched = useRef(false); // fetch the /catalogue once, lazily, on first slash menu
   const [thinking, setThinking] = useState(false);
   const [liveAnswer, setLiveAnswer] = useState(''); // streamed markdown preview while a turn runs
   const [frame, setFrame] = useState(0);
@@ -326,12 +328,30 @@ export function App({
     await streamTurn(payload, kind === 'turn'); // MEM-11: server slash-commands aren't persisted
   }
 
+  // #149: fetch the server's prompt/skill catalogue once, lazily, the first time a slash menu opens
+  // (the session is open by then, so the gated GET passes). Fail-soft: any error → static commands only.
+  useEffect(() => {
+    if (!buffer.startsWith('/') || catalogueFetched.current) return;
+    catalogueFetched.current = true; // latch now so concurrent slash-opens don't double-fetch
+    void (async () => {
+      try {
+        setCatalogueCmds(catalogueToCommands(await srv.catalogue()));
+      } catch {
+        // no /catalogue (older server), gated/closed session, network blip, or a stub without
+        // the method → static commands only; un-latch so a later slash-open can retry.
+        catalogueFetched.current = false;
+        setCatalogueCmds([]);
+      }
+    })();
+  }, [buffer, srv]);
+
   // MEM-16(2): the slash-command suggestion list is open while the buffer is a slash prefix with
   // matches and the user hasn't dismissed it (Esc). completions() trims, so once an argument is
-  // being typed the prefix stops matching and the menu closes on its own.
+  // being typed the prefix stops matching and the menu closes on its own. #149: the server-fed
+  // prompt items (catalogueCmds) are merged in so loaded prompts autocomplete as `/<name>`.
   const menuItems = useMemo(
-    () => (buffer.startsWith('/') && !menuDismissed ? completions(buffer.slice(1)) : []),
-    [buffer, menuDismissed],
+    () => (buffer.startsWith('/') && !menuDismissed ? completions(buffer.slice(1), catalogueCmds) : []),
+    [buffer, menuDismissed, catalogueCmds],
   );
   const menuOpen = !thinking && menuItems.length > 0;
 

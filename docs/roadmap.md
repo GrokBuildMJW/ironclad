@@ -79,10 +79,14 @@ Evolving (design): [ADR-0002](adr/0002-core-always-on-skills.md) — the skill/p
 become **core, always-on** built-ins (loaded from a fixed core dir, independent of
 `GX10_PLUGINS_DIR`); the plugin surface stays for 3rd-party skills; MPR de-plugined (runtime
 `mpr.enabled`, default on).
-Planned (design): [ADR-0003](adr/0003-prompt-library.md) + [`prompt-packaging.md`](prompt-packaging.md)
-— a curated, **multilingual prompt library** + generator: a prompt is a declarative `kind: prompt`
-core built-in (variables + languages + guided elicitation); `/<prompt-name>` → asked for inputs →
-finished prompt in the target language; add a prompt by dropping an MD file.
+Delivered: [ADR-0003](adr/0003-prompt-library.md) + [`prompt-packaging.md`](prompt-packaging.md) —
+a curated, **multilingual prompt library**: a prompt is a declarative `kind: prompt` core built-in
+(variables + languages + guided elicitation); add one by dropping an MD file. Made **usable &
+discoverable** by [ADR-0005](adr/0005-prompt-skill-discovery-invocation.md) — `/prompts`/`/skills`
+list the loaded registry, `/<prompt-name>` invokes an item deterministically (finished prompt in
+the target language), catalogue-fed slash autocomplete, and a 7-item curated seed. See
+[`status.md`](status.md) for the shipped surface; the **intelligent curation/maintenance** flow is
+the next phase below.
 
 **Extension SDK — build plugins in a separate repo.** A **curated, versioned** extension surface
 (`ack.sdk`) so a plugin can be developed in its **own repository** against published `ironclad-ai`
@@ -115,5 +119,22 @@ Maturing the project itself toward a dependable, versioned release.
   export) into an automated, gated flow; the core stays inbound-closed.
 - **A stable (1.0) release** once the APIs settle (today: tagged `0.0.x` alpha previews
   on PyPI `ironclad-ai` + GitHub Releases).
+
+## 6. Skill & prompt library — usability & content
+
+A continuation of the skill/prompt library (phase 3): make the library **easy to find, use, grow,
+and maintain**. The **usability & seed** foundation has shipped — discovery (`/prompts`/`/skills`),
+deterministic `/<prompt-name>` invocation, catalogue-fed autocomplete, and a curated multilingual
+starter set ([ADR-0005](adr/0005-prompt-skill-discovery-invocation.md); see [`status.md`](status.md)).
+What remains is forward-looking:
+
+- **Intelligent curation & maintenance.** A guided flow that proposes new prompts/skills from a
+  described need, drafts the declarative item, runs it through `ack.gate`, and keeps the library
+  fresh — quality-checked and provenance-tracked, never blind imports.
+- **Save-as-item.** Turn an assembled `/<prompt-name>` result into a new reusable library item
+  (the deferred half of the invocation flow), with the same gate + multilingual overlays.
+- **Per-principal / 3rd-party libraries.** User- and tenant-scoped prompt/skill libraries over the
+  existing plugin surface, surfaced in discovery alongside the built-ins (soft-depends on the
+  multi-tenant work in phase 1).
 
 Issues and discussions are welcome — this is an early, openly-developed project.

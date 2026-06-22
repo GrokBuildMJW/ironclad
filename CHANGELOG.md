@@ -9,6 +9,44 @@ Released versions are listed below; upcoming work accumulates under *Unreleased*
 
 ## [Unreleased]
 
+## [0.0.13] - 2026-06-22
+
+### Added
+- **ADR-0005 + roadmap phase 6** (#161, epic #146): records the discovery + per-item invocation +
+  `/catalogue` design as [ADR-0005](docs/adr/0005-prompt-skill-discovery-invocation.md) (closing the
+  [ADR-0003](docs/adr/0003-prompt-library.md) D5 gap), and adds roadmap **phase 6** "Skill & prompt
+  library — usability & content" (the shipped usability/seed foundation + the forward-looking
+  curation/maintenance flow). roadmap.md phase 3 marked delivered.
+- **Three curated prompt-library seeds** (#150, epic #146): `pr-description`, `refactor-plan`, and
+  `test-plan` (engineering, EN+DE) bring the curated starter set under `skills/prompts/` to
+  **7**. Each is one declarative `kind: prompt` MD file (+ a `locales/de.json` overlay), passes
+  `ack.gate`, and is visible via `/prompts` + invocable via `/<name>` purely by dropping the file —
+  no engine change. `test_prompt_library.py` now parametrises over all 7 (24).
+- **Catalogue endpoint + dynamic slash autocomplete** (#149, epic #146): a guarded `GET /catalogue`
+  serves the loaded registry snapshot (the same `_catalogue_snapshot` that backs `/prompts`/`/skills`
+  — one surface). It is gated like `/tasks`/`/doctor` (added to `GATED_PATHS`; 401 without the
+  deployment secret under token/sealed). The TypeScript client fetches it lazily on the first
+  slash-menu open and merges loaded **prompt** names into autocomplete as directly-invocable
+  `/<name>` entries — a built-in command wins on a name collision; skills (not bare-slash invocable)
+  are intentionally not injected. Fail-soft: an older server / gated session → built-in commands
+  only. `test_catalogue_endpoint.py` (3) + `catalogue.test.ts` (6).
+- **Per-item prompt invocation `/<prompt-name>`** (#148, epic #146): the command router resolves a
+  `/<prompt-name>` against the loaded prompt catalogue and runs it deterministically (model-free) —
+  parses `var=value` / a single positional / `--lang xx`, and reuses the `ack.promptgen` elicitation
+  state machine: assembles the finished prompt in the target language when all required variables are
+  present, else returns the guiding questions for what is missing. Resolution runs **after** every
+  built-in command, so a real command is never shadowed; an unknown `/x` still falls through to a
+  model turn. The model-elected `use_prompt` tool stays available (additive). A single positional value fills the
+  lone required variable verbatim (a `=`/`--lang` inside a code/diff value is preserved), with a
+  trailing `--lang xx` peeled; explicit `var=value` sets named variables. `test_prompt_invocation.py` (14).
+- **Discovery commands `/prompts` + `/skills`** (#147, epic #146): read-only listing of the **one
+  loaded registry** (no re-scan, no parallel mechanism). `/prompts` lists every loaded
+  `kind: prompt` item (name, declared languages, description); `/skills` lists every loaded skill
+  across both kinds — `SKILL.md` playbooks and typed `CASE`+`run` tools (incl. the MPR built-in).
+  Both are advertised in `/help` and offered in the TypeScript client's slash autocomplete. Backed
+  by a shared `_catalogue_snapshot` helper over `_PROMPTS`/`_PLAYBOOKS`/`_PLUGIN_TOOLS`.
+  `test_discovery_cmds.py` (6) + `classify.test.ts`.
+
 ## [0.0.12] - 2026-06-22
 
 ### Changed

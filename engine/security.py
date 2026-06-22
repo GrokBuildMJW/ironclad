@@ -37,9 +37,11 @@ PROFILES = ("open", "token", "sealed")
 #: (``/session/open`` checks the token itself; ``/health`` is the liveness + handshake
 #: probe the client needs *before* it has a session — it leaks only the profile shape,
 #: never the token). ``/tasks`` IS gated: the TaskStore snapshot carries task titles and
-#: descriptions, which must not be readable without the deployment secret.
+#: descriptions, which must not be readable without the deployment secret. ``/catalogue`` is
+#: likewise gated: the loaded prompt/skill registry snapshot (names + descriptions) is deployment
+#: detail that must not be readable without the secret.
 GATED_PATHS = ("/chat", "/chat/stream", "/tool-result", "/fanout", "/cancel",
-               "/tasks", "/pending", "/feedback", "/doctor")
+               "/tasks", "/pending", "/feedback", "/doctor", "/catalogue")
 
 
 class SecurityPolicy:

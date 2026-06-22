@@ -37,6 +37,8 @@ export const COMMANDS: readonly Command[] = [
   {name: 'quit', scope: 'local', desc: 'quit'},
   // orchestrator (forwarded to the server)
   {name: 'status', scope: 'server', desc: 'status (model, perf, tasks, tools)'},
+  {name: 'prompts', scope: 'server', desc: 'list the loaded prompt-library items (name, languages, description)'},
+  {name: 'skills', scope: 'server', desc: 'list the loaded skills (playbooks + typed tools, incl. MPR)'},
   {name: 'config', scope: 'server', desc: 'active configuration'},
   {name: 'clear', scope: 'server', desc: "clear the orchestrator's context"},
   {name: 'context', scope: 'server', desc: 'show injected summary + retrieved block (diagnose)'},
@@ -59,10 +61,39 @@ export const LOCAL_COMMANDS: ReadonlySet<string> = new Set(
 );
 
 /** Autocomplete (MEM-16): commands whose name starts with `prefix` (prefix WITHOUT the leading
- *  '/'; empty → all). Drives the slash suggestion overlay. */
-export function completions(prefix: string): readonly Command[] {
+ *  '/'; empty → all). Drives the slash suggestion overlay. `extra` carries dynamic, server-fed
+ *  entries (#149, the prompt catalogue) appended after the static set; a built-in command always
+ *  wins on a name collision (the dynamic entry with that name is dropped — matching the server's
+ *  dispatch order where a real command beats a prompt). */
+export function completions(prefix: string, extra: readonly Command[] = []): readonly Command[] {
   const p = prefix.trim().toLowerCase();
-  return COMMANDS.filter((c) => c.name.startsWith(p));
+  const builtin = new Set(COMMANDS.map((c) => c.name));
+  const dyn = extra.filter((c) => !builtin.has(c.name));
+  return [...COMMANDS, ...dyn].filter((c) => c.name.startsWith(p));
+}
+
+/** Map a server `/catalogue` snapshot into dynamic completion entries (#149). Only **prompts** are
+ *  injected — they are directly invocable as `/<name>` (#148). Skills are discoverable via `/skills`
+ *  but are not bare-slash invocable, so injecting them would create dead completions; they are
+ *  intentionally left out. */
+export function catalogueToCommands(cat: {
+  prompts?: Array<{name?: unknown; description?: unknown; languages?: unknown}>;
+}): Command[] {
+  const out: Command[] = [];
+  for (const p of cat?.prompts ?? []) {
+    const name = typeof p?.name === 'string' ? p.name : '';
+    if (!name) continue;
+    const langs = Array.isArray(p?.languages)
+      ? (p.languages as unknown[]).filter((x): x is string => typeof x === 'string').join(',')
+      : '';
+    const desc = typeof p?.description === 'string' ? p.description : '';
+    out.push({
+      name,
+      scope: 'server',
+      desc: `prompt${langs ? ' · ' + langs : ''}${desc ? ' — ' + desc : ''}`,
+    });
+  }
+  return out;
 }
 
 export function classify(line: string): Classified {

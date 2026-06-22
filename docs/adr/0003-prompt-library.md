@@ -1,6 +1,6 @@
 # ADR-0003 — Prompt library & multilingual prompt generator
 
-- **Status:** Accepted (design) — implementation under epic #105 (sub-issues #108, #109, #110, #111). Records the design; not a claim it ships yet (see [`status.md`](../status.md)).
+- **Status:** Accepted (design) — implementation under epic #105 (sub-issues #108, #109, #110, #111). Records the design; for what ships see [`status.md`](../status.md). The D5 slash-command surface (discovery + per-item `/<prompt-name>` invocation) is delivered by [ADR-0005](0005-prompt-skill-discovery-invocation.md) (epic #146).
 - **Date:** 2026-06-21
 - **Context sources:** the research catalogue `plan_skill_libary.md` (prompt/skill patterns), `skills/mpr/` (the real skill format + `i18n` usage), and the **core base** from [ADR-0002](0002-core-always-on-skills.md) (always-on built-in loader, shared `ack.i18n`, `ack.playbook`, `ack.catalogue`, `ack.gate`).
 

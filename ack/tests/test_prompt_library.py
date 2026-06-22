@@ -17,7 +17,8 @@ from ack import promptgen as G
 _PROMPTS_DIR = Path(__file__).resolve().parents[2] / "skills" / "prompts"
 
 # The curated set this library guarantees. Each must round-trip through the gate in EN + DE.
-_CURATED = {"code-review", "commit-message", "bug-report", "explain-code"}
+_CURATED = {"code-review", "commit-message", "bug-report", "explain-code",
+            "pr-description", "refactor-plan", "test-plan"}
 
 
 def _discovered() -> dict[str, P.Prompt]:

@@ -3660,6 +3660,9 @@ HELP = """
     ls [dir]         list a directory
     clear            clear the context (the prompt stays)
     status           context info (incl. streaming/thinking/max_tokens)
+    prompts          list the loaded prompt-library items (name, languages, description)
+    <prompt-name>    run a prompt item directly: /<name> [var=value …] [--lang xx] (see /prompts)
+    skills           list the loaded skills (playbooks + typed tools, incl. MPR)
     config           the effectively-loaded CLI config + source
     config get <key>          read a dotted config key (e.g. mpr.enabled)
     config set <key> <value>  override a dotted config key at runtime
@@ -3873,6 +3876,156 @@ def _initiative_command(arg_str: str) -> str:
         return f"[initiative] {e}"
 
 
+def _catalogue_snapshot() -> Dict[str, List[Dict[str, Any]]]:
+    """A read-only snapshot of the **one loaded registry** — the single source for both the
+    ``/prompts``/``/skills`` discovery commands and the ``/catalogue`` endpoint. No re-scan: it
+    reads the live ``_PROMPTS`` / ``_PLAYBOOKS`` / ``_PLUGIN_TOOLS`` dicts that ``_load_skills``
+    populated at startup (so discovery never drifts from what is actually loaded).
+
+    Returns ``{"prompts": [{name, description, languages}], "skills": [{name, kind, description}]}``
+    — ``skills`` covers both discovered skill kinds: ``SKILL.md`` playbooks (``_PLAYBOOKS``) and
+    typed ``CASE``+``run`` tools (``_PLUGIN_TOOLS``, incl. the MPR built-in)."""
+    prompts: List[Dict[str, Any]] = []
+    for cap in sorted(_PROMPTS):
+        p = _PROMPTS[cap]
+        prompts.append({"name": cap, "description": p.description, "languages": list(p.languages)})
+    skills: List[Dict[str, Any]] = []
+    for cap in sorted(_PLAYBOOKS):
+        pb = _PLAYBOOKS[cap]
+        skills.append({"name": cap, "kind": "playbook", "description": pb.description})
+    for name in sorted(_PLUGIN_TOOLS):
+        fn = (_PLUGIN_TOOLS[name].get("schema") or {}).get("function") or {}
+        skills.append({"name": name, "kind": "tool", "description": str(fn.get("description", "") or "")})
+    skills.sort(key=lambda s: s["name"])
+    return {"prompts": prompts, "skills": skills}
+
+
+def _render_prompts() -> str:
+    """Text view of the loaded ``kind: prompt`` items for the ``/prompts`` command."""
+    items = _catalogue_snapshot()["prompts"]
+    if not items:
+        return col("  No prompt items are loaded.", C.YELLOW)
+    lines = [col(f"  Loaded prompts ({len(items)}) — [languages] description:", C.CYAN)]
+    for it in items:
+        langs = ",".join(it["languages"]) or "en"
+        lines.append(f"    {it['name']:<18} [{langs}]  {it['description']}")
+    lines.append(col("  → invoke one directly: /<name> [var=value …] [--lang xx]  "
+                     "(or the use_prompt tool for a model-guided flow).", C.GRAY))
+    return "\n".join(lines)
+
+
+def _render_skills() -> str:
+    """Text view of the loaded skills (playbooks + typed tools) for the ``/skills`` command."""
+    items = _catalogue_snapshot()["skills"]
+    if not items:
+        return col("  No skills are loaded.", C.YELLOW)
+    lines = [col(f"  Loaded skills ({len(items)}) — kind  name  description:", C.CYAN)]
+    for it in items:
+        lines.append(f"    {it['kind']:<9} {it['name']:<22} {it['description']}")
+    lines.append(col("  → playbooks load via the use_skill tool; typed tools are model-elected (or /tool <name>).", C.GRAY))
+    return "\n".join(lines)
+
+
+_LANG_TAIL_RE = re.compile(r"\s+--lang(?:=|\s+)(\S+)\s*$")
+
+
+def _parse_prompt_args(prompt: Any, rest: str) -> Tuple[Dict[str, str], Optional[str], Optional[str]]:
+    """Parse the argument string of a `/<prompt-name> …` invocation into (values, lang, error).
+
+    Two ergonomic forms, both deterministic. A trailing ``--lang xx`` / ``--lang=xx`` is peeled
+    first (only at the very end — a ``--lang`` *inside* a value is left intact). Then:
+      * **single positional** — if there is exactly one required variable AND the remaining text is
+        not an explicit ``<declared-var>=…`` assignment, the whole text is that variable's value.
+        This is the headline path for code/diffs (``/explain-code def f(x=1): ...``) — a value
+        containing ``=`` is preserved verbatim, never tokenised.
+      * **key=value** — ``var=value`` tokens (``shlex``-quoted for spaces), used when the text
+        begins with a declared variable assignment or there is not exactly one required variable.
+        Unrecognised barewords are ignored (not an error)."""
+    import shlex
+    rest = rest.strip()
+    if not rest:
+        return {}, None, None
+    lang: Optional[str] = None
+    m = _LANG_TAIL_RE.search(rest)               # peel a TRAILING --lang only (mid-value --lang stays)
+    if m:
+        lang = m.group(1)
+        rest = rest[: m.start()].rstrip()
+    if not rest:
+        return {}, lang, None
+    declared = {v.name for v in prompt.variables}
+    required = [v.name for v in prompt.variables if v.required]
+    # Does the text start with an explicit `<declared-var>=` assignment? Only then is it key=value.
+    head = rest.split("=", 1)[0].strip() if "=" in rest else ""
+    looks_kv = head in declared and head != ""
+    if not looks_kv and len(required) == 1:
+        return {required[0]: rest}, lang, None    # positional: whole value, '=' and all
+    try:
+        tokens = shlex.split(rest)
+    except ValueError as e:
+        return {}, lang, f"could not parse arguments: {e}"
+    values: Dict[str, str] = {}
+    for t in tokens:
+        if "=" in t:
+            k, v = t.split("=", 1)
+            if k.strip():
+                values[k.strip()] = v
+    return values, lang, None
+
+
+def _resolve_prompt_name(text: str) -> Optional[str]:
+    """The first whitespace token of *text* if it names a loaded prompt (case-insensitive), else
+    None. Safe on empty/whitespace input (returns None — never an IndexError)."""
+    toks = text.split()
+    if not toks:
+        return None
+    first = toks[0]
+    if first in _PROMPTS:
+        return first
+    low = first.lower()
+    return next((cap for cap in _PROMPTS if cap.lower() == low), None)
+
+
+def _invoke_prompt(user_input: str) -> str:
+    """Resolve + run one prompt-library item by name. Returns the finished prompt when all required
+    variables are present, else the guiding questions for what is still missing (#148)."""
+    from ack.promptgen import run_prompt
+    name = _resolve_prompt_name(user_input)
+    if name is None:                                     # defensive — the dispatch guard checked this
+        return col("  no such prompt — try /prompts", C.YELLOW)
+    prompt = _PROMPTS[name]
+    parts = user_input.split(None, 1)
+    rest = parts[1] if len(parts) > 1 else ""
+    values, lang, err = _parse_prompt_args(prompt, rest)
+    if err:
+        return col(f"  /{name}: {err}", C.YELLOW)
+    try:
+        step = run_prompt(prompt, values, lang=(lang or None))
+    except Exception as e:  # noqa: BLE001 — surfaced as a message, never raises into dispatch
+        return col(f"  /{name}: could not assemble — {e!r}", C.RED)
+    if step["status"] == "done":
+        return (col(f"  /{name} → assembled prompt ({step['lang']}):", C.GREEN)
+                + "\n\n" + step["prompt"])
+    # status == "ask": guide the user to provide the missing required input(s)
+    missing = set(step.get("missing") or [])
+    first = step.get("variable") or (sorted(missing)[0] if missing else "var")
+    langs = ",".join(prompt.languages) or "en"
+    lines = [col(f"  /{name}: {prompt.description}  [{langs}]", C.CYAN),
+             col(f"  Provide the required input(s) — e.g.  /{name} {first}=\"…\"  [--lang de]", C.GRAY),
+             col("  Required:", C.GRAY)]
+    for v in prompt.variables:
+        if v.name in missing:
+            q = v.question or v.description or f"value for {v.name}"
+            lines.append(f"    {v.name} — {q}")
+    optional = [v for v in prompt.variables if not v.required]
+    if optional:
+        lines.append(col("  Optional:", C.GRAY))
+        for v in optional:
+            q = v.question or v.description or ""
+            lines.append(f"    {v.name}{(' — ' + q) if q else ''}")
+    lines.append(col("  (or use the use_prompt tool for a model-guided flow)", C.GRAY))
+    return "\n".join(lines)
+
+
 def _dispatch(agent: GX10, user_input: str):
     cmd = user_input.lower()
     if cmd == "help":
@@ -3881,6 +4034,10 @@ def _dispatch(agent: GX10, user_input: str):
         _ui_print(agent.clear_context())
     elif cmd == "status":
         _ui_print(agent.status())
+    elif cmd == "prompts":
+        _ui_print(_render_prompts())
+    elif cmd == "skills":
+        _ui_print(_render_skills())
     elif cmd == "config":
         _ui_print(_render_config())
     elif cmd.startswith("config get "):
@@ -4048,6 +4205,12 @@ def _dispatch(agent: GX10, user_input: str):
             args = {prim: rest} if prim else {}
         if args is not None:
             _ui_print(run_tool(name, args))
+    elif _PROMPTS and _resolve_prompt_name(user_input) is not None:
+        # Per-item prompt invocation: `/<prompt-name> [var=value ...] [--lang xx]`. Checked AFTER
+        # every built-in command above, so a real command always wins (no shadowing). Deterministic,
+        # model-free — reuses the `ack.promptgen` elicitation state machine. The model-elected
+        # `use_prompt` tool stays available; this is the additive direct surface (#148; design: ADR-0003 D5).
+        _ui_print(_invoke_prompt(user_input))
     else:
         agent.run(user_input)
         # LOK-1: persist the LLM context after each real turn so it survives an orchestrator restart.

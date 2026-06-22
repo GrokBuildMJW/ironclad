@@ -1,0 +1,3 @@
+{
+  "template": "Du bist eine erfahrene Entwicklerin und planst ein Refactoring. Schlage einen sicheren, schrittweisen Plan fuer den folgenden Code vor, hin zu diesem Ziel: {goal}.\n\n{code}\n\nGib eine geordnete Liste kleiner, unabhaengig pruefbarer Schritte an. Nenne fuer jeden Schritt: die Aenderung, warum sie verhaltenswahrend ist, und wie man sie verifiziert (ein Test oder eine konkrete Pruefung). Weise auf Risiken hin und auf jeden Schritt, der zuerst einen neuen Test braucht. Schreibe den Code nicht um — plane den Weg. Bewahre das Verhalten, sofern eine Aenderung nicht ausdruecklich begruendet ist."
+}

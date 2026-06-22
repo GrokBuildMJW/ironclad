@@ -1,7 +1,7 @@
 # Test report
 
 > Maximum transparency: this is the actual state of testing, including issues found
-> **and fixed** during the campaign. Counts re-confirmed **2026-06-21** (offline suite; live
+> **and fixed** during the campaign. Counts re-confirmed **2026-06-22** (offline suite; live
 > verification 2026-06-17). For per-component wiring status see
 > [`status.md`](status.md); for what's planned see [`roadmap.md`](roadmap.md).
 
@@ -9,10 +9,10 @@
 
 | | |
 |---|---|
-| Automated tests (offline, no model) | **954 passed** |
+| Automated tests (offline, no model) | **986 passed** |
 | Live smoke tests (skipped without a model) | **9** |
-| **Total Python** | **963** |
-| TypeScript client tests (`node:test`) | **333 passed** (337 total, 4 skipped) |
+| **Total Python** | **995** |
+| TypeScript client tests (`node:test`) | **340 passed** (344 total, 4 skipped) |
 | Full agentic loop, end to end, with a **real** code-agent | **verified** |
 | Issues found during the campaign | **1 functional gap + 5 review findings — all found and fixed** (see below) |
 
@@ -24,7 +24,7 @@ default** and only runs when pointed at a real server.
 
 ```bash
 # 1) offline suite — deterministic, no model needed
-pytest -q                                   # from core/  → 954 passed, 9 skipped
+pytest -q                                   # from core/  → 986 passed, 9 skipped
 
 # 2) live smoke — against your own running orchestrator
 GX10_LIVE_URL=http://<your-host>:8100 pytest -k live -q     # 9 passed
@@ -34,13 +34,13 @@ GX10_LIVE_URL=http://<your-host>:8100 pytest -k live -q     # 9 passed
 ## Coverage by area
 
 Counts below are reproduced from `pytest --collect-only` (2026-06-22) and sum to
-the **963** total (954 offline + 9 live) — now includes the MPR core built-in suite.
+the **995** total (986 offline + 9 live) — now includes the MPR core built-in suite.
 
 | Area | Test files | Tests |
 |------|-----------|-------|
 | **Agent-Contract-Kernel** (schema SSOT, validate→reask, constrained emission, registry) | `registry`, `case_spec`, `constrained_emission`, `validated_emit`, `engine_ack_gate`, `lodestar_tracking` | 87 |
 | **Function-calling robustness** (tool-arg validate→reask, model-agnostic recovery) | `tool_args`, `tool_extract` | 24 |
-| **Server / client split & security** (HTTP surface, trust profiles, sessions, sealing, config tree + runtime config, command router, doctor, server-side tool bridge) | `server_split`, `security`, `config_tree`, `config_runtime`, `commands`, `doctor_endpoint`, `tool_bridge`, `session_persist` | 76 |
+| **Server / client split & security** (HTTP surface, trust profiles, sessions, sealing, config tree + runtime config, command router, doctor, catalogue endpoint, server-side tool bridge) | `server_split`, `security`, `config_tree`, `config_runtime`, `commands`, `doctor_endpoint`, `catalogue_endpoint`, `tool_bridge`, `session_persist` | 79 |
 | **Provider-router / dispatch (P0)** (backend registry, routing policy, artifact routing, spill/fallback, setup-types) | `dispatch`, `router`, `providers`, `providers_config`, `artifact_routing`, `offload_topology` | 69 |
 | **Memory & context** (Mem0 client, chunking, RAG, summary, deep query, vault reconcile, warm tier) | `memory`, `memory_chunking`, `worker_memory`, `context_rag`, `context_summary`, `deep_query`, `reconcile_vault`, `warm` | 78 |
 | **Open plugin surface** (discover + expose `skills/*` plugins, no core patch) | `plugins` | 7 |
@@ -59,7 +59,9 @@ the **963** total (954 offline + 9 live) — now includes the MPR core built-in 
 | **Prompt-library item** (`kind: prompt` parse/validate/discover + variable build) | `prompt` | 7 |
 | **Multilingual prompt assembly** (template + values → target language via ack.i18n) | `promptgen` | 6 |
 | **Prompt slash surface & elicitation** (`use_prompt` list → guided ask-next → assemble + lang) | `prompt_cmd` | 9 |
-| **Curated prompt library** (shipped starter prompts discover + gate + assemble EN/DE, drop-MD adds) | `prompt_library` | 15 |
+| **Curated prompt library** (7 shipped starter prompts discover + gate + assemble EN/DE, drop-MD adds) | `prompt_library` | 24 |
+| **Discovery commands** (`/prompts`, `/skills` list the one loaded registry) | `discovery_cmds` | 6 |
+| **Per-item prompt invocation** (`/<prompt-name>` resolve + parse + elicit/assemble) | `prompt_invocation` | 14 |
 | **Orchestration state** (TaskStore lifecycle/dedup, initiative, autoplan, state e2e) | `taskstore`, `initiative`, `autoplan`, `state_e2e` | 45 |
 | **Parallelism** (governed fan-out, in-engine tool, single-writer reduce, parallel router) | `workers`, `parallel_tool`, `worker_reduce`, `parallel_router` | 29 |
 | **Thin client + BYO code-agent** (agent pool, `GX10_AGENT_CMD` template, managed transport) | `client_pool`, `client_transport` | 14 |
