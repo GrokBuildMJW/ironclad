@@ -542,3 +542,14 @@ def test_upstream_released_not_closed_registered_warn_flag_only():
     pd = _load()
     c = {x.name: x for x in pd.registry()}["upstream-released-not-closed"]
     assert c.warn is True and c.group == "upstream" and c.heal is None        # flag-only: no public-write
+
+
+def test_devloop_merge_evidence_registered_and_inert_without_key(monkeypatch):
+    # epic #262 S8: the marker reconciler is wired in, fail-closed (warn=False) once active, and
+    # INERT before GX10_DEVLOOP_MARKER_KEY is set — making NO GitHub calls (offline-safe).
+    pd = _load()
+    c = {x.name: x for x in pd.registry()}["devloop-merge-has-evidence"]
+    assert c.warn is False and c.group == "repo"
+    monkeypatch.delenv("GX10_DEVLOOP_MARKER_KEY", raising=False)
+    data = c.fetch(None)
+    assert data["active"] is False and c.assert_fn(data) == []                 # inert => no violations
