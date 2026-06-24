@@ -9,7 +9,83 @@ Released versions are listed below; upcoming work accumulates under *Unreleased*
 
 ## [Unreleased]
 
+## [0.0.18] - 2026-06-24
+
+### Fixed
+- **Token-accurate context budgeting** (#371, epic #366 P1 1/3): the context budget was char-based
+  (`CHARS_PER_TOKEN = 4`) against a hard 32 768-**token** wall. Real agent content (code/JSON/CJK) is
+  ~2–2.6 chars/token, so the working set silently exceeded the window and vLLM rejected the request
+  before generating (`HTTP 400 "maximum context length is 32768"`, `0 gen · 0 tok`). The trim now
+  counts **real tokens** via the served model's tokenizer (the vLLM `/tokenize` endpoint — no bundled
+  tokenizer dependency) and the RAG block is budgeted in real tokens; the calibrated chars/token
+  fallback (default **2.6**) is used only when the endpoint is unreachable (conservative — it trims
+  early rather than overflowing). Fail-soft: a tokenizer outage never makes the engine 400. Also fixes
+  the false `_derive_ctx_budget` docstring ("never overflows it" held only at 4 c/t). See ADR-0003.
+- **Pre-flight overflow guard + emergency single-turn trim** (#372, epic #366 P1 2/3): `_make_completion`
+  now checks, before every vLLM call, that the prompt + the reserves it must leave free — output
+  (`max_tokens`) + the **tools schema** vLLM serializes into the prompt + the **conditional thinking
+  budget** (only when `think=True`) — fit the model window. If not, it does ONE emergency trim of the
+  oldest **whole** rounds (atomic `assistant.tool_calls` + their `tool` responses, else a different 400);
+  if it still can't fit (an irreducible single oversized turn) it raises a clear **`ContextOverflowError`**
+  (prompt/output/window sizes) instead of a raw vLLM 400. Evicted rounds are archived losslessly to cold.
+  Fail-soft (skipped when token budgeting is off). See ADR-0003.
+- **Bounded summarizer input** (#373, epic #366 P1 3/3): `_summarize` capped only its OUTPUT
+  (`SUMMARY_MAX_TOKENS`), never its INPUT — a large evicted transcript was fed whole, so the summarizer
+  call itself could hit the model window and vLLM would silently truncate it (a lossy rolling summary,
+  state loss over long sessions). The input is now bounded token-based, **tail-first**
+  (`input_budget = min(4096, max_model_len // 4)`); the **full raw transcript is still archived losslessly
+  to cold first**, then only the most-recent (tail) rounds within budget are summarized (a warning is
+  logged on truncation). Completes the P1 trio. See ADR-0003.
+- **`ironclad` `/exit` now stops the local background engine** (#428): the launcher
+  (`core/install/ironclad.ps1`) started or reused a local `server.py` and only stopped it on exit
+  *when this session had started it* (`$started`), so a **reused or orphaned engine lingered on the
+  port** after `/exit` (the CLI quit but `server.py` kept serving). The teardown now stops the local
+  engine by its listening port regardless — the engine is ephemeral per session (single-tenant by
+  design; the `spark` thin-client path is unaffected — it has no local engine).
+
 ### Added
+- **`GX10_CHARS_PER_TOKEN`** / **`GX10_TOKENIZE`** env knobs (#371): tune the calibrated fallback
+  ratio; `GX10_TOKENIZE` is `auto` (probe a real remote/LAN host), `1` (force — server-mode loopback),
+  or `0` (pure char fallback).
+- **`GX10_THINKING_RESERVE`** env knob (#372, default 4000): output headroom reserved for the thinking
+  budget, applied only when thinking is on for the call.
+- **Live `max_model_len` discovery** (#377, epic #366 P2): the engine reads the served model window
+  from `GET /v1/models` at boot and adopts it (re-deriving the char-fallback watermarks), so the token
+  budget can't drift if the Spark is relaunched with a different `--max-model-len`. Fail-soft (keeps the
+  configured `MAX_MODEL_LEN` on any error); only a real remote/LAN host (the offline suite stays
+  hermetic); `GX10_DISCOVER_WINDOW=0` disables.
+
+### Documentation
+- **Windows conhost copy/scaling limitation** (#382, epic #366 P3): documented the legacy Windows
+  console (`conhost.exe`) right-click-copy / scaling limitation in the `clients/ink` docs — the renderer
+  owns selection (alt-buffer + SGR mouse tracking), so on conhost a right-click copy is captured by the
+  app; *workaround:* Windows Terminal + Shift-drag. Terminal limitation, not a renderer bug; shares the
+  alt-buffer + mouse-tracking class with #256 (where the client-side fix is tracked). Docs only.
+- **Output reserve is tunable** (#379, epic #366 P2): documented that the output (generation) token
+  reserve — `generation.max_tokens` / **`GX10_MAX_TOKENS`**, default **8192** — is the permanent output
+  budget subtracted from the model window. The default stays 8192 (raising it from 4096 in PERF-10 fixed
+  long-handover truncation; post-#371 it is reserved token-accurately). Raise it for longer single
+  outputs, lower it for more context headroom. Addresses C-5.
+
+## [0.0.17] - 2026-06-24
+
+### Fixed
+- **Publish workflow permissions** (#411): the publish job set `permissions: id-token: write` explicitly,
+  which drops the default `contents: read`, so `actions/checkout` failed on a private repo
+  (*"repository not found"*). Grant `contents: read` back (a no-op on the public repo; required for a
+  private Test-PyPI proof repo).
+- **Post-publish-smoke install index** (#413): the post-publish smoke `pip install`ed `ironclad-ai==<ver>`
+  with no index, so it queried production PyPI even for a Test-PyPI release and could not find the version.
+  Install from the SAME index the release published to (derive the simple index from `PYPI_REPOSITORY_URL`
+  + add production as an `--extra-index-url` for dependencies); unset keeps production-default.
+
+### Added
+- **Repo-scoped publish index** (#397, epic #348 S14c): the publish workflow's `repository-url` is now
+  repo-scoped via the `PYPI_REPOSITORY_URL` variable (default: production PyPI). This lets a separate
+  Test-PyPI proof repo (`ironclad-testpypi`, with its own Test-PyPI Trusted Publisher + the variable set to
+  `https://test.pypi.org/legacy/`) publish the SAME generated workflow to Test-PyPI — so the release chain
+  is proven on Test-PyPI first, with both push- and index-isolation, before any production cut. Production
+  `ironclad` is unaffected (the variable is unset → production PyPI).
 - **Deploy/spark consistency** (#216, epic #210): the deployed Spark topology is a derived view of the
   released artifact. CI-runnable (no SSH): `scripts/ci/check_deploy_consistency.py` asserts every literal
   `setup.type` value in the deploy scripts is one the engine accepts (`_VALID_SETUP_TYPES`) and that no

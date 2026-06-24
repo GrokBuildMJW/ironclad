@@ -86,3 +86,65 @@ def test_confinement_flags_a_dirtied_live_tree(tmp_path):
     (repo / "leaked.txt").write_text("written outside the worktree\n", encoding="utf-8")
     violations = wt.confinement_violations(repo)
     assert any("leaked.txt" in v for v in violations)   # an out-of-worktree write is caught
+
+
+def test_pinned_base_has_unit_docs_but_untampered_gate_scripts(tmp_path):
+    # NC-1 / ADR-0002 D5 (#312 S2): the integrity-pinned base checkout carries the unit's (non-protected)
+    # change AND the BASE's OWN guard scripts — so the gate sees the unit's docs but never the agent copy.
+    wt = _load()
+    repo = tmp_path / "repo"; repo.mkdir(parents=True)
+    subprocess.run(["git", "-c", "init.defaultBranch=main", "init", str(repo)], check=True, capture_output=True, text=True)
+    _git(repo, "config", "user.name", "t"); _git(repo, "config", "user.email", "t@local")
+    (repo / "scripts" / "ci").mkdir(parents=True); (repo / "core" / "docs").mkdir(parents=True)
+    (repo / "scripts" / "ci" / "tool.py").write_text("GATE-V1\n", encoding="utf-8")   # the base's gate script
+    (repo / "core" / "docs" / "x.md").write_text("v1\n", encoding="utf-8")
+    _git(repo, "add", "-A"); _git(repo, "commit", "-m", "init")
+
+    # the agent edits a NON-protected doc in its unit worktree
+    h = wt.create_worktree(repo, tmp_path / "wt", "feat/devloop-x-1", base="main")
+    (Path(h.path) / "core" / "docs" / "x.md").write_text("v2 (unit edit)\n", encoding="utf-8")
+    diff = wt.capture_diff(h)
+
+    base = wt.create_pinned_base(repo, tmp_path / "base", "main", diff)
+    # the unit's doc change IS present in the pinned base (so the gate audits the unit's docs)
+    assert (Path(base) / "core" / "docs" / "x.md").read_text(encoding="utf-8") == "v2 (unit edit)\n"
+    # the gate script is the BASE's OWN, untampered copy (never the agent-mutated tree)
+    assert (Path(base) / "scripts" / "ci" / "tool.py").read_text(encoding="utf-8") == "GATE-V1\n"
+
+
+def test_create_release_base_is_a_clean_no_diff_pinned_base(tmp_path):
+    # #348 S4: the DELIVER staging primitive is a CLEAN integrity-pinned checkout with NO unit diff —
+    # distinct from create_pinned_base(diff). The release base == base_ref tree exactly (no agent change).
+    wt = _load()
+    repo = tmp_path / "repo"; _init_repo(repo)
+    (repo / "core").mkdir(parents=True, exist_ok=True)
+    (repo / "core" / "pyproject.toml").write_text("version = '0.0.1'\n", encoding="utf-8")
+    _git(repo, "add", "-A"); _git(repo, "commit", "-m", "release base")
+    base = wt.create_release_base(repo, tmp_path / "rel-base", "main")
+    # the base carries the committed tree, with NOTHING extra applied (no unit diff exists per release)
+    assert (Path(base) / "core" / "pyproject.toml").read_text(encoding="utf-8") == "version = '0.0.1'\n"
+    porcelain = subprocess.run(["git", "-C", base, "status", "--porcelain"],
+                               capture_output=True, text=True).stdout.strip()
+    assert porcelain == ""                                          # clean — no diff applied
+    wt.dispose(repo, wt.WorktreeHandle(path=base, branch="", base="main"))   # disposes like a worktree
+
+
+def test_engine_git_ops_ignore_a_planted_hook(tmp_path):
+    # Default C / ADR-0002 D5 (#312 S2): confinement is blind to .git/, so a unit could plant a hook.
+    # The engine disables hooks for its git ops, so a planted pre-commit never fires during apply.
+    wt = _load()
+    repo = tmp_path / "repo"; _init_repo(repo)
+    hooks = repo / ".git" / "hooks"; hooks.mkdir(parents=True, exist_ok=True)
+    (hooks / "pre-commit").write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+    (hooks / "pre-commit").chmod(0o755)
+
+    h = wt.create_worktree(repo, tmp_path / "wt", "feat/devloop-x-1", base="main")
+    (Path(h.path) / "f.txt").write_text("changed\n", encoding="utf-8")
+    # control: a RAW commit (no hooks override) is blocked by the planted hook on this platform...
+    subprocess.run(["git", "-C", h.path, "add", "-A"], check=True, capture_output=True, text=True)
+    raw = subprocess.run(["git", "-C", h.path, "commit", "-m", "x"], capture_output=True, text=True)
+    if raw.returncode == 0:
+        pytest.skip("git did not run the planted hook here — isolation test inconclusive on this platform")
+    # ...but the engine's apply (hooks disabled, Default C) commits cleanly despite the hook
+    sha = wt.apply(h, "unit change")
+    assert sha and len(sha) >= 7

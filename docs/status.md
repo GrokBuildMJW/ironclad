@@ -15,7 +15,7 @@
 This document is the single source of truth for **what actually works right now**.
 
 > **Release model.** Ironclad is **pre-release** (`0.0.x`, alpha). Tagged releases are
-> published on **PyPI** as `ironclad-ai` and as **GitHub Releases** (latest `v0.0.15`);
+> published on **PyPI** as `ironclad-ai` and as **GitHub Releases** (latest `v0.0.18`);
 > the importable wheel is the Agent-Contract-Kernel (`ack` + `ack.lodestar`), while the
 > orchestration engine ships as runnable scripts until its API stabilizes. There is **no
 > stable/1.0 release yet** — APIs, layout, and config may change between `0.0.x` versions.
@@ -89,14 +89,21 @@ secret-free client for a **Mem0-style HTTP service** (`POST /add`, `POST /search
 Mem0 stack (Qdrant + Neo4j + BGE-M3, LLM pointed at the local model).
 
 **Three tiers (all server-side, fail-soft).** *Hot* = the model window (a bounded working
-set, char/token-budget trimmed). *Warm* = `engine/warm.py`, a BSD-licensed in-memory store
+set, **token-accurately** trimmed against the model wall — real token counts from the served
+model's tokenizer, with a calibrated chars/token fallback). *Warm* = `engine/warm.py`, a BSD-licensed in-memory store
 (`GX10_WARM_URL`, e.g. Valkey) holding the rolling conversation summary + recent-turn state — which
 **survive a restart** and are **shared across the reasoning workers** — plus a separate short-TTL
 (~3 min) retrieval cache-aside. The shipped compose defaults `GX10_WARM_URL` to the `mem-valkey`
 loopback, so the warm tier wires automatically under `--profile memory` (fail-soft otherwise). *Cold* = the Mem0 vector(+graph) store below. On top of the tiers:
-rolling/hierarchical summarization on eviction (raw archived to cold, prefix-stable),
-per-turn RAG assembly (warm cache-aside), token-accurate budgeting that scales the working
-set to the model window, chunked + recency-ranked long-artifact storage, an on-demand
+rolling/hierarchical summarization on eviction (raw archived to cold first, then a **bounded
+tail-first** summary input so the summarizer can't itself overflow the window, prefix-stable),
+per-turn RAG assembly (warm cache-aside, the RAG block itself token-budgeted), token-accurate
+budgeting (real token counts via the served model's tokenizer — the vLLM `/tokenize` endpoint —
+with a calibrated chars/token fallback; the model window is auto-adopted from `/v1/models` at boot)
+that scales the working set to the model window without overflowing it, a **pre-flight overflow guard** (before each call, reserve output —
+`generation.max_tokens` / `GX10_MAX_TOKENS`, default 8192 — + the tools schema + the conditional
+thinking budget; one emergency whole-round trim, then a clear `ContextOverflowError` instead of a raw
+vLLM 400), chunked + recency-ranked long-artifact storage, an on-demand
 `deep_query_memory` graph tool, and worker memory (workers read the shared summary +
 per-item retrieval, a single-writer reducer consolidates their writes). Each piece is
 individually flag-gated (default-on where a memory/warm service is configured); with the

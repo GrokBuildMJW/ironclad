@@ -1,23 +1,37 @@
 name: Publish to PyPI
 
-# Publishes the package to PyPI on every published GitHub release, using PyPI
-# **Trusted Publishing (OIDC)** — no token/secret stored in the repo. This requires a
-# Trusted Publisher registered on PyPI for:
-#   project: ironclad-ai   owner: GrokBuildMJW   repo: ironclad   workflow: publish.yml
+# Publishes the package on every published GitHub release, using **Trusted Publishing (OIDC)** —
+# no token/secret stored in the repo. The destination index is repo-scoped (see `repository-url`
+# below): the production `ironclad` repo publishes to PyPI; a separate Test-PyPI proof repo
+# (`ironclad-testpypi`) sets the repo variable PYPI_REPOSITORY_URL to test.pypi.org. Each needs its
+# own Trusted Publisher registered on the matching index:
+#   PyPI:      project ironclad-ai  owner GrokBuildMJW  repo ironclad           workflow publish.yml
+#   Test-PyPI: project ironclad-ai  owner GrokBuildMJW  repo ironclad-testpypi  workflow publish.yml
 # (If you registered an environment there, add `environment:` below to match.)
 
 on:
+  # #348 S7a: release:published is the ONLY publish trigger. workflow_dispatch was removed — it let
+  # anyone with Actions:write fire the OIDC upload with NO tag (the preflight's empty-tag skip path).
   release:
     types: [published]
-  workflow_dispatch:
 
 jobs:
   publish:
     runs-on: ubuntu-latest
     permissions:
       id-token: write          # OIDC token for Trusted Publishing
+      contents: read           # #411: setting permissions explicitly drops the default contents:read, so
+                               #   actions/checkout fails on a PRIVATE repo ("repository not found"). Grant
+                               #   it back (a no-op on the public production repo; required for a private
+                               #   Test-PyPI proof repo).
     steps:
       - uses: actions/checkout@v4
+        with:
+          # export-sync re-assert (#348 S5 / S1-D): build the EXACT tagged export tree, never a moving
+          # main — closes the push -> release-create window where main could advance to a different tree.
+          # release:published always carries a tag (workflow_dispatch removed in S7a); the engine's
+          # PRE-push staged-tree export-sync (scripts/ci/export_sync_check.py --staged) is the private leg.
+          ref: ${{ github.event.release.tag_name }}
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -31,7 +45,13 @@ jobs:
           set -eu
           VER=$(grep -m1 -E '^[[:space:]]*version[[:space:]]*=' pyproject.toml | sed -E 's/.*"([^"]+)".*/\1/')
           echo "pyproject version: ${VER} ; release tag: ${TAG:-<none>}"
-          if [ -n "${TAG:-}" ] && [ "${TAG#v}" != "${VER}" ]; then
+          # #348 S7a: fail-closed on an empty tag (was a skip) — converges on release_preflight.py's
+          # `--preflight needs --tag` posture. The engine's DELIVER uses scripts/ci/release_preflight.py
+          # directly; this inline mirror stays self-contained because the public tree carries no scripts/ci.
+          if [ -z "${TAG:-}" ]; then
+            echo "::error::no release tag — refusing to publish (fail-closed)"; exit 1
+          fi
+          if [ "${TAG#v}" != "${VER}" ]; then
             echo "::error::release tag '${TAG}' != pyproject version '${VER}'"; exit 1
           fi
           # require the [VER] section to EXIST and be NON-EMPTY (a real '- '/'* ' entry, not just a header)
@@ -48,3 +68,9 @@ jobs:
           python -m build
       - name: Publish to PyPI (Trusted Publishing)
         uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          # The index this repo publishes to. Unset (production `ironclad`) -> the action's default
+          # production PyPI. A separate Test-PyPI proof repo sets the repo variable
+          # PYPI_REPOSITORY_URL=https://test.pypi.org/legacy/ (+ a Test-PyPI Trusted Publisher) so the SAME
+          # generated workflow uploads there instead — push- + index-isolation for the Test-PyPI cut.
+          repository-url: ${{ vars.PYPI_REPOSITORY_URL || 'https://upload.pypi.org/legacy/' }}

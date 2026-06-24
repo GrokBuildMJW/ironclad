@@ -132,7 +132,9 @@ def test_dedups_against_live_window(monkeypatch, tmp_path):
 
 def test_token_budget_caps_lines(monkeypatch, tmp_path):
     monkeypatch.setattr(gx10, "RAG_ENABLED", True)
-    monkeypatch.setattr(gx10, "RAG_MAX_TOKENS", 10)    # ~40 chars budget → one 30-char hit fits
+    # #366: the RAG budget is now enforced in REAL tokens (calibrated fallback here, no live
+    # tokenizer). A 30-char hit ≈ ceil(33/2.6)=13 tokens; budget 20 fits one, not two.
+    monkeypatch.setattr(gx10, "RAG_MAX_TOKENS", 20)
     monkeypatch.setattr(gx10, "_MEMORY", _FakeMem(["a" * 30, "b" * 30]))
     monkeypatch.setattr(gx10, "_WARM", None)
     g = _mk_agent(monkeypatch, tmp_path)

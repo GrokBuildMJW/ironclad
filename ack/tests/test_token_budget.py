@@ -68,6 +68,19 @@ def test_env_gx10_overrides_ironclad(monkeypatch):
     assert cfg["context"]["max_model_len"] == 65536
 
 
+# ── #379: the output reserve (MAX_TOKENS) is a tunable default (kept at 8192) ─────────────────
+def test_max_tokens_default_is_8192():
+    # #379/C-5: the output (generation) token reserve default. Kept at 8192 (PERF-10: 4096 truncated
+    # long handovers); tunable for more context headroom (test below).
+    assert gx10._code_defaults()["generation"]["max_tokens"] == 8192
+
+
+def test_env_wires_max_tokens(monkeypatch):
+    monkeypatch.setenv("GX10_MAX_TOKENS", "4096")          # lower the reserve → more context headroom
+    cfg = gx10._apply_env(gx10._code_defaults())
+    assert cfg["generation"]["max_tokens"] == 4096
+
+
 # ── _apply_config integration (globals restored) ─────────────────────────────
 def test_apply_config_derives_when_on_and_respects_off():
     saved = (gx10.MAX_CTX_CHARS, gx10.TRIM_TARGET_CHARS, gx10.MAX_MODEL_LEN,
@@ -78,7 +91,9 @@ def test_apply_config_derives_when_on_and_respects_off():
                               "rag_max_tokens": 1024, "summary_max_tokens": 512})
         on["generation"]["max_tokens"] = 8192
         gx10._apply_config(on)
-        assert gx10.MAX_CTX_CHARS == 82944  # derived from the window, not the char default
+        # derived from the window via the CALIBRATED fallback ratio (2.6, #366): int(20736*2.6).
+        # (The fixed 4 c/t was the live overflow; the live tokenizer is exact, this is the fallback.)
+        assert gx10.MAX_CTX_CHARS == 53913
 
         off = gx10._code_defaults()
         off["context"].update({"token_budget": False, "max_ctx_chars": 80000})

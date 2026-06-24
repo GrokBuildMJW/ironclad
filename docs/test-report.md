@@ -9,9 +9,9 @@
 
 | | |
 |---|---|
-| Automated tests (offline, no model) | **1139 passed** |
+| Automated tests (offline, no model) | **1366 passed** |
 | Live smoke tests (skipped without a model) | **9** |
-| **Total Python** | **1148** |
+| **Total Python** | **1375** |
 | TypeScript client tests (`node:test`) | **340 passed** (344 total, 4 skipped) |
 | Full agentic loop, end to end, with a **real** code-agent | **verified** |
 | Issues found during the campaign | **1 functional gap + 5 review findings — all found and fixed** (see below) |
@@ -24,7 +24,7 @@ default** and only runs when pointed at a real server.
 
 ```bash
 # 1) offline suite — deterministic, no model needed
-pytest -q                                   # from core/  → 1139 passed, 9 skipped
+pytest -q                                   # from core/  → 1366 passed, 9 skipped
 
 # 2) live smoke — against your own running orchestrator
 GX10_LIVE_URL=http://<your-host>:8100 pytest -k live -q     # 9 passed
@@ -34,7 +34,7 @@ GX10_LIVE_URL=http://<your-host>:8100 pytest -k live -q     # 9 passed
 ## Coverage by area
 
 Counts below are reproduced from `pytest --collect-only` (2026-06-22) and sum to
-the **1148** total (1139 offline + 9 live) — now includes the MPR core built-in suite.
+the **1375** total (1366 offline + 9 live) — now includes the MPR core built-in suite.
 
 | Area | Test files | Tests |
 |------|-----------|-------|
@@ -42,7 +42,7 @@ the **1148** total (1139 offline + 9 live) — now includes the MPR core built-i
 | **Function-calling robustness** (tool-arg validate→reask, model-agnostic recovery) | `tool_args`, `tool_extract` | 24 |
 | **Server / client split & security** (HTTP surface, trust profiles, sessions, sealing, config tree + runtime config, command router, doctor, catalogue endpoint, server-side tool bridge) | `server_split`, `security`, `config_tree`, `config_runtime`, `commands`, `doctor_endpoint`, `catalogue_endpoint`, `tool_bridge`, `session_persist` | 79 |
 | **Provider-router / dispatch (P0)** (backend registry, routing policy, artifact routing, spill/fallback, setup-types) | `dispatch`, `router`, `providers`, `providers_config`, `artifact_routing`, `offload_topology` | 69 |
-| **Memory & context** (Mem0 client, chunking, RAG, summary, deep query, vault reconcile, warm tier) | `memory`, `memory_chunking`, `worker_memory`, `context_rag`, `context_summary`, `deep_query`, `reconcile_vault`, `warm` | 78 |
+| **Memory & context** (Mem0 client, chunking, RAG, summary, bounded summarizer input, deep query, vault reconcile, warm tier) | `memory`, `memory_chunking`, `worker_memory`, `context_rag`, `context_summary`, `summary_input_bound`, `deep_query`, `reconcile_vault`, `warm` | 87 |
 | **Open plugin surface** (discover + expose `skills/*` plugins, no core patch) | `plugins` | 7 |
 | **Extension SDK** (`ack.sdk` curated surface: `__all__` contract, re-export identity, gate/schema/assemble via SDK) | `sdk` | 7 |
 | **Packaged-plugin loading** (`ironclad.plugins` entry-point: root resolution, additive load, fail-soft) | `entrypoint_loader` | 10 |
@@ -66,10 +66,10 @@ the **1148** total (1139 offline + 9 live) — now includes the MPR core built-i
 | **Parallelism** (governed fan-out, in-engine tool, single-writer reduce, parallel router) | `workers`, `parallel_tool`, `worker_reduce`, `parallel_router` | 29 |
 | **Thin client + BYO code-agent** (agent pool, `GX10_AGENT_CMD` template, managed transport) | `client_pool`, `client_transport` | 14 |
 | **Runtime-aware output & language** (encoding safety, color gating, reply language) | `output`, `language` | 14 |
-| **Token budget / context trimming** | `token_budget` | 8 |
+| **Token budget / context trimming** (token-accurate budgeting: vLLM `/tokenize` seam + calibrated char fallback, real-token RAG budget, token-accurate trim with tools/output reserve; pre-flight overflow guard + emergency whole-round trim → `ContextOverflowError`; live max_model_len discovery from /v1/models at boot) | `token_budget`, `token_counter`, `preflight_guard`, `model_len_discovery` | 56 |
 | **Misc** (manual cat tool, orchestrator version) | `manual_cat`, `version` | 7 |
 | **Demo vessel** (example workspace doctor preflight) | `demo_vessel` | 1 |
-| **Docs & process** (doc-reality-audit + roadmap generator + process-doctor invariants + export-sync + test-count generator + machine-gated dev-loop spec + structured guards + coupling guards + worktree isolation + driver state machine + transition ledger + guard-evidence marker/reconciler + on-merge verifier + abort/rollback teardown + credential contract/tool-fence + supervised gate/GO-token/dial + resume/idempotency + loop economics/autopilot reconciliation + end-to-end integration + runnable engine CLI, negative tests) | `doc_audit`, `gen_roadmap`, `process_doctor`, `export_sync_check`, `export_secret_gate`, `release_preflight`, `gen_test_counts`, `required_checks`, `deploy_consistency`, `devloop_spec`, `devloop_guards`, `devloop_coupling`, `devloop_worktree`, `devloop_driver`, `devloop_ledger`, `devloop_marker`, `devloop_abort`, `devloop_credentials`, `devloop_dial`, `devloop_resume`, `devloop_economics`, `devloop_e2e`, `devloop_run` | 150 |
+| **Docs & process** (doc-reality-audit + roadmap generator + process-doctor invariants (+ phase-2b cross-cutting: marker-key-requires-walk / deliver-dial-stays-supervised / required-checks-ssot-protected / delivery-pending-resolves / ledger-chain-intact) + export-sync + test-count generator + pre-push staged-export verification (export-sync prevention) + machine-gated dev-loop spec + structured guards (incl. ci.yml Actions-economy parity: PR-only + folded-job list-mapping) + coupling guards (self-mod protected class incl. public delivery-integrity workflows) + worktree isolation + driver state machine + transition ledger + guard-evidence marker/reconciler + merge-walk (delivery-surface DATA + HWM + ledger-chain-verified stamper, stamp-fail-open surfaced) + on-merge verifier + abort/rollback teardown + credential contract/tool-fence + push-credential containment (scratch git/gh credential discovery + refuse_to_start scope gate) + supervised gate/GO-token/dial + GO-gated DELIVER credential lane (tree/version-bound single-use GO + gated execute) + MERGE->DELIVER driver leg (deliver_release + DeliverOps + merged-vs-published split) + resume/idempotency + loop economics/autopilot reconciliation + end-to-end integration + composed-gate execution e2e + DELIVER composer (deliver_plan + delivery-gate commands + release-staging primitive) + clean-room PRE-publish proof runner + Test-PyPI target descriptor + Produce≠Apply branch commit + runnable engine CLI (real gate + scrubbed agent env + marker-key activation seam: grandfather-HWM + interlock) + upstream round-trip close-out verify (fail-closed; source-lane re-admit; blocking-label SSOT) + DELIVERED-PENDING watcher (async smoke+round-trip flip / yank-candidate / delivery-stage poison-cap / published-from-ledger) + epic-completion trigger (epic-bundled DELIVER, fail-closed on unmerged/blocked/no-C2) + operator GO-mint seam (release_index-bound DELIVER GO so a Test-PyPI GO is rejected for production) + DELIVERED-PENDING completion gate (run.py --complete-delivery: push-time delivered-pending, terminal delivered only on green smoke + closed round-trip, fail-closed + idempotent; DELIVER-leg deliver_scope refusal; log-seam ledger persistence) + Test-PyPI index routing (separate-repo release_repo + IRONCLAD_REPO push routing + repo-scoped publish.yml repository-url + release_preflight --index-url) + Test-PyPI-FIRST machine guard (production refused until a terminal Test-PyPI DELIVERED for the version is in the ledger) + release-preflight first-publish 404 (a fresh index returns 404 = no versions = safe first publish, not fail-closed-unreachable) + DELIVER bash resolution (Windows: a full Git-Bash path, not the System32 WSL shim) + scheduled-workflow liveness + no-stdlib-shadow invariant + launcher stops the local engine on /exit (#428), negative tests) | `doc_audit`, `gen_roadmap`, `process_doctor`, `export_sync_check`, `export_secret_gate`, `release_preflight`, `clean_room`, `gen_test_counts`, `required_checks`, `deploy_consistency`, `launcher_teardown`, `devloop_spec`, `devloop_guards`, `devloop_coupling`, `devloop_worktree`, `devloop_driver`, `devloop_ledger`, `devloop_marker`, `devloop_abort`, `devloop_credentials`, `devloop_dial`, `devloop_deliver`, `devloop_resume`, `devloop_economics`, `devloop_e2e`, `devloop_e2e_core`, `devloop_run`, `devloop_lock`, `devloop_selection`, `devloop_roundtrip`, `devloop_watcher`, `devloop_completion` | 320 |
 | **Live smoke** (real model, all endpoints) | `live_smoke` | 9 |
 
 ## Live end-to-end verification

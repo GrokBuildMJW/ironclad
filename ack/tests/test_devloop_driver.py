@@ -35,7 +35,9 @@ def _ops(d, *, rc=0, changed=None, viol=None, gate_ok=True, pr="Closes #266"):
     """A DriverOps wired with fakes; `state` records what happened."""
     from guards import GuardResult  # the sibling module driver.py put on sys.path
     state = {"created": 0, "disposed": 0, "log": []}
-    changed = changed if changed is not None else ["scripts/devloop/x.py", "ack/tests/test_devloop_x.py"]
+    # default = an ORDINARY (non-protected) unit so the happy path reaches MERGE; a self-modifying
+    # diff (scripts/devloop/**) is routed to BLOCKED — see test_self_mod_protected_unit_is_blocked.
+    changed = changed if changed is not None else ["ack/x.py", "ack/tests/test_devloop_x.py"]
 
     def create(unit):
         state["created"] += 1
@@ -67,6 +69,39 @@ def test_happy_path_stops_at_merge_and_disposes():
     assert out.worktree_disposed and state["disposed"] >= 1     # finally always disposes
     assert any(r["dst"] == "MERGE" for r in out.trace)          # reached the human gate
     assert state["created"] == 1
+
+
+def test_apply_persists_a_green_unit_and_a_failed_apply_halts_fail_closed():
+    # Produce != Apply (ADR-0002 D3): ONLY a green unit is applied (committed onto the branch), exactly
+    # once, and the run still reaches the frozen MERGE stop.
+    d = _load()
+    calls = []
+    ops, _ = _ops(d)
+    ops.apply = lambda unit, h: (calls.append(unit.issue), "abc123def0")[1]
+    out = d.Driver(ops).run(_unit(d), ["agent"])
+    assert out.state == "MERGE" and calls == [266]
+    assert any(r["guard"] == "apply" and r["passed"] for r in out.trace)
+    # a failing apply is RED -> halt at GATE, fail-closed (the validated work is never silently dropped).
+    ops2, _ = _ops(d)
+
+    def boom(unit, h):
+        raise RuntimeError("nothing to commit / fast-forward failed")
+    ops2.apply = boom
+    out2 = d.Driver(ops2).run(_unit(d), ["agent"])
+    assert out2.status == "halted" and out2.state == "GATE" and out2.guard == "apply"
+    assert any("apply failed" in x for x in out2.reasons)
+
+
+def test_self_mod_protected_unit_is_blocked_for_review():
+    # ADR-0002 D5 / #312 S2: a diff touching the engine is propose-only -> terminal BLOCKED, NOT GATE/MERGE,
+    # even though the (faked) gate is green. Independent of dial position.
+    d = _load()
+    ops, state = _ops(d, changed=["scripts/devloop/driver.py", "ack/tests/test_devloop_x.py"], gate_ok=True)
+    out = d.Driver(ops).run(_unit(d), ["agent"])
+    assert out.state == "BLOCKED" and out.status == "blocked-for-review"
+    assert out.guard == "self-mod-protected" and "out-of-band" in out.reasons[0]
+    assert not any(r["dst"] in ("GATE", "MERGE") for r in out.trace)   # never reached the gate/merge
+    assert out.worktree_disposed and state["disposed"] >= 1            # still torn down
 
 
 def test_bad_branch_halts_before_a_worktree_exists():

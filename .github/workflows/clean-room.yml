@@ -93,15 +93,26 @@ jobs:
       - name: Install the published package from PyPI + import-smoke (with propagation retry)
         env:
           TAG: ${{ github.ref_name }}
+          # #413: install from the SAME index the release published to. Unset -> production PyPI (default).
+          # A Test-PyPI proof repo sets PYPI_REPOSITORY_URL (the legacy/upload URL); derive the simple index
+          # and add production as an --extra-index-url so the package comes from Test-PyPI but its
+          # dependencies (which live only on production PyPI) still resolve.
+          PYPI_REPOSITORY_URL: ${{ vars.PYPI_REPOSITORY_URL }}
         run: |
           python -m pip install --upgrade pip
           version="${TAG#v}"
+          index_args=""
+          if [ -n "${PYPI_REPOSITORY_URL:-}" ]; then
+            simple="${PYPI_REPOSITORY_URL%/legacy/}/simple/"
+            index_args="--index-url ${simple} --extra-index-url https://pypi.org/simple/"
+            echo "installing ironclad-ai==${version} from ${simple} (+ pypi.org for deps)"
+          fi
           for attempt in $(seq 1 10); do
-            if python -m pip install "ironclad-ai==${version}"; then
+            if python -m pip install ${index_args} "ironclad-ai==${version}"; then
               ok=1; break
             fi
-            echo "PyPI not propagated yet (attempt ${attempt}/10) — waiting 30s..."
+            echo "index not propagated yet (attempt ${attempt}/10) — waiting 30s..."
             sleep 30
           done
-          [ "${ok:-0}" = "1" ] || { echo "::error::ironclad-ai==${version} never appeared on PyPI"; exit 1; }
+          [ "${ok:-0}" = "1" ] || { echo "::error::ironclad-ai==${version} never appeared on the index"; exit 1; }
           cd /tmp && python -c "import ack, ack.lodestar, ack.sdk; print('PyPI install OK ->', ack.__file__, '| sdk exports:', len(ack.sdk.__all__))"

@@ -73,3 +73,22 @@ def test_e2e_skipping_the_test_is_blocked_at_the_gate(tmp_path):
     assert out.status == "halted" and out.state == "IMPLEMENT"  # code-needs-test coupling fired
     assert any("without a test" in r for r in out.reasons)
     assert out.worktree_disposed                                # still cleaned up
+
+
+# ── real composed gate plan (#312 S5): the core/ gate is NOT the sys.exit(0) stub ──
+def test_gate_plan_stages_export_first_then_real_guards():
+    e2e = _load()
+    target = {"boundary_cmd": "python scripts/ci/check_core_boundary.py",
+              "gate_profile": ["boundary", "pytest", "doc-reality-audit", "test-counts", "node-boundary",
+                               "english-only", "secret-scan", "deploy-consistency"]}
+    plan = e2e.gate_plan(target, "/base")
+    names = [n for n, _ in plan]
+    assert names[0] == "stage+secret-scan"                       # the export is staged BEFORE the audit
+    assert "secret-scan" not in names                            # folded into the stage step
+    assert names.index("stage+secret-scan") < names.index("doc-reality-audit")
+    assert {"boundary", "pytest", "doc-reality-audit", "test-counts", "node-boundary",
+            "deploy-consistency"}.issubset(set(names))
+    # every step is a real argv from the base root — never the sys.exit(0) no-op
+    assert not any("sys.exit(0)" in " ".join(argv) for _, argv in plan)
+    stage_argv = dict(plan)["stage+secret-scan"]
+    assert stage_argv[1].replace("\\", "/").endswith("/base/scripts/ci/export_core.py") and "--require-scanner" in stage_argv

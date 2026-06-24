@@ -75,5 +75,15 @@ try {
     & $venvPy "$engineDir\client.py" --codedir $proj
   }
 } finally {
-  if ($started) { Say "stopping the engine (pid $($started.Id))."; Stop-Process -Id $started.Id -Force -ErrorAction SilentlyContinue }
+  # #428: /exit ends the client → reliably stop the LOCAL engine it was using, whether THIS session
+  # started it ($started) or reused a running/orphaned one ($reuse) — otherwise a background server.py
+  # lingers on the port after /exit. Stop by the listening port (the same mechanism as the stale-engine
+  # restart above). The spark path returned earlier (no local engine); single-tenant by design (one
+  # engine per port).
+  Say "stopping the engine on $base ..."
+  try {
+    Get-NetTCPConnection -State Listen -LocalPort $port -ErrorAction SilentlyContinue |
+      Select-Object -ExpandProperty OwningProcess -Unique |
+      ForEach-Object { Stop-Process -Id $_ -Force -ErrorAction SilentlyContinue }
+  } catch {}
 }

@@ -58,3 +58,23 @@ def test_autopilot_conflict_single_steering_authority():
     assert e.autopilot_conflict(driver_active=False, autopilot_enabled=True) == []
     conflict = e.autopilot_conflict(driver_active=True, autopilot_enabled=True)
     assert conflict and "single authority" in conflict[0]
+
+
+def test_should_abort_on_poison_cap_or_over_budget():
+    e = _load()
+    assert e.should_abort(attempt=0, cap=3) == []                                  # fresh, no ceiling => keep going
+    assert any("poison-cap" in r for r in e.should_abort(attempt=3, cap=3))         # cap reached => ABORT
+    assert any("cost ceiling" in r for r in e.should_abort(attempt=0, cap=3, spent=5.0, ceiling=1.0))
+    assert e.should_abort(attempt=1, cap=3, spent=0.5, ceiling=1.0) == []           # under both => keep going
+
+
+def test_delivery_stage_poison_cap_is_distinct_and_lower(monkeypatch):
+    # #362 S12: the delivery STAGE cap is separate from the agent-attempt cap and gives up sooner
+    # (each retry re-fires heavy paid build/publish/smoke steps).
+    e = _load()
+    assert e.DELIVERY_STAGE_CAP < 3                                                 # lower than a typical agent cap
+    assert e.delivery_stage_should_abort(attempt=0) == []                           # fresh => a retry is permitted
+    aborts = e.delivery_stage_should_abort(attempt=e.DELIVERY_STAGE_CAP)
+    assert any("delivery-stage poison-cap" in r for r in aborts)                    # cap reached => ABORT the stage
+    assert any("delivery-stage cost" in r
+               for r in e.delivery_stage_should_abort(attempt=0, spent=5.0, ceiling=1.0))

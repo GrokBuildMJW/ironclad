@@ -35,6 +35,10 @@ import subprocess
 import threading
 import queue as _q
 import argparse
+import math
+import urllib.request
+import urllib.error
+import urllib.parse
 from collections import deque
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Tuple, Callable
@@ -120,15 +124,28 @@ CODE_ROOT        = ""            # optional code root for the handover path guar
 MAX_ITERATIONS   = 20
 MAX_CTX_CHARS    = 80_000        # high-water: trimming starts only here (char-based; derived from MAX_MODEL_LEN under TOKEN_BUDGET)
 TRIM_TARGET_CHARS = 48_000       # PERF-06: low-water after the trim (60 %)
-MAX_TOKENS       = 8192          # PERF-10: was 4096 → handover truncation
+MAX_TOKENS       = 8192          # output (generation) token reserve. PERF-10: raised 4096→8192 (4096
+                                 # truncated long handovers). It permanently subtracts from the usable
+                                 # window; the token budget (#371/#372) reserves it accurately. Tunable —
+                                 # generation.max_tokens / GX10_MAX_TOKENS: raise for longer single
+                                 # outputs, lower for more context headroom (#379, default kept at 8192).
 # MEM-9 / §3-mechanism 3 — token-accurate budgeting: couple the trim working set to the MODEL WINDOW
 # instead of fixed chars. When TOKEN_BUDGET=True, _apply_config derives MAX_CTX_CHARS/
-# TRIM_TARGET_CHARS from MAX_MODEL_LEN (minus reserve for output+RAG+summary, chars/4 estimate,
-# 10 % headroom) → the working set scales with the window but never overflows it. OFF = fixed
-# char thresholds as today (then context.max_ctx_chars / GX10_MAX_CTX_CHARS apply).
+# TRIM_TARGET_CHARS from MAX_MODEL_LEN (minus reserve for output+RAG+summary, 10 % headroom). The
+# LIVE trim measures REAL tokens via the served model's tokenizer (the vLLM /tokenize endpoint,
+# Epic #366) and only falls back to the CHARS_PER_TOKEN estimate when that endpoint is unreachable.
+# OFF = fixed char thresholds as today (then context.max_ctx_chars / GX10_MAX_CTX_CHARS apply).
 MAX_MODEL_LEN    = 32768         # hard per-request token window (vLLM --max-model-len); GX10_MAX_MODEL_LEN/IRONCLAD_MAX_MODEL_LEN
 TOKEN_BUDGET     = True          # default ON (06-18); off via context.token_budget=false / GX10_TOKEN_BUDGET=0
-CHARS_PER_TOKEN  = 4             # rough token estimate (chars/token)
+# CALIBRATED chars/token FALLBACK — used ONLY when the live tokenizer is unavailable. Real agent
+# content (code/JSON/CJK) is ~2–2.6 c/t, NOT 4; a too-high ratio under-counts tokens and overflows
+# the 32 768-token wall (the #366 live HTTP 400). 2.6 is conservative (under-counts c/t ⇒ over-counts
+# tokens ⇒ trims earlier ⇒ never overflows). Tunable via context.chars_per_token / GX10_CHARS_PER_TOKEN.
+CHARS_PER_TOKEN  = 2.6
+# #366 D5: output headroom reserved for the model's thinking budget, applied ONLY when think=True for
+# the call (the pre-flight guard #372 counts it so a thinking turn doesn't overflow the wall). Tunable
+# via context.thinking_reserve / GX10_THINKING_RESERVE.
+THINKING_RESERVE = 4000
 # B1 — rolling summarization: on trim, roll the evicted rounds into a compact
 # summary block directly BELOW the system prompt AND archive the raw text losslessly
 # to Mem0 (/add_bulk, vector-only). Flag-gated, fail-soft, off-critical-
@@ -142,7 +159,7 @@ _SUMMARY_MARKER    = "## Conversation so far (rolling summary)"   # stable block
 # FLAG OFF = user message appended verbatim → byte-identical to today's behaviour.
 RAG_ENABLED     = True            # B2 switch (default ON, 06-18 decision); off via context.rag_enabled=false / GX10_CONTEXT_RAG=0
 RAG_TOP_K       = 5               # hits per retrieval
-RAG_MAX_TOKENS  = 1024            # token budget of the injected block (chars/4 estimate)
+RAG_MAX_TOKENS  = 1024            # token budget of the injected block (enforced in real tokens, #366)
 _RAG_MARKER     = "## Relevant context (retrieved)"
 LANGUAGE         = "en"          # the orchestrator's reply language (OSS default en; via GX10_LANGUAGE/config)
 MAX_FILE_CHARS   = 24_000        # PERF-05: read_file cap (head+tail)
@@ -668,6 +685,10 @@ _MEMORY: Optional[Any] = None
 # + session state. Singleton, initialized in GX10.__init__(); without a url it stays None (no-op).
 _WARM_CONFIG: Dict[str, Any] = {}
 _WARM: Optional[Any] = None
+# Epic #366 — the per-engine token counter (vLLM /tokenize + calibrated char fallback). Created in
+# GX10.__init__; module-global so the module-level budgeters (_rag_block / _count_tokens / the trim)
+# can reach it. None ⇒ pure calibrated char fallback.
+_TOKENS: Optional[Any] = None
 #: Phase-e reasoning fan-out (engine/workers.py). Set by the server; stays None in the
 #: monolithic CLI, so the parallel tool is offered only where the governed workers exist.
 _WORKERS: Optional[Any] = None
@@ -1745,6 +1766,12 @@ class DuplicateTaskError(Exception):
         self.existing_id = existing_id
 
 
+class ContextOverflowError(RuntimeError):
+    """Epic #366 (#372): raised by the pre-flight guard when a single turn cannot be made to fit the
+    model window — even after an emergency whole-round trim. A clear, actionable error (prompt /
+    output / window sizes) instead of letting vLLM return a raw HTTP 400 (`maximum context length`)."""
+
+
 class TaskStore:
     STATUSES = ("pending", "in_progress", "done")
     REQUIRED = ("type", "priority", "title", "description")
@@ -2491,10 +2518,227 @@ def _retrieve_hits(query: str, top_k: int) -> List[str]:
     return list(hits or [])
 
 
+# ── Epic #366 — token-accurate counting against the served model ─────────────
+# Primary: the vLLM `/tokenize` endpoint (exact, no bundled tokenizer dependency — keeps the wheel
+# lean). Fallback: the CALIBRATED chars/token estimate (CHARS_PER_TOKEN). Replaces the fixed chars/4
+# guess everywhere it gates the 32 768-token wall (_derive_ctx_budget / _rag_block / the trim).
+_TOKENIZE_TIMEOUT = 4.0
+
+
+def _tokenize_url(base_url: str) -> str:
+    """Derive the vLLM tokenize endpoint from the OpenAI base_url. The real route is ``/tokenize``
+    at the server ROOT (NOT ``/v1/tokenize``, which 404s — verified live 2026-06-24), so a trailing
+    ``/v1`` is stripped. Empty base_url ⇒ "" (the counter stays in fallback)."""
+    b = (base_url or "").rstrip("/")
+    if b.endswith("/v1"):
+        b = b[:-len("/v1")].rstrip("/")
+    return (b + "/tokenize") if b else ""
+
+
+def _host_is_probeable(base_url: str) -> bool:
+    """Auto-probe the tokenize endpoint only for a real remote/LAN deployment host — never a
+    loopback or a bare single-label stub. Keeps the offline unit suite hermetic; a server-mode
+    loopback deployment (orchestrator co-located with vLLM) opts in explicitly via GX10_TOKENIZE=1."""
+    try:
+        host = (urllib.parse.urlsplit(base_url).hostname or "").strip().lower()
+    except Exception:  # noqa: BLE001
+        return False
+    if not host or host in ("localhost", "127.0.0.1", "0.0.0.0", "::1"):
+        return False
+    return "." in host          # a dotted name or an IPv4 ⇒ a real deployment endpoint
+
+
+def _discover_max_model_len(base_url: str, model: str, timeout: float = 4.0) -> Optional[int]:
+    """#377 (Epic #366 P2): read the LIVE model window from ``GET /v1/models`` at boot — the served
+    ``max_model_len`` of the entry matching *model* (else the first). Returns None on any failure
+    (fail-soft) so the caller keeps the configured ``MAX_MODEL_LEN``. Prevents budget drift when the
+    Spark is relaunched with a different ``--max-model-len``."""
+    try:
+        url = (base_url or "").rstrip("/") + "/models"
+        with urllib.request.urlopen(url, timeout=float(timeout)) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        entries = data.get("data") or []
+        chosen = next((e for e in entries if e.get("id") == model), None) or (entries[0] if entries else {})
+        mml = chosen.get("max_model_len")
+        return int(mml) if mml else None
+    except Exception:  # noqa: BLE001 — fail-soft: never let boot discovery break startup
+        return None
+
+
+def _char_token_estimate(text: str) -> int:
+    """The calibrated chars/token fallback count (conservative; rounds up)."""
+    ratio = float(CHARS_PER_TOKEN) if CHARS_PER_TOKEN else 1.0
+    if ratio < 1.0:
+        ratio = 1.0
+    return int(math.ceil(len(text or "") / ratio))
+
+
+def _message_text(m: Dict[str, Any]) -> str:
+    """The countable text of a chat message: content + any tool-call names/arguments."""
+    parts = [str(m.get("content") or "")]
+    for tc in (m.get("tool_calls") or []):
+        fn = tc.get("function") or {}
+        parts.append(str(fn.get("name", "")))
+        parts.append(str(fn.get("arguments", "")))
+    return "\n".join(p for p in parts if p)
+
+
+def _count_tokens(text: str) -> int:
+    """Best-available token count of *text*: the live tokenizer when reachable (Epic #366), else the
+    calibrated chars/token estimate. Never raises, never None — for budgeting that always needs a
+    number."""
+    c = _TOKENS
+    if c is not None:
+        n = c.count_text(text)
+        if n is not None:
+            return n
+    return _char_token_estimate(text)
+
+
+def _live_token_counter():
+    """The engine token counter iff it can still produce EXACT counts (live endpoint), else None →
+    the caller uses the calibrated char path. A dead/inert counter returns None."""
+    c = _TOKENS
+    return c if (c is not None and c.usable()) else None
+
+
+def _tools_schema_tokens() -> int:
+    """Token cost of the tools schema vLLM serializes into EVERY prompt (Epic #366 — the trim must
+    reserve it, else a dense tool set + memory/plugin tools overflows the wall even when the message
+    trim 'fits'). Best-available count (live tokenizer or calibrated estimate); 0 on any error."""
+    try:
+        tools = _effective_tools()
+        if not tools:
+            return 0
+        return _count_tokens(json.dumps(tools, ensure_ascii=False))
+    except Exception:  # noqa: BLE001 — never let the reserve computation break the trim
+        return 0
+
+
+def _count_prompt_tokens(messages: List[Dict[str, Any]]) -> int:
+    """Best-available token count of a whole message list (live tokenizer or the calibrated
+    estimate, never None), summed per message with the same per-message framing overhead as
+    ``_TokenCounter.count_prompt`` — for the pre-flight guard (#372)."""
+    return sum(_count_tokens(_message_text(m)) + 4 for m in messages)
+
+
+def _bound_text_tail(text: str, budget_tokens: int) -> Tuple[str, bool]:
+    """Keep the TAIL (most recent end) of *text* within ``budget_tokens`` — the live tokenizer when
+    available, else the calibrated estimate (Epic #366 #373: bound the summarizer input so a large
+    evicted transcript can't itself overflow the window and get silently truncated). Snaps to a
+    paragraph boundary so a round isn't cut mid-way. Returns ``(bounded_text, truncated)``."""
+    text = text or ""
+    if budget_tokens <= 0 or _count_tokens(text) <= budget_tokens:
+        return text, False
+    approx = max(1, int(budget_tokens * float(CHARS_PER_TOKEN)))
+    tail = text[-approx:]
+    while tail and _count_tokens(tail) > budget_tokens:
+        tail = tail[max(1, len(tail) // 10):]        # drop ~10 % from the head each pass (terminates)
+    # Snap to a round boundary so we don't start mid-round — but ONLY when it discards a SMALL leading
+    # fragment (≤20 %). A large round leading the slice has its first "\n\n" at the boundary to the
+    # NEXT round, so an unconditional snap would throw the whole budgeted tail away (#373 review S3).
+    nl = tail.find("\n\n")
+    if 0 <= nl and (nl + 2) <= len(tail) * 0.2:
+        tail = tail[nl + 2:]
+    return tail, True
+
+
+def _derive_token_budget(max_model_len: int, max_tokens: int, rag_tokens: int,
+                         summary_tokens: int) -> Tuple[int, int]:
+    """Epic #366 — the trim watermark in TOKENS (not chars): the model window minus the reserves it
+    must leave free (output + RAG + summary), with 10 % headroom. Returns ``(high_tok, low_tok)``,
+    low = 60 % of high (mirrors the legacy hysteresis). Floored so a tiny window can't yield ≤0."""
+    reserve = max(0, int(max_tokens) + int(rag_tokens) + int(summary_tokens))
+    high = max(2048, int((int(max_model_len) - reserve) * 0.9))
+    return high, int(high * 0.6)
+
+
+class _TokenCounter:
+    """Token counting against the served model (Epic #366). Primary: the vLLM ``/tokenize``
+    endpoint — exact, no bundled tokenizer dependency. Fallback: the calibrated chars/token
+    estimate. The endpoint is probed lazily and disabled for the session on the first failure
+    (fail-soft → the engine never 400s because counting broke). Per-text counts are cached.
+    ``usable()`` stays True until a failure makes the counter inert/dead."""
+    _MAX_CACHE = 4096
+
+    def __init__(self, base_url: str, model: str, *, enabled: bool = True,
+                 force_probe: bool = False, fallback_ratio: Optional[float] = None,
+                 timeout: float = _TOKENIZE_TIMEOUT):
+        self.model = model
+        self.url = _tokenize_url(base_url)
+        self.timeout = float(timeout)
+        self.ratio = float(fallback_ratio) if fallback_ratio else float(CHARS_PER_TOKEN)
+        self._cache: Dict[str, int] = {}
+        self.live = False                       # flips True after the first successful tokenize
+        probeable = bool(force_probe) or _host_is_probeable(base_url)
+        # _dead ⇒ never touch the network; pure calibrated fallback (keeps the unit suite offline)
+        self._dead = not (bool(enabled) and probeable and bool(self.url))
+
+    def usable(self) -> bool:
+        return not self._dead
+
+    def _post(self, payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        if self._dead:
+            return None
+        try:
+            data = json.dumps(payload).encode("utf-8")
+            req = urllib.request.Request(self.url, data=data,
+                                         headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                out = json.loads(resp.read().decode("utf-8"))
+            self.live = True
+            return out
+        except Exception:  # noqa: BLE001 — any failure ⇒ permanent fallback for the session
+            self._dead = True
+            return None
+
+    def count_text(self, text: str) -> Optional[int]:
+        """Exact token count of *text* (cached), or None when the endpoint is unavailable."""
+        text = text or ""
+        if not text:
+            return 0
+        if self._dead:
+            return None
+        hit = self._cache.get(text)
+        if hit is not None:
+            return hit
+        out = self._post({"model": self.model, "prompt": text, "add_special_tokens": False})
+        if out is None:
+            return None
+        n = out.get("count")
+        if not isinstance(n, int) or isinstance(n, bool) or n < 0:
+            # a 200 without a valid integer `count` (a proxy, a different service on the port, a
+            # future/older route shape) must NOT be read as 0 tokens — that would leave the counter
+            # "usable", never trim, and re-introduce the #366 overflow. Treat it as endpoint-dead so
+            # the engine drops to the conservative calibrated char path.
+            self._dead = True
+            return None
+        if len(self._cache) < self._MAX_CACHE:
+            self._cache[text] = n
+        return n
+
+    def count_prompt(self, messages: List[Dict[str, Any]], *, per_msg_overhead: int = 4
+                     ) -> Optional[int]:
+        """Best-available exact prompt token count: the sum of per-message text counts plus a small
+        per-message framing overhead (role/template tokens). Returns None only when the endpoint is
+        unavailable (so the caller falls back to the calibrated char path wholesale)."""
+        if self._dead:
+            return None
+        total = 0
+        for m in messages:
+            c = self.count_text(_message_text(m))
+            if c is None:
+                return None
+            total += c + max(0, int(per_msg_overhead))
+        return total
+
+
 def _rag_block(hits: List[str], budget_tokens: int, in_window: str = "") -> str:
     """Format hits into a token-budgeted, deduped ``## Relevant context (retrieved)`` block (or
-    ""). Dedups within the block and against *in_window* (already-visible context; "" ⇒ skip)."""
-    budget_chars = max(0, budget_tokens) * 4   # rough chars/4 token estimate
+    ""). The budget is enforced in REAL tokens (the live tokenizer when available, else the
+    calibrated chars/token estimate — Epic #366), not a chars/4 guess. Dedups within the block and
+    against *in_window* (already-visible context; "" ⇒ skip)."""
+    budget = max(0, int(budget_tokens))
     lines: List[str] = []
     seen: set = set()
     used = 0
@@ -2506,11 +2750,12 @@ def _rag_block(hits: List[str], budget_tokens: int, in_window: str = "") -> str:
         if key in seen or (in_window and h in in_window):
             continue
         line = f"- {h}"
-        if used + len(line) + 1 > budget_chars:
+        cost = _count_tokens(line + "\n")
+        if used + cost > budget:
             break
         lines.append(line)
         seen.add(key)
-        used += len(line) + 1
+        used += cost
     if not lines:
         return ""
     return _RAG_MARKER + "\n" + "\n".join(lines)
@@ -2603,16 +2848,17 @@ def _reduce_worker_results(results: List[Dict[str, Any]], topic: str = "") -> in
 
 
 def _derive_ctx_budget(max_model_len: int, max_tokens: int, rag_tokens: int,
-                       summary_tokens: int, chars_per_token: int = CHARS_PER_TOKEN) -> tuple:
-    """MEM-9 / §3-Mechanismus 3: trim watermark (in CHARS, since _trim_context measures chars)
-    derived from the model window minus the reserves it must leave free — output (``max_tokens``)
-    + the RAG block + the summary block — via the chars/token estimate with 10% headroom. Returns
-    ``(high_chars, low_chars)`` with low = 60% of high (mirrors the legacy 80k→48k hysteresis).
-    Scales the working set with ``max_model_len`` while never overflowing it; floored so a tiny
-    window can't yield ≤0."""
+                       summary_tokens: int, chars_per_token: float = CHARS_PER_TOKEN) -> tuple:
+    """MEM-9 / §3-Mechanismus 3 — the CHAR-fallback trim watermark (used when the live tokenizer is
+    unreachable; ``_trim_context`` then measures chars). Derived from the model window minus the
+    reserves it must leave free — output (``max_tokens``) + the RAG block + the summary block — via
+    the CALIBRATED chars/token estimate with 10 % headroom. Returns ``(high_chars, low_chars)`` with
+    low = 60 % of high (mirrors the legacy 80k→48k hysteresis). At the calibrated ratio it stays
+    conservatively UNDER the token wall (the old default of 4 c/t was the #366 overflow); the live
+    path (``_derive_token_budget`` + the tokenizer) is exact. Floored so a tiny window can't yield ≤0."""
     reserve = max(0, int(max_tokens) + int(rag_tokens) + int(summary_tokens))
     budget_tok = max(2048, int((int(max_model_len) - reserve) * 0.9))
-    high = budget_tok * max(1, int(chars_per_token))
+    high = int(budget_tok * max(1.0, float(chars_per_token)))
     return high, int(high * 0.6)
 
 
@@ -2908,12 +3154,33 @@ class GX10:
             self._append_guidance(_onboarding_guidance())
         self._ensure_dirs()
         # Initialize the memory layer (fail-soft, once per process)
-        global _MEMORY, _WARM
+        global _MEMORY, _WARM, _TOKENS
         if _MemoryManager is not None and _MEMORY_CONFIG and _MEMORY is None:
             _MEMORY = _MemoryManager(_MEMORY_CONFIG)
         # Initialize the warm tier (B0) — optional; without a url the tier stays a no-op (fail-soft).
         if _WarmTier is not None and _WARM_CONFIG and _WARM is None:
             _WARM = _WarmTier(_WARM_CONFIG)
+        # Epic #366 — the per-engine token counter (vLLM /tokenize + calibrated char fallback).
+        # GX10_TOKENIZE: unset/auto ⇒ probe only a real remote/LAN host; 1/on ⇒ force the probe
+        # (a server-mode loopback deployment opts in here); 0/off ⇒ pure calibrated char fallback.
+        _tok_env = os.environ.get("GX10_TOKENIZE", "").strip().lower()
+        if _TOKENS is None and _tok_env not in ("0", "false", "off", "no"):
+            _TOKENS = _TokenCounter(base_url, self.model,
+                                    force_probe=_tok_env in ("1", "true", "on", "yes"))
+        # #377: adopt the LIVE model window from GET /v1/models at boot (fail-soft) — prevents budget
+        # drift if the Spark relaunched with a different --max-model-len. Only a real remote/LAN host
+        # (keeps the offline suite hermetic); disable with GX10_DISCOVER_WINDOW=0.
+        global MAX_MODEL_LEN, MAX_CTX_CHARS, TRIM_TARGET_CHARS
+        _disc_env = os.environ.get("GX10_DISCOVER_WINDOW", "").strip().lower()
+        if _disc_env not in ("0", "false", "off", "no") and _host_is_probeable(base_url):
+            _live_win = _discover_max_model_len(base_url, self.model)
+            if _live_win and _live_win != MAX_MODEL_LEN:
+                _ui_print(col(f"[INFO] adopting live model window: max_model_len={_live_win} "
+                              f"(configured {MAX_MODEL_LEN})", C.GRAY))
+                MAX_MODEL_LEN = _live_win
+                if TOKEN_BUDGET:   # re-derive the char-fallback watermarks for the new window
+                    MAX_CTX_CHARS, TRIM_TARGET_CHARS = _derive_ctx_budget(
+                        MAX_MODEL_LEN, MAX_TOKENS, RAG_MAX_TOKENS, SUMMARY_MAX_TOKENS, CHARS_PER_TOKEN)
 
     def _append_guidance(self, note: str):
         """Appends a runtime note to the system prompt (or creates a
@@ -2930,7 +3197,69 @@ class GX10:
         self._append_guidance(_language_guidance(LANGUAGE))
 
     # OPT-4: one completion call with 1× retry on a transient API error
+    def _preflight_context(self, think: bool) -> None:
+        """Epic #366 (#372): before the vLLM call, make sure the full prompt + the reserves it must
+        leave free — output (``self.max_tokens``) + the tools schema vLLM serializes into the prompt
+        + the CONDITIONAL thinking budget (only when ``think``) — fit the model window. If not, do
+        ONE emergency trim of the oldest WHOLE rounds; if it still can't fit, raise a clear
+        ``ContextOverflowError`` instead of letting vLLM return a raw HTTP 400. Fail-fast (no retry
+        against vLLM) and fail-soft: skipped when token budgeting is off OR no EXACT tokenizer is
+        reachable — the calibrated estimate over-counts, so trusting it here could raise a FALSE
+        ContextOverflowError on input that would actually fit; #371's calibrated ``_trim_context`` has
+        already budgeted conservatively in that mode."""
+        if not TOKEN_BUDGET or _live_token_counter() is None:
+            return
+        tools_tok = _tools_schema_tokens()
+        think_tok = THINKING_RESERVE if think else 0
+        reserve = int(self.max_tokens) + tools_tok + int(think_tok)
+        budget = MAX_MODEL_LEN - reserve
+        est = _count_prompt_tokens(self.messages)
+        if _live_token_counter() is None:
+            return                                  # tokenizer DIED mid-count ⇒ `est` is contaminated by
+                                                    # the over-counting char fallback ⇒ abort (no false raise)
+        if est <= budget:
+            return
+        est = self._emergency_trim(budget)          # ONE pass: drop oldest whole rounds
+        if _live_token_counter() is None:
+            return                                  # died mid-trim ⇒ don't raise on a contaminated count
+        if est > budget:
+            raise ContextOverflowError(
+                f"context overflow: prompt ~{est} tok + reserve {reserve} "
+                f"(output {self.max_tokens}"
+                + (f" + thinking {THINKING_RESERVE}" if think else "")
+                + f" + tools {tools_tok}) exceeds the model window {MAX_MODEL_LEN}. "
+                f"Shorten this turn (smaller paste / file excerpt / tool output) or raise the model "
+                f"window (GX10_MAX_MODEL_LEN / a larger --max-model-len).")
+
+    def _emergency_trim(self, budget: int) -> int:
+        """Drop the oldest WHOLE rounds (the round's user turn + its assistant.tool_calls + their
+        tool responses, atomically — dropping a partial round triggers a different 400,
+        ``tool_calls must be followed by tool messages``) until the prompt fits ``budget`` tokens or
+        only the system partition + the last user turn remain (an irreducible single oversized turn
+        is then the caller's ``ContextOverflowError``). Best-effort lossless cold archive of the
+        evicted text. Returns the final estimated prompt tokens."""
+        system = [m for m in self.messages if m.get("role") == "system"]
+        others = [m for m in self.messages if m.get("role") != "system"]
+        evicted: List[Dict] = []
+        while len(others) > 1 and _count_prompt_tokens(system + others) > budget:
+            cut = 1
+            while cut < len(others) and others[cut].get("role") != "user":
+                cut += 1
+            if cut >= len(others):
+                break                                # only the last user turn remains → irreducible
+            evicted.extend(others[:cut])
+            del others[:cut]
+        if evicted and _MEMORY is not None:          # lossless archive, fire-and-forget (no model call)
+            try:
+                if _MEMORY.is_available():
+                    _MEMORY.add_bulk(self._render_rounds(evicted), {"source": "emergency_trim"})
+            except Exception:  # noqa: BLE001 — the archive is best effort
+                pass
+        self.messages = system + others
+        return _count_prompt_tokens(self.messages)
+
     def _make_completion(self, think: bool, stream: bool):
+        self._preflight_context(think)              # #372: guard + emergency trim (raises on irreducible overflow)
         kwargs: Dict[str, Any] = dict(
             model=self.model,
             messages=self.messages,
@@ -3054,6 +3383,77 @@ class GX10:
             return 0
 
     def _trim_context(self):
+        # Epic #366: trim against REAL token counts when the live tokenizer is reachable — the
+        # gating path no longer guesses chars/token, so a dense (code/JSON/CJK) window can't
+        # silently exceed the model wall. Fail-soft: no live tokenizer (or it dies mid-trim) ⇒
+        # today's calibrated char hysteresis below (_trim_context_chars).
+        if TOKEN_BUDGET:
+            tok = _live_token_counter()
+            if tok is not None and self._trim_context_tokens(tok):
+                return
+        self._trim_context_chars()
+
+    def _trim_context_tokens(self, tok) -> bool:
+        """Token-accurate trim: evict whole oldest rounds until the FULL prompt the server will see —
+        the system partition (prompt + rolling summary) + the non-system window + the tools schema +
+        the output reserve — fits the model wall. Returns True ONLY when the result actually fits;
+        False (⇒ the caller falls back to the char path, and ultimately the #372 pre-flight guard)
+        when the tokenizer dies mid-count OR the system partition + tools + output alone can't fit
+        (an irreducible over-wall window is the guard's job, not the trimmer's). Preserves the
+        prefix-cache hysteresis (no edit below the high-water) and the whole-round trim invariant."""
+        # Reserve the value the REQUEST actually uses (self.max_tokens) — the module global desyncs
+        # on a runtime `config set generation.max_tokens` (#371 review S3) — plus the tools schema
+        # vLLM serializes into the prompt on every call (#371 review S2).
+        out_reserve = int(self.max_tokens)
+        tools_tok = _tools_schema_tokens()
+        high, low = _derive_token_budget(MAX_MODEL_LEN, out_reserve, RAG_MAX_TOKENS, SUMMARY_MAX_TOKENS)
+        system = [m for m in self.messages if m.get("role") == "system"]
+        others = [m for m in self.messages if m.get("role") != "system"]
+        sys_tok = tok.count_prompt(system)
+        if sys_tok is None:
+            return False
+        # the hard ceiling for non-system content: what's left under the wall after system + tools +
+        # output. The hysteresis watermarks are CLAMPED to it, so a floor can never certify a non-fit
+        # (#371 review S2 — the old max(512,…) floor lifted the ceiling above the wall).
+        hard_room = MAX_MODEL_LEN - out_reserve - tools_tok - sys_tok
+        if hard_room <= 0:
+            return False                        # system + tools + output alone overflow ⇒ defer to #372
+        hi_others = max(0, min(high - sys_tok - tools_tok, hard_room))
+        lo_others = max(0, min(low - sys_tok - tools_tok, int(hard_room * 0.9)))
+        others_tok = tok.count_prompt(others)
+        if others_tok is None:
+            return False
+        if others_tok > hi_others:              # above the high-water ⇒ trim down to the low-water
+            track = SUMMARIZE_EVICTED
+            evicted: List[Dict] = []
+            while len(others) > 1:
+                cur = tok.count_prompt(others)
+                if cur is None:
+                    return False                # endpoint died mid-trim ⇒ let the char path retry
+                if cur <= lo_others:
+                    break
+                cut = 1
+                while cut < len(others) and others[cut].get("role") != "user":
+                    cut += 1
+                # Safety: never delete the only user turn (→ API 400 "No user query found"). A single
+                # irreducible oversized turn is the pre-flight guard's job (#372), not the trimmer's.
+                if cut >= len(others):
+                    break
+                if track:
+                    evicted.extend(others[:cut])
+                del others[:cut]
+            if track and evicted:
+                self._roll_summary(system, evicted)   # mutates `system` (adds/updates the summary block)
+            self.messages = system + others
+        # Honest fit check on the FINAL prompt (system may have grown a summary block above) — only
+        # claim success if it really fits, else fall back (so a genuinely-too-big window is not
+        # silently certified and sent to vLLM).
+        final = tok.count_prompt(self.messages)
+        if final is None:
+            return False
+        return (final + tools_tok + out_reserve) <= MAX_MODEL_LEN
+
+    def _trim_context_chars(self):
         def total_len(msgs):
             return sum(len(str(m.get("content") or "")) for m in msgs)
 
@@ -3140,11 +3540,22 @@ class GX10:
             "made, facts established, file paths, task ids, open threads — anything needed to "
             "continue the work. Be terse and factual. Output only the summary text."
         )
-        user = ""
         prev_body = ""
         if prev_summary.strip():
             # remove the marker line before re-feeding (only the content matters)
             prev_body = prev_summary.split("\n", 1)[1].strip() if "\n" in prev_summary else ""
+        # #373: bound the summarizer INPUT (tail-first) so a large evicted transcript can't itself
+        # overflow the model window and get silently truncated by vLLM (a lossy rolling summary). The
+        # FULL raw was already archived losslessly to cold by _roll_summary; here we summarize the
+        # most recent (tail) within budget. input_budget = min(4096, max_model_len // 4) (decision #3).
+        input_budget = min(4096, max(256, int(MAX_MODEL_LEN) // 4))
+        raw_budget = max(256, input_budget - _count_tokens(prev_body))
+        raw, truncated = _bound_text_tail(raw, raw_budget)
+        if truncated:
+            _ui_print(col("[WARN] summarizer input bounded to the most recent rounds "
+                          f"(~{raw_budget} tok); older rounds were dropped from the summary "
+                          "(kept in cold if memory is configured).", C.YELLOW))
+        user = ""
         if prev_body:
             user += "PREVIOUS SUMMARY:\n" + prev_body + "\n\n"
         user += "NEW TRANSCRIPT:\n" + raw
@@ -4695,6 +5106,8 @@ def _code_defaults() -> Dict[str, Any]:
             "trim_target_chars":  TRIM_TARGET_CHARS,
             "max_model_len":      MAX_MODEL_LEN,    # MEM-9: hard token window (budget source)
             "token_budget":       TOKEN_BUDGET,     # MEM-9: couple the trim to the window (default ON)
+            "chars_per_token":    CHARS_PER_TOKEN,  # #366: calibrated chars/token FALLBACK (live tokenizer is primary)
+            "thinking_reserve":   THINKING_RESERVE, # #366 D5: output headroom reserved when think=True
             "max_file_chars":     MAX_FILE_CHARS,
             "list_dir_hard_cap":  LIST_DIR_HARD_CAP,
             "summarize_evicted":  SUMMARIZE_EVICTED,   # B1: default ON (06-18); off → byte-identical trim
@@ -4864,6 +5277,8 @@ def _apply_env(cfg: Dict[str, Any]) -> Dict[str, Any]:
     setif("IRONCLAD_MAX_MODEL_LEN",  "context", "max_model_len",      int)
     setif("GX10_MAX_MODEL_LEN",      "context", "max_model_len",      int)
     setif("GX10_TOKEN_BUDGET",       "context", "token_budget",       _truthy)
+    setif("GX10_CHARS_PER_TOKEN",    "context", "chars_per_token",    float)   # #366: calibrated fallback ratio
+    setif("GX10_THINKING_RESERVE",   "context", "thinking_reserve",   int)     # #366 D5: thinking output reserve
     setif("GX10_AUTOPILOT",  "autopilot",  "enabled", _truthy)
     setif("GX10_AUTOPILOT_STREAM",    "autopilot", "stream",          _truthy)
     setif("GX10_AUTOPILOT_TERMINATE", "autopilot", "terminate_on_advance", _truthy)
@@ -4899,7 +5314,7 @@ def _apply_config(cfg: Dict[str, Any]):
     global TEMPERATURE, MAX_TOKENS, RETRY_BACKOFF, LANGUAGE
     global MAX_ITERATIONS, MAX_CTX_CHARS, TRIM_TARGET_CHARS, MAX_FILE_CHARS, LIST_DIR_HARD_CAP
     global SUMMARIZE_EVICTED, SUMMARY_MAX_TOKENS, RAG_ENABLED, RAG_TOP_K, RAG_MAX_TOKENS
-    global MAX_MODEL_LEN, TOKEN_BUDGET
+    global MAX_MODEL_LEN, TOKEN_BUDGET, CHARS_PER_TOKEN, THINKING_RESERVE
     global WORKER_MEMORY, WORKER_WRITE, WORKER_WRITE_MODE, WARM_SESSION_ID
     global _PLANNING_KW, _ROUTINE_KW, WORKSPACE_DIRS, _IDLE_ACTIVE
     global WATCHER_FEEDBACK_DIR, _WATCHER_ENABLED, RECONCILER_INTERVAL
@@ -4961,6 +5376,8 @@ def _apply_config(cfg: Dict[str, Any]):
     # OFF → the char thresholds above stay (today's behaviour, GX10_MAX_CTX_CHARS applies).
     MAX_MODEL_LEN      = int(ctx.get("max_model_len", MAX_MODEL_LEN))
     TOKEN_BUDGET       = bool(ctx.get("token_budget", True))
+    CHARS_PER_TOKEN    = float(ctx.get("chars_per_token", CHARS_PER_TOKEN))   # #366 calibrated fallback
+    THINKING_RESERVE   = int(ctx.get("thinking_reserve", THINKING_RESERVE))   # #366 D5
     if TOKEN_BUDGET:
         MAX_CTX_CHARS, TRIM_TARGET_CHARS = _derive_ctx_budget(
             MAX_MODEL_LEN, MAX_TOKENS, RAG_MAX_TOKENS, SUMMARY_MAX_TOKENS, CHARS_PER_TOKEN)

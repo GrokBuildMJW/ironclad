@@ -98,6 +98,18 @@ Env-only: `GX10_STATE` overrides the per-project session-state file path; `GX10_
 CLI flags (highest precedence): `--server`, `--codedir`, `--max-agents`, and
 `--resume` / `--fresh` / `--no-resume` (resume is off by default).
 
+## Known limitations
+
+- **Windows legacy console (`conhost.exe`) — selection/copy & scaling.** The renderer owns scrollback
+  and selection, so it enables the alternate screen (`?1049h`) + SGR mouse tracking
+  (`?1000`/`?1002`/`?1006`) and the **application**, not the terminal, drives mouse selection. On the
+  legacy Windows console a right-click "copy" (or click-drag) is delivered to the app instead of doing
+  a native terminal selection, and conhost's copy/reflow can corrupt the layout/scaling. This is a
+  terminal limitation, not a renderer bug. *Workaround:* use **Windows Terminal** (or another modern
+  terminal) and **hold `Shift` while dragging** to bypass the app's mouse capture for a native
+  selection + copy; `Ctrl+V` paste is unaffected. Shares the alt-buffer + mouse-tracking class with
+  issue #256 (the client-side teardown fix is tracked there).
+
 ## Develop
 
 ```bash

@@ -65,3 +65,63 @@ def test_authorize_advance_supervised_needs_valid_go():
     # supervised, forged GO => refused
     no, why2 = d.authorize_advance("MERGE", d.FROZEN_DIAL, go="bad", unit=274, operator="alice", secret=_SECRET)
     assert not no and "forged" in why2
+
+
+# ── #348 S7: GO binds tree_sha + version; single-use (replay refused) ──
+def test_go_binds_tree_sha_and_version():
+    d = _load()
+    go = d.compute_go(356, "DELIVER", "alice", _SECRET, tree_sha="abc", version="0.0.16")
+    assert d.verify_go(go, unit=356, gate="DELIVER", operator="alice", secret=_SECRET, tree_sha="abc", version="0.0.16")
+    # a captured GO does NOT authorize a different tree or version than the operator saw
+    assert not d.verify_go(go, unit=356, gate="DELIVER", operator="alice", secret=_SECRET, tree_sha="OTHER", version="0.0.16")
+    assert not d.verify_go(go, unit=356, gate="DELIVER", operator="alice", secret=_SECRET, tree_sha="abc", version="9")
+    # the MERGE gate carries no release artifact (empty tree/version) — still round-trips internally
+    m = d.compute_go(274, "MERGE", "alice", _SECRET)
+    assert d.verify_go(m, unit=274, gate="MERGE", operator="alice", secret=_SECRET)
+
+
+def test_go_binds_release_index():
+    # #395 S14a (blocker D1-1): test-pypi vs production differ ONLY in release_index, so the GO MUST bind it —
+    # else a Test-PyPI GO is byte-identical to a production GO at the same HEAD and "Test-PyPI FIRST" is
+    # operator-discipline-only.
+    d = _load()
+    testpypi = d.compute_go(364, "DELIVER", "alice", _SECRET, tree_sha="abc", version="0.0.16", release_index="testpypi")
+    assert d.verify_go(testpypi, unit=364, gate="DELIVER", operator="alice", secret=_SECRET,
+                       tree_sha="abc", version="0.0.16", release_index="testpypi")
+    # a Test-PyPI GO is REJECTED for the production index
+    assert not d.verify_go(testpypi, unit=364, gate="DELIVER", operator="alice", secret=_SECRET,
+                           tree_sha="abc", version="0.0.16", release_index="pypi")
+    # the two indices yield DIFFERENT tokens at the same HEAD/version
+    pypi = d.compute_go(364, "DELIVER", "alice", _SECRET, tree_sha="abc", version="0.0.16", release_index="pypi")
+    assert testpypi != pypi
+    # authorize_advance refuses the wrong-index GO too (the consume path)
+    no, why = d.authorize_advance("DELIVER", d.FROZEN_DIAL, go=testpypi, unit=364, operator="alice",
+                                  secret=_SECRET, tree_sha="abc", version="0.0.16", release_index="pypi")
+    assert not no and "index" in why
+
+
+def test_authorize_advance_refuses_a_replayed_go():
+    d = _load()
+    go = d.compute_go(356, "DELIVER", "alice", _SECRET, tree_sha="abc", version="1")
+    spent = [{"payload": {"go_consumed": go}}]                  # a prior consumed record in the ledger
+    ok, why = d.authorize_advance("DELIVER", d.FROZEN_DIAL, go=go, unit=356, operator="alice",
+                                  secret=_SECRET, tree_sha="abc", version="1", ledger_records=spent)
+    assert not ok and "consumed" in why
+    # not-yet-consumed -> authorized
+    ok2, _ = d.authorize_advance("DELIVER", d.FROZEN_DIAL, go=go, unit=356, operator="alice",
+                                 secret=_SECRET, tree_sha="abc", version="1", ledger_records=[])
+    assert ok2
+
+
+def test_go_secret_resolves_env_then_file(monkeypatch, tmp_path):
+    # #348 S7: provision once via env OR a file (default ~/.devloop/go_secret, outside the repo) so it is
+    # always available without re-exporting; env wins, file is the fallback, neither -> inert.
+    d = _load()
+    monkeypatch.delenv("GX10_DEVLOOP_GO_SECRET", raising=False)
+    f = tmp_path / "go_secret"
+    monkeypatch.setenv("GX10_DEVLOOP_GO_SECRET_FILE", str(f))
+    assert d.go_secret_from_env() is None                       # no env, no file -> inert
+    f.write_text("  file-secret-123  ", encoding="utf-8")
+    assert d.go_secret_from_env() == b"file-secret-123"         # file fallback (whitespace stripped)
+    monkeypatch.setenv("GX10_DEVLOOP_GO_SECRET", "env-secret")
+    assert d.go_secret_from_env() == b"env-secret"              # env wins over the file

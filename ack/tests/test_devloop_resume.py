@@ -58,3 +58,20 @@ def test_forward_only_ledger_cross_check():
     assert r.consistent_with_ledger({"pr": 1, "ci": "green", "ledger_last": "GATE"}) == []   # MERGE >= GATE
     behind = r.consistent_with_ledger({"branch": True, "ledger_last": "PR"})                  # BRANCH < PR
     assert behind and "behind ledger" in behind[0]
+
+
+def test_already_merged_idempotency():
+    r = _load()
+    assert r.already_merged(322, {322, 323, 325})        # delivered -> do not re-drive
+    assert not r.already_merged(326, {322, 323, 325})    # not yet delivered -> steer it
+    assert not r.already_merged(326, [])                 # empty / None set is safe
+
+
+def test_already_merged_vs_already_published_are_split():
+    # #348 S8 / deep-review #6: merged != delivered. A merged-but-unpublished unit stays DELIVER-eligible;
+    # only already_published is terminal.
+    r = _load()
+    assert r.already_merged(357, [357, 350]) and not r.already_merged(999, [357])
+    assert r.already_published(350, [350]) and not r.already_published(357, [350])
+    # the corner the conflation would break: merged True, published False -> still deliverable
+    assert r.already_merged(357, [357]) and not r.already_published(357, [350])

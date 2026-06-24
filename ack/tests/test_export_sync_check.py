@@ -73,3 +73,26 @@ def test_norm_treats_crlf_and_lf_as_equal(tmp_path):
     a = tmp_path / "a"; b = tmp_path / "b"
     a.write_bytes(b"line1\r\nline2\r\n"); b.write_bytes(b"line1\nline2\n")
     assert es._norm(a) == es._norm(b)            # CRLF-only difference is never drift
+
+
+# ── #348 S5 PRE-push staged-tree leg (verify_staged_export / staged_drift) ──
+def test_staged_drift_passes_on_byte_identity():
+    es = _load()
+    fresh = {"ack/x.py": b"v1", "README.md": b"r"}
+    assert es.staged_drift(fresh, dict(fresh)) == []          # a faithful staged tree == a fresh export
+
+
+def test_staged_drift_flags_extra_missing_and_differing_files():
+    es = _load()
+    fresh = {"ack/x.py": b"v1", "ack/y.py": b"v2"}
+    staged = {"ack/x.py": b"TAMPERED", "evil.py": b"stale"}   # y.py missing, x.py differs, evil.py extra
+    f = es.staged_drift(fresh, staged)
+    assert any("evil.py" in x and "stale/tampered" in x for x in f)     # extra (not producible)
+    assert any("ack/y.py" in x and "missing" in x for x in f)           # incomplete stage
+    assert any("ack/x.py" in x and "differs" in x for x in f)           # content drift
+
+
+def test_verify_staged_export_missing_dir_is_fail_closed(tmp_path):
+    es = _load()
+    failures, _ = es.verify_staged_export(tmp_path / "does-not-exist")  # no re-export needed
+    assert failures and "does not exist" in failures[0] and "fail-closed" in failures[0]

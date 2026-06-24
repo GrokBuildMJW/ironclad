@@ -124,3 +124,79 @@ def test_preflight_blocks_a_version_already_on_pypi():
 def test_tag_normalisation_strips_leading_v():
     rp = _load()
     assert rp.release_preflight("0.0.15", "0.0.15", _RELEASED, []) == []   # bare tag, no 'v'
+
+
+# ── #348 S7a: trigger-ownership + fail-closed preflight ──
+_PUBLISH_YML = _REPO / "core" / ".github" / "workflows" / "publish.yml"
+
+
+def test_preflight_main_requires_a_tag():
+    rp = _load()
+    assert rp.main(["--preflight"]) == 2                       # empty tag -> fail-closed (was a skip path)
+
+
+def test_preflight_main_fails_closed_on_unreachable_pypi(monkeypatch):
+    # a transient PyPI blip must NOT no-op the duplicate guard: an unresolvable check is now a refusal.
+    rp = _load()
+    monkeypatch.setattr(rp, "_pypi_versions", lambda *a, **k: ([], False))   # index unreachable (#397: accepts index_base)
+    monkeypatch.setattr(rp, "release_preflight", lambda *a, **k: [])         # tag/version/changelog all agree
+    assert rp.main(["--preflight", "--tag", "v9.9.9"]) == 1                  # unreachable -> fail-closed
+    # control: reachable + all-agree passes
+    monkeypatch.setattr(rp, "_pypi_versions", lambda *a, **k: (["0.0.1"], True))
+    assert rp.main(["--preflight", "--tag", "v9.9.9"]) == 0
+
+
+def test_preflight_index_url_routes_the_duplicate_check(monkeypatch):
+    # #397 S14c: --index-url threads the JSON-API base into the duplicate check so a Test-PyPI cut checks
+    # Test-PyPI (not production). The default is production.
+    rp = _load()
+    seen = {}
+    monkeypatch.setattr(rp, "_pypi_versions", lambda base=rp.PYPI_JSON_BASE: (seen.__setitem__("base", base) or ([], True)))
+    monkeypatch.setattr(rp, "release_preflight", lambda *a, **k: [])
+    rp.main(["--preflight", "--tag", "v9.9.9", "--index-url", rp.TESTPYPI_JSON_BASE])
+    assert seen["base"] == rp.TESTPYPI_JSON_BASE                              # routed to Test-PyPI
+    rp.main(["--preflight", "--tag", "v9.9.9"])
+    assert seen["base"] == rp.PYPI_JSON_BASE                                  # default = production
+
+
+def test_pypi_versions_404_is_first_publish_other_errors_unreachable(monkeypatch):
+    # #407: a 404 (project not on the index yet) is the FIRST publish -> ([], reachable=True), NOT
+    # fail-closed; any other HTTP status + network errors stay unreachable ([], False).
+    import urllib.error
+    rp = _load()
+
+    def _raise(code_or_exc):
+        def _f(url, timeout=0):
+            if isinstance(code_or_exc, int):
+                raise urllib.error.HTTPError(url, code_or_exc, "x", {}, None)
+            raise code_or_exc
+        return _f
+
+    monkeypatch.setattr(rp.urllib.request, "urlopen", _raise(404))
+    assert rp._pypi_versions("https://test.pypi.org/pypi") == ([], True)     # fresh index -> safe first publish
+    monkeypatch.setattr(rp.urllib.request, "urlopen", _raise(503))
+    assert rp._pypi_versions() == ([], False)                                # server error -> unreachable (fail-closed)
+    monkeypatch.setattr(rp.urllib.request, "urlopen", _raise(urllib.error.URLError("dns")))
+    assert rp._pypi_versions() == ([], False)                                # network down -> unreachable (fail-closed)
+
+
+def test_publish_yml_only_release_triggered_and_failcloses_empty_tag():
+    # workflow_dispatch (the ungated, tagless manual-publish bypass) is removed; the only trigger is
+    # release:published, and the inline preflight refuses an empty tag.
+    import yaml
+    text = _PUBLISH_YML.read_text(encoding="utf-8")
+    doc = yaml.safe_load(text)
+    triggers = doc["on"] if "on" in doc else doc[True]         # PyYAML maps a bare `on:` key to True
+    assert "workflow_dispatch" not in triggers                 # the ungated trigger is gone (key, not comment)
+    assert "release" in triggers and triggers["release"]["types"] == ["published"]
+    assert 'if [ -z "${TAG:-}" ]' in text                      # fail-closed on an empty tag
+
+
+def test_inline_publish_preflight_agrees_with_release_preflight_on_tag_version():
+    # equivalence pin (charter fork-5 fallback): publish.yml's portable inline preflight and the engine's
+    # release_preflight.py enforce the SAME tag==pyproject-version invariant, so the two cannot drift.
+    rp = _load()
+    text = _PUBLISH_YML.read_text(encoding="utf-8")
+    assert '"${TAG#v}" != "${VER}"' in text                    # inline: tag (sans v) must equal version
+    assert rp.release_preflight("v0.0.14", "0.0.15", _RELEASED, []) , "release_preflight must flag a mismatch"
+    assert rp.release_preflight("v0.0.15", "0.0.15", _RELEASED, []) == []   # agree -> pass

@@ -553,3 +553,187 @@ def test_devloop_merge_evidence_registered_and_inert_without_key(monkeypatch):
     monkeypatch.delenv("GX10_DEVLOOP_MARKER_KEY", raising=False)
     data = c.fetch(None)
     assert data["active"] is False and c.assert_fn(data) == []                 # inert => no violations
+
+
+# ── scheduled-workflow liveness invariant (#303): the watcher is watched ──────
+def test_scheduled_workflow_crons_finds_only_cron_workflows():
+    pd = _load()
+    texts = {
+        "reconcile.yml": "on:\n  schedule:\n    - cron: \"23 5 * * *\"\n  workflow_dispatch:\n",
+        "ci.yml": "on:\n  pull_request:\n    paths: [core/**]\n",                 # event-only => not scheduled
+        "mirror.yml": "on:\n  schedule:\n    - cron: '*/15 * * * *'\n",
+    }
+    out = pd.scheduled_workflow_crons(texts)
+    assert set(out) == {"reconcile.yml", "mirror.yml"}                            # ci.yml excluded
+    assert out["reconcile.yml"] == ["23 5 * * *"] and out["mirror.yml"] == ["*/15 * * * *"]
+
+
+def test_scheduled_liveness_flags_a_workflow_with_only_failures():
+    # the reconcile.yml-dead class: runs exist but none succeeded => silently broken.
+    pd = _load()
+    data = {"dead.yml": [{"status": "completed", "conclusion": "failure"},
+                         {"status": "completed", "conclusion": "failure"}]}
+    out = pd.scheduled_workflow_liveness(data)
+    assert len(out) == 1 and "dead.yml" in out[0] and "silently broken" in out[0]
+
+
+def test_scheduled_liveness_passes_when_any_recent_run_succeeded():
+    pd = _load()
+    data = {"ok.yml": [{"status": "completed", "conclusion": "failure"},        # latest flaked...
+                       {"status": "completed", "conclusion": "success"}]}        # ...but a recent success exists
+    assert pd.scheduled_workflow_liveness(data) == []
+
+
+def test_scheduled_liveness_treats_skipped_as_healthy():
+    # a secret-gated scheduled job that conditionally skips is alive, not broken.
+    pd = _load()
+    assert pd.scheduled_workflow_liveness({"gated.yml": [{"status": "completed", "conclusion": "skipped"}]}) == []
+
+
+def test_scheduled_liveness_ignores_never_run_and_in_progress_only():
+    # no completed run yet (brand-new / never fired) or only in-flight => cannot prove broken, no flag.
+    pd = _load()
+    assert pd.scheduled_workflow_liveness({"new.yml": []}) == []
+    assert pd.scheduled_workflow_liveness({"running.yml": [{"status": "in_progress", "conclusion": None}]}) == []
+
+
+def test_scheduled_liveness_registered_fail_closed_repo_group():
+    pd = _load()
+    c = {x.name: x for x in pd.registry()}["scheduled-workflow-liveness"]
+    assert c.warn is False and c.group == "repo" and c.heal is None             # fail-closed, assert-only
+
+
+# ── no-ungated-autonomous-launcher (epic #312 S4, ADR-0002 D7) ──
+def test_no_ungated_launcher_flags_an_enabled_default():
+    pd = _load()
+    assert pd.no_ungated_autonomous_launcher({"text": "AUTOPILOT_ENABLED = True\nAUTOPILOT_AUTOPLAN = False\n"})
+    out = pd.no_ungated_autonomous_launcher({"text": "AUTOPILOT_ENABLED = True\n"})
+    assert any("AUTOPILOT_ENABLED" in x and "not False" in x for x in out)
+
+
+def test_no_ungated_launcher_passes_off_by_default_and_is_inert_without_gx10():
+    pd = _load()
+    assert pd.no_ungated_autonomous_launcher({"text": "AUTOPILOT_ENABLED = False\nAUTOPILOT_AUTOPLAN = False\n"}) == []
+    assert pd.no_ungated_autonomous_launcher({"text": ""}) == []                # gx10 absent => inert
+    c = {x.name: x for x in pd.registry()}["no-ungated-autonomous-launcher"]
+    assert c.warn is False and c.group == "repo" and c.heal is None             # fail-closed, assert-only
+
+
+# ── devloop-no-stdlib-shadow (epic #337 — the select.py→stdlib-select sys.path[0] hijack) ──
+def test_no_stdlib_shadow_flags_a_stdlib_collision():
+    # the original regression: scripts/devloop/select.py shadowed stdlib `select`, crashing
+    # subprocess→selectors→select when marker.py ran as a script (sys.path[0] = scripts/devloop).
+    pd = _load()
+    out = pd.no_stdlib_shadow({"stems": ["driver", "select", "marker"]})
+    assert len(out) == 1 and "select" in out[0] and "shadows the stdlib module" in out[0]
+
+
+def test_no_stdlib_shadow_passes_clean_and_is_inert_when_empty():
+    pd = _load()
+    assert pd.no_stdlib_shadow({"stems": ["driver", "selection", "marker", "guards"]}) == []
+    assert pd.no_stdlib_shadow({"stems": []}) == []                             # no dir => inert
+
+
+def test_no_stdlib_shadow_real_tree_is_clean_and_registered_fail_closed():
+    # the live invariant over the actual scripts/devloop tree must be clean (no module shadows stdlib).
+    pd = _load()
+    assert pd.no_stdlib_shadow(pd._fetch_devloop_modules()) == []
+    c = {x.name: x for x in pd.registry()}["devloop-no-stdlib-shadow"]
+    assert c.warn is False and c.group == "repo" and c.heal is None             # fail-closed, assert-only
+
+
+def test_fetch_devloop_evidence_active_assembles_real_merges_not_empty(monkeypatch, tmp_path):
+    # #348 S9: the merges:[] vacuous-green foot-gun is closed — when K is set, _fetch_devloop_evidence
+    # assembles the real DELIVERY merges from the ledger via the merge-walk (a markerless one is flagged).
+    pd = _load()
+    monkeypatch.setenv("GX10_DEVLOOP_MARKER_KEY", "K")
+    monkeypatch.setenv("GX10_DEVLOOP_HWM_FILE", str(tmp_path / "nohwm"))     # HWM -> 0 (no grandfathering)
+
+    class _FakeLedger:
+        @staticmethod
+        def read_all(_p):
+            return [{"seq": 0, "payload": {"surface": "DELIVER", "status": "delivered", "sha": "s1",
+                                            "tree_sha": "t1", "gate_results": {}, "marker": None}}]
+
+        @staticmethod
+        def verify_chain(_p):
+            return []                                                    # intact chain
+
+    monkeypatch.setattr(pd, "_devloop_ledger", lambda: _FakeLedger)
+    d = pd._fetch_devloop_evidence()
+    assert d["active"] is True and len(d["merges"]) == 1 and d["merges"][0]["sha"] == "s1"   # NOT merges:[]
+    assert d["chain_errors"] == []
+    assert pd.devloop_merge_has_evidence(d)                                   # the markerless delivery is flagged
+
+
+def test_devloop_evidence_broken_ledger_chain_is_a_hard_violation(monkeypatch, tmp_path):
+    # #358 review: the merge-walk trusts seq/marker from the ledger, so a tampered/truncated/reordered
+    # chain (which could grandfather-evade or hide a record) must fail closed BEFORE the marker check.
+    pd = _load()
+    monkeypatch.setenv("GX10_DEVLOOP_MARKER_KEY", "K")
+    monkeypatch.setenv("GX10_DEVLOOP_HWM_FILE", str(tmp_path / "nohwm"))
+
+    class _TamperedLedger:
+        @staticmethod
+        def read_all(_p):
+            return []                                                    # truncated to hide the record(s)
+
+        @staticmethod
+        def verify_chain(_p):
+            return ["record 0: prev_hash break (chain reordered/truncated)"]
+
+    monkeypatch.setattr(pd, "_devloop_ledger", lambda: _TamperedLedger)
+    d = pd._fetch_devloop_evidence()
+    assert d["chain_errors"]
+    violations = pd.devloop_merge_has_evidence(d)
+    assert any("ledger chain broken" in v for v in violations)            # green-via-truncation is refused
+
+
+# ── Phase-2b cross-cutting invariants (#360 S10a): pure-logic + wiring, each with its negative ──
+def test_marker_key_requires_walk_activation_ordering(monkeypatch):
+    pd = _load()
+    # the trap: K set while the walk is UNBUILT => violation (active-but-vacuously-green)
+    assert pd.marker_key_requires_walk({"key_set": True, "walk_built": False})
+    # safe orderings: K with the walk built, or no K
+    assert pd.marker_key_requires_walk({"key_set": True, "walk_built": True}) == []
+    assert pd.marker_key_requires_walk({"key_set": False, "walk_built": False}) == []
+    # wiring: today K is unset + MERGE_WALK_BUILT True => fetch is non-violating
+    monkeypatch.delenv("GX10_DEVLOOP_MARKER_KEY", raising=False)
+    assert pd.marker_key_requires_walk(pd._fetch_marker_key_walk()) == []
+
+
+def test_deliver_dial_stays_supervised_rejects_auto(monkeypatch):
+    pd = _load()
+    assert pd.deliver_dial_stays_supervised({"auto_refused": False})       # a regressed hard-force is flagged
+    assert pd.deliver_dial_stays_supervised({"auto_refused": True}) == []
+    # wiring: the REAL probe authorizes nothing under {DELIVER:auto} + no GO
+    monkeypatch.delenv("GX10_DEVLOOP_GO_SECRET", raising=False)
+    assert pd._fetch_deliver_dial_probe()["auto_refused"] is True
+    assert pd.deliver_dial_stays_supervised(pd._fetch_deliver_dial_probe()) == []
+
+
+def test_required_checks_ssot_protected(monkeypatch):
+    pd = _load()
+    assert pd.required_checks_ssot_protected({"probes": {".github/required-status-checks.yml": False}})
+    assert pd.required_checks_ssot_protected({"probes": {"a": True, "b": True}}) == []
+    # wiring: the real coupling protected-class blocks every delivery-integrity SSOT path
+    probes = pd._fetch_required_checks_protected()["probes"]
+    assert probes and all(probes.values())
+    assert pd.required_checks_ssot_protected({"probes": probes}) == []
+
+
+def test_delivery_pending_unresolved(monkeypatch):
+    pd = _load()
+    pend = [{"payload": {"surface": "DELIVER", "status": "delivered-unrecorded", "sha": "s1"}}]
+    assert pd.delivery_pending_unresolved(pend)                            # shipped-but-pending, never resolved
+    resolved = pend + [{"payload": {"surface": "DELIVER", "status": "delivered", "sha": "s1"}}]
+    assert pd.delivery_pending_unresolved(resolved) == []                  # a later delivered record resolves it
+    assert pd.delivery_pending_unresolved([]) == []                        # inert until pending records exist
+
+
+def test_devloop_ledger_chain_intact_is_always_on(monkeypatch):
+    pd = _load()
+    assert pd.devloop_ledger_chain_intact(["record 2: hash mismatch (payload tampered)"])
+    assert pd.devloop_ledger_chain_intact([]) == []
+    # wiring: not K-gated — a missing/empty ledger yields no errors (inert), a real chain is verified
+    assert pd.devloop_ledger_chain_intact(pd._fetch_devloop_ledger_chain()) == []
