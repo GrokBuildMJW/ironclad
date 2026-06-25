@@ -186,14 +186,6 @@ Released versions are listed below; upcoming work accumulates under *Unreleased*
   `to:`/`effort:` still override. Both launch paths share one `build_agent_argv` (moved to stdlib
   `commands.py` so the zero-dependency client never pulls pydantic). `test_code_agent_registry.py` (+32).
   (Core seam — `providers.py`/`gx10.py`/`server.py`/`client.py`/`commands.py`; private config — `conf/`.)
-- **The standard C0 method is machine-checked** (#464, epic #440 Phase 0): the alternating two-distinct-
-  reviewer C0 method that recovered #440 is now enforced, not just discipline. Two `process_doctor`
-  invariants (ADR-0007, scheduled `reconcile.yml`) join #446's: `epic-ready-has-verbatim-requirements`
-  (a `status/ready` epic must carry a 'VERBATIM REQUIREMENTS' comment — the operator's requirements pasted
-  1:1, so paraphrasing can't silently drop scope) and `epic-ready-has-coverage-matrix` (a 'Coverage matrix'
-  comment mapping each requirement → a sub-issue). The alternating A↔B distinct-reviewer chain itself stays
-  the documented convention behind the `c0/converged` label; `NEW_EPIC.md` records the full method.
-  `test_process_doctor.py` (+3). (Private tooling — `scripts/ci/` + `.github/`.)
 - **Deterministic code-agent result capture (hybrid feedback)** (#443, epic #440 Phase 2): the handover
   runner read only the agent-written `…-feedback.md`, so an agent that finished its work but forgot to
   write that file produced a silent no-feedback → retry. `_build_agent_argv` now accepts an optional
@@ -212,15 +204,6 @@ Released versions are listed below; upcoming work accumulates under *Unreleased*
   capture (`-o`/`--json`) is #443; the live workspace-write run is operator-verified later.
   `test_client_pool.py` (+1). (Private config — `conf/`; the BYO-code-agent guide
   `code-agents.md` + `status.md` gain a verified Codex example + the `{feedback}` placeholder, #444.)
-- **C0-bypass guards: the epic process is machine-checked, not just discipline** (#446, epic #440 Phase 0):
-  the machine-gated dev-loop only guarded the autonomous engine, so manual `gh`/`git` work could create an
-  epic without `[epic]`, self-mark `status/ready`, and start without a C0 review. Three `process_doctor`
-  invariants (ADR-0007, scheduled `reconcile.yml`) close that: `epic-has-bracket-title` (an open
-  `type/feature` epic must carry `[epic]`; pre-enforcement epics grandfathered), `epic-ready-is-decomposed`
-  (a `status/ready` epic needs ≥1 native sub-issue — no ready without scope decomposition), and
-  `epic-ready-has-c0-marker` (a `status/ready` epic must carry the new `c0/converged` label — the deliberate
-  marker of a converged two-distinct-reviewer C0). `test_process_doctor.py` (+4). `NEW_EPIC.md` records the
-  enforcement. (Private tooling — `scripts/ci/` + `.github/`.)
 - **Multi-line paste collapses to a `[Pasted #N +L lines]` placeholder in the TUI input** (#438): pasting
   more than one line into the chat input now shows a compact placeholder (like Claude Code) instead of the
   raw lines, and expands back to the full text when the turn is submitted — so a large paste no longer
@@ -232,31 +215,6 @@ Released versions are listed below; upcoming work accumulates under *Unreleased*
   or over-deleted; deleting a collapsed paste **reclaims** its stored block; the sentinel delimiters are
   stripped from incoming paste content so a paste can't forge one; and LF/CRLF/lone-CR are all treated as
   line breaks. Single-line pastes and typed input are unaffected. `node:test` (+13).
-
-### Fixed
-- **Engine-cut GitHub releases carry the real CHANGELOG notes** (#432): the DELIVER lane hard-coded the
-  release body to a placeholder (`DELIVER vX.Y.Z (engine, GO-gated)`), so every engine-driven release —
-  including the first production cut (0.0.18) — shipped empty notes until hand-fixed. `deliver.py` now
-  extracts the matching `## [X.Y.Z]` section of `core/CHANGELOG.md` (tag `v` prefix stripped; heading
-  semantics mirror `release_preflight._section` so the two agree on the section bounds) and passes it as
-  the `gh release create --notes`; it fails soft to the old placeholder when the CHANGELOG is absent or the
-  version has no non-empty section. `test_devloop_deliver.py` (+5). (Private tooling — `scripts/devloop/`;
-  no runtime change.)
-- **Board `In Review` + `Blocked` are now set automatically** (#278): on the Projects-v2 board these two
-  columns were never reached — `In Review` relied on a built-in that proved unreliable on this
-  single-developer board (and the board's option is the lower-case "in Review"), and `Blocked` had no
-  setter or reconciler at all (the gap the #223 audit recorded as F-G-02). Both are now derived states
-  with the full ADR-0007 treatment: invariant + on-event guard + scheduled reconciler + negative test.
-  `status/blocked` label ⟺ board **Blocked**, and an open linked PR ⟺ **In Review**; the on-event guard
-  `project-status.yml` extends to `issues: [labeled, unlabeled]` and `pull_request: [opened, reopened,
-  ready_for_review, closed]`, and `process_doctor.py` gains the reconcilers `board-blocked-reflects-label`
-  and `board-in-review-reflects-open-pr` (group=repo, healed daily). Blocked takes precedence over In
-  Review. `test_process_doctor.py` (+5 = 70). Per ADR-0007. (Private tooling — `scripts/ci/` + `.github/`;
-  no runtime change.)
-- **`complete-delivery` idempotency is release-index-aware** (#433): the delivered-pending → terminal-delivered
-  completion key now includes the release index, so a Test-PyPI completion can never be mistaken for the
-  production one (or vice-versa). `test_devloop_run.py`/`test_devloop_watcher.py` (+3). (Private tooling —
-  `scripts/devloop/`; no runtime change.)
 
 ## [0.0.18] - 2026-06-24
 
