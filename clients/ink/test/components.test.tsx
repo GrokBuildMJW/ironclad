@@ -17,6 +17,7 @@ test('Footer — model · conn · mem · tasks · perf', () => {
     model: 'qwen3.6-35b',
     connected: true,
     memory: 'up',
+    warm: 'up',
     watcher: true,
     autopilot: false,
     pending: 1,
@@ -25,12 +26,13 @@ test('Footer — model · conn · mem · tasks · perf', () => {
     perf: 'TTFT 0.5s · 62 tok/s',
     agent: 'codex · cheapest-capable',
   };
-  const {frame, unmount} = renderToString(<Footer st={st} />, 160, 3);
+  const {frame, unmount} = renderToString(<Footer st={st} />, 200, 3);
   const f = frame();
   assert.match(f, /Ironclad/);
   assert.match(f, /qwen3\.6-35b/);
   assert.match(f, /conn/);
   assert.match(f, /mem up/, 'shows memory status'); // MEM-7
+  assert.match(f, /warm up/, '#385: shows the Warm (Valkey) tier separately');
   assert.match(f, /1P\/0IP\/4D/);
   assert.match(f, /TTFT 0\.5s/);
   assert.match(f, /coder codex/, '#453: shows which coder was routed');
@@ -39,14 +41,16 @@ test('Footer — model · conn · mem · tasks · perf', () => {
 
 test('Footer — memory off/down render their state', () => {
   const base: StatusState = {
-    model: 'm', connected: true, memory: 'off', watcher: false, autopilot: false,
+    model: 'm', connected: true, memory: 'off', warm: 'off', watcher: false, autopilot: false,
     pending: 0, inProgress: 0, done: 0, perf: '', agent: '',
   };
-  const off = renderToString(<Footer st={base} />, 100, 3);
+  const off = renderToString(<Footer st={base} />, 120, 3);
   assert.match(off.frame(), /mem off/);
+  assert.match(off.frame(), /warm off/);                 // #385: warm tri-state rendered too
   off.unmount();
-  const down = renderToString(<Footer st={{...base, memory: 'down'}} />, 100, 3);
+  const down = renderToString(<Footer st={{...base, memory: 'down', warm: 'down'}} />, 120, 3);
   assert.match(down.frame(), /mem down/);
+  assert.match(down.frame(), /warm down/);
   down.unmount();
 });
 

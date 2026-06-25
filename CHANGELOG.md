@@ -9,6 +9,18 @@ Released versions are listed below; upcoming work accumulates under *Unreleased*
 
 ## [Unreleased]
 
+### Added
+- **`/health` reports the Warm tier separately (Cold ⇏ Warm)** (#385): `/health` reported a single
+  `memory` field that reflected only **Cold** (Mem0), so a silent **Warm** (Valkey) outage — the tier is
+  fail-soft and degrades to a no-op when unreachable — read as a healthy `memory: up` and could regress
+  unnoticed. `/health` now also returns `warm` as `up` (reachable) / `down` (configured but unreachable) /
+  `off` (not configured), and the Ink footer shows it next to `mem`. Also reconciles the docs that
+  conflated Warm and Cold placement: **Cold (Mem0) is model-host-pinned** (GPU/LLM-coupled); the **Warm
+  cache (Valkey) follows the orchestrator** — loopback is the ideal, a LAN hop to the model host is
+  acceptable (Decision D-Valkey). `test_server_split.py` (+1), `clients/ink` (+warm footer assertions).
+  (Core — `server.py` `/health`; client — Ink footer + status poller; docs — `setup-types.md`,
+  `docker-compose.yml`.)
+
 ## [0.0.19] - 2026-06-25
 
 ### Changed

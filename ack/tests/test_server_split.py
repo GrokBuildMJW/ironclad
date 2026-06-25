@@ -152,6 +152,9 @@ def test_http_health_and_chat_capture(tmp_path, monkeypatch):
     try:
         health = _get(port, "/health")
         assert health["ok"] and health["model"] == "stub-model"
+        # #385: Cold (memory) and Warm tiers are reported SEPARATELY; with neither configured in the stub
+        # both read "off" (a Warm outage can no longer hide behind a Cold-only `memory: up`).
+        assert health["memory"] == "off" and health["warm"] == "off"
 
         res = _post(port, "/chat", {"message": "ping"})
         assert res["ok"] and "echo:ping" in res["output"]
@@ -166,6 +169,24 @@ def test_http_health_and_chat_capture(tmp_path, monkeypatch):
         assert fo["ok"]
         assert [r["content"] for r in fo["results"]] == ["r:x", "r:y"]
         assert fo["results"][0]["think"] is False
+    finally:
+        httpd.shutdown()
+
+
+def test_health_reports_warm_tier_up_down_off(tmp_path, monkeypatch):
+    # #385: /health distinguishes the Warm (Valkey) tier — up (reachable PING), down (configured but
+    # unreachable → the silent-no-op case), off (not configured). Read at request time from gx10._WARM.
+    httpd, port = _start_server(monkeypatch, tmp_path)
+    try:
+        class _Warm:
+            def __init__(self, ok): self._ok = ok
+            def is_available(self): return self._ok
+        monkeypatch.setattr(gx10, "_WARM", _Warm(True), raising=False)
+        assert _get(port, "/health")["warm"] == "up"
+        monkeypatch.setattr(gx10, "_WARM", _Warm(False), raising=False)
+        assert _get(port, "/health")["warm"] == "down"       # outage no longer hides behind Cold's memory:up
+        monkeypatch.setattr(gx10, "_WARM", None, raising=False)
+        assert _get(port, "/health")["warm"] == "off"
     finally:
         httpd.shutdown()
 

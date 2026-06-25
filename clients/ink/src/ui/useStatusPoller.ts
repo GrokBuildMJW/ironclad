@@ -16,7 +16,8 @@ import type {Server} from '../net/server.js';
 export interface StatusState {
   model: string;
   connected: boolean;
-  memory: string; // /health.memory: 'up' (reachable) · 'down' (configured, unreachable) · 'off' (none)
+  memory: string; // /health.memory (Cold/Mem0): 'up' (reachable) · 'down' (configured, unreachable) · 'off'
+  warm: string; // #385 /health.warm (Warm/Valkey): 'up' · 'down' (configured, unreachable) · 'off' (none)
   watcher: boolean;
   autopilot: boolean;
   pending: number;
@@ -30,6 +31,7 @@ export const EMPTY_STATUS: StatusState = {
   model: '—',
   connected: false,
   memory: 'off',
+  warm: 'off',
   watcher: false,
   autopilot: false,
   pending: 0,
@@ -53,6 +55,7 @@ export async function pollStatus(srv: Server): Promise<StatusFields | null> {
       connected: Boolean(h['ok']),
       model: String(h['model'] ?? '—'),
       memory: String(h['memory'] ?? 'off'),
+      warm: String(h['warm'] ?? 'off'),
       watcher: Boolean(h['watcher']),
       autopilot: Boolean(h['autopilot']),
       pending: c('pending'),

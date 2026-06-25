@@ -519,8 +519,13 @@ class _Handler(BaseHTTPRequestHandler):
                     "watcher": gx10._WATCHER_ENABLED,
                     "autopilot": gx10.AUTOPILOT_ENABLED,
                     "language": gx10.LANGUAGE,
+                    # #385: report the Cold (Mem0) AND Warm (Valkey) tiers SEPARATELY. `memory` was
+                    # Cold-only, so a silent Warm outage (Valkey unreachable → fail-soft no-op) read as a
+                    # healthy `memory: up` and could regress unnoticed; `warm` surfaces it.
                     "memory": ("off" if gx10._MEMORY is None
                                else ("up" if gx10._MEMORY.is_available() else "down")),
+                    "warm": ("off" if gx10._WARM is None
+                             else ("up" if gx10._WARM.is_available() else "down")),
                     "security": self.policy.summary(),
                     "sealed": self.sessions.is_sealed(),
                     "coders": _coders_health(),            # #452: compact bound/total for the 2s poller

@@ -66,9 +66,11 @@ services:
       GX10_SERVER_PORT: ${GX10_SERVER_PORT:-8100}
       GX10_LANGUAGE: ${GX10_LANGUAGE:-en}
       GX10_MEMORY_URL: ${GX10_MEMORY_URL:-}
-      # Warm tier (B0): the host-network orchestrator reaches the mem-valkey loopback publish at
-      # localhost:6379 → wired automatically under `--profile memory`. Fail-soft: with valkey absent
-      # the tier is a no-op (one failed connect, then disabled). Override/disable via GX10_WARM_URL.
+      # Warm tier (B0): a CO-LOCATED (server-mode) orchestrator reaches the mem-valkey loopback publish at
+      # localhost:6379 → wired automatically under `--profile memory`. Fail-soft: with valkey absent the
+      # tier is a no-op (one failed connect, then disabled). The Warm tier FOLLOWS THE ORCHESTRATOR (#385,
+      # Decision D-Valkey): a local-mode orchestrator on another machine sets GX10_WARM_URL to this host's
+      # LAN address (loopback is the ideal; a LAN hop is acceptable) — see the loopback-only port note below.
       GX10_WARM_URL: ${GX10_WARM_URL:-redis://localhost:6379}
       GX10_WORKDIR: /work
     volumes:
@@ -137,7 +139,11 @@ services:
     restart: unless-stopped
     command: ["valkey-server", "--appendonly", "yes", "--save", "60", "1000"]
     ports:
-      - "127.0.0.1:6379:6379"          # loopback only — the host orchestrator reaches it, never the LAN
+      # Loopback only by default (safe — a co-located/server-mode orchestrator reaches it here). To serve a
+      # local-mode orchestrator on ANOTHER machine (#385): bind on the LAN AND add `--requirepass <secret>`
+      # to the command above (Valkey has no default auth) + firewall-pin to that desktop. Keep the default
+      # loopback unless you have done both — never expose an unauthenticated Valkey on the LAN.
+      - "127.0.0.1:6379:6379"
     volumes:
       - valkey-data:/data
     healthcheck:

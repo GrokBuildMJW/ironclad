@@ -1,6 +1,7 @@
 /**
- * Pinned status footer — model · conn · mem · watch · auto · tasks · perf. Mirrors cli.py's
- * _footer() content with the same palette. `mem` reflects /health.memory (up/down/off).
+ * Pinned status footer — model · conn · mem · warm · watch · auto · tasks · perf, with the same palette.
+ * `mem` reflects /health.memory (Cold/Mem0) and `warm` reflects /health.warm (Warm/Valkey), each up/down/off
+ * (#385).
  */
 import React from 'react';
 import {Box, Text} from '../render/ink-compat.js';
@@ -18,6 +19,8 @@ function Sep(): React.ReactElement {
 export function Footer({st}: {st: StatusState}): React.ReactElement {
   // memory tri-state: up = reachable (green), down = configured-but-unreachable (red), off = none (dim)
   const memColor = st.memory === 'up' ? SUCCESS : st.memory === 'down' ? ERROR : DIM;
+  // #385: the Warm (Valkey) tier shown separately so an outage can't hide behind Cold's `mem up`.
+  const warmColor = st.warm === 'up' ? SUCCESS : st.warm === 'down' ? ERROR : DIM;
   return (
     <Box>
       <Text bold color={ACCENT}>
@@ -33,6 +36,10 @@ export function Footer({st}: {st: StatusState}): React.ReactElement {
       <Text color={memColor}>{st.memory === 'off' ? '○' : '●'}</Text>
       <Text color={DIM}> mem </Text>
       <Text color={memColor}>{st.memory}</Text>
+      <Sep />
+      <Text color={warmColor}>{st.warm === 'off' ? '○' : '●'}</Text>
+      <Text color={DIM}> warm </Text>
+      <Text color={warmColor}>{st.warm}</Text>
       <Sep />
       <Dot on={st.watcher} />
       <Text color={DIM}> watch </Text>

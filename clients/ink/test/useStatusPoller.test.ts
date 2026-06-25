@@ -9,7 +9,7 @@ function srvOf(health: () => Promise<Json>, tasks: () => Promise<Json[]>): Serve
 
 test('pollStatus maps /health + /tasks into status fields', async () => {
   const s = srvOf(
-    async () => ({ok: true, model: 'qwen', memory: 'up', watcher: true, autopilot: false}),
+    async () => ({ok: true, model: 'qwen', memory: 'up', warm: 'down', watcher: true, autopilot: false}),
     async () => [{status: 'pending'}, {status: 'pending'}, {status: 'done'}],
   );
   const f = await pollStatus(s);
@@ -17,6 +17,7 @@ test('pollStatus maps /health + /tasks into status fields', async () => {
   assert.equal(f.connected, true);
   assert.equal(f.model, 'qwen');
   assert.equal(f.memory, 'up');
+  assert.equal(f.warm, 'down');                          // #385: Warm tier mapped separately from Cold
   assert.equal(f.watcher, true);
   assert.equal(f.pending, 2);
   assert.equal(f.done, 1);

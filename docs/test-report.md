@@ -9,9 +9,9 @@
 
 | | |
 |---|---|
-| Automated tests (offline, no model) | **1591 passed** |
+| Automated tests (offline, no model) | **1592 passed** |
 | Live smoke tests (skipped without a model) | **9** |
-| **Total Python** | **1600** |
+| **Total Python** | **1601** |
 | TypeScript client tests (`node:test`) | **359 passed** (363 total, 4 skipped) |
 | Full agentic loop, end to end, with a **real** code-agent | **verified** |
 | Issues found during the campaign | **1 functional gap + 5 review findings — all found and fixed** (see below) |
@@ -24,7 +24,7 @@ default** and only runs when pointed at a real server.
 
 ```bash
 # 1) offline suite — deterministic, no model needed
-pytest -q                                   # from core/  → 1591 passed, 9 skipped
+pytest -q                                   # from core/  → 1592 passed, 9 skipped
 
 # 2) live smoke — against your own running orchestrator
 GX10_LIVE_URL=http://<your-host>:8100 pytest -k live -q     # 9 passed
@@ -33,46 +33,48 @@ GX10_LIVE_URL=http://<your-host>:8100 pytest -k live -q     # 9 passed
 
 ## Coverage by area
 
-Counts below are reproduced from `pytest --collect-only` (2026-06-22) and sum to
-the **1600** total (1591 offline + 9 live) — now includes the MPR core built-in suite.
+The breakdown below groups the suite by capability area and sums to
+the **1601** total (1592 offline + 9 live). It is a high-level view of internal QA
+coverage; the granular test names and the maintainers' internal tracker are
+intentionally not enumerated here.
 
-| Area | Test files | Tests |
-|------|-----------|-------|
-| **Agent-Contract-Kernel** (schema SSOT, validate→reask, constrained emission, registry) | `registry`, `case_spec`, `constrained_emission`, `validated_emit`, `engine_ack_gate`, `lodestar_tracking` | 87 |
-| **Function-calling robustness** (tool-arg validate→reask, model-agnostic recovery) | `tool_args`, `tool_extract` | 24 |
-| **Server / client split & security** (HTTP surface, trust profiles, sessions, sealing, config tree + runtime config, command router, doctor, catalogue endpoint, server-side tool bridge, fail-closed /feedback agent #449, GET /coders + /health coders block + probe-cache TTL #452, [agent] routing-provenance frames + live coder indicator #453, runtime agent pin: effective-agent override + POST /coders + reconciler feedback-discovery across pin changes #454, budget-exhausted circuit-breaker + equal-peer failover + /feedback classification #455, task_class derivation + task_class-scoped failover capability matrix #456, /coders shows onboarded-but-disabled agents #460, /pending carries the sealed-gated Memory-MCP launch fields #480) | `server_split`, `security`, `config_tree`, `config_runtime`, `commands`, `doctor_endpoint`, `catalogue_endpoint`, `tool_bridge`, `session_persist` | 116 |
-| **Provider-router / dispatch (P0)** (backend registry, routing policy, artifact routing, spill/fallback, setup-types, Codex-is-external sovereignty #442, dispatcher.snapshot for /coders #452, SOFT distinct-reviewer anti-affinity: `excluded_provider_ids` + `distinct_reviewer` provenance, waive-vs-apply, no-op exclusion stays None, sovereignty outranks it #457, first-class web search through the provider lane: has_web_provider gate + web_search routes needs_web/PUBLIC to the captured CLI runner, never a non-web provider, must be an enabled EXTERNAL CLI with a runnable-web fallback (effort-independent), fail-soft #459) | `dispatch`, `router`, `providers`, `providers_config`, `artifact_routing`, `offload_topology` | 89 |
-| **Web search & current-info routing** (#459, §4 / FORK-H — fixes #447: the `web_search` tool gating + handler run server-side via the captured runner, the current-info intent classifier (EN+DE, no bare "current"/"aktuell") + proactive per-turn steer, the fail-closed execute_command shell guardrail fired server-side before the bridge + mirrored into the Ink client for the /sh path (remote-fetch command-position deny-list + long-running + web_search redirect) + PowerShell `$ProgressPreference` hardening) | `websearch` | 50 |
-| **Memory & context** (Mem0 client, chunking, RAG, summary, bounded summarizer input, deep query, vault reconcile, warm tier, token-budgeted handover brief: body-keyed + relational + warm summary, dedup/trim/fail-soft + capped relational timeout + newline-aware budget + explicit-timeout passthrough #458) | `memory`, `memory_chunking`, `worker_memory`, `context_rag`, `context_summary`, `summary_input_bound`, `deep_query`, `reconcile_vault`, `warm` | 98 |
-| **Read-only Memory MCP** (#480, §FORK-G D2 — a dependency-free stdio JSON-RPC server: initialize/tools-list/tools-call, read-only `memory_search`+`memory_deep_query` (no write), notifications + garbage-safe serve loop, fail-soft; the sealed-gated launch renderer `render_mcp_launch` — sealed profile + memory + per-CLI mcp_template only, secret-free env, forward-slash JSON path) | `memory_mcp` | 10 |
-| **Open plugin surface** (discover + expose `skills/*` plugins, no core patch) | `plugins` | 7 |
-| **Extension SDK** (`ack.sdk` curated surface: `__all__` contract, re-export identity, gate/schema/assemble via SDK) | `sdk` | 7 |
-| **Packaged-plugin loading** (`ironclad.plugins` entry-point: root resolution, additive load, fail-soft) | `entrypoint_loader` | 10 |
-| **Export-leak guard** (internal plugin repo forbidden in boundary+export; synthetic-leak flagged; real tree clean) | `export_leak_guard` | 4 |
-| **Example plugin** (shipped separate-repo example: discovers+runs via loader, schema matches SDK, passes its own `ack.sdk.gate` via a sibling test) | `example_plugin`, `reverse` | 6 |
-| **Playbook skill kind** (SKILL.md parse/validate/discover, progressive disclosure, `use_skill`) | `playbook` | 15 |
-| **Skill generator** (spec → scaffold both kinds, schema-valid by construction) | `skillgen` | 7 |
-| **Skill library catalogue** (manifest index, semver, provenance, install/update) | `catalogue` | 6 |
-| **Skill registration gate** (tool doctor-preflight / playbook schema+check / prompt eval-gate, no unchecked code) | `gate` | 12 |
-| **Skill lifecycle end-to-end** (generate → gate → register → load → invoke, both kinds) | `skill_e2e` | 3 |
-| **Shared content i18n** (`ack.i18n` overlay loader, parameterized dir, fallback) | `i18n` | 6 |
-| **Core built-in loader** (always-on built-ins from a fixed dir; plugins additive) | `builtin_loader` | 4 |
-| **MPR core built-in** (router/registry/synthesis/audit/panels/templates/eval/packaging) | `skills/mpr/tests/*` | 381 |
-| **Prompt-library item** (`kind: prompt` parse/validate/discover + variable build) | `prompt` | 7 |
-| **Multilingual prompt assembly** (template + values → target language via ack.i18n) | `promptgen` | 6 |
-| **Prompt slash surface & elicitation** (`use_prompt` list → guided ask-next → assemble + lang) | `prompt_cmd` | 9 |
-| **Curated prompt library** (7 shipped starter prompts discover + gate + assemble EN/DE, drop-MD adds) | `prompt_library` | 24 |
-| **Discovery commands** (`/prompts`, `/skills` list the one loaded registry) | `discovery_cmds` | 6 |
-| **Per-item prompt invocation** (`/<prompt-name>` resolve + parse + elicit/assemble) | `prompt_invocation` | 14 |
-| **Orchestration state** (TaskStore lifecycle/dedup, initiative, autoplan, state e2e) | `taskstore`, `initiative`, `autoplan`, `state_e2e` | 45 |
-| **Parallelism** (governed fan-out, in-engine tool, single-writer reduce, parallel router) | `workers`, `parallel_tool`, `worker_reduce`, `parallel_router` | 29 |
-| **Thin client + BYO code-agent** (agent pool, `GX10_AGENT_CMD` template incl. Codex exec shape #442 + `{feedback}` capture + stale-capture cleanup #443, managed transport; config-driven code-agent registry #449: `code_agents` pool keyed by `agent_id`, unknown-agent fail-closed, letters-only filename-token round-trip vs both regexes, server resolves the full spec / client renders it, dynamic handover schema enum, client-override precedence; per-agent boot probe #451: PATH-shim-else-glob-newest bin resolution, cli-available iff any enabled agent resolves; budget-exhausted result classifier #455: layered JSON→stderr→exit on raw stderr only, real feedback wins, conservative unknown=task-failed; onboarded-but-disabled agent #460: enabled:false ⇒ inert (not in names/has/resolve/by_id, never a failover peer) but visible via all_ids/spec_of, still validated; #480 `{mcp}` multi-token argv placeholder) | `client_pool`, `client_transport`, `code_agent_registry` | 85 |
-| **Runtime-aware output & language** (encoding safety, color gating, reply language) | `output`, `language` | 14 |
-| **Token budget / context trimming** (token-accurate budgeting: vLLM `/tokenize` seam + calibrated char fallback, real-token RAG budget, token-accurate trim with tools/output reserve; pre-flight overflow guard + emergency whole-round trim → `ContextOverflowError`; live max_model_len discovery from /v1/models at boot) | `token_budget`, `token_counter`, `preflight_guard`, `model_len_discovery` | 56 |
-| **Misc** (manual cat tool, orchestrator version) | `manual_cat`, `version` | 7 |
-| **Demo vessel** (example workspace doctor preflight) | `demo_vessel` | 1 |
-| **Docs & process** (doc-reality-audit + roadmap generator + process-doctor invariants (+ phase-2b cross-cutting: marker-key-requires-walk / deliver-dial-stays-supervised / required-checks-ssot-protected / delivery-pending-resolves / ledger-chain-intact) + export-sync + test-count generator + pre-push staged-export verification (export-sync prevention) + machine-gated dev-loop spec + structured guards (incl. ci.yml Actions-economy parity: PR-only + folded-job list-mapping) + coupling guards (self-mod protected class incl. public delivery-integrity workflows) + worktree isolation + driver state machine + transition ledger + guard-evidence marker/reconciler + merge-walk (delivery-surface DATA + HWM + ledger-chain-verified stamper, stamp-fail-open surfaced) + on-merge verifier + abort/rollback teardown + credential contract/tool-fence + push-credential containment (scratch git/gh credential discovery + refuse_to_start scope gate) + supervised gate/GO-token/dial + GO-gated DELIVER credential lane (tree/version-bound single-use GO + gated execute) + MERGE->DELIVER driver leg (deliver_release + DeliverOps + merged-vs-published split) + resume/idempotency + loop economics/autopilot reconciliation + end-to-end integration + composed-gate execution e2e + DELIVER composer (deliver_plan + delivery-gate commands + release-staging primitive) + clean-room PRE-publish proof runner + Test-PyPI target descriptor + Produce≠Apply branch commit + runnable engine CLI (real gate + scrubbed agent env + marker-key activation seam: grandfather-HWM + interlock) + upstream round-trip close-out verify (fail-closed; source-lane re-admit; blocking-label SSOT) + DELIVERED-PENDING watcher (async smoke+round-trip flip / yank-candidate / delivery-stage poison-cap / published-from-ledger) + epic-completion trigger (epic-bundled DELIVER, fail-closed on unmerged/blocked/no-C2) + operator GO-mint seam (release_index-bound DELIVER GO so a Test-PyPI GO is rejected for production) + DELIVERED-PENDING completion gate (run.py --complete-delivery: push-time delivered-pending, terminal delivered only on green smoke + closed round-trip, fail-closed + idempotent; DELIVER-leg deliver_scope refusal; log-seam ledger persistence) + Test-PyPI index routing (separate-repo release_repo + IRONCLAD_REPO push routing + repo-scoped publish.yml repository-url + release_preflight --index-url) + Test-PyPI-FIRST machine guard (production refused until a terminal Test-PyPI DELIVERED for the version is in the ledger) + release-preflight first-publish 404 (a fresh index returns 404 = no versions = safe first publish, not fail-closed-unreachable) + DELIVER bash resolution (Windows: a full Git-Bash path, not the System32 WSL shim) + scheduled-workflow liveness + no-stdlib-shadow invariant + launcher stops the local engine on /exit (#428) + board In Review/Blocked reconcilers (status/blocked label ⟺ Blocked, open linked PR ⟺ In Review; #278) + engine-cut release notes from the CHANGELOG section (#432) + C0-bypass guards (epic-has-bracket-title / ready-is-decomposed / ready-has-c0-marker; #446) + standard-method markers (ready-has-verbatim-requirements / ready-has-coverage-matrix; #464) + review-distinct-reviewer invariant (route_one keeps the SOFT anti-affinity: excluded_provider_ids consumed + distinct_reviewer provenance emitted; #457) + node-version-matrix invariant (node-client CI validates the engines minimum Node 22 AND the shipped desktop Node 24; #448), negative tests) | `doc_audit`, `gen_roadmap`, `process_doctor`, `export_sync_check`, `export_secret_gate`, `release_preflight`, `clean_room`, `gen_test_counts`, `required_checks`, `deploy_consistency`, `launcher_teardown`, `devloop_spec`, `devloop_guards`, `devloop_coupling`, `devloop_worktree`, `devloop_driver`, `devloop_ledger`, `devloop_marker`, `devloop_abort`, `devloop_credentials`, `devloop_dial`, `devloop_deliver`, `devloop_resume`, `devloop_economics`, `devloop_e2e`, `devloop_e2e_core`, `devloop_run`, `devloop_lock`, `devloop_selection`, `devloop_roundtrip`, `devloop_watcher`, `devloop_completion` | 346 |
-| **Live smoke** (real model, all endpoints) | `live_smoke` | 9 |
+| Area | Tests |
+|------|-------|
+| **Agent-Contract-Kernel** — schema SSOT, validate→reask, constrained emission, capability registry | 87 |
+| **Function-calling robustness** — tool-argument validation and model-agnostic call recovery | 24 |
+| **Server / client split & security** — HTTP surface, trust profiles, sessions, sealing, the config tree + runtime config, command router, doctor, catalogue endpoint, the server-side tool bridge, and the coders / health observability blocks | 117 |
+| **Provider-router / dispatch** — backend registry, routing policy, artifact routing, spill / fallback, setup-type resolution, reviewer anti-affinity, and first-class web-search routing | 89 |
+| **Web search & current-info routing** — the web-search tool gating + handler, the current-info intent classifier (English + German), and a fail-closed shell guardrail | 50 |
+| **Memory & context** — Mem0 client, chunking, RAG, the rolling summary, bounded summarizer input, deep query, vault reconcile, the warm tier, and the token-budgeted handover brief | 98 |
+| **Read-only Memory MCP** — a dependency-free stdio JSON-RPC server exposing project memory as read-only search + deep-query tools, with a sealed-gated launch | 10 |
+| **Open plugin surface** — discover and expose `skills/*` plugins with no core patch | 7 |
+| **Extension SDK** — the curated public `ack.sdk` surface (contract, re-export identity, gate / schema / assemble) | 7 |
+| **Packaged-plugin loading** — the `ironclad.plugins` entry point (root resolution, additive load, fail-soft) | 10 |
+| **Export-leak guard** — internal artifacts kept out of the boundary and the public export | 4 |
+| **Example plugin** — the shipped separate-repo example: discovers and runs via the loader and passes its own gate | 6 |
+| **Playbook skill kind** — `SKILL.md` parse / validate / discover, progressive disclosure | 15 |
+| **Skill generator** — spec → scaffold both skill kinds, schema-valid by construction | 7 |
+| **Skill library catalogue** — manifest index, semver, provenance, install / update | 6 |
+| **Skill registration gate** — doctor-preflight / schema-check / eval-gate, no unchecked code | 12 |
+| **Skill lifecycle end-to-end** — generate → gate → register → load → invoke | 3 |
+| **Shared content i18n** — the `ack.i18n` overlay loader (parameterized dir, fallback) | 6 |
+| **Core built-in loader** — always-on built-ins from a fixed dir; plugins additive | 4 |
+| **MPR core built-in** — router / registry / synthesis / audit / panels / templates / eval / packaging | 381 |
+| **Prompt-library item** — `kind: prompt` parse / validate / discover + variable build | 7 |
+| **Multilingual prompt assembly** — template + values → target language | 6 |
+| **Prompt slash surface & elicitation** — list → guided ask-next → assemble + language | 9 |
+| **Curated prompt library** — the shipped starter prompts: discover + gate + assemble (English + German) | 24 |
+| **Discovery commands** — `/prompts` and `/skills` list the one loaded registry | 6 |
+| **Per-item prompt invocation** — `/<prompt-name>` resolve + parse + elicit / assemble | 14 |
+| **Orchestration state** — task lifecycle / dedup, initiative, autoplan, state end-to-end | 45 |
+| **Parallelism** — governed fan-out, the in-engine tool, single-writer reduce, the parallel router | 29 |
+| **Thin client + BYO code-agent** — the agent pool, a configurable agent-command template, managed transport, the config-driven code-agent registry, a per-agent boot probe, result classification, and onboarded-but-disabled agents | 85 |
+| **Runtime-aware output & language** — encoding safety, color gating, reply language | 14 |
+| **Token budget / context trimming** — token-accurate budgeting, a pre-flight overflow guard with emergency trim, and live context-length discovery | 56 |
+| **Misc** — manual cat tool, orchestrator version | 7 |
+| **Demo vessel** — the example-workspace doctor preflight | 1 |
+| **Documentation & release integrity (internal QA)** — documentation-reality checks, the generated roadmap and test counts, export-sync verification, the clean-room pre-publish proof, deploy-consistency checks, and the maintainers' release-process guards | 346 |
+| **Live smoke** — real model, all endpoints | 9 |
 
 ## Live end-to-end verification
 
@@ -88,7 +90,7 @@ the task snapshot, governed fan-out (concurrent, measured speedup), input valida
 **The full agentic loop — the headline flow — end to end:**
 
 1. A chat turn makes the orchestrator plan and `stage_handover` a task (its `task_json`
-   validated through the ACK contract gate) → task **KGC-1** created, handover staged.
+   validated through the ACK contract gate) → a task is created and the handover staged.
 2. The thin client pulls `/pending`, runs the local code-agent against a local working
    copy, and uploads the result via `/feedback`.
 3. The server's reconciler advances the task → **done**.
