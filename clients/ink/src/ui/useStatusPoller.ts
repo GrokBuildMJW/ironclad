@@ -23,6 +23,7 @@ export interface StatusState {
   inProgress: number;
   done: number;
   perf: string;
+  agent: string; // #453: which coder was last routed (pushed from the stream, like perf)
 }
 
 export const EMPTY_STATUS: StatusState = {
@@ -35,10 +36,11 @@ export const EMPTY_STATUS: StatusState = {
   inProgress: 0,
   done: 0,
   perf: '',
+  agent: '',
 };
 
-/** The status fields derived from one /health + /tasks fetch (perf is pushed separately). */
-export type StatusFields = Omit<StatusState, 'perf'>;
+/** The status fields derived from one /health + /tasks fetch (perf + agent are pushed separately). */
+export type StatusFields = Omit<StatusState, 'perf' | 'agent'>;
 
 /** One poll: map /health + /tasks into status fields, or `null` on ANY error (→ caller keeps the
  *  previous state and only marks it disconnected — the coalescing guarantee). Never throws. */
@@ -69,10 +71,14 @@ export function nextConnState(prev: boolean, upd: StatusFields | null): {connect
   return {connected: now, reconnected: now && !prev};
 }
 
-export function useStatusPoller(srv: Server, intervalMs = 2000): [StatusState, (perf: string) => void] {
+export function useStatusPoller(
+  srv: Server,
+  intervalMs = 2000,
+): [StatusState, (perf: string) => void, (agent: string) => void] {
   const [st, setSt] = useState<StatusState>(EMPTY_STATUS);
   const wasConnected = useRef(false);
   const setPerf = (perf: string): void => setSt((s) => ({...s, perf}));
+  const setAgent = (agent: string): void => setSt((s) => ({...s, agent})); // #453
 
   useEffect(() => {
     let live = true;
@@ -94,5 +100,5 @@ export function useStatusPoller(srv: Server, intervalMs = 2000): [StatusState, (
     };
   }, [srv, intervalMs]);
 
-  return [st, setPerf];
+  return [st, setPerf, setAgent];
 }

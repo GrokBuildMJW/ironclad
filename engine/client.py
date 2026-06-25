@@ -49,7 +49,7 @@ from concurrent.futures import Future, ThreadPoolExecutor, wait
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from commands import HELP_TEXT, classify, setup_output
+from commands import HELP_TEXT, build_agent_argv, classify, setup_output
 
 # Default is localhost (secret-free); the real server address (e.g. the box on the
 # LAN) comes from GX10_SERVER_URL / --server — private via conf/, never hard-coded here.
@@ -79,11 +79,22 @@ CLAUDE_PERMISSION_MODE = os.environ.get("GX10_CLAUDE_PERMISSION_MODE", "acceptEd
 #: prompt (read the handover, do the task, write the feedback file). See docs/code-agents.md.
 DEFAULT_AGENT_CMD = ("{bin} --model {model} --effort {effort} "
                      "--permission-mode {permission} --print {prompt}")
-AGENT_CMD = os.environ.get("GX10_AGENT_CMD") or DEFAULT_AGENT_CMD
+#: #449 (review B round 4): the RAW client-side overrides (None when unset) — an EXPLICIT
+#: ``GX10_AGENT_CMD``/``GX10_CLAUDE_BIN`` is the documented single-agent BYO path and must WIN over the
+#: server-resolved registry spec (otherwise the default server's OPUS/SONNET template would make the
+#: documented client-side override unreachable). When unset, the server spec is authoritative.
+AGENT_CMD_OVERRIDE = os.environ.get("GX10_AGENT_CMD") or None
+CLAUDE_BIN_OVERRIDE = os.environ.get("GX10_CLAUDE_BIN") or None
+AGENT_CMD = AGENT_CMD_OVERRIDE or DEFAULT_AGENT_CMD
 #: Max local code-agents running at once. Each is heavy → conservative default; override
 #: with GX10_MAX_AGENTS.
 DEFAULT_MAX_AGENTS = int(os.environ.get("GX10_MAX_AGENTS", "3"))
-_MODEL_BY_AGENT = {"OPUS": "claude-opus-4-8", "SONNET": "claude-sonnet-4-6"}
+#: #455: how much of a code-agent's stderr to upload for the server-side exhausted classifier (a
+#: bounded tail — the budget/quota signal is at the end; never ship an unbounded log over the wire).
+_STDERR_TAIL_CHARS = 4000
+# #449: the client-side OPUS/SONNET→model table is retired. The server now resolves the agent's
+# full spec (bin/cmd_template/model/effort/permission) from the config-driven registry and ships it
+# in the /pending item; this client only renders what it is sent (see _run_handover).
 
 # --------------------------------------------------------------------------- #
 # Inline presentation — colour the REPL like a real CLI (Claude-Code-style),
@@ -126,24 +137,6 @@ def _print_banner(srv: "Server", h: Dict[str, Any], codedir: Path, max_agents: i
     print(_c("    /help · commands   ·   exit · quit   ·   Strg+C · cancel turn", "gray"))
 
 
-def _build_agent_argv(template: str, *, bin: str, model: str, effort: str,
-                      permission: str, prompt: str) -> List[str]:
-    """Render a code-agent command template into an argv list. Tokens are split with
-    shlex (POSIX), then placeholders are substituted **per token** so ``{prompt}`` (which
-    contains spaces) stays exactly one argument. Unknown ``{x}`` are left as-is."""
-    subs = {"bin": bin, "model": model, "effort": effort,
-            "permission": permission, "prompt": prompt}
-    argv: List[str] = []
-    for tok in shlex.split(template):
-        if tok.startswith("{") and tok.endswith("}") and tok[1:-1] in subs:
-            argv.append(str(subs[tok[1:-1]]))          # whole token is a placeholder
-        else:
-            for k, v in subs.items():                  # placeholder(s) embedded in token
-                tok = tok.replace("{" + k + "}", str(v))
-            argv.append(tok)
-    return argv
-
-
 def default_cli_runner(spec, prompt: str, *, effort: str, max_tokens: Optional[int] = None,
                        timeout: Optional[float] = None) -> Dict[str, Any]:
     """CLI substrate for the provider dispatcher (MPR P0 §5.2) — CLIENT-lane.
@@ -154,7 +147,7 @@ def default_cli_runner(spec, prompt: str, *, effort: str, max_tokens: Optional[i
     Returns the same result shape as ``workers._one`` so aggregation is uniform. Never raises.
     ``permission_mode`` has one source: ``spec.permission_mode`` or ``CLAUDE_PERMISSION_MODE``.
     """
-    argv = _build_agent_argv(
+    argv = build_agent_argv(
         getattr(spec, "cmd_template", None) or AGENT_CMD,
         bin=getattr(spec, "bin", None) or CLAUDE_BIN,
         model=spec.model,
@@ -304,9 +297,19 @@ class Server:
     def pending(self) -> List[Dict[str, Any]]:
         return self._req("GET", "/pending").get("pending", [])
 
-    def feedback(self, task_id: str, agent: str, content: str) -> Dict[str, Any]:
+    def coders(self) -> Dict[str, Any]:
+        return self._req("GET", "/coders")
+
+    def set_coder_pin(self, agent: str) -> Dict[str, Any]:
+        return self._req("POST", "/coders", {"agent": agent})
+
+    def feedback(self, task_id: str, agent: str, content: str,
+                 exit_code: Optional[int] = None, stderr: str = "") -> Dict[str, Any]:
+        # #455: also report the raw run signal (exit code + a stderr tail) so the server can classify
+        # a budget-exhausted run and fail over. Back-compatible: omitted ⇒ today's feedback-only post.
         return self._req("POST", "/feedback",
-                         {"task_id": task_id, "agent": agent, "content": content})
+                         {"task_id": task_id, "agent": agent, "content": content,
+                          "exit_code": exit_code, "stderr": stderr})
 
 
 # --------------------------------------------------------------------------- #
@@ -441,8 +444,16 @@ def _run_handover(item: Dict[str, Any], codedir: Path, log=print) -> Optional[st
     ho_dir.mkdir(parents=True, exist_ok=True)
     (ho_dir / ho_name).write_text(ho_text, encoding="utf-8")
 
-    model = item.get("model") or _MODEL_BY_AGENT.get(agent, "claude-opus-4-8")
+    # #449 (C0R-9): the SERVER resolves the agent's full spec from the config-driven registry and
+    # ships it in the item — the client is a THIN RENDERER (no client-side registry, no agent→model
+    # table). Precedence per field: an EXPLICIT client-side override (GX10_AGENT_CMD / GX10_CLAUDE_BIN —
+    # the documented single-agent BYO path, review B round 4) > the server spec > the Claude default.
+    # So a default server's OPUS/SONNET template never makes a deliberate client override unreachable.
+    model = item.get("model") or "claude-opus-4-8"
     effort = item.get("effort") or DEFAULT_EFFORT
+    bin_ = CLAUDE_BIN_OVERRIDE or item.get("bin") or CLAUDE_BIN
+    template = AGENT_CMD_OVERRIDE or item.get("cmd_template") or DEFAULT_AGENT_CMD
+    permission = item.get("permission") or CLAUDE_PERMISSION_MODE
     # CLI-agnostic prompt: the feedback-file convention is stated HERE (not via a
     # Claude-only .claude/CLAUDE.md), so any headless code-agent can fulfil the contract.
     fb_name = f"{tid}_{agent}-feedback.md"
@@ -451,25 +462,60 @@ def _run_handover(item: Dict[str, Any], codedir: Path, log=print) -> Optional[st
               f"(e.g. AGENTS.md / CLAUDE.md). When done, write a short result summary to "
               f".ironclad/agent/feedback/{fb_name}.")
 
-    argv = _build_agent_argv(AGENT_CMD, bin=CLAUDE_BIN, model=str(model),
-                             effort=str(effort), permission=CLAUDE_PERMISSION_MODE,
-                             prompt=prompt)
+    # #443 (FORK-A2=C, hybrid): a deterministic result-capture path for the {feedback} token. An agent
+    # whose template uses it (e.g. Codex `-o {feedback}`) writes its FINAL message here; if the agent
+    # never writes the in-prompt feedback file, we fall back to this capture. Relative to codedir (the
+    # agent's cwd); Claude's default template omits {feedback} and is unaffected.
+    cap_rel = f".ironclad/agent/feedback/{tid}_{agent}-output.md"
+    # #480: the server resolves the gated read-only Memory MCP (sealed profile only) into `mcp` (the
+    # {mcp} placeholder args) + `mcp_env` (the memory connection for the spawned MCP). Empty under
+    # open/token ⇒ the launch is byte-identical to today; the client only renders what the server sent.
+    argv = build_agent_argv(template, bin=bin_, model=str(model),
+                            effort=str(effort), permission=permission,
+                            prompt=prompt, feedback=cap_rel, mcp=str(item.get("mcp") or ""))
+    # #443 (review F-1): the result paths are deterministic per (tid, agent) and the codedir persists
+    # across re-runs (a no-feedback handover is unclaimed + retried). Unlink BOTH before launching so a
+    # stale file from a prior failed attempt can never be read as THIS run's result.
+    fb_dir = codedir / ".ironclad" / "agent" / "feedback"
+    fb_dir.mkdir(parents=True, exist_ok=True)
+    fb_path = fb_dir / f"{tid}_{agent}-feedback.md"
+    cap_path = fb_dir / f"{tid}_{agent}-output.md"
+    fb_path.unlink(missing_ok=True)
+    cap_path.unlink(missing_ok=True)
     log(f"  → code-agent (local): {tid} ({agent}, {model}, effort={effort})  cwd={codedir}")
+    # #480: the spawned MCP (a sub-subprocess of the agent CLI) inherits the memory connection from the
+    # agent's env — the connection travels here, NEVER on the MCP JSON-RPC wire (secret-free).
     env = {**os.environ, "PYTHONIOENCODING": "utf-8"}
+    mcp_env = item.get("mcp_env")
+    if isinstance(mcp_env, dict):
+        env.update({str(k): str(v) for k, v in mcp_env.items()})
     try:
-        proc = subprocess.run(argv, cwd=str(codedir), env=env,
-                              stdin=subprocess.DEVNULL, text=True)
+        # #455: capture stderr (and still surface it) so the server can classify a budget/quota
+        # exhausted run as `agent-unavailable` and fail over instead of retrying forever.
+        proc = subprocess.run(argv, cwd=str(codedir), env=env, stdin=subprocess.DEVNULL,
+                              text=True, stderr=subprocess.PIPE)
     except FileNotFoundError:
         log(f"  ✗ code-agent binary '{argv[0] if argv else CLAUDE_BIN}' not found "
             f"(set GX10_CLAUDE_BIN / GX10_AGENT_CMD) — handover {tid} skipped")
-        return None
+        return None, {"exit_code": None, "stderr_tail": "binary-not-found"}
     rc = proc.returncode
+    stderr = getattr(proc, "stderr", "") or ""            # real proc captures it; tolerant of stubs
+    if stderr.strip():
+        log(stderr.rstrip())                                  # keep the agent's stderr visible
+    meta = {"exit_code": rc, "stderr_tail": stderr[-_STDERR_TAIL_CHARS:]}
 
-    fb_path = codedir / ".ironclad" / "agent" / "feedback" / f"{tid}_{agent}-feedback.md"
     if fb_path.exists():
-        return fb_path.read_text(encoding="utf-8")
-    log(f"  ⚠ claude exited (exit {rc}) without a feedback file {fb_path.name}")
-    return None
+        return fb_path.read_text(encoding="utf-8"), meta
+    # #443 hybrid fallback: the agent didn't write the feedback file — use its captured final message
+    # (`-o {feedback}`, written THIS run since we unlinked stale copies above) if present, so a forgotten
+    # feedback file no longer yields a silent no-feedback retry.
+    if cap_path.exists():
+        text = cap_path.read_text(encoding="utf-8")
+        if text.strip():
+            log(f"  ⓘ no feedback file {fb_path.name}; using the captured final message {cap_path.name}")
+            return text, meta
+    log(f"  ⚠ agent exited (exit {rc}) without a feedback file {fb_path.name} or a captured message")
+    return None, meta
 
 
 def _process_one(srv: Server, codedir: Path, item: Dict[str, Any], claimed: set,
@@ -479,12 +525,20 @@ def _process_one(srv: Server, codedir: Path, item: Dict[str, Any], claimed: set,
     tid = item.get("id") or ""
     agent = (item.get("agent") or "OPUS").upper()
     try:
-        fb = _run_handover(item, codedir, log=log)
-        if fb:
-            res = srv.feedback(tid, agent, fb)
+        fb, meta = _run_handover(item, codedir, log=log)
+        # #455: ALWAYS report the run signal (even with no feedback) so the server can classify a
+        # budget-exhausted run → trip the breaker + fail over on the next poll, instead of retrying
+        # the same out-of-budget agent forever.
+        res = srv.feedback(tid, agent, fb or "",
+                           exit_code=meta.get("exit_code"), stderr=meta.get("stderr_tail", ""))
+        cls = res.get("classification")
+        if cls == "ok-feedback" or (cls is None and fb):
             log(f"  ✓ feedback uploaded: {tid} → {res.get('feedback_file')}")
             return True
-        log(f"  ⚠ {tid}: no feedback produced — will retry on the next poll")
+        if cls == "agent-unavailable":
+            log(f"  ⚠ {tid}: {agent} unavailable (budget/quota) → failing over to a peer on the next poll")
+        else:
+            log(f"  ⚠ {tid}: no feedback produced — will retry on the next poll")
     except urllib.error.URLError as e:
         log(f"  ✗ {tid}: upload/network failed: {e}")
     except Exception as e:  # noqa: BLE001
@@ -520,7 +574,7 @@ def _style_stream_line(line: str) -> str:
     """Lightly colour one streamed output line so the technical markers recede and the
     completion line stands out — without touching the answer body."""
     s = line.lstrip()
-    if "[perf]" in s:
+    if "[perf]" in s or "[agent]" in s:                  # #453: routing provenance recedes like [perf]
         return _c(line, "gray")
     if "===" in s and "DONE" in s:
         return _c(line, "green")
@@ -538,6 +592,54 @@ def _print_tasks(tasks: List[Dict[str, Any]]) -> None:
     for t in tasks:
         print(f"  {t.get('status','?'):11} {t.get('id','?'):10} "
               f"{t.get('type','?'):14} {t.get('title','')}")
+
+
+def http_error_msg(e: "urllib.error.HTTPError") -> str:
+    """Best-effort: the server's JSON ``{"error": …}`` from an HTTPError body (e.g. the friendly
+    'unknown agent …' from POST /coders), else the raw error. Shared by the clients (#454)."""
+    try:
+        return json.loads(e.read().decode()).get("error", str(e))
+    except Exception:
+        return str(e)
+
+
+def _print_coders(data: Dict[str, Any]) -> None:
+    """#452: render which coding agents are bound (● green) vs not found (○ red), then the fan-out
+    provider lane (active/spend + per-provider reachability + last routing reason)."""
+    coding = data.get("coding_agents") or []
+    pinned = data.get("pinned")
+    if pinned:
+        print(_c(f"  pinned: {pinned}", "cyan") + _c("  (/coders use auto to clear)", "gray"))
+    else:
+        print(_c("  routing: auto (orchestrator's staged agent per task)", "gray"))
+    if not coding:
+        print("  (no coding agents configured)")
+    for a in coding:
+        enabled = a.get("enabled", True)               # #460: False ⇒ onboarded but not yet activated
+        bound = a.get("bound")
+        dot = _c("◌", "gray") if not enabled else (_c("●", "green") if bound else _c("○", "red"))
+        is_pin = pinned and str(a.get("id", "")).upper() == str(pinned).upper()
+        if not enabled:
+            suffix = _c("  (onboarded · disabled)", "gray")
+        elif is_pin:
+            suffix = _c("  ← pinned", "cyan")
+        else:
+            suffix = "" if bound else _c("  (binary not found)", "gray")
+        print(f"  {dot} {str(a.get('id','?')):8} {a.get('model','—')}" + suffix)
+    prov = data.get("providers") or {}
+    pool = prov.get("pool") or []
+    if pool:
+        b = prov.get("budget") or {}
+        cap = b.get("usd_cap")
+        head = (f"  providers (fan-out): {'active' if prov.get('active') else 'inactive'}"
+                f"  ·  spent ${b.get('spent_usd', 0):.4f}")
+        if cap is not None:
+            head += f" / ${cap}"
+        print(_c(head, "gray"))
+        for p in pool:
+            dot = _c("●", "green") if p.get("reachable") else _c("○", "red")
+            tail = f"  ← {p.get('last_route_reason')}" if p.get("last_route_reason") else ""
+            print(f"    {dot} {str(p.get('id','?')):14} {str(p.get('kind','?')):9} {p.get('model','—')}{tail}")
 
 
 def repl(srv: Server, codedir: Path, max_agents: int = DEFAULT_MAX_AGENTS) -> None:
@@ -591,6 +693,20 @@ def repl(srv: Server, codedir: Path, max_agents: int = DEFAULT_MAX_AGENTS) -> No
                     for it in p:
                         print(f"  {it.get('id'):10} {it.get('agent','?'):7} "
                               f"{it.get('type','?'):14} {it.get('title','')}")
+                except urllib.error.URLError as e:
+                    print(f"  ✗ {e}")
+            elif name == "coders":
+                try:
+                    parts = payload.split()
+                    if len(parts) >= 2 and parts[1].lower() == "use":  # /coders use <id>|auto
+                        arg = parts[2] if len(parts) >= 3 else "auto"
+                        res = srv.set_coder_pin(arg)
+                        pin = res.get("pinned")
+                        print(_c(f"  → pinned coder: {pin}" if pin
+                                 else "  → coder pin cleared (auto: the staged agent per task)", "cyan"))
+                    _print_coders(srv.coders())
+                except urllib.error.HTTPError as e:
+                    print(f"  ✗ {http_error_msg(e)}")
                 except urllib.error.URLError as e:
                     print(f"  ✗ {e}")
             elif name == "work":

@@ -26,6 +26,7 @@ export const COMMANDS: readonly Command[] = [
   {name: 'help', scope: 'local', desc: 'this help'},
   {name: 'tasks', scope: 'local', desc: 'TaskStore overview'},
   {name: 'pending', scope: 'local', desc: 'staged handovers for local code-agents'},
+  {name: 'coders', scope: 'local', usage: '[use <id>|auto]', desc: 'which coding agents are bound/active (+ pin one at runtime)'},
   {name: 'work', scope: 'local', desc: 'run all open handovers ONCE locally (in parallel)'},
   {name: 'auto', scope: 'local', usage: 'on|off', desc: 'background poller for handovers'},
   {name: 'health', scope: 'local', desc: 'server status'},

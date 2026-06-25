@@ -50,6 +50,15 @@ test('MEM-16: registry derives LOCAL_COMMANDS + powers completions', () => {
   assert.equal(completions('zzz').length, 0); // no match
 });
 
+test('#452: /coders is a local command + offered in completions', () => {
+  assert.deepEqual(classify('/coders'), {kind: 'local', name: 'coders', payload: 'coders'});
+  assert.ok(LOCAL_COMMANDS.has('coders'), 'coders should be local');
+  assert.ok(
+    completions('cod').some((c) => c.name === 'coders' && c.scope === 'local'),
+    'coders should appear in slash autocomplete',
+  );
+});
+
 test('#147: /prompts + /skills are server discovery commands, in completions + help', () => {
   // forwarded to the orchestrator (slash stripped), like /status
   assert.deepEqual(classify('/prompts'), {kind: 'server', name: 'prompts', payload: 'prompts'});

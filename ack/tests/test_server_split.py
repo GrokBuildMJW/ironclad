@@ -182,6 +182,25 @@ def test_http_fanout_requires_prompts(tmp_path, monkeypatch):
         httpd.shutdown()
 
 
+def test_http_feedback_rejects_unknown_agent(tmp_path, monkeypatch):
+    # #449 (review B-6): /feedback is fail-closed — an unknown/missing agent is rejected (400), not
+    # silently defaulted to OPUS (which would drop a feedback file that never advances the task).
+    httpd, port = _start_server(monkeypatch, tmp_path)
+    try:
+        for bad in ({"task_id": "KGC-1", "agent": "BOGUS", "content": "x"},
+                    {"task_id": "KGC-1", "content": "x"}):          # missing agent
+            try:
+                _post(port, "/feedback", bad)
+                assert False, "expected HTTP 400"
+            except urllib.error.HTTPError as e:  # type: ignore[name-defined]
+                assert e.code == 400
+        # a configured agent still works
+        ok = _post(port, "/feedback", {"task_id": "KGC-1", "agent": "sonnet", "content": "done"})
+        assert ok["ok"] and ok["feedback_file"].endswith("KGC-1_SONNET-feedback.md")
+    finally:
+        httpd.shutdown()
+
+
 def test_http_chat_stream(tmp_path, monkeypatch):
     httpd, port = _start_server(monkeypatch, tmp_path)
     try:
@@ -221,3 +240,421 @@ def test_http_chat_requires_message(tmp_path, monkeypatch):
 
 
 import urllib.error  # noqa: E402  (used in the 400 assertion above)
+
+
+# ── #452: GET /coders + /health coders block ────────────────────────────────────────────────────
+def test_coders_snapshot_degrades_without_dispatcher(monkeypatch):
+    monkeypatch.setattr(gx10, "_DISPATCHER", None, raising=False)
+    snap = server._coders_snapshot()
+    ids = {a["id"] for a in snap["coding_agents"]}
+    assert {"OPUS", "SONNET"} <= ids                      # default registry coding agents
+    assert all("bound" in a and "model" in a for a in snap["coding_agents"])
+    assert snap["providers"]["active"] is False           # no dispatcher → degraded, never raises
+
+
+def test_coders_snapshot_shows_onboarded_disabled_agent(monkeypatch):
+    # #460: an onboarded-but-disabled agent (enabled:false, e.g. KIMI pending calibration) is INERT but
+    # appears in /coders as registered (enabled:false, bound:false) so the operator can see it.
+    cfg = gx10._code_defaults()
+    cfg["code_agents"]["pool"].append({
+        "provider_id": "kimi", "kind": "cli", "agent_id": "KIMI", "model": "kimi",
+        "bin": "kimi", "cmd_template": "{bin} -p {prompt}", "enabled": False})
+    monkeypatch.setattr(gx10, "_EFFECTIVE_CFG", cfg, raising=False)
+    monkeypatch.setattr(gx10, "_DISPATCHER", None, raising=False)
+    snap = server._coders_snapshot()
+    by = {a["id"]: a for a in snap["coding_agents"]}
+    assert by["OPUS"]["enabled"] is True
+    assert "KIMI" in by and by["KIMI"]["enabled"] is False and by["KIMI"]["bound"] is False  # onboarded, inert
+
+
+def test_coders_health_counts(monkeypatch):
+    monkeypatch.setattr(gx10, "_DISPATCHER", None, raising=False)
+    h = server._coders_health()
+    assert h["total"] >= 2 and 0 <= h["bound"] <= h["total"]
+
+
+def test_http_coders_and_health_block(tmp_path, monkeypatch):
+    httpd, port = _start_server(monkeypatch, tmp_path)
+    try:
+        d = _get(port, "/coders")
+        assert "coding_agents" in d and "providers" in d
+        assert {"OPUS", "SONNET"} <= {a["id"] for a in d["coding_agents"]}
+        h = _get(port, "/health")
+        assert "coders" in h and h["coders"]["total"] >= 2
+    finally:
+        httpd.shutdown()
+
+
+def test_probe_cache_reuses_within_ttl(monkeypatch):
+    # #452 (review A perf): /health re-derives the coders count every 2s — the boot probe is cached
+    # for a short TTL so the poll reuses it instead of stat-ing the filesystem each time.
+    import providers
+    monkeypatch.setattr(server, "_PROBE_CACHE", {"at": -1e9, "data": None}, raising=False)
+    calls = {"n": 0}
+    real = providers.probe_code_agents
+    monkeypatch.setattr(providers, "probe_code_agents",
+                        lambda reg: (calls.__setitem__("n", calls["n"] + 1), real(reg))[1])
+    server._probe_cached()
+    server._probe_cached()
+    assert calls["n"] == 1                                # second call served from cache (within TTL)
+    # an expired entry re-probes
+    server._PROBE_CACHE["at"] = -1e9
+    server._probe_cached()
+    assert calls["n"] == 2
+
+
+# ── #453: [agent] control frames (routing provenance → client footer) ────────────────────────────
+def test_emit_agent_frames(monkeypatch):
+    captured: list = []
+    monkeypatch.setattr(gx10, "_ui_print", lambda s, *a, **k: captured.append(s))
+    gx10._emit_agent_frames([
+        {"provider_id": "codex", "route_reason": "cheapest-capable", "ok": True},
+        {"provider_id": "codex", "route_reason": "cheapest-capable", "ok": True},   # dup → ONE frame
+        {"provider_id": "spark-vllm", "route_reason": "local-idle", "spilled": True, "ok": True},
+        {"ok": True},                                    # no provider_id (byte-identical fanout) → skipped
+    ])
+    text = "\n".join(captured)
+    assert text.count("[agent]") == 2                    # one frame per DISTINCT routed provider
+    assert "[agent] codex · cheapest-capable" in text
+    assert "[agent] spark-vllm · local-idle · spilled" in text
+
+
+def test_emit_agent_frames_failsoft(monkeypatch):
+    monkeypatch.setattr(gx10, "_ui_print", lambda *a, **k: None)
+    gx10._emit_agent_frames("not a list")                # never raises on a bad shape
+    gx10._emit_agent_frames([None, 42, {"route_reason": "x"}])   # malformed/no-id entries skipped
+
+
+def test_app_status_text_shows_coder_live():
+    # #453: the Textual client surfaces the live coder — in the spinner WHILE thinking (the spinner
+    # replaces the footer during a turn) and in the footer when idle.
+    import app as appmod
+    inst = appmod.IroncladApp.__new__(appmod.IroncladApp)
+    inst._status = {"model": "m", "connected": True, "watcher": False, "autopilot": False,
+                    "pending": 0, "in_progress": 0, "done": 0, "perf": "",
+                    "agent": "codex · cheapest-capable"}
+    inst._spin = 0
+    inst._think_t0 = 0.0
+    inst._thinking = True
+    assert "coder codex" in str(inst._status_text())     # live during the turn (spinner line)
+    inst._thinking = False
+    assert "coder codex" in str(inst._status_text())     # footer when idle
+    inst._status["agent"] = ""                           # #453 (review B): turn-start clear → no stale coder
+    inst._thinking = True
+    assert "coder" not in str(inst._status_text())
+    inst._thinking = False
+    assert "coder" not in str(inst._status_text())
+
+
+# ── #454: runtime agent switching (operator pin overrides the staged agent) ──────────────────────
+def test_effective_code_agent_pin_overrides(monkeypatch):
+    monkeypatch.setattr(gx10, "_EFFECTIVE_CFG", gx10._code_defaults(), raising=False)
+    assert gx10._effective_code_agent("OPUS") == "OPUS"        # no pin → staged
+    gx10._EFFECTIVE_CFG["code_agents"]["pinned"] = "SONNET"
+    assert gx10._effective_code_agent("OPUS") == "SONNET"      # pin overrides the staged agent
+    gx10._EFFECTIVE_CFG["code_agents"]["pinned"] = "BOGUS"     # unknown pin → fail-closed (staged)
+    assert gx10._effective_code_agent("OPUS") == "OPUS"
+    gx10._EFFECTIVE_CFG["code_agents"]["pinned"] = None
+    assert gx10._effective_code_agent("OPUS") == "OPUS"
+
+
+def test_set_coder_pin_validate_set_clear(monkeypatch):
+    monkeypatch.setattr(gx10, "_EFFECTIVE_CFG", gx10._code_defaults(), raising=False)
+    assert server._set_coder_pin("sonnet") == {"pinned": "SONNET"}
+    assert gx10._code_agent_pin() == "SONNET"
+    for clear in ("auto", "", None, "off"):
+        assert server._set_coder_pin(clear) == {"pinned": None}
+    import pytest as _pt
+    with _pt.raises(ValueError, match="unknown agent"):
+        server._set_coder_pin("bogus")
+
+
+def test_pending_handover_honors_pin(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    gx10.initiative_new("PinDemo", "software")
+    store = gx10._store()
+    store.create({"type": "feature", "priority": "high", "title": "wire", "description": "x"}, force=True)
+    tid = store.list("pending")[0]["id"]
+    ho_dir = gx10.handovers_dir()
+    ho_dir.mkdir(parents=True, exist_ok=True)
+    # staged OPUS WITH frontmatter (the orchestrator's model choice for OPUS)
+    (ho_dir / f"{tid}_OPUS.md").write_text("---\nto: claude-opus-4-8\neffort: xhigh\n---\nbody",
+                                           encoding="utf-8")
+    monkeypatch.setattr(gx10, "_EFFECTIVE_CFG", gx10._code_defaults(), raising=False)
+    gx10._EFFECTIVE_CFG["code_agents"]["pinned"] = "SONNET"            # operator pins SONNET
+    item = server._pending_handovers()[0]
+    assert item["agent"] == "SONNET"                                  # the pin overrode the staged OPUS
+    # #454 (review B): the pinned agent runs ITS OWN model — NOT the staged handover's `to:` frontmatter
+    assert item["model"] == "claude-sonnet-4-6"
+    assert item["effort"] == "high"                                  # SONNET's spec effort, not xhigh
+
+
+def test_http_coders_pin_set_clear_reject(tmp_path, monkeypatch):
+    httpd, port = _start_server(monkeypatch, tmp_path)
+    try:
+        monkeypatch.setattr(gx10, "_EFFECTIVE_CFG", gx10._code_defaults(), raising=False)
+        r = _post(port, "/coders", {"agent": "sonnet"})
+        assert r["ok"] and r["pinned"] == "SONNET"
+        assert _get(port, "/coders")["pinned"] == "SONNET"            # GET reflects the pin
+        r = _post(port, "/coders", {"agent": "auto"})
+        assert r["ok"] and r["pinned"] is None
+        try:
+            _post(port, "/coders", {"agent": "bogus"})
+            assert False, "expected HTTP 400"
+        except urllib.error.HTTPError as e:  # type: ignore[name-defined]
+            assert e.code == 400
+    finally:
+        httpd.shutdown()
+
+
+def test_reconciler_matches_pinned_agent_feedback(tmp_path, monkeypatch):
+    # #454: with a pin, the executing (effective) agent writes {tid}_{pin}-feedback.md — the reconciler
+    # must match it to the staged task (look for the EFFECTIVE agent's feedback, not only the staged one).
+    monkeypatch.chdir(tmp_path)
+    gx10.initiative_new("PinRec", "software")
+    store = gx10._store()
+    store.create({"type": "feature", "priority": "high", "title": "t", "description": "d",
+                  "assigned_to": "OPUS"}, force=True)
+    tid = store.list("pending")[0]["id"]
+    monkeypatch.setattr(gx10, "_EFFECTIVE_CFG", gx10._code_defaults(), raising=False)
+    gx10._EFFECTIVE_CFG["code_agents"]["pinned"] = "SONNET"
+    fb_dir = gx10.feedback_dir()
+    fb_dir.mkdir(parents=True, exist_ok=True)
+    (fb_dir / f"{tid}_SONNET-feedback.md").write_text("done", encoding="utf-8")   # effective-agent feedback
+    captured: list = []
+    seen: dict = {}
+    enq: set = set()
+    gx10._reconcile_once(store, lambda *a: captured.append(a), seen, enq)   # tick 1: records mtime
+    gx10._reconcile_once(store, lambda *a: captured.append(a), seen, enq)   # tick 2: mtime stable → enqueue
+    assert any(c[0] == tid and c[1] == "SONNET" for c in captured)   # advanced under the effective agent
+
+
+def test_reconciler_pin_change_falls_back_to_staged_feedback(tmp_path, monkeypatch):
+    # #454 (review A): the pin changed mid-handover (effective=SONNET) but the work completed under the
+    # STAGED agent (OPUS) — the reconciler falls back to {tid}_OPUS-feedback.md so the task still advances.
+    monkeypatch.chdir(tmp_path)
+    gx10.initiative_new("PinFb", "software")
+    store = gx10._store()
+    store.create({"type": "feature", "priority": "high", "title": "t", "description": "d",
+                  "assigned_to": "OPUS"}, force=True)
+    tid = store.list("pending")[0]["id"]
+    monkeypatch.setattr(gx10, "_EFFECTIVE_CFG", gx10._code_defaults(), raising=False)
+    gx10._EFFECTIVE_CFG["code_agents"]["pinned"] = "SONNET"            # effective = SONNET
+    fb_dir = gx10.feedback_dir()
+    fb_dir.mkdir(parents=True, exist_ok=True)
+    (fb_dir / f"{tid}_OPUS-feedback.md").write_text("done", encoding="utf-8")   # ONLY the staged feedback
+    captured: list = []
+    seen: dict = {}
+    enq: set = set()
+    gx10._reconcile_once(store, lambda *a: captured.append(a), seen, enq)
+    gx10._reconcile_once(store, lambda *a: captured.append(a), seen, enq)
+    assert any(c[0] == tid and c[1] == "OPUS" for c in captured)      # fell back to the staged agent
+
+
+def test_reconciler_advances_after_pin_cleared_post_run(tmp_path, monkeypatch):
+    # #454 (review B round 4): the pin was active during execution (SONNET ran, wrote {tid}_SONNET-
+    # feedback.md) then was CLEARED before reconcile — the reconciler must still DISCOVER + advance the
+    # SONNET feedback (not only look at the now-effective staged OPUS), or the task strands.
+    monkeypatch.chdir(tmp_path)
+    gx10.initiative_new("PinClr", "software")
+    store = gx10._store()
+    store.create({"type": "feature", "priority": "high", "title": "t", "description": "d",
+                  "assigned_to": "OPUS"}, force=True)
+    tid = store.list("pending")[0]["id"]
+    monkeypatch.setattr(gx10, "_EFFECTIVE_CFG", gx10._code_defaults(), raising=False)
+    gx10._EFFECTIVE_CFG["code_agents"]["pinned"] = None              # pin CLEARED at reconcile time
+    fb_dir = gx10.feedback_dir()
+    fb_dir.mkdir(parents=True, exist_ok=True)
+    (fb_dir / f"{tid}_SONNET-feedback.md").write_text("done", encoding="utf-8")   # SONNET ran (pinned)
+    captured: list = []
+    seen: dict = {}
+    enq: set = set()
+    gx10._reconcile_once(store, lambda *a: captured.append(a), seen, enq)
+    gx10._reconcile_once(store, lambda *a: captured.append(a), seen, enq)
+    assert any(c[0] == tid and c[1] == "SONNET" for c in captured)   # discovered the pinned-run feedback
+
+
+# ── #455: circuit-breaker + equal-peer failover + /feedback classification ───────────────────────
+@pytest.fixture
+def _clean_breaker():
+    gx10._CODE_AGENT_BREAKER.clear()
+    yield
+    gx10._CODE_AGENT_BREAKER.clear()
+
+
+def test_breaker_trip_reset_snapshot(_clean_breaker):
+    assert not gx10._breaker_tripped("CODEX")
+    gx10._breaker_trip("codex", "budget")
+    assert gx10._breaker_tripped("CODEX") and gx10._breaker_snapshot() == {"CODEX": "budget"}
+    gx10._breaker_reset("CODEX")
+    assert not gx10._breaker_tripped("CODEX")
+
+
+def test_effective_agent_fails_over_when_tripped(_clean_breaker, monkeypatch):
+    monkeypatch.setattr(gx10, "_EFFECTIVE_CFG", gx10._code_defaults(), raising=False)  # OPUS+SONNET
+    assert gx10._effective_code_agent("OPUS") == "OPUS"        # not tripped → chosen
+    gx10._breaker_trip("OPUS")
+    assert gx10._effective_code_agent("OPUS") == "SONNET"      # OPUS tripped → cheapest non-tripped peer
+    gx10._breaker_trip("SONNET")
+    assert gx10._effective_code_agent("OPUS") == "OPUS"        # ALL tripped → keep chosen (fail-closed)
+
+
+def test_http_feedback_classifies_exhausted_trips_breaker(tmp_path, monkeypatch, _clean_breaker):
+    httpd, port = _start_server(monkeypatch, tmp_path)
+    try:
+        monkeypatch.setattr(gx10, "_EFFECTIVE_CFG", gx10._code_defaults(), raising=False)
+        # a no-feedback run whose stderr says "rate limit" → agent-unavailable → breaker trips
+        r = _post(port, "/feedback", {"task_id": "KGC-1", "agent": "OPUS", "content": "",
+                                      "exit_code": 1, "stderr": "Error: rate limit exceeded"})
+        assert r["ok"] and r["classification"] == "agent-unavailable"
+        assert gx10._breaker_tripped("OPUS")
+        # a no-feedback run with no exhausted signal → task-failed (NOT a failover), no breaker trip
+        r2 = _post(port, "/feedback", {"task_id": "KGC-2", "agent": "SONNET", "content": "",
+                                       "exit_code": 1, "stderr": "compile error"})
+        assert r2["classification"] == "task-failed" and not gx10._breaker_tripped("SONNET")
+        # a real result → ok-feedback, feedback file written
+        r3 = _post(port, "/feedback", {"task_id": "KGC-3", "agent": "SONNET", "content": "done"})
+        assert r3["classification"] == "ok-feedback" and r3["feedback_file"].endswith("KGC-3_SONNET-feedback.md")
+        # #455 (review B): feedback content that legitimately mentions a budget term must NOT false-trip
+        gx10._breaker_reset("SONNET")
+        r4 = _post(port, "/feedback", {"task_id": "KGC-4", "agent": "SONNET",
+                                       "content": "Implemented rate limit + quota handling.", "exit_code": 0})
+        assert r4["classification"] == "ok-feedback" and not gx10._breaker_tripped("SONNET")
+    finally:
+        httpd.shutdown()
+
+
+def test_coders_snapshot_shows_breaker_and_pin_resets(monkeypatch, _clean_breaker):
+    monkeypatch.setattr(gx10, "_EFFECTIVE_CFG", gx10._code_defaults(), raising=False)
+    gx10._breaker_trip("OPUS", "budget/quota exhausted")
+    snap = server._coders_snapshot()
+    opus = [a for a in snap["coding_agents"] if a["id"] == "OPUS"][0]
+    assert opus["unavailable"] is True and opus["unavailable_reason"] == "budget/quota exhausted"
+    server._set_coder_pin("opus")                            # pinning an agent clears its breaker
+    assert not gx10._breaker_tripped("OPUS")
+
+
+# ── #456: task_class derivation + task_class-scoped failover (capability matrix) ──────────────────
+@pytest.mark.parametrize("ttype,expected", [
+    ("security", "security"), ("security-audit", "security"), ("architecture", "architecture"),
+    ("verification", "analysis"), ("feature", "coding"), ("bugfix", "coding"),
+    ("implementation", "coding"), ("", "coding"), ("unknown-type", "coding"),
+])
+def test_task_class_derivation(ttype, expected):
+    assert gx10._task_class({"type": ttype}) == expected   # deterministic from task_json.type (no model trust)
+
+
+def test_class_capable_agents_failopen(monkeypatch):
+    monkeypatch.setattr(gx10, "_EFFECTIVE_CFG", gx10._code_defaults(), raising=False)
+    assert gx10._class_capable_agents("security") == ["OPUS"]
+    assert gx10._class_capable_agents("coding") == ["OPUS", "SONNET"]
+    assert gx10._class_capable_agents("zzz") is None        # unknown class → no restriction (fail-open)
+    assert gx10._class_capable_agents(None) is None
+
+
+def test_failover_scoped_by_task_class(_clean_breaker, monkeypatch):
+    monkeypatch.setattr(gx10, "_EFFECTIVE_CFG", gx10._code_defaults(), raising=False)
+    gx10._breaker_trip("OPUS")
+    # coding: SONNET is capable → failover to SONNET
+    assert gx10._effective_code_agent("OPUS", task_class="coding") == "SONNET"
+    # security: only OPUS is capable → keep OPUS (NEVER fail over to a non-security agent), fail-closed
+    assert gx10._effective_code_agent("OPUS", task_class="security") == "OPUS"
+    # unknown class / no class → no restriction (byte-identical to #455)
+    assert gx10._effective_code_agent("OPUS", task_class="zzz") == "SONNET"
+    assert gx10._effective_code_agent("OPUS") == "SONNET"
+
+
+def test_pending_handover_failover_stays_in_task_class(tmp_path, monkeypatch, _clean_breaker):
+    monkeypatch.chdir(tmp_path)
+    gx10.initiative_new("ClassDemo", "software")
+    store = gx10._store()
+    store.create({"type": "security", "priority": "high", "title": "audit", "description": "x"}, force=True)
+    tid = store.list("pending")[0]["id"]
+    ho_dir = gx10.handovers_dir()
+    ho_dir.mkdir(parents=True, exist_ok=True)
+    (ho_dir / f"{tid}_OPUS.md").write_text("body", encoding="utf-8")   # staged OPUS for a security task
+    monkeypatch.setattr(gx10, "_EFFECTIVE_CFG", gx10._code_defaults(), raising=False)
+    gx10._breaker_trip("OPUS")                                        # OPUS budget-exhausted
+    item = server._pending_handovers()[0]
+    # only OPUS is security-capable → the failover keeps OPUS (it does NOT route a security task to SONNET)
+    assert item["agent"] == "OPUS"
+
+
+def test_class_capable_empty_list_fails_closed(_clean_breaker, monkeypatch):
+    # #456 (review B / Codex S2): an EXPLICIT empty capability list means "no agent may serve this class"
+    # → it must scope the failover to nothing (keep the chosen agent, fail-CLOSED), NOT collapse to fail-open.
+    cfg = gx10._code_defaults()
+    cfg["code_agents"]["classes"]["security"] = []          # operator: nothing is security-capable
+    monkeypatch.setattr(gx10, "_EFFECTIVE_CFG", cfg, raising=False)
+    assert gx10._class_capable_agents("security") == []     # mapped-but-empty → restrict to nothing
+    assert gx10._class_capable_agents("zzz") is None         # still unmapped → fail-open
+    gx10._breaker_trip("OPUS")
+    # OPUS tripped, security capable set empty → NO peer → keep OPUS (never leaks to SONNET/CODEX)
+    assert gx10._effective_code_agent("OPUS", task_class="security") == "OPUS"
+
+
+def test_autopilot_launch_path_failover_is_task_class_scoped(tmp_path, monkeypatch, _clean_breaker):
+    # #456 (review B / Codex S2): the autopilot reconciler LAUNCH path is a 2nd execution surface — it must
+    # also scope the budget failover by task_class, else a tripped Opus on a security task leaks to a peer.
+    monkeypatch.chdir(tmp_path)
+    gx10.initiative_new("LaunchClass", "software")
+    store = gx10._store()
+    store.create({"type": "security", "priority": "high", "title": "audit", "description": "x"}, force=True)
+    tid = store.list("pending")[0]["id"]
+    ho_dir = gx10.handovers_dir()
+    ho_dir.mkdir(parents=True, exist_ok=True)
+    (ho_dir / f"{tid}_OPUS.md").write_text("body", encoding="utf-8")    # staged OPUS for a security task
+    monkeypatch.setattr(gx10, "_EFFECTIVE_CFG", gx10._code_defaults(), raising=False)
+    monkeypatch.setattr(gx10, "AUTOPILOT_ENABLED", True, raising=False)
+    monkeypatch.setattr(gx10, "AUTOPILOT_MAX_CONCURRENT", 0, raising=False)
+    gx10._breaker_trip("OPUS")
+    launched_cmds: list = []
+    gx10._reconcile_once(store, lambda *a: None, {}, set(),
+                         launch_enqueue=lambda tid, agent: launched_cmds.append((tid, agent)),
+                         launched=set())
+    # only OPUS is security-capable → the launch path keeps OPUS (does NOT launch a non-security agent)
+    assert launched_cmds == [(tid, "OPUS")]
+
+
+# ── #480: gated read-only Memory MCP injection (sealed profile only) ──────────────────────────────
+def _mcp_spec():
+    import providers
+    return providers.ProviderSpec(
+        provider_id="claude-opus", kind="cli", agent_id="OPUS", model="claude-opus-4-8", bin="claude",
+        cmd_template="{bin} {mcp} --print {prompt}",
+        mcp_template='--mcp-config \'{"x":"{mcp_cmd}","y":"{mcp_script}"}\'')
+
+
+def test_mcp_for_launch_is_sealed_gated(monkeypatch):
+    spec = _mcp_spec()
+    monkeypatch.setattr(gx10, "_MEMORY_CONFIG", {"base_url": "http://mem:8800", "agent_id": "ironclad"}, raising=False)
+    # open profile (default) → NO mcp, byte-identical launch
+    monkeypatch.setattr(gx10, "_EFFECTIVE_CFG", {"security": {"profile": "open"}}, raising=False)
+    monkeypatch.delenv("GX10_PROFILE", raising=False)
+    assert gx10._is_sealed_profile() is False
+    assert gx10._mcp_for_launch(spec) == ("", {})
+    # sealed profile + memory + mcp_template → mcp args + the secret-free connection env
+    monkeypatch.setattr(gx10, "_EFFECTIVE_CFG", {"security": {"profile": "sealed"}}, raising=False)
+    assert gx10._is_sealed_profile() is True
+    args, env = gx10._mcp_for_launch(spec)
+    assert "--mcp-config" in args and env["GX10_MEMORY_URL"] == "http://mem:8800"
+    assert env["GX10_MCP_MEMORY_NS"] == "ironclad"                # project namespace, not the code-agent id
+
+
+def test_mcp_for_launch_off_without_memory(monkeypatch):
+    monkeypatch.setattr(gx10, "_EFFECTIVE_CFG", {"security": {"profile": "sealed"}}, raising=False)
+    monkeypatch.setattr(gx10, "_MEMORY_CONFIG", {}, raising=False)   # sealed but no memory service → off
+    assert gx10._mcp_for_launch(_mcp_spec()) == ("", {})
+
+
+def test_pending_handover_carries_mcp_fields(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    gx10.initiative_new("McpDemo", "software")
+    store = gx10._store()
+    store.create({"type": "feature", "priority": "high", "title": "t", "description": "d"}, force=True)
+    tid = store.list("pending")[0]["id"]
+    ho = gx10.handovers_dir(); ho.mkdir(parents=True, exist_ok=True)
+    (ho / f"{tid}_OPUS.md").write_text("body", encoding="utf-8")
+    monkeypatch.setattr(gx10, "_EFFECTIVE_CFG", gx10._code_defaults(), raising=False)  # open profile default
+    item = server._pending_handovers()[0]
+    assert "mcp" in item and item["mcp"] == "" and item["mcp_env"] == {}   # present + empty under open

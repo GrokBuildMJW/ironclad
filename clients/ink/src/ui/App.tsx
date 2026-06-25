@@ -17,6 +17,10 @@ import {chatStream} from '../net/stream.js';
 import {answerBody, createRouter} from '../stream/route.js';
 import {renderMarkdown, StreamMarkdown} from '../markdown.js';
 import {useStatusPoller} from './useStatusPoller.js';
+import {
+  newPasteStore, isMultilinePaste, storePaste, expandPastes, stripSentinels,
+  backspace as backspacePaste,
+} from './pasteStore.js';
 import {Footer} from './Footer.js';
 import {WorkingLine} from './WorkingLine.js';
 import {InputBox} from './InputBox.js';
@@ -49,7 +53,7 @@ export function App({
   const {exit} = useApp();
   const {stdout} = useStdout();
   const width = stdout?.columns ?? 80;
-  const [status, setPerf] = useStatusPoller(srv);
+  const [status, setPerf, setAgent] = useStatusPoller(srv);
   const [items, setItems] = useState<Item[]>([]);
   const [buffer, setBuffer] = useState('');
   const [menuSel, setMenuSel] = useState(0); // MEM-16(2): selected slash-command suggestion
@@ -66,6 +70,7 @@ export function App({
   const t0Ref = useRef(0);
   const didInit = useRef(false);
   const transcriptRef = useRef<string[]>([]); // §3b(a): plain-text transcript persisted for resume
+  const pasteStoreRef = useRef(newPasteStore()); // #438: per-turn multi-line pastes, shown collapsed as [Pasted #N +L lines]
   const sessionFile = useMemo(() => statePath(codedir), [codedir]); // MEM-19: per-project state path
   const srcDir = useMemo(() => loadConfig().srcDir, []); // MEM-17: repo root for /update (GX10_SRC)
   const poolRef = useRef<Pool | null>(null);
@@ -169,6 +174,7 @@ export function App({
     setSecs(0);
     setTokens(0);
     setThinking(true);
+    setAgent(''); // #453: clear last turn's coder so a non-routed turn shows no stale "live" indicator
     setLiveAnswer('');
     const stream = new StreamMarkdown(Math.max(20, width - 4));
     let lastRender = 0;
@@ -184,6 +190,7 @@ export function App({
             router.feed(c);
             if (router.tokens) setTokens(router.tokens);
             if (router.perf) setPerf(router.perf);
+            if (router.agent) setAgent(router.agent); // #453: live "which coder" indicator
             // live preview, throttled to ~30fps so a fast stream doesn't re-render every token
             const now = Date.now();
             if (now - lastRender > 33) {
@@ -204,6 +211,7 @@ export function App({
     }
     router.flush();
     if (router.perf) setPerf(router.perf);
+    if (router.agent) setAgent(router.agent); // #453
     setLiveAnswer(''); // drop the live preview; the exact whole-document render is committed below
     const body = answerBody(router);
     if (body) {
@@ -279,6 +287,68 @@ export function App({
         const ps = await srv.pending();
         if (!ps.length) commit(<Text color={DIM}> (no open handovers)</Text>);
         ps.forEach((p) => commit(<Text>{`  ${String(p['id'] ?? '?')}  ${String(p['title'] ?? '')}`}</Text>));
+      } else if (name === 'coders') {
+        // #452: which coding agents are bound (● green) vs not found (○ red), then the fan-out lane.
+        // #454: `/coders use <id>|auto` pins/clears the runtime coding agent.
+        const parts = payload.split(/\s+/);
+        if (parts.length >= 2 && parts[1]?.toLowerCase() === 'use') {
+          const res = await srv.setCoderPin(parts[2] ?? 'auto');
+          const pin = res['pinned'];
+          commit(
+            <Text color="cyan">
+              {pin ? `  → pinned coder: ${String(pin)}` : '  → coder pin cleared (auto: the staged agent per task)'}
+            </Text>,
+          );
+        }
+        const d = await srv.coders();
+        const coding = (d['coding_agents'] as Array<Record<string, unknown>>) ?? [];
+        const pinned = d['pinned'] ? String(d['pinned']) : '';
+        commit(
+          <Text color={DIM}>
+            {pinned ? `  pinned: ${pinned}  (/coders use auto to clear)` : '  routing: auto (orchestrator staged agent)'}
+          </Text>,
+        );
+        if (!coding.length) commit(<Text color={DIM}> (no coding agents configured)</Text>);
+        coding.forEach((a) => {
+          // #460: an onboarded-but-disabled agent (enabled:false, e.g. KIMI pending calibration) is inert
+          // but shown as registered. `enabled` is absent on older servers → default true (back-compat).
+          const enabled = a['enabled'] !== false;
+          const bound = Boolean(a['bound']);
+          const isPin = pinned && String(a['id'] ?? '').toUpperCase() === pinned.toUpperCase();
+          const dot = !enabled ? <Text color={DIM}>◌</Text> : <Text color={bound ? 'green' : 'red'}>{bound ? '●' : '○'}</Text>;
+          let suffix: React.ReactNode = '';
+          if (!enabled) suffix = <Text color={DIM}>{'  (onboarded · disabled)'}</Text>;
+          else if (isPin) suffix = <Text color="cyan">{'  ← pinned'}</Text>;
+          else if (!bound) suffix = <Text color={DIM}>{'  (binary not found)'}</Text>;
+          commit(
+            <Text>
+              {'  '}
+              {dot}
+              {`  ${String(a['id'] ?? '?').padEnd(8)} ${String(a['model'] ?? '—')}`}
+              {suffix}
+            </Text>,
+          );
+        });
+        const prov = (d['providers'] as Record<string, unknown>) ?? {};
+        const pool = (prov['pool'] as Array<Record<string, unknown>>) ?? [];
+        if (pool.length) {
+          const b = (prov['budget'] as Record<string, unknown>) ?? {};
+          const spent = Number(b['spent_usd'] ?? 0).toFixed(4);
+          commit(
+            <Text color={DIM}>{`  providers (fan-out): ${prov['active'] ? 'active' : 'inactive'} · spent $${spent}`}</Text>,
+          );
+          pool.forEach((p) => {
+            const reach = Boolean(p['reachable']);
+            const reason = p['last_route_reason'] ? `  ← ${String(p['last_route_reason'])}` : '';
+            commit(
+              <Text>
+                {'    '}
+                <Text color={reach ? 'green' : 'red'}>{reach ? '●' : '○'}</Text>
+                {`  ${String(p['id'] ?? '?').padEnd(14)} ${String(p['kind'] ?? '?').padEnd(9)} ${String(p['model'] ?? '—')}${reason}`}
+              </Text>,
+            );
+          });
+        }
       } else if (name === 'work') {
         const pool = (poolRef.current ??= new Pool(maxAgents));
         const jobs = await dispatchPending(srv, codedir, hcfg, pool, claimedRef.current, hlog);
@@ -310,7 +380,9 @@ export function App({
         }
       }
     } catch (e) {
-      commit(<Text color={ERROR}>{`  ✗ ${String(e)}`}</Text>);
+      // #454: HttpError carries the server's JSON error detail in its message — show that, not 'Error: …'.
+      const msg = e instanceof Error ? e.message : String(e);
+      commit(<Text color={ERROR}>{`  ✗ ${msg}`}</Text>);
     }
   }
 
@@ -380,8 +452,9 @@ export function App({
       }
     }
     if (key.return) {
-      const line = buffer;
+      const line = expandPastes(buffer, pasteStoreRef.current); // #438: sentinel tokens -> the raw paste
       setBuffer('');
+      pasteStoreRef.current = newPasteStore();
       setMenuSel(0);
       setMenuDismissed(false);
       void submit(line);
@@ -392,14 +465,23 @@ export function App({
       return;
     }
     if (key.backspace || key.delete) {
-      setBuffer((b) => b.slice(0, -1));
+      setBuffer((b) => backspacePaste(b, pasteStoreRef.current)); // #438: one Backspace clears a whole [Pasted …] token + reclaims its block
       setMenuSel(0);
       setMenuDismissed(false);
       return;
     }
     if (key.tab) return; // swallow a stray Tab when the menu isn't open (no '\t' into the buffer)
     if (input && !key.ctrl && !key.meta) {
-      setBuffer((b) => b + input);
+      // #438: a multi-line PASTE collapses to a [Pasted #N +L lines] placeholder (expanded on submit);
+      // typed input and single-line pastes append verbatim. Strip the sentinel delimiters first so a
+      // paste can never smuggle a forged token into the buffer.
+      const safe = stripSentinels(input);
+      if (key.paste && isMultilinePaste(safe)) {
+        const token = storePaste(pasteStoreRef.current, safe);
+        setBuffer((b) => b + token);
+      } else {
+        setBuffer((b) => b + safe);
+      }
       setMenuSel(0);
       setMenuDismissed(false);
     }

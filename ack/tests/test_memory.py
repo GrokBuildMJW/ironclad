@@ -98,3 +98,125 @@ def test_disabled_when_no_endpoint():
     assert m.is_available() is False
     assert m.query("anything") == "[Memory] no relevant matches."
     m.store_task_completion("KGC-1", {}, "x")  # must not raise
+
+
+# ── #458 (D1): richer token-budgeted handover brief ───────────────────────────────────────────────
+def _count4(s):
+    return len(s or "") // 4 + 1
+
+
+def test_brief_composes_warm_summary_vector_and_relational(mm, monkeypatch):
+    def fake(q, limit, graph=False, timeout=None):
+        if graph:
+            return ["rel: A depends on B", "past decision X"]   # 2nd dups a vector hit → must dedup
+        return ["past decision X", "gotcha Y"]
+    monkeypatch.setattr(mm, "_search", fake)
+    out = mm.brief(body="wire the failover", title="router", warm_summary="We chose SOFT anti-affinity.",
+                   budget_tokens=1000, count_tokens=_count4)
+    assert out.startswith("## Relevant context from memory")
+    assert "### Recent context (rolling summary)" in out and "We chose SOFT anti-affinity." in out
+    assert "### Related past work" in out and "- past decision X" in out and "- gotcha Y" in out
+    assert "### Connections (relational)" in out and "- rel: A depends on B" in out
+    assert out.count("past decision X") == 1                    # the relational dup was removed
+
+
+def test_brief_is_token_budgeted(mm, monkeypatch):
+    monkeypatch.setattr(mm, "_search", lambda *a, **k: ["hit one", "hit two", "hit three"])
+    # budget = the warm section as RENDERED (head + "\n"+heading + "\n"+line), so it fits exactly and the
+    # next section's heading pushes over → dropped (newline-aware accounting, review B S3-1).
+    budget = (_count4("## Relevant context from memory")
+              + _count4("\n### Recent context (rolling summary)")
+              + _count4("\nROLLING"))
+    out = mm.brief(body="b", title="t", warm_summary="ROLLING", deep=False,
+                   budget_tokens=budget, count_tokens=_count4)
+    assert "ROLLING" in out and "### Related past work" not in out   # only what fits within budget survives
+
+
+def test_brief_deep_off_skips_relational(mm, monkeypatch):
+    calls = {"graph": 0}
+    def fake(q, limit, graph=False, timeout=None):
+        if graph:
+            calls["graph"] += 1
+        return ["v1", "v2"]
+    monkeypatch.setattr(mm, "_search", fake)
+    out = mm.brief(body="b", title="t", deep=False, budget_tokens=1000, count_tokens=_count4)
+    assert calls["graph"] == 0 and "### Connections" not in out
+
+
+def test_brief_is_body_keyed(mm):
+    # the handover BODY (not just type:title) must reach the vector query → richer retrieval
+    mm.brief(body="implement the circuit breaker for budget exhaustion", title="breaker",
+             deep=False, budget_tokens=1000, count_tokens=_count4)
+    assert "circuit breaker for budget exhaustion" in mm._captured["search"]["query"]
+
+
+def test_brief_empty_when_nothing(mm, monkeypatch):
+    monkeypatch.setattr(mm, "_search", lambda *a, **k: [])
+    assert mm.brief(body="x", title="t", warm_summary="", count_tokens=_count4) == ""
+
+
+def test_brief_is_fail_soft(mm, monkeypatch):
+    def boom(*a, **k):
+        raise RuntimeError("mem down")
+    monkeypatch.setattr(mm, "_search", boom)
+    assert mm.brief(body="x", title="t", warm_summary="", count_tokens=_count4) == ""   # never raises
+
+
+def test_brief_warm_summary_survives_a_search_error(mm, monkeypatch):
+    # a vector hiccup must not discard a warm summary already in hand (#458 D1 robustness)
+    def boom(*a, **k):
+        raise RuntimeError("mem down")
+    monkeypatch.setattr(mm, "_search", boom)
+    out = mm.brief(body="x", title="t", warm_summary="the rolling summary", budget_tokens=1000, count_tokens=_count4)
+    assert "the rolling summary" in out and "### Related past work" not in out
+
+
+def test_brief_relational_query_timeout_is_capped(mm, monkeypatch):
+    # review A S3-1: the brief's graph enrichment must NOT use the full deep_timeout (40s) — a slow graph
+    # store would otherwise stall a handover stage. Assert the graph call gets the short brief timeout.
+    mm.deep_timeout = 40.0
+    seen_to = {}
+    def fake(q, limit, graph=False, timeout=None):
+        if graph:
+            seen_to["t"] = timeout
+            return []
+        return ["v1"]
+    monkeypatch.setattr(mm, "_search", fake)
+    mm.brief(body="b", title="t", deep=True, budget_tokens=1000, count_tokens=_count4)
+    assert seen_to["t"] == mm._BRIEF_DEEP_TIMEOUT and seen_to["t"] < mm.deep_timeout
+
+
+def test_brief_budget_accounts_for_newline_separators(mm, monkeypatch):
+    # review B S3-1: with a tokenizer that charges for newlines, the RENDERED brief (after "\n".join)
+    # must still fit budget — the accounting counts "\n"+piece, so summed-without-separators can't overflow.
+    monkeypatch.setattr(mm, "_search", lambda q, l, graph=False, timeout=None:
+                        [] if graph else ["aaaa", "bbbb", "cccc", "dddd", "eeee"])
+    chars = lambda s: len(s or "")              # 1 token per char, INCLUDING newlines
+    budget = 80
+    out = mm.brief(body="b", title="t", deep=False, budget_tokens=budget, count_tokens=chars)
+    assert out and chars(out) <= budget         # rendered length (with newlines) never exceeds budget
+
+
+def test_brief_skips_relational_when_deep_timeout_disabled(mm, monkeypatch):
+    # review B S3-2: deep_timeout<=0 means relational disabled — the brief must NOT issue a graph search
+    # (and must never pass 0 to urlopen, which read_timeout-coalescing used to mask).
+    mm.deep_timeout = 0.0
+    calls = {"graph": 0}
+    def fake(q, l, graph=False, timeout=None):
+        if graph:
+            calls["graph"] += 1
+        return ["v1"]
+    monkeypatch.setattr(mm, "_search", fake)
+    out = mm.brief(body="b", title="t", deep=True, budget_tokens=1000, count_tokens=_count4)
+    assert calls["graph"] == 0 and "### Connections" not in out
+
+
+def test_search_honors_explicit_zero_timeout(mm, monkeypatch):
+    # review B S3-2 root cause: _search must pass an explicit timeout through (is-None check), not coalesce
+    # a falsy 0 to read_timeout. Existing None callers still get read_timeout.
+    seen = {}
+    monkeypatch.setattr(mm, "_post", lambda path, body, timeout: (seen.update(t=timeout), {"results": []})[1])
+    mm._search("q", 3, graph=True, timeout=0.0)
+    assert seen["t"] == 0.0
+    mm._search("q", 3)                           # default None → read_timeout (back-compat)
+    assert seen["t"] == mm.read_timeout

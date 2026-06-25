@@ -14,10 +14,20 @@ to direct ``_WORKERS.fanout`` (the router stays inert when no pool is configured
 """
 from __future__ import annotations
 
+import glob
+import json
+import os
+import re
+import shutil
 from enum import Enum
 from typing import Dict, List, Optional
 
 from pydantic import BaseModel, Field, field_validator
+
+# #449 (review B): the agent_id is a filename token matched by the ASCII-only regexes
+# _HO_AGENT_RE/_FB_RE (r"_([A-Za-z]+)…"). Validate against the SAME ASCII class — `str.isalpha()`
+# would accept non-ASCII letters (e.g. "ÄGENT") that pass here but can never round-trip a filename.
+_AGENT_ID_RE = re.compile(r"[A-Za-z]+")
 
 
 class ProviderKind(str, Enum):
@@ -44,13 +54,26 @@ class ProviderSpec(BaseModel):
     provider_id: str                # unique key, e.g. "spark-vllm", "claude-sonnet", "kimi-cli"
     kind: ProviderKind
     model: str                      # model identifier (passed to the substrate; NEVER a literal in code)
+    # #449: a provider that ALSO serves as a handover code-AGENT declares its agent identity here. The
+    # agent_id is the FILENAME-SAFE token (ASCII letters only — must satisfy _HO_AGENT_RE/_FB_RE,
+    # §C0R-1): e.g. OPUS/SONNET. The agent registry is fully config-driven (no agents hard-coded in
+    # core/ logic) — Ironclad ships OPUS/SONNET as OVERRIDABLE config defaults; conf/ adds its own.
+    agent_id: Optional[str] = None       # handover agent token (letters only); None = routing-only provider
+    display: Optional[str] = None        # human label for /coders + logs; falls back to provider_id
     # exactly one set, depending on kind:
     endpoint_env: Optional[str] = None   # in-engine: ENV name holding the base_url (e.g. "GX10_BASE_URL")
     api_key_env: Optional[str] = None    # in-engine: ENV name holding the key (fallback "not-needed")
     cmd_template: Optional[str] = None   # cli: GX10_AGENT_CMD-style template ({bin}{model}{effort}{permission}{prompt})
     bin: Optional[str] = None            # cli: executable ({bin})
+    bin_glob: Optional[str] = None       # cli: #451/FORK-A3 — private-layer glob to a rotating launcher
+                                         #   path (e.g. a hashed AppData dir); resolved newest when `bin`
+                                         #   is not on PATH. Lives in conf/ (never a literal path in core/).
     effort: Optional[str] = None         # cli: default effort ({effort}), per-item overridable
     permission_mode: Optional[str] = None  # cli: {permission}; None → inherits CLAUDE_PERMISSION_MODE
+    mcp_template: Optional[str] = None   # cli: #480 — per-CLI read-only Memory MCP config args, injected
+                                         #   into the {mcp} placeholder ONLY under the sealed profile. The
+                                         #   {mcp_server} token renders to the python invocation of
+                                         #   memory_mcp.py. Lives in conf/ (per-CLI flag shape).
     cost_per_1k_in: float = 0.0          # $/1k input tokens (routing cost axis; local = 0.0)
     cost_per_1k_out: float = 0.0         # $/1k output tokens
     rate_limit: RateLimit = Field(default_factory=RateLimit)
@@ -64,6 +87,19 @@ class ProviderSpec(BaseModel):
         if not v or " " in v:
             raise ValueError(f"provider_id must be a non-empty slug: {v!r}")
         return v
+
+    @field_validator("agent_id")
+    @classmethod
+    def _agent_token(cls, v: Optional[str]) -> Optional[str]:
+        # #449/§C0R-1: the agent_id is the handover/feedback FILENAME token — must be ASCII LETTERS ONLY
+        # so it round-trips _HO_AGENT_RE (r"_([A-Za-z]+)\.md$") and _FB_RE; no underscores/hyphens/digits/
+        # non-ASCII (review B: `str.isalpha()` accepts e.g. "ÄGENT", which then strands the handover).
+        if v is not None and not _AGENT_ID_RE.fullmatch(v):
+            raise ValueError(f"agent_id must be ASCII letters only (filename-safe token): {v!r}")
+        return v
+
+    def agent_display(self) -> str:
+        return self.display or self.provider_id
 
     def kind_consistent(self) -> Optional[str]:
         """fail-loud: cli needs cmd_template+bin; in-engine needs endpoint_env."""
@@ -107,3 +143,180 @@ def load_registry(cfg: Dict) -> Optional["ProviderRegistry"]:
         default_id=block.get("default_id"),
     )
     return reg.validate_loud()
+
+
+# --------------------------------------------------------------------------- #
+# Code-AGENT registry (#449, C0R-9) — the handover code-agent identity map. A SEPARATE,
+# ALWAYS-ON config surface (``config.code_agents.pool``), INDEPENDENT of the fan-out
+# ``providers.pool`` / ``providers.enabled`` (which is True in local-mode and would otherwise turn
+# default agents into fan-out reasoning substrates). Each entry is a ProviderSpec carrying an
+# ``agent_id``. Ironclad ships OPUS/SONNET as OVERRIDABLE defaults; ``conf/`` adds CODEX/KIMI.
+# Unknown agent id fails closed (rejected, never silently defaulted) — replaces the six OPUS/SONNET
+# allowlists, ``_MODEL_BY_AGENT`` and the legacy KIMI→SONNET normalization.
+# --------------------------------------------------------------------------- #
+class CodeAgentRegistry(BaseModel):
+    agents: List[ProviderSpec]
+
+    def by_agent(self) -> Dict[str, ProviderSpec]:
+        """agent_id (UPPER) → spec, enabled entries only."""
+        return {a.agent_id.upper(): a for a in self.agents if a.agent_id and a.enabled}
+
+    def names(self) -> List[str]:
+        """Canonical agent ids (UPPER), declaration order — the dynamic schema enum source."""
+        out: List[str] = []
+        for a in self.agents:
+            if a.agent_id and a.enabled:
+                aid = a.agent_id.upper()
+                if aid not in out:
+                    out.append(aid)
+        return out
+
+    def has(self, agent_id: str) -> bool:
+        return (agent_id or "").upper() in self.by_agent()
+
+    def resolve(self, agent_id: str) -> Optional[ProviderSpec]:
+        """Spec for an agent id, or None if unknown (caller fails closed). ENABLED entries only — a
+        disabled (onboarded) agent resolves to None, so it is never launched/probed/failed-over to."""
+        return self.by_agent().get((agent_id or "").upper())
+
+    def all_ids(self) -> List[str]:
+        """#460: ALL configured agent ids (UPPER), declaration order, INCLUDING disabled/onboarded ones.
+        ``names()`` is enabled-only (the launch/schema surface); this is for operator VISIBILITY — an
+        onboarded-but-disabled agent (e.g. KIMI pending exhausted-signal calibration) is inert but should
+        be shown as registered."""
+        out: List[str] = []
+        for a in self.agents:
+            if a.agent_id:
+                aid = a.agent_id.upper()
+                if aid not in out:
+                    out.append(aid)
+        return out
+
+    def spec_of(self, agent_id: str) -> Optional[ProviderSpec]:
+        """The spec for an agent id INCLUDING disabled entries (``resolve`` is enabled-only). Visibility
+        only — never use this to launch (a disabled agent must stay inert)."""
+        aid = (agent_id or "").upper()
+        return next((a for a in self.agents if (a.agent_id or "").upper() == aid), None)
+
+    def validate_loud(self) -> "CodeAgentRegistry":
+        seen = set()
+        for a in self.agents:
+            if not a.agent_id:
+                raise ValueError(f"code_agents entry {a.provider_id!r} has no agent_id")
+            aid = a.agent_id.upper()
+            if aid in seen:                              # dupe guard (fail-loud)
+                raise ValueError(f"duplicate code-agent agent_id: {aid}")
+            seen.add(aid)
+            err = a.kind_consistent()
+            if err:
+                raise ValueError(err)
+            # #449 (review B): a code-agent must ship a COMPLETE launch spec — BOTH bin and cmd_template.
+            # The generic provider lane tolerates one-or-the-other (kind_consistent), but a partial agent
+            # would silently mix a configured bin with the client's Claude fallback template (or vice
+            # versa) and emit a broken command. Fail loud here instead.
+            if not (a.bin and a.cmd_template):
+                raise ValueError(f"code-agent {aid} must define BOTH bin and cmd_template "
+                                 f"(got bin={a.bin!r}, cmd_template={'set' if a.cmd_template else None})")
+        return self
+
+
+def load_code_agents(cfg: Dict) -> "CodeAgentRegistry":
+    """Build the code-agent registry from ``config.code_agents.pool``. Always returns a registry
+    (never None): the public defaults supply OPUS/SONNET even with no ``conf/``. Lists replace on
+    config merge, so ``conf/`` re-lists the agents it wants (OPUS/SONNET/CODEX/…)."""
+    block = (cfg or {}).get("code_agents") or {}
+    pool = block.get("pool") or []
+    reg = CodeAgentRegistry(agents=[ProviderSpec(**p) for p in pool])
+    return reg.validate_loud()
+
+
+# --------------------------------------------------------------------------- #
+# Boot probe (#451) — resolve each code-agent's executable WITHOUT spending a prompt. Path-resolution
+# IS the liveness signal: a resolvable executable means the agent can run; this stays filesystem-only
+# (no subprocess, no token spend) so boot is fast and never flaky on a CLI's `--version` quirks.
+# --------------------------------------------------------------------------- #
+def resolve_agent_bin(spec: Optional[ProviderSpec]) -> Optional[str]:
+    """Resolve a code-agent's executable (FORK-A3, charter): a PATH entry wins (``shutil.which`` —
+    covers a stable PATH shim, option B); else, when the spec declares a private-layer ``bin_glob``,
+    the NEWEST match by mtime (option C — the hashed launcher path rots on update). ``None`` ⇒ not
+    resolvable. Env vars / ``~`` in ``bin_glob`` are expanded; the private path lives in ``conf/``."""
+    if spec is None or not spec.bin:
+        return None
+    found = shutil.which(spec.bin)
+    if found:
+        return found
+    if spec.bin_glob:
+        # Normalize separators (a conf glob may use `/` while %LOCALAPPDATA% expands to `\`) and pick the
+        # NEWEST match. stat() inside the try (review A): a file that vanishes between glob and stat is
+        # skipped, so the probe returns None rather than raising — it never breaks boot.
+        pat = os.path.expandvars(os.path.expanduser(spec.bin_glob)).replace("/", os.sep)
+        best, best_mtime = None, -1.0
+        for p in glob.glob(pat):
+            try:
+                if not os.path.isfile(p):
+                    continue
+                mt = os.path.getmtime(p)
+            except OSError:
+                continue
+            if mt > best_mtime:
+                best, best_mtime = p, mt
+        return best
+    return None
+
+
+def probe_code_agents(registry: "CodeAgentRegistry") -> Dict[str, Optional[str]]:
+    """Per-enabled-agent liveness probe: ``agent_id`` → resolved bin path (or ``None``). The boot
+    caller treats ``any(resolved)`` as cli-available and fails closed only when ZERO agents resolve."""
+    return {aid: resolve_agent_bin(registry.resolve(aid)) for aid in registry.names()}
+
+
+# Result classes the result classifier returns (#455).
+RESULT_OK = "ok-feedback"            # the agent produced feedback → advance
+RESULT_FAILED = "task-failed"        # the agent ran but produced no usable result (not a budget signal)
+RESULT_UNAVAILABLE = "agent-unavailable"   # budget/quota exhausted → trip the breaker + fail over
+
+
+def classify_agent_result(*, exit_code: Optional[int], stderr: str,
+                          has_feedback: bool, patterns: Optional[Dict] = None) -> str:
+    """#455: classify a code-agent's RAW run result into ``RESULT_OK`` | ``RESULT_FAILED`` |
+    ``RESULT_UNAVAILABLE`` (budget/quota exhausted).
+
+    A run that produced FEEDBACK is ``ok-feedback`` — period. The feedback is the agent's task result
+    (semantically arbitrary: a coding answer may legitimately contain "rate limit"/"quota"), so it is
+    NEVER pattern-matched (review B: scanning it caused false breaker trips + discarded good work). The
+    exhausted signal lives only in the RAW process channel — stderr + exit code — which is what we scan,
+    and only when there is NO feedback. LAYERED, most specific first: a structured JSON error-event
+    ``type`` (one JSON object per stderr line) → a stderr regex → an exit code. Patterns come from conf
+    (``code_agents.exhausted``); none ⇒ no exhausted signal. CONSERVATIVE: only an EXPLICIT exhausted
+    match yields ``agent-unavailable`` — an unknown failure is ``task-failed`` (NOT unavailable), so a
+    normal failure never triggers a wasteful failover. Pure + never raises (a bad conf regex is
+    skipped); runs on the SERVER, so the patterns + agent literals stay in ``conf/``."""
+    if has_feedback:
+        return RESULT_OK                                  # a real result is never re-judged as exhausted
+    pats = patterns or {}
+    text = stderr or ""                                   # ONLY the raw process stderr — not the feedback
+    # 1) structured JSON error-event types (most specific) — one JSON object per line
+    evtypes = {str(t).lower() for t in (pats.get("json_event_types") or [])}
+    if evtypes:
+        for line in text.splitlines():
+            line = line.strip()
+            if not line.startswith("{"):
+                continue
+            try:
+                ev = json.loads(line)
+            except Exception:
+                continue
+            t = str(ev.get("type") or ev.get("event") or "").lower()
+            if t and t in evtypes:
+                return RESULT_UNAVAILABLE
+    # 2) stderr regex (a bad conf regex must never crash classification)
+    for rx in (pats.get("stderr_patterns") or []):
+        try:
+            if re.search(rx, text):
+                return RESULT_UNAVAILABLE
+        except re.error:
+            continue
+    # 3) exit code
+    if exit_code is not None and int(exit_code) in {int(c) for c in (pats.get("exit_codes") or [])}:
+        return RESULT_UNAVAILABLE
+    return RESULT_FAILED

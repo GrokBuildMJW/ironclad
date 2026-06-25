@@ -28,7 +28,7 @@ _ALLOWLIST_DISPATCHER = {"ProviderDispatcher"}       # the P0 type MPR may refer
 _FORBIDDEN_IMPORT_MODULES = {"subprocess", "multiprocessing", "concurrent.futures", "asyncio"}
 _FORBIDDEN_IMPORT_HEADS = {"subprocess", "multiprocessing", "concurrent"}   # first dotted segment
 _FORBIDDEN_IMPORT_NAMES = {"ThreadPoolExecutor", "ProcessPoolExecutor", "Popen"}
-_FORBIDDEN_DEF_NAMES = {"_plan_concurrency", "_build_agent_argv"}
+_FORBIDDEN_DEF_NAMES = {"_plan_concurrency", "_build_agent_argv", "build_agent_argv"}
 # `import threading` is NOT banned — loader.py legitimately uses threading.Lock() for the registry
 # singleton (mirrors ack.Registry). A thread-POOL rebuild is caught at the call site instead
 # (threading.Thread(...)), so the Lock passes while a hand-rolled fan-out does not.

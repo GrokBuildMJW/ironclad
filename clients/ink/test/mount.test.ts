@@ -99,6 +99,22 @@ test('bracketed paste injects the content as one input (markers stripped)', () =
   inst.unmount();
 });
 
+test('bracketed paste carries key.paste=true so the app can collapse it (#438)', () => {
+  const out = fakeStdout();
+  const inp = fakeStdin();
+  const flags: boolean[] = [];
+  const typed: boolean[] = [];
+  function App(): React.ReactElement {
+    useInput((_input, key) => {flags.push(key.paste); typed.push(false);});
+    return h('ink-text', null, 'x');
+  }
+  const inst = mount(h(App), {stdout: out.stream, stdin: inp.stream, altScreen: false});
+  inp.emitData('\x1b[200~line one\nline two\x1b[201~'); // a multi-line paste
+  inp.emitData('a');                                     // a typed key
+  assert.deepEqual(flags, [true, false]); // paste flagged; typed input is not
+  inst.unmount();
+});
+
 test('right-click pastes the OS clipboard into the input', async () => {
   const out = fakeStdout();
   const inp = fakeStdin();

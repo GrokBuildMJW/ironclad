@@ -28,6 +28,9 @@ export interface Key {
   backspace: boolean;
   delete: boolean;
   meta: boolean;
+  /** True when `input` is a bracketed paste (one chunk, markers stripped) rather than typed — lets the
+   * app compress a multi-line paste to a `[Pasted #N +L lines]` placeholder (#438). */
+  paste: boolean;
 }
 
 export type InputHandler = (input: string, key: Key) => void;
@@ -38,6 +41,7 @@ export function emptyKey(over: Partial<Key> = {}): Key {
     upArrow: false, downArrow: false, leftArrow: false, rightArrow: false,
     pageDown: false, pageUp: false, return: false, escape: false,
     ctrl: false, shift: false, tab: false, backspace: false, delete: false, meta: false,
+    paste: false,
     ...over,
   };
 }

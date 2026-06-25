@@ -70,13 +70,41 @@ async function mkdirp(dir: string): Promise<void> {
 }
 
 /** ≙ subprocess.run with DEVNULL stdin, UTF-8-lossy capture, timeout. */
+// #459: harden the PowerShell invocation — prepend $ProgressPreference='SilentlyContinue' so WriteProgress
+// can never draw a progress bar into the renderer-owned conhost (the verified scaling break). Mirrors the
+// Python server branch. Pure → unit-testable.
+export function winPowershellArgs(command: string): string[] {
+  return ['-NoProfile', '-NonInteractive', '-Command', `$ProgressPreference='SilentlyContinue'; ${command}`];
+}
+
+// #459 (review B S2): the SAME fail-closed shell guardrail as the Python gx10._shell_guard — ported so the
+// LOCAL Ink paths (a bridged execute_command AND the user's `/sh` escape hatch, which never reach the
+// server-side guard) refuse a remote/web fetch or an unbounded/progress-emitting process before it can
+// corrupt the renderer (the verified scaling break). Returns the block reason, or null when allowed. Pure;
+// must stay byte-for-byte equivalent to the Python deny-list (parity).
+const SHELL_DENY: ReadonlyArray<readonly [RegExp, string]> = [
+  // unambiguous web/remote APIs — match anywhere
+  [/\b(invoke-webrequest|invoke-restmethod|start-bitstransfer|net\.webclient|downloadstring|downloadfile|system\.net\.(http|webclient))\b/i,
+    'a remote/web fetch'],
+  // bare fetch commands — only at a COMMAND position (start / after a separator), so a filename/search
+  // string merely CONTAINING the token isn't blocked
+  [/(?:^|[\n;|&({`])\s*(curl|wget|iwr|irm)\b/i, 'a remote/web fetch'],
+  // long-running / progress-emitting processes
+  [/(\bstart-sleep\b|while\s*\(\s*\$?true\s*\)|for\s*\(\s*;\s*;|\bping\s+-t\b|\bping\s+-n\s*\d{3,}|\bstart-job\b|\bstart-process\b|\bregister-scheduledtask\b|\bget-content\b[^\n|]*\s-wait\b|\btail\s+-f\b|\bwatch-\w|\btcpdump\b|\bhtop\b)/i,
+    'a long-running / progress-emitting process'],
+];
+
+export function shellGuard(command: string): string | null {
+  const cmd = command ?? '';
+  for (const [pat, why] of SHELL_DENY) if (pat.test(cmd)) return why;
+  return null;
+}
+
 function execCommand(command: string, timeoutS: number): Promise<string> {
   return new Promise((resolve) => {
     const child =
       process.platform === 'win32'
-        ? spawn('powershell', ['-NoProfile', '-NonInteractive', '-Command', command], {
-            stdio: ['ignore', 'pipe', 'pipe'],
-          })
+        ? spawn('powershell', winPowershellArgs(command), {stdio: ['ignore', 'pipe', 'pipe']})
         : spawn(command, {shell: true, stdio: ['ignore', 'pipe', 'pipe']});
     const out: Buffer[] = [];
     const err: Buffer[] = [];
@@ -190,6 +218,14 @@ export async function runTool(name: string, args: Args): Promise<string> {
 
       case 'execute_command': {
         const command = reqStr(args, 'command');
+        // #459 (review B S2): the fail-closed guardrail also fires on this LOCAL client path (a bridged
+        // command OR the `/sh` escape hatch), so a remote/web fetch or an unbounded/progress process is
+        // refused before it can corrupt the renderer. The server-side guard already covers the model's
+        // tool calls; this covers what never reaches the server.
+        const blocked = shellGuard(command);
+        if (blocked !== null) {
+          return `BLOCKED: execute_command refuses ${blocked} — it can corrupt the display or hang the session (#459).`;
+        }
         // ≙ Python int(args.get("timeout", 30)): absent → 30; present-but-not-int → ERROR
         // (Python raises ValueError/TypeError), NOT a silent 30s fallback that runs the command.
         let timeoutS = 30;

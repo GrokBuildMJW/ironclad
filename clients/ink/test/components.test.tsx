@@ -23,8 +23,9 @@ test('Footer — model · conn · mem · tasks · perf', () => {
     inProgress: 0,
     done: 4,
     perf: 'TTFT 0.5s · 62 tok/s',
+    agent: 'codex · cheapest-capable',
   };
-  const {frame, unmount} = renderToString(<Footer st={st} />, 100, 3);
+  const {frame, unmount} = renderToString(<Footer st={st} />, 160, 3);
   const f = frame();
   assert.match(f, /Ironclad/);
   assert.match(f, /qwen3\.6-35b/);
@@ -32,13 +33,14 @@ test('Footer — model · conn · mem · tasks · perf', () => {
   assert.match(f, /mem up/, 'shows memory status'); // MEM-7
   assert.match(f, /1P\/0IP\/4D/);
   assert.match(f, /TTFT 0\.5s/);
+  assert.match(f, /coder codex/, '#453: shows which coder was routed');
   unmount();
 });
 
 test('Footer — memory off/down render their state', () => {
   const base: StatusState = {
     model: 'm', connected: true, memory: 'off', watcher: false, autopilot: false,
-    pending: 0, inProgress: 0, done: 0, perf: '',
+    pending: 0, inProgress: 0, done: 0, perf: '', agent: '',
   };
   const off = renderToString(<Footer st={base} />, 100, 3);
   assert.match(off.frame(), /mem off/);

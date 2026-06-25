@@ -449,7 +449,7 @@ def _ledger_payloads(repo: Path):
 
 
 _PENDING = {"surface": "DELIVER", "status": "delivered-pending", "sha": "treeX", "tree_sha": "treeX",
-            "gate_results": {"clean-room": 0}, "marker": "abc123", "unit": 364}
+            "gate_results": {"clean-room": 0}, "marker": "abc123", "release_index": "testpypi", "unit": 364}
 
 
 def test_complete_delivery_green_flips_to_delivered_terminal(tmp_path):
@@ -505,6 +505,40 @@ def test_complete_delivery_is_idempotent(tmp_path):
     r = _load()
     repo = tmp_path / "repo"; _write_ledger(repo, [_PENDING, {**_PENDING, "status": "delivered"}])
     rc, msg = r.complete_delivery(str(repo), "test-pypi", 364, "o/r",
+                                  smoke_reader=lambda: "success", body_reader=lambda: "")
+    assert rc == 0 and "already DELIVERED" in msg
+    assert len((repo / ".devloop" / "ledger.jsonl").read_text(encoding="utf-8").splitlines()) == 2   # nothing appended
+
+
+def test_complete_delivery_not_blocked_by_a_testpypi_proof_433(tmp_path):
+    # #433: a Test-PyPI terminal `delivered` record must NOT make the PRODUCTION completion idempotent —
+    # the production cut is a SEPARATE delivery of the same unit. `--complete-delivery --target
+    # core-monorepo` must proceed (not short-circuit) and append the production (release_index=pypi)
+    # terminal record. This is the exact bug the first real production cut surfaced.
+    import json as _j
+    r = _load()
+    repo = tmp_path / "repo"
+    testpypi_delivered = {**_PENDING, "status": "delivered", "release_index": "testpypi", "unit": 348}
+    pypi_pending = {**_PENDING, "release_index": "pypi", "unit": 348}
+    # a bare lifecycle pending (no release_index, no gate_results) — the real ledger interleaves these;
+    # the index-bearing STAMP must still win, so the terminal record carries release_index=pypi.
+    lifecycle_pending = {"surface": "DELIVER", "state": "DELIVER", "status": "delivered-pending", "unit": 348}
+    _write_ledger(repo, [testpypi_delivered, pypi_pending, lifecycle_pending])
+    rc, msg = r.complete_delivery(str(repo), "core-monorepo", 348, "o/r",
+                                  smoke_reader=lambda: "success", body_reader=lambda: "")
+    assert rc == 0 and "DELIVERED" in msg and "already" not in msg     # proceeded, not short-circuited
+    last = _j.loads((repo / ".devloop" / "ledger.jsonl").read_text(encoding="utf-8").splitlines()[-1])
+    p = last.get("payload", last)
+    assert p.get("status") == "delivered" and p.get("release_index") == "pypi" and p.get("unit") == 348
+
+
+def test_complete_delivery_production_is_idempotent_per_index_433(tmp_path):
+    # #433: once the PRODUCTION terminal record exists, a re-run is idempotent (per index).
+    r = _load()
+    repo = tmp_path / "repo"
+    pypi_delivered = {**_PENDING, "status": "delivered", "release_index": "pypi", "unit": 348}
+    _write_ledger(repo, [{**_PENDING, "release_index": "pypi", "unit": 348}, pypi_delivered])
+    rc, msg = r.complete_delivery(str(repo), "core-monorepo", 348, "o/r",
                                   smoke_reader=lambda: "success", body_reader=lambda: "")
     assert rc == 0 and "already DELIVERED" in msg
     assert len((repo / ".devloop" / "ledger.jsonl").read_text(encoding="utf-8").splitlines()) == 2   # nothing appended

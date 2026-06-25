@@ -98,6 +98,74 @@ def test_delivery_commands_are_the_push_and_release_create(tmp_path):
     assert "owner/ironclad" in cmds["release-create"]
 
 
+# ── #432: the GitHub release body is the CHANGELOG section, not a placeholder ──
+def _write_changelog(root: Path, body: str) -> None:
+    (root / "core").mkdir(parents=True, exist_ok=True)
+    (root / "core" / "CHANGELOG.md").write_text(body, encoding="utf-8")
+
+
+_CHANGELOG = """# Changelog
+
+## [Unreleased]
+
+## [0.0.16] - 2026-06-20
+### Fixed
+- **Real fix one** (#100): something meaningful happened here.
+- **Real fix two** (#101): and another.
+
+## [0.0.15] - 2026-06-19
+### Added
+- An older entry that must NOT leak into the 0.0.16 notes.
+"""
+
+
+def test_changelog_notes_extracts_the_section_body(tmp_path):
+    d = _load()
+    _write_changelog(tmp_path, _CHANGELOG)
+    notes = d.changelog_notes(tmp_path, "v0.0.16")
+    assert notes is not None
+    assert notes.startswith("### Fixed")                       # heading line stripped, body kept
+    assert "Real fix one" in notes and "Real fix two" in notes
+    assert "0.0.15" not in notes and "must NOT leak" not in notes  # stops at the next '## ' heading
+
+
+def test_changelog_notes_strips_v_prefix(tmp_path):
+    d = _load()
+    _write_changelog(tmp_path, _CHANGELOG)
+    assert d.changelog_notes(tmp_path, "0.0.16") == d.changelog_notes(tmp_path, "v0.0.16")
+    assert d.changelog_notes(tmp_path, "v0.0.16") is not None
+
+
+def test_changelog_notes_fail_soft(tmp_path):
+    d = _load()
+    # no CHANGELOG file at all
+    assert d.changelog_notes(tmp_path, "v0.0.16") is None
+    # file present but the version has no section
+    _write_changelog(tmp_path, _CHANGELOG)
+    assert d.changelog_notes(tmp_path, "v9.9.9") is None
+    # empty tag
+    assert d.changelog_notes(tmp_path, "") is None
+    # a section with a heading but no list entry -> None (placeholder is more honest)
+    _write_changelog(tmp_path, "# Changelog\n\n## [0.0.99] - 2026-06-24\n\nProse only, no bullet.\n")
+    assert d.changelog_notes(tmp_path, "v0.0.99") is None
+
+
+def test_delivery_commands_uses_changelog_notes_when_present(tmp_path):
+    d = _load()
+    _write_changelog(tmp_path, _CHANGELOG)
+    cmds = dict(d.delivery_commands(tmp_path, "v0.0.16", "owner/ironclad"))
+    rc = cmds["release-create"]
+    notes = rc[rc.index("--notes") + 1]
+    assert "Real fix one" in notes and "GO-gated" not in notes     # the real section, not the placeholder
+
+
+def test_delivery_commands_falls_back_to_placeholder_without_changelog(tmp_path):
+    d = _load()
+    cmds = dict(d.delivery_commands(tmp_path, "v0.0.16", "owner/ironclad"))
+    rc = cmds["release-create"]
+    assert rc[rc.index("--notes") + 1] == "DELIVER v0.0.16 (engine, GO-gated)"
+
+
 # ── #348 S7 review hardening: never-auto, artifact-bound, structurally GO-bound scope ──
 def test_authorize_delivery_hard_forces_supervised_ignoring_auto_dial(tmp_path):
     # the irreversible publish lane NEVER auto-advances: a caller-supplied {'DELIVER':'auto'} cannot bypass

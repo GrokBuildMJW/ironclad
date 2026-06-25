@@ -9,6 +9,243 @@ Released versions are listed below; upcoming work accumulates under *Unreleased*
 
 ## [Unreleased]
 
+## [0.0.19] - 2026-06-25
+
+### Changed
+- **Node toolchain validated end-to-end (Node 22 → 24)** (#448, epic #440): the `clients/ink` CI now runs a
+  **Node matrix `[22, 24]`** (`node-client.yml`), so CI validates BOTH the `engines` minimum (Node 22, npm 10)
+  AND the version a desktop actually ships (Node 24, npm 11) — closing the gap where CI never tested the
+  toolchain the operator builds/installs with. Each matrix leg uses its bundled npm, so the npm 10 ↔ 11
+  resolution skew is covered; the `package.json` declares the canonical `packageManager` (`npm@11.17.0`) for
+  corepack users (verified `npm ci` is in sync — no lockfile drift). A `process_doctor` invariant
+  `node-version-matrix` keeps the matrix from regressing. The public `clean-room.yml` pre-publish job stays
+  single-Node on purpose (it is a branch-protection required check; matrixing it would rename the check and
+  needs a coordinated, operator-gated protection update). `test_process_doctor.py` (+2).
+
+### Added
+- **Read-only Memory MCP for external coding CLIs** (#480, epic #440 Phase 6 / FORK-G D2): a dependency-free
+  **stdio MCP server** (`engine/memory_mcp.py`, JSON-RPC 2.0) that exposes the project memory to an
+  MCP-capable code CLI (Codex/Claude) as **read-only** tools — `memory_search` (vector) and
+  `memory_deep_query` (graph), no write (write-back deferred). The CLI spawns it as a subprocess; the
+  code-agent registry injects the per-CLI MCP config via a new `{mcp}` multi-token placeholder in the
+  `cmd_template` (filled from the agent's `mcp_template`). The injection is **gated server-side on the
+  `sealed` trust profile** (operator) AND a configured memory service — under `open`/`token` the launch is
+  byte-identical to before. **Secret-free**: the memory connection travels in the spawned process's env
+  (`GX10_MEMORY_URL`/`GX10_MCP_MEMORY_NS`), never on the MCP wire; the read is scoped to the **project
+  namespace** (the same memory the orchestrator + the #458 handover brief use), not the code-agent's id.
+  Fully fail-soft (a memory hiccup returns a tool result, never crashes the server). `test_memory_mcp.py`
+  (new, 10), `test_client_pool.py` (+1), `test_server_split.py` (+3). (Core — `memory_mcp.py` +
+  `commands.build_agent_argv` `{mcp}` + `gx10`/`server` gate + `client` env; the per-CLI `mcp_template` is a
+  private `conf/` detail.)
+- **Onboard-but-disabled code agents** (#460, epic #440 Phase 6): a code agent can now be **registered
+  while `enabled: false`** — onboarded but **inert** until activated. A disabled agent is excluded from the
+  enabled-only launch/schema surface (`names`/`has`/`resolve`/`by_agent`), so it is never offered in the
+  handover schema, never boot-probed, never launchable, and **never a budget-failover peer** (even if its id
+  is listed in a `code_agents.classes` set — `resolve()` returns None, so it is skipped); `validate_loud`
+  still checks it is well-formed. New `CodeAgentRegistry.all_ids()`/`spec_of()` expose ALL registered agents
+  (including disabled) for **operator visibility**: `GET /coders` (and all four clients) now show an
+  onboarded-but-disabled agent as `enabled:false` / `(onboarded · disabled)`, so the operator can see a
+  registered agent that is pending activation. This is the onboarding seam for a new backend whose
+  exhausted-signal is calibrated from one real run before it is enabled. `test_code_agent_registry.py` (+3),
+  `test_server_split.py` (+1). (Core — `providers.py`/`server.py` + the four clients.)
+- **First-class web search + current-info routing + shell guardrail** (#459, epic #440 Phase 6 / §4 /
+  FORK-H — fixes the verified scaling-break #447): the orchestrator gains a real `web_search` tool so the
+  model never has to improvise a shell web fetch for current information. Three parts: **(1)** a `web_search`
+  tool, offered only when a **web-capable provider is configured**, that runs the search **server-side
+  through the provider lane** (`ProviderDispatcher.web_search` routes a `needs_web`/PUBLIC request to the
+  web provider and runs it via the **captured** CLI runner — structurally immune to the console write that
+  corrupted the renderer); **(2)** a conservative EN+DE **current-info intent classifier** that proactively
+  steers "latest / today / aktuelle Lage" requests to `web_search`; **(3)** a **fail-closed shell
+  guardrail** on `execute_command` — a remote/web fetch (`Invoke-WebRequest`, `curl`, …) or an
+  unbounded/progress-emitting process (sleep loops, `-Wait` follows, watchers, `ping -t`) is **refused
+  before it runs** (and a web fetch is redirected to `web_search`), plus the PowerShell invocation is
+  hardened with `$ProgressPreference='SilentlyContinue'`. The guard fires **server-side at the top of
+  `run_tool`, before the local-tool bridge**, so it covers every client (the thin client AND the Ink
+  client, which also gets the PowerShell hardening at its own execution site). The deny-list anchors bare
+  `curl`/`wget` to a command position (a filename/search string merely *containing* the token isn't
+  blocked), and the intent classifier avoids bare "current" (everywhere in coding context). The web CLI
+  itself (e.g. Codex `--search`) is a private `conf/` deployment detail; core ships the capability-gated
+  mechanism. The guard is **mirrored into the Ink client** (`shellGuard` in `runTool.ts`) so the local
+  `/sh` escape hatch — which never reaches the server — is also covered, and the web provider must be an
+  **enabled external CLI** (an in-engine/disabled web spec is never offered or routed). `test_dispatch.py`
+  (+7), `test_websearch.py` (+46), `clients/ink` `runTool.test.ts` (+4). (Core — `dispatch.py`/`gx10.py`;
+  client — `clients/ink/src/tools/runTool.ts`.)
+- **Token-budgeted Memory brief in the handover** (#458, epic #440 Phase 6 / FORK-G D1): the plain
+  `type: title` `get_context` that was appended to a staged handover is replaced by a richer, token-budgeted
+  **Memory brief** for every code agent — so the external coding CLI starts a task with the same memory the
+  orchestrator has. The brief composes, in priority order and trimmed to stay within a token budget
+  (`context.memory_brief_tokens`, default 1200; counted with the best-available tokenizer): (1) the shared
+  **warm rolling summary** (the main loop's common ground), (2) **body-keyed** vector hits — the handover
+  BODY is a far richer retrieval query than `type: title`, (3) optional **relational** (graph) hits, deduped
+  against the vector hits. Fully **fail-soft**: any memory hiccup (or nothing relevant) just stages the
+  handover without a brief, and a vector-search error still keeps a warm summary already in hand. `get_context`
+  remains for plain callers. `test_memory.py` (+7). (Core — `memory.py` `MemoryManager.brief` + the
+  `stage_handover` injection in `gx10.py`.) The read-only Memory **MCP** for external CLIs (D2) is tracked
+  separately (#480, stdio transport).
+- **Distinct-reviewer routing (anti-affinity)** (#457, epic #440 Phase 5): the pure provider router can be
+  told to **avoid the agent that produced the artifact under review**, so a review-of-a-review is never
+  routed back to its own author while an equal peer is available. A new `RouteRequest.excluded_provider_ids`
+  (caller-passed — `route_one` stays pure and snapshot-testable) drops those providers from the candidate
+  set after the capability filter, before load/spill/budget (so the producer can't slip back in via a
+  fallback). It is **SOFT**: if excluding the producer would leave no capable agent, the route is not
+  declined — the producer is kept and the decision records the waive. `RouteDecision.distinct_reviewer`
+  carries the provenance: `"applied"` (an excluded producer was dropped and an equal peer chosen),
+  `"waived"` (the producer was the only capable agent), or `None` (no exclusion requested). **HARD axes
+  outrank it**: a SENSITIVE/local-only request whose only local provider is the excluded producer stays
+  local (waived) rather than leaking to an external "distinct" peer. `test_router.py` (+5). (Pure router
+  seam — `router.py`; a private CI invariant `review-distinct-reviewer` asserts the seam stays intact.)
+- **Task-class-scoped budget failover** (#456, epic #440 Phase 5): the #455 failover now stays within the
+  agents that are *capable of the task's class*, so a budget-exhausted Opus on a **security** or
+  **architecture** task never silently falls to a cheaper-but-weaker peer. The task class is derived
+  **deterministically from `task_json.type`** (`gx10._task_class`, FORK-D — no model self-report is
+  trusted): `security`/`security-audit` → `security`, `architecture` → `architecture`, `verification`
+  → `analysis`, everything else → `coding`. A new `code_agents.classes` capability map
+  (`security: [OPUS]`, `architecture: [OPUS]`, `coding: [OPUS, SONNET]`, `analysis: [SONNET]`) names which
+  registry agents may serve each class; `_effective_code_agent(staged, task_class=…)` restricts the
+  cheapest-non-tripped-peer search to that set. The **staged (orchestrator-chosen) agent stays
+  authoritative** and an operator pin still wins — the class only *scopes the failover peers*. Fail-open
+  by design: an unknown/unmapped class (or no class) imposes no restriction, byte-identical to #455; if
+  every capable agent is tripped the chosen one is kept (fail-closed, never an out-of-class agent).
+  `test_server_split.py` (+12). (Core seam — `gx10.py`/`server.py`; the conf `classes` map refines the
+  per-deployment roster privately.)
+- **Budget-exhausted classifier + circuit-breaker + equal-peer failover** (#455, epic #440 Phase 4):
+  turns an out-of-budget agent's silent infinite-retry into a clean failover. The client now reports the
+  raw run signal (exit code + a bounded stderr tail) to the server, which **classifies** it
+  (`providers.classify_agent_result`, FORK-C=C: layered JSON-event → stderr regex → exit code, patterns
+  from conf) into `ok-feedback` / `task-failed` / `agent-unavailable`. A run that produced FEEDBACK is
+  always `ok-feedback` — the feedback (the agent's task result) is never pattern-matched (so a coding
+  answer that mentions "rate limit"/"quota" can't false-trip); only the RAW stderr is scanned, only when
+  there is no feedback. **Conservative**: only an explicit exhausted match is `agent-unavailable` — an
+  unknown failure is `task-failed`, never a wasteful failover. On `agent-unavailable` the server trips a **process-lifetime circuit-breaker**, and
+  `_effective_code_agent` fails over to the **cheapest non-tripped capable peer** (USD soft ordering;
+  all tripped → keep the chosen one, fail-closed). `GET /coders` shows breaker-tripped agents; pinning an
+  agent (`/coders use <id>`) clears its breaker (recovery). Generic, public-safe exhausted patterns ship
+  in core; a deployment refines per-agent in `conf/` — an agent's exact signal is calibrated from one
+  consented run (e.g. Kimi at #460). `test_code_agent_registry.py` (+9), `test_server_split.py` (+4).
+  (Core seam — `providers.py`/`gx10.py`/`server.py`/`client.py`; conf patterns private.)
+- **Runtime coding-agent switching** (#454, epic #440 Phase 4): the operator can pin which coding
+  agent handles ALL handovers at runtime with `/coders use <id>` (and `/coders use auto` to clear) —
+  the runtime "switch" between equal-strength agents. A new `code_agents.pinned` runtime config, a
+  guarded `POST /coders` (validates the agent against the registry, fail-closed on unknown), and a
+  single `gx10._effective_code_agent(staged)` seam that **overrides the orchestrator's task-chosen
+  (staged) agent** at every execution/reconciliation point (`/pending` spec resolution, the reconciler
+  feedback match — with a staged fallback if the pin changes mid-handover, and the autopilot launch).
+  No pin ⇒ the staged agent (task-appropriate — the orchestrator already routes "Opus for
+  security/architecture"); cost-based auto-routing among task-equal peers is deferred to the Phase 5
+  `task_class` work. `GET /coders` + the `/coders` view (all four clients) show the active pin.
+  `test_server_split.py` (+5). (Core seam — `gx10.py`/`server.py` + the four clients.)
+- **Live "which coder is being called" indicator** (#453, epic #440 Phase 4): the fan-out routing
+  provenance (`provider_id`/`route_reason`/`spilled`) is now surfaced as a typed, backward-compatible
+  `[agent]` control frame — the same line-protocol pattern as `[perf]`. The orchestrator emits one
+  frame per distinct routed provider (`_emit_agent_frames`, fail-soft); every client parses it out of
+  the chat stream into the status footer (`coder <id> · <reason>`): the TypeScript client
+  (`stream/route.ts` + `Footer`), the Rich full-screen client, the Textual client, and the REPL. The
+  parser is a byte-exact port across the Python (`cli.py`) and TypeScript renderers. `test_server_split.py`
+  (+2), `route.test.ts`/`components.test.tsx` (+1). (Core seam — `gx10.py` + the four clients.)
+- **`/coders` — which coding agents are bound + active** (#452, epic #440 Phase 4): a new guarded
+  `GET /coders` and a `/coders` client command (REPL, full-screen, and the TypeScript client) answer
+  "which coding agents are actually bound right now". It surfaces the config-driven code-agent registry
+  with each agent's prompt-free **boot-probe liveness** (bin resolved = bound) alongside the fan-out
+  provider lane via a new `ProviderDispatcher.snapshot()` (per-provider reachability + last routing
+  reason + running budget). `/health` carries a compact `coders: {bound,total}` for the 2s poller.
+  `GET /coders` is gated like `/tasks`/`/doctor`. `test_dispatch.py` (+4), `test_server_split.py` (+4),
+  `classify.test.ts` (+1). (Core seam — `dispatch.py`/`server.py`/`commands.py`/`client.py`/`cli.py` +
+  `clients/ink`.)
+- **Per-agent boot probe** (#451, epic #440 Phase 3): the server checked a single `which(CLAUDE_BIN)` to
+  decide whether a local code-agent was available. It now probes EACH enabled code-agent (prompt-free
+  path resolution, `providers.probe_code_agents`) and is cli-available iff AT LEAST ONE resolves —
+  fail-closed only when ZERO do. Each agent's binary resolves via `PATH` (a stable shim) else the spec's
+  private-layer `bin_glob` newest-by-mtime (FORK-A3: the hashed AppData launcher path rots on update);
+  env vars/`~` in `bin_glob` are expanded, and the concrete path stays in `conf/` (never a literal in
+  `core/`). Boot logs each agent's resolution. `test_code_agent_registry.py` (+7). (Core seam —
+  `providers.py`/`server.py`; private config — `conf/`.)
+- **Config-driven code-agent registry — the multi-CLI spine** (#449, epic #440 Phase 3): the handover
+  code-agent identity was fused to Claude across six OPUS/SONNET allowlists, a `client._MODEL_BY_AGENT`
+  table and a legacy KIMI→SONNET normalization. Agents now live in ONE config-driven, always-on surface —
+  `config.code_agents.pool`, a `providers.CodeAgentRegistry` keyed by `agent_id` — SEPARATE from the
+  fan-out `providers.pool` (so it is independent of `providers.enabled`, which is on in local-mode).
+  Ironclad ships **OPUS**/**SONNET** as **overridable** defaults; `conf/` adds CODEX (KIMI at #460). The
+  `agent_id` is a letters-only filename token (it must round-trip BOTH `_HO_AGENT_RE` and `_FB_RE`); an
+  **unknown agent fails closed** everywhere (the two `stage_handover`/`advance_pipeline` guards, the
+  autopilot reconciler, the server pull) instead of silently defaulting. The handover schema `agent` enum
+  is generated from the LIVE registry, so a conf-added agent is offerable. The server now resolves the
+  FULL agent spec (`bin`/`cmd_template`/`model`/`effort`/`permission`) from the registry into the
+  `/pending` item and the client is a thin renderer (no client-side registry); the handover-frontmatter
+  `to:`/`effort:` still override. Both launch paths share one `build_agent_argv` (moved to stdlib
+  `commands.py` so the zero-dependency client never pulls pydantic). `test_code_agent_registry.py` (+32).
+  (Core seam — `providers.py`/`gx10.py`/`server.py`/`client.py`/`commands.py`; private config — `conf/`.)
+- **The standard C0 method is machine-checked** (#464, epic #440 Phase 0): the alternating two-distinct-
+  reviewer C0 method that recovered #440 is now enforced, not just discipline. Two `process_doctor`
+  invariants (ADR-0007, scheduled `reconcile.yml`) join #446's: `epic-ready-has-verbatim-requirements`
+  (a `status/ready` epic must carry a 'VERBATIM REQUIREMENTS' comment — the operator's requirements pasted
+  1:1, so paraphrasing can't silently drop scope) and `epic-ready-has-coverage-matrix` (a 'Coverage matrix'
+  comment mapping each requirement → a sub-issue). The alternating A↔B distinct-reviewer chain itself stays
+  the documented convention behind the `c0/converged` label; `NEW_EPIC.md` records the full method.
+  `test_process_doctor.py` (+3). (Private tooling — `scripts/ci/` + `.github/`.)
+- **Deterministic code-agent result capture (hybrid feedback)** (#443, epic #440 Phase 2): the handover
+  runner read only the agent-written `…-feedback.md`, so an agent that finished its work but forgot to
+  write that file produced a silent no-feedback → retry. `_build_agent_argv` now accepts an optional
+  `{feedback}` token (a result-capture path) and `_run_handover` threads it through; an agent whose
+  template uses it — e.g. Codex `-o {feedback}` (now in the conf Codex entry) — writes its FINAL message
+  there, and the runner falls back to that captured message when the in-prompt feedback file is missing
+  (FORK-A2 = C, hybrid: file is primary, capture is the fallback). Claude's default template omits
+  `{feedback}` and is unchanged. `test_client_pool.py` (+4). (Core seam — `client.py`; private conf.)
+- **Codex is a first-class code-agent backend on the template-driven client lane** (#442, epic #440 Phase 2):
+  a `codex` provider entry in the private `conf/` pool proves the existing template-driven handover lane
+  runs Codex with ZERO core change. The Codex `cmd_template` (`codex exec -m {model} -s workspace-write -c
+  'approval_policy="never"' --skip-git-repo-check {prompt}`) **drops `{effort}`/`{permission}`** — `codex
+  exec` rejects `--effort`/`--permission-mode`/`-a` (verified live, §C0R-8) — and `_build_agent_argv` leaks
+  none of the Claude-only flags/values. `bin: "codex"` is the logical name; the per-provider boot probe
+  (#451) resolves it glob-newest from `%LOCALAPPDATA%\OpenAI\Codex\bin` (the hashed path rots). Output
+  capture (`-o`/`--json`) is #443; the live workspace-write run is operator-verified later.
+  `test_client_pool.py` (+1). (Private config — `conf/`; the BYO-code-agent guide
+  `code-agents.md` + `status.md` gain a verified Codex example + the `{feedback}` placeholder, #444.)
+- **C0-bypass guards: the epic process is machine-checked, not just discipline** (#446, epic #440 Phase 0):
+  the machine-gated dev-loop only guarded the autonomous engine, so manual `gh`/`git` work could create an
+  epic without `[epic]`, self-mark `status/ready`, and start without a C0 review. Three `process_doctor`
+  invariants (ADR-0007, scheduled `reconcile.yml`) close that: `epic-has-bracket-title` (an open
+  `type/feature` epic must carry `[epic]`; pre-enforcement epics grandfathered), `epic-ready-is-decomposed`
+  (a `status/ready` epic needs ≥1 native sub-issue — no ready without scope decomposition), and
+  `epic-ready-has-c0-marker` (a `status/ready` epic must carry the new `c0/converged` label — the deliberate
+  marker of a converged two-distinct-reviewer C0). `test_process_doctor.py` (+4). `NEW_EPIC.md` records the
+  enforcement. (Private tooling — `scripts/ci/` + `.github/`.)
+- **Multi-line paste collapses to a `[Pasted #N +L lines]` placeholder in the TUI input** (#438): pasting
+  more than one line into the chat input now shows a compact placeholder (like Claude Code) instead of the
+  raw lines, and expands back to the full text when the turn is submitted — so a large paste no longer
+  floods the input line. Re-introduces the model the retired Python TUI had (`tui.py`), ported to the
+  TypeScript client: bracketed **and right-click** pastes are flagged (`key.paste`) at the mount layer, a
+  pure `pasteStore` module owns the compress/expand/Backspace logic, and `App.tsx` keeps the per-turn
+  block store. Hardened after an adversarial review: the buffer holds an **out-of-band sentinel** (not the
+  visible grammar), so typing or single-line-pasting the literal `[Pasted #N +L lines]` is never expanded
+  or over-deleted; deleting a collapsed paste **reclaims** its stored block; the sentinel delimiters are
+  stripped from incoming paste content so a paste can't forge one; and LF/CRLF/lone-CR are all treated as
+  line breaks. Single-line pastes and typed input are unaffected. `node:test` (+13).
+
+### Fixed
+- **Engine-cut GitHub releases carry the real CHANGELOG notes** (#432): the DELIVER lane hard-coded the
+  release body to a placeholder (`DELIVER vX.Y.Z (engine, GO-gated)`), so every engine-driven release —
+  including the first production cut (0.0.18) — shipped empty notes until hand-fixed. `deliver.py` now
+  extracts the matching `## [X.Y.Z]` section of `core/CHANGELOG.md` (tag `v` prefix stripped; heading
+  semantics mirror `release_preflight._section` so the two agree on the section bounds) and passes it as
+  the `gh release create --notes`; it fails soft to the old placeholder when the CHANGELOG is absent or the
+  version has no non-empty section. `test_devloop_deliver.py` (+5). (Private tooling — `scripts/devloop/`;
+  no runtime change.)
+- **Board `In Review` + `Blocked` are now set automatically** (#278): on the Projects-v2 board these two
+  columns were never reached — `In Review` relied on a built-in that proved unreliable on this
+  single-developer board (and the board's option is the lower-case "in Review"), and `Blocked` had no
+  setter or reconciler at all (the gap the #223 audit recorded as F-G-02). Both are now derived states
+  with the full ADR-0007 treatment: invariant + on-event guard + scheduled reconciler + negative test.
+  `status/blocked` label ⟺ board **Blocked**, and an open linked PR ⟺ **In Review**; the on-event guard
+  `project-status.yml` extends to `issues: [labeled, unlabeled]` and `pull_request: [opened, reopened,
+  ready_for_review, closed]`, and `process_doctor.py` gains the reconcilers `board-blocked-reflects-label`
+  and `board-in-review-reflects-open-pr` (group=repo, healed daily). Blocked takes precedence over In
+  Review. `test_process_doctor.py` (+5 = 70). Per ADR-0007. (Private tooling — `scripts/ci/` + `.github/`;
+  no runtime change.)
+- **`complete-delivery` idempotency is release-index-aware** (#433): the delivered-pending → terminal-delivered
+  completion key now includes the release index, so a Test-PyPI completion can never be mistaken for the
+  production one (or vice-versa). `test_devloop_run.py`/`test_devloop_watcher.py` (+3). (Private tooling —
+  `scripts/devloop/`; no runtime change.)
+
 ## [0.0.18] - 2026-06-24
 
 ### Fixed

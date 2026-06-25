@@ -21,6 +21,8 @@
   "engines": {
     "node": ">=22"
   },
+  "packageManager": "npm@11.17.0",
+  "_toolchain_comment": "#448: supported toolchain = Node 22 (engines minimum) through 24 (what the desktop ships) — both validated in CI (node-client.yml + clean-room.yml matrix). packageManager pins npm for corepack users; CI uses each matrix Node's bundled npm (npm 10 on 22, npm 11 on 24), so npm itself does not enforce this field.",
   "scripts": {
     "dev": "tsx src/cli.tsx",
     "build": "tsc -p tsconfig.build.json",

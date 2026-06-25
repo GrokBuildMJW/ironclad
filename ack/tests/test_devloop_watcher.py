@@ -53,19 +53,31 @@ def test_watch_delivery_red_smoke_is_a_yank_candidate_not_done():
 def test_published_issues_from_ledger_counts_only_terminal_delivered():
     w = _load("watcher")
     records = [
-        {"seq": 0, "payload": {"surface": "DELIVER", "status": "delivered", "unit": 358}},
-        {"seq": 1, "payload": {"surface": "DELIVER", "status": "delivered-pending", "unit": 359}},
-        {"seq": 2, "payload": {"surface": "DELIVER", "status": "delivered-yank-candidate", "unit": 360}},
-        {"seq": 3, "payload": {"surface": "DRIVER", "status": "delivered", "unit": 999}},   # not a DELIVER record
-        {"seq": 4, "payload": {"surface": "DELIVER", "status": "delivered", "unit": 358}},  # dedup
+        {"seq": 0, "payload": {"surface": "DELIVER", "status": "delivered", "release_index": "pypi", "unit": 358}},
+        {"seq": 1, "payload": {"surface": "DELIVER", "status": "delivered-pending", "release_index": "pypi", "unit": 359}},
+        {"seq": 2, "payload": {"surface": "DELIVER", "status": "delivered-yank-candidate", "release_index": "pypi", "unit": 360}},
+        {"seq": 3, "payload": {"surface": "DRIVER", "status": "delivered", "release_index": "pypi", "unit": 999}},   # not a DELIVER record
+        {"seq": 4, "payload": {"surface": "DELIVER", "status": "delivered", "release_index": "pypi", "unit": 358}},  # dedup
+        {"seq": 5, "payload": {"surface": "DELIVER", "status": "delivered", "release_index": "testpypi", "unit": 361}},  # #433: Test-PyPI proof, NOT published
     ]
-    assert w.published_issues_from_ledger(records) == [358]        # pending / yank / non-DELIVER excluded
+    assert w.published_issues_from_ledger(records) == [358]        # pending / yank / non-DELIVER / Test-PyPI excluded
+
+
+def test_testpypi_delivered_is_not_published_433():
+    # #433: a Test-PyPI terminal `delivered` record (an isolated proof) must NOT count as published —
+    # else the production `--complete-delivery` idempotency short-circuits and never appends the
+    # production terminal record (the bug the first real production cut surfaced).
+    w = _load("watcher")
+    records = [{"seq": 0, "payload": {"surface": "DELIVER", "status": "delivered", "release_index": "testpypi", "unit": 348}}]
+    assert w.published_issues_from_ledger(records) == []           # testpypi proof ≠ public delivery
+    records.append({"seq": 1, "payload": {"surface": "DELIVER", "status": "delivered", "release_index": "pypi", "unit": 348}})
+    assert w.published_issues_from_ledger(records) == [348]        # the production delivery DOES count
 
 
 def test_published_source_feeds_resume_already_published():
     w = _load("watcher")
     resume = _load("resume")
-    records = [{"seq": 0, "payload": {"surface": "DELIVER", "status": "delivered", "unit": 358}}]
+    records = [{"seq": 0, "payload": {"surface": "DELIVER", "status": "delivered", "release_index": "pypi", "unit": 358}}]
     published = w.published_issues_from_ledger(records)
     assert resume.already_published(358, published) is True       # terminal: never re-delivered
     assert resume.already_published(359, published) is False      # a different (unpublished) unit

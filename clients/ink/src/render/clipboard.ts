@@ -79,7 +79,7 @@ export function readClipboard(onText: (text: string) => void, platform: NodeJS.P
       buf += d.toString('utf8');
     });
     child.on('close', (code) => {
-      if (code === 0 || buf) onText(buf.replace(/\r\n/g, '\n').replace(/\n+$/, ''));
+      if (code === 0 || buf) onText(buf.replace(/\r\n?/g, '\n').replace(/\n+$/, '')); // CRLF + lone CR -> LF (#438)
       else tryAt(i + 1);
     });
   };

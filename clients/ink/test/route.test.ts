@@ -14,6 +14,17 @@ test('route — [perf] goes to status (perf + tokens), not the answer', () => {
   assert.equal(r.answer.length, 0);
 });
 
+test('route — #453 [agent] goes to the agent status, not the answer', () => {
+  const r = createRouter();
+  assert.equal(r.agent, ''); // a fresh per-turn router has no stale coder (no carry-over between turns)
+  r.route('  [agent] codex · cheapest-capable');
+  assert.equal(r.agent, 'codex · cheapest-capable');
+  assert.equal(r.answer.length, 0);
+  r.route('  [agent] spark-vllm · local-idle'); // last-wins (the most recently routed coder)
+  assert.equal(r.agent, 'spark-vllm · local-idle');
+  assert.equal(r.answer.length, 0);
+});
+
 test('route — DONE banner + role labels are dropped', () => {
   const r = createRouter();
   r.route('  ======== ✓ DONE · ready · 1 gen · 2s · 117 tok ========');

@@ -69,6 +69,10 @@ jobs:
   pre-publish-ink:
     if: github.event_name != 'release'
     runs-on: ubuntu-latest
+    # #448: stays SINGLE-Node (the engines minimum, 22) because this job is a BRANCH-PROTECTION required
+    # check — matrixing it would rename the check to `pre-publish-ink (22|24)` and require a coordinated
+    # live-protection + SSOT update (operator-gated). The per-change Node 22↔24 validation lives in the
+    # private `node-client.yml` matrix, which runs on every `clients/ink` change (incl. the desktop rebuild).
     defaults:
       run:
         working-directory: clients/ink

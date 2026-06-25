@@ -14,7 +14,7 @@ separate MPR token notion.
 from __future__ import annotations
 
 from enum import Enum
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Set
 
 from pydantic import BaseModel, Field
 
@@ -40,6 +40,11 @@ class RouteRequest(BaseModel):
     needs_web: bool = False                       # needs web_search capability
     needs_file_io: bool = False                   # needs file_io capability
     est_input_chars: int = 0                      # len(item)+len(context), filled by the dispatcher
+    excluded_provider_ids: List[str] = Field(default_factory=list)   # SOFT distinct-reviewer anti-affinity
+                                                  # (#457, FORK-F): provider(s) to avoid (e.g. the agent that
+                                                  # PRODUCED the artifact under review) so a review-of-a-review
+                                                  # is not routed back to its author — waived if no equal peer
+                                                  # remains. Caller-passed; route_one stays pure (§ router purity).
 
 
 class LoadSignal(BaseModel):
@@ -62,6 +67,10 @@ class RouteDecision(BaseModel):
                                                   # no-local-provider | no-capable-provider | budget-exhausted
     est_max_tokens: int                           # §4.1 mapping, passed to the substrate
     est_cost_usd: float                           # for budget counting + manifest
+    distinct_reviewer: Optional[str] = None       # #457 anti-affinity provenance: "applied" (an excluded
+                                                  # producer was dropped and an equal peer chosen), "waived"
+                                                  # (the producer was the ONLY capable agent → SOFT-kept), or
+                                                  # None (no exclusion requested). Snapshot-stable.
 
 
 # ── Scoring SSOT (module constants; config-overridable via providers.scoring) ─────────────────────
@@ -124,6 +133,7 @@ def route_one(
     effort = _effort(req.effort)
     out_tok = EFFORT_MAX_TOKENS[effort]
     in_tok = _est_input_tokens(req.est_input_chars)
+    distinct: Optional[str] = None    # #457 anti-affinity provenance (set after the capability filter)
 
     def decision(p: Optional[ProviderSpec], reason: str) -> RouteDecision:
         cost = round(_cost_usd(p, in_tok, out_tok), 6) if p is not None else 0.0
@@ -133,6 +143,7 @@ def route_one(
             reason=reason,
             est_max_tokens=out_tok,
             est_cost_usd=cost,
+            distinct_reviewer=distinct,
         )
 
     candidates = list(registry.by_id().values())
@@ -155,6 +166,27 @@ def route_one(
     candidates = [p for p in candidates if cap_ok(p)]
     if not candidates:
         return decision(None, "no-capable-provider")
+
+    # 2b) SOFT distinct-reviewer anti-affinity (#457, FORK-F): drop the excluded producer(s) so a
+    #     review is never routed back to its author — but ONLY while ≥1 capable peer remains (the rule
+    #     is conditional on an equal peer being available). If excluding them would empty the capable
+    #     set, WAIVE and record provenance (never decline a route over a SOFT preference). Applied here,
+    #     before load/spill/budget, so the reduced set propagates through every later axis (the producer
+    #     cannot slip back in via a spill/budget fallback). HARD axes (sovereignty/budget) still outrank it.
+    if req.excluded_provider_ids:
+        excl: Set[str] = set(req.excluded_provider_ids)
+        kept = [p for p in candidates if p.provider_id not in excl]
+        if len(kept) == len(candidates):
+            pass                         # the producer wasn't among the candidates → no-op exclusion:
+                                         # distinct stays None (don't claim "applied" for a route nothing changed)
+        elif kept:
+            candidates, distinct = kept, "applied"   # producer dropped, ≥1 equal peer remains
+        else:
+            distinct = "waived"          # the producer was the ONLY capable agent → SOFT-kept (never declined)
+    # NOTE (HARD outranks SOFT): a later HARD axis (sovereignty already applied above; the budget gate
+    # below) may still decline or re-pin. The intended distinct-reviewer producers are EXTERNAL CLI agents,
+    # never the local provider, so the cost-0 local stays an affordable fallback and the exclusion does not
+    # cause a budget decline in practice; HARD budget/sovereignty deliberately win over this SOFT preference.
 
     locals_ = [p for p in candidates if p.capabilities.local]
     externals = [p for p in candidates if not p.capabilities.local]

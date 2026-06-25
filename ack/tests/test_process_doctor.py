@@ -133,6 +133,95 @@ def test_board_check_registered_with_heal():
     assert "board-closed-is-done" in names and names["board-closed-is-done"].heal is not None
 
 
+# ── #278: board reflects Blocked + In Review (previously unwired) ──────────────
+def test_board_blocked_reflects_label_both_directions():
+    pd = _load()
+    data = {
+        "items": [{"number": 1, "board": "In Progress"}, {"number": 2, "board": "Blocked"},
+                  {"number": 3, "board": "Blocked"}, {"number": 4, "board": "Todo"}],
+        "issues": [
+            {"number": 1, "state": "OPEN", "labels": ["status/blocked"]},   # labeled, not Blocked -> violation
+            {"number": 2, "state": "OPEN", "labels": ["status/blocked"]},   # labeled + Blocked -> fine
+            {"number": 3, "state": "OPEN", "labels": []},                    # Blocked col, no label -> unblock violation
+            {"number": 4, "state": "OPEN", "labels": []},                    # neither -> fine
+        ],
+    }
+    v = pd.board_blocked_reflects_label(data)
+    assert any("#1" in x for x in v) and any("#3" in x and "unblock" in x for x in v)
+    assert not any("#2" in x for x in v) and not any("#4" in x for x in v)
+    assert len(v) == 2
+
+
+def test_board_blocked_heal_sets_and_clears():
+    pd = _load()
+    calls = []
+
+    class FakeClient:
+        def ensure_board_status(self, url, option_id):
+            calls.append((url, option_id))
+
+    data = {
+        "items": [{"number": 1, "board": "In Progress"}, {"number": 3, "board": "Blocked"},
+                  {"number": 5, "board": "Blocked"}],
+        "issues": [
+            {"number": 1, "state": "OPEN", "labels": ["status/blocked"], "url": "u1", "assignees": []},   # -> Blocked
+            {"number": 3, "state": "OPEN", "labels": [], "url": "u3", "assignees": ["x"]},   # unblock+assigned -> In Progress
+            {"number": 5, "state": "OPEN", "labels": [], "url": "u5", "assignees": []},      # unblock+unassigned -> Todo
+        ],
+    }
+    acted = pd._heal_board_blocked_reflects_label(FakeClient(), data)
+    assert ("u1", pd.BLOCKED_OPTION_ID) in calls
+    assert ("u3", pd.IN_PROGRESS_OPTION_ID) in calls
+    assert ("u5", pd.TODO_OPTION_ID) in calls
+    assert len(acted) == 3
+
+
+def test_board_in_review_reflects_open_pr_and_blocked_precedence():
+    pd = _load()
+    data = {
+        "items": [{"number": 10, "board": "In Progress"}, {"number": 11, "board": "in Review"},
+                  {"number": 12, "board": "Blocked"}, {"number": 13, "board": "in Review"}],
+        "issues": [
+            {"number": 10, "state": "OPEN", "labels": []},                  # open PR, not In Review -> violation
+            {"number": 11, "state": "OPEN", "labels": []},                  # In Review, no PR -> violation
+            {"number": 12, "state": "OPEN", "labels": ["status/blocked"]},  # blocked + PR -> skipped (Blocked wins)
+            {"number": 13, "state": "OPEN", "labels": []},                  # In Review + PR -> fine
+        ],
+        "linked_pr_issues": [10, 12, 13],
+    }
+    v = pd.board_in_review_reflects_open_pr(data)
+    assert any("#10" in x for x in v) and any("#11" in x for x in v)
+    assert not any("#12" in x for x in v) and not any("#13" in x for x in v)
+    assert len(v) == 2
+
+
+def test_board_in_review_heal_sets_and_rederives():
+    pd = _load()
+    calls = []
+
+    class FakeClient:
+        def ensure_board_status(self, url, option_id):
+            calls.append((url, option_id))
+
+    data = {
+        "items": [{"number": 10, "board": "In Progress"}, {"number": 11, "board": "in Review"}],
+        "issues": [{"number": 10, "state": "OPEN", "labels": [], "url": "u10", "assignees": ["x"]},
+                   {"number": 11, "state": "OPEN", "labels": [], "url": "u11", "assignees": []}],
+        "linked_pr_issues": [10],
+    }
+    acted = pd._heal_board_in_review(FakeClient(), data)
+    assert ("u10", pd.IN_REVIEW_OPTION_ID) in calls    # open linked PR -> In Review
+    assert ("u11", pd.TODO_OPTION_ID) in calls          # PR gone + unassigned -> Todo
+    assert len(acted) == 2
+
+
+def test_board_278_checks_registered_with_heal():
+    pd = _load()
+    names = {c.name: c for c in pd.registry()}
+    for nm in ("board-blocked-reflects-label", "board-in-review-reflects-open-pr"):
+        assert nm in names and names[nm].heal is not None
+
+
 # ── issue/milestone invariants (#192) ─────────────────────────────────────────
 def test_open_epic_without_milestone_is_flagged():
     pd = _load()
@@ -642,6 +731,31 @@ def test_no_stdlib_shadow_real_tree_is_clean_and_registered_fail_closed():
     assert c.warn is False and c.group == "repo" and c.heal is None             # fail-closed, assert-only
 
 
+# ── review-distinct-reviewer (epic #440 P5, #457 — SOFT anti-affinity in the pure router) ──
+def test_review_distinct_reviewer_flags_a_dropped_anti_affinity():
+    pd = _load()
+    # the param removed entirely → the anti-affinity is gone AND the provenance is gone (2 violations)
+    out = pd.review_distinct_reviewer({"text": "def route_one(req, registry): return best\n"})
+    assert len(out) == 2
+    assert any("excluded_provider_ids" in x and "is gone" in x for x in out)
+    assert any("distinct_reviewer" in x and "invisible" in x for x in out)
+
+
+def test_review_distinct_reviewer_flags_declared_but_unconsumed():
+    pd = _load()
+    # declared on the model but route_one never reads it → dead code (anti-affinity not actually applied)
+    out = pd.review_distinct_reviewer({"text": "excluded_provider_ids: List[str]\n    distinct_reviewer=None\n"})
+    assert len(out) == 1 and "never consumes it" in out[0]
+
+
+def test_review_distinct_reviewer_passes_real_router_and_registered_fail_closed():
+    pd = _load()
+    assert pd.review_distinct_reviewer(pd._fetch_router_text()) == []           # live router honors it
+    assert pd.review_distinct_reviewer({"text": ""}) == []                      # router absent ⇒ inert
+    c = {x.name: x for x in pd.registry()}["review-distinct-reviewer"]
+    assert c.warn is False and c.group == "repo" and c.heal is None             # fail-closed, assert-only
+
+
 def test_fetch_devloop_evidence_active_assembles_real_merges_not_empty(monkeypatch, tmp_path):
     # #348 S9: the merges:[] vacuous-green foot-gun is closed — when K is set, _fetch_devloop_evidence
     # assembles the real DELIVERY merges from the ledger via the merge-walk (a markerless one is flagged).
@@ -737,3 +851,109 @@ def test_devloop_ledger_chain_intact_is_always_on(monkeypatch):
     assert pd.devloop_ledger_chain_intact([]) == []
     # wiring: not K-gated — a missing/empty ledger yields no errors (inert), a real chain is verified
     assert pd.devloop_ledger_chain_intact(pd._fetch_devloop_ledger_chain()) == []
+
+
+# ── #446: close the interactive C0-bypass (epic-form / ready-needs-C0 / decomposed) ───────────
+def test_epic_has_bracket_title():
+    pd = _load()
+    epics = [
+        {"number": 440, "title": "[epic] x", "parent": None, "labels": ["type/feature"], "sub_total": 5},
+        {"number": 500, "title": "no prefix", "parent": None, "labels": ["type/feature"], "sub_total": 3},
+        {"number": 75, "title": "[skills] old", "parent": None, "labels": ["type/feature"], "sub_total": 5},  # grandfathered
+        {"number": 600, "title": "sub unit", "parent": 440, "labels": ["type/feature"], "sub_total": 0},      # sub-issue exempt
+    ]
+    v = pd.epic_has_bracket_title(epics)
+    assert any("#500" in x for x in v)
+    assert not any("#440" in x for x in v) and not any("#75" in x for x in v) and not any("#600" in x for x in v)
+    assert len(v) == 1
+
+
+def test_epic_ready_is_decomposed():
+    pd = _load()
+    epics = [
+        {"number": 1, "title": "[epic] a", "parent": None, "labels": ["type/feature", "status/ready"], "sub_total": 0},  # viol
+        {"number": 2, "title": "[epic] b", "parent": None, "labels": ["type/feature", "status/ready"], "sub_total": 4},  # ok
+        {"number": 3, "title": "[epic] c", "parent": None, "labels": ["type/feature"], "sub_total": 0},                  # not ready → ok
+    ]
+    v = pd.epic_ready_is_decomposed(epics)
+    assert any("#1" in x for x in v) and len(v) == 1
+
+
+def test_epic_ready_has_c0_marker():
+    pd = _load()
+    epics = [
+        {"number": 1, "title": "[epic] a", "parent": None, "labels": ["type/feature", "status/ready"], "sub_total": 3},                    # viol (no marker)
+        {"number": 2, "title": "[epic] b", "parent": None, "labels": ["type/feature", "status/ready", "c0/converged"], "sub_total": 3},     # ok
+        {"number": 3, "title": "[epic] c", "parent": None, "labels": ["type/feature"], "sub_total": 3},                                     # not ready → ok
+    ]
+    v = pd.epic_ready_has_c0_marker(epics)
+    assert any("#1" in x and "c0/converged" in x for x in v) and len(v) == 1
+
+
+def test_446_c0_bypass_checks_registered():
+    pd = _load()
+    names = {c.name for c in pd.registry()}
+    for nm in ("epic-has-bracket-title", "epic-ready-is-decomposed", "epic-ready-has-c0-marker"):
+        assert nm in names
+
+
+# ── #464: standard-method markers (verbatim requirements + coverage matrix on a ready epic) ───
+_RDY = ["type/feature", "status/ready"]
+
+
+def test_epic_ready_has_verbatim_requirements():
+    pd = _load()
+    epics = [
+        {"number": 1, "parent": None, "labels": _RDY, "comments": "intro ... verbatim requirements ... more"},  # ok
+        {"number": 2, "parent": None, "labels": _RDY, "comments": "no marker here"},                            # viol
+        {"number": 3, "parent": 9, "labels": _RDY, "comments": ""},                                             # sub-issue exempt
+        {"number": 4, "parent": None, "labels": ["type/feature"], "comments": ""},                             # NOT ready (F-S1) → exempt
+    ]
+    v = pd.epic_ready_has_verbatim_requirements(epics)
+    assert any("#2" in x for x in v) and len(v) == 1   # only the ready epic missing the marker
+
+
+def test_epic_ready_has_coverage_matrix():
+    pd = _load()
+    epics = [
+        {"number": 1, "parent": None, "labels": _RDY, "comments": "... coverage matrix ..."},      # ok
+        {"number": 2, "parent": None, "labels": _RDY, "comments": "verbatim requirements only"},   # viol (no coverage)
+        {"number": 3, "parent": 9, "labels": _RDY, "comments": ""},                                # sub-issue exempt
+        {"number": 4, "parent": None, "labels": ["type/feature"], "comments": ""},                 # NOT ready → exempt
+    ]
+    v = pd.epic_ready_has_coverage_matrix(epics)
+    assert any("#2" in x for x in v) and len(v) == 1
+
+
+def test_464_markers_accept_hyphenated_doc_form():
+    # review B: NEW_EPIC.md documents the markers hyphenated (Verbatim-Requirements / Coverage-Matrix);
+    # _norm_marker normalizes hyphens → a doc-follower's heading must satisfy the invariant, not fail.
+    pd = _load()
+    epics = [{"number": 1, "parent": None, "labels": _RDY,
+              "comments": "## verbatim-requirements ... ## coverage-matrix ..."}]
+    assert pd.epic_ready_has_verbatim_requirements(epics) == []
+    assert pd.epic_ready_has_coverage_matrix(epics) == []
+
+
+def test_464_standard_method_checks_registered():
+    pd = _load()
+    names = {c.name for c in pd.registry()}
+    for nm in ("epic-ready-has-verbatim-requirements", "epic-ready-has-coverage-matrix"):
+        assert nm in names
+
+
+# ── node-version-matrix (epic #440, #448 — CI must not skew from the shipped desktop Node) ──
+def test_node_version_matrix_flags_a_missing_version():
+    pd = _load()
+    out = pd.node_version_matrix({"node-client.yml": 'matrix:\n        node: ["22"]'})
+    assert len(out) == 1 and "missing ['24']" in out[0]
+    out2 = pd.node_version_matrix({"x.yml": '  node-version: "22"'})    # no matrix at all
+    assert len(out2) == 1 and "no `matrix: node:" in out2[0]
+
+
+def test_node_version_matrix_passes_real_workflows_and_registered_fail_closed():
+    pd = _load()
+    assert pd.node_version_matrix(pd._fetch_node_ci_workflows()) == []   # the live workflows test 22 + 24
+    assert pd.node_version_matrix({"x.yml": ""}) == []                   # missing file ⇒ inert
+    c = {x.name: x for x in pd.registry()}["node-version-matrix"]
+    assert c.warn is False and c.group == "repo" and c.heal is None      # fail-closed, assert-only

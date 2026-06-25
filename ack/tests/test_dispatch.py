@@ -281,3 +281,137 @@ def test_default_cli_runner_renders_argv(monkeypatch):
     assert captured["argv"][:4] == ["claude", "--model", "sonnet", "--print"]
     assert "hello world" in captured["argv"]              # prompt stays one argument
 
+
+
+# ── #452: GET /coders — dispatcher.snapshot() (read-only fan-out view) ───────────────────────────
+def test_snapshot_inactive_is_empty():
+    disp = ProviderDispatcher(None, workers=FakeWorkers(), enabled=False)
+    snap = disp.snapshot()
+    assert snap["active"] is False and snap["pool"] == []
+    assert snap["budget"] == {"usd_cap": None, "spent_usd": 0.0}
+
+
+def test_snapshot_pool_and_reachability(monkeypatch):
+    import providers
+    # a CLI substrate resolves its bin via PATH; an in-engine substrate is reachable when active.
+    monkeypatch.setattr(providers.shutil, "which", lambda b: "/usr/bin/claude" if b == "claude" else None)
+    disp = ProviderDispatcher(REG, workers=FakeWorkers(), agent_runner=make_runner(), enabled=True)
+    snap = disp.snapshot()
+    assert snap["active"] is True
+    by = {p["id"]: p for p in snap["pool"]}
+    assert by["spark-vllm"]["kind"] == "in-engine" and by["spark-vllm"]["reachable"] is True
+    assert by["claude-sonnet"]["kind"] == "cli" and by["claude-sonnet"]["reachable"] is True
+
+
+def test_snapshot_records_last_route_reason_and_budget():
+    disp = ProviderDispatcher(REG, workers=FakeWorkers(), agent_runner=make_runner(), enabled=True)
+    reqs = [RouteRequest(index=0, effort="medium")]
+    disp.dispatch(["a"], policy=DispatchPolicy(reqs, budget=Budget(usd_cap=2.5)))
+    snap = disp.snapshot()
+    sp = {p["id"]: p for p in snap["pool"]}["spark-vllm"]
+    assert sp["last_route_reason"]                        # a reason was recorded for the routed provider
+    assert snap["budget"]["usd_cap"] == 2.5               # the cap from the last dispatch
+    assert snap["budget"]["spent_usd"] >= 0.0
+
+
+def test_snapshot_never_raises_on_empty_registry():
+    disp = ProviderDispatcher(load_registry({"providers": {"pool": []}}), workers=FakeWorkers(), enabled=True)
+    snap = disp.snapshot()                                # registry present but empty → inactive, no crash
+    assert snap["active"] is False and snap["pool"] == []
+
+
+# ── #459: first-class web search through the provider lane (has_web_provider + web_search) ─────────
+# Neutral fake (no private CLI literal): the real web cmd_template is a conf/ deployment detail.
+WEB = {"provider_id": "web-cli", "kind": "cli", "model": "web-model", "bin": "web-cli",
+       "cmd_template": "{bin} search {prompt}",
+       "capabilities": {"max_effort": "xhigh", "web_search": True}}
+REG_WEB = load_registry({"providers": {"pool": [SPARK, WEB]}})
+
+
+def test_has_web_provider_gates_on_capability_and_active():
+    assert ProviderDispatcher(REG_WEB, workers=None, agent_runner=make_runner(), enabled=True).has_web_provider() is True
+    assert ProviderDispatcher(REG, workers=None, agent_runner=make_runner(), enabled=True).has_web_provider() is False   # no web cap
+    assert ProviderDispatcher(REG_WEB, workers=None, agent_runner=make_runner(), enabled=False).has_web_provider() is False  # inactive
+
+
+def test_web_search_routes_to_web_provider_and_captures():
+    disp = ProviderDispatcher(REG_WEB, workers=None, agent_runner=make_runner(), enabled=True)
+    r = disp.web_search("aktuelle Lage X")
+    assert r["ok"] is True and r["provider_id"] == "web-cli"
+    assert r["content"] == "cli:web-cli:aktuelle Lage X"          # ran the WEB cli, captured its output
+
+
+def test_web_search_never_routes_to_a_non_web_provider():
+    # only SPARK (web_search=False) is configured → needs_web filters it out → no spawn, no provenance lie
+    calls = []
+    def runner(spec, prompt, *, effort, max_tokens=None):
+        calls.append(prompt)
+        return {"ok": True, "content": "x"}
+    disp = ProviderDispatcher(REG, workers=None, agent_runner=runner, enabled=True)
+    r = disp.web_search("x")
+    assert r["ok"] is False and r["error"] == "no-capable-provider" and r["provider_id"] is None
+    assert calls == []                                              # never spawned a non-web provider
+
+
+def test_web_search_empty_query_and_runner_fail_soft():
+    assert ProviderDispatcher(REG_WEB, workers=None, agent_runner=make_runner(), enabled=True).web_search("  ")["error"] == "empty-query"
+    disp = ProviderDispatcher(REG_WEB, workers=None, agent_runner=make_runner(raise_exc=True), enabled=True)
+    r = disp.web_search("q")                                        # runner raises → fail-soft, never raises out
+    assert r["ok"] is False and "cli boom" in r["error"] and r["provider_id"] == "web-cli"
+
+
+def test_web_search_inactive_dispatcher_does_not_spawn():
+    disp = ProviderDispatcher(REG_WEB, workers=None, agent_runner=make_runner(), enabled=False)  # inactive
+    r = disp.web_search("q")
+    assert r["ok"] is False and r["error"] == "no-web-substrate"
+
+
+WEB_LOCAL = {"provider_id": "spark-web", "kind": "in-engine", "model": "qwen", "endpoint_env": "X",
+             "capabilities": {"local": True, "max_effort": "xhigh", "web_search": True}}
+REG_WEB_LOCAL = load_registry({"providers": {"pool": [WEB_LOCAL]}})
+
+
+def test_web_search_requires_external_provider(monkeypatch):
+    # review A S3: an in-engine provider flagged web_search has no CLI runner — must NOT be offered, and a
+    # call must not route to it (the CLI runner can't run an in-engine spec).
+    calls = []
+    def runner(spec, prompt, *, effort, max_tokens=None):
+        calls.append(prompt)
+        return {"ok": True, "content": "x"}
+    disp = ProviderDispatcher(REG_WEB_LOCAL, workers=None, agent_runner=runner, enabled=True)
+    assert disp.has_web_provider() is False                          # in-engine web spec → not a usable web tool
+    r = disp.web_search("q")
+    assert r["ok"] is False and r["error"] == "web-provider-not-external" and calls == []
+
+
+def test_has_web_provider_requires_enabled_external_cli():
+    # review B S2: a DISABLED web CLI must not be offered (it can't run); only an enabled external CLI counts.
+    web_disabled = {**WEB, "enabled": False}
+    reg = load_registry({"providers": {"pool": [SPARK, web_disabled]}})
+    disp = ProviderDispatcher(reg, workers=None, agent_runner=make_runner(), enabled=True)
+    assert disp.has_web_provider() is False                          # disabled → not web-runnable
+
+
+def test_web_search_falls_back_to_external_when_route_prefers_local_web():
+    # review A (2nd round) S3: in a mixed config (a web-flagged LOCAL spec + an external web CLI) route_one
+    # may prefer the cost-0 local; has_web_provider() promised a runnable web exists, so web_search() must
+    # fall back to the external CLI (consistent gate ⇄ call), not error out.
+    spark_web = {**SPARK, "provider_id": "spark-web", "capabilities": {**SPARK["capabilities"], "web_search": True}}
+    reg = load_registry({"providers": {"pool": [spark_web, WEB]}})
+    disp = ProviderDispatcher(reg, workers=None, agent_runner=make_runner(), enabled=True)
+    assert disp.has_web_provider() is True
+    r = disp.web_search("q")
+    assert r["ok"] is True and r["provider_id"] == "web-cli"          # ran the external CLI, not the local spec
+
+
+def test_web_search_runs_a_low_capped_web_cli_offered_by_the_gate():
+    # review B (round 2) S3: a web CLI capped below the medium default would make route_one decline; since
+    # has_web_provider() offers the tool, web_search() must still run it (the CLI caps its own effort), not
+    # return no-capable-provider — gate ⇄ call stay consistent.
+    low_web = {"provider_id": "web-low", "kind": "cli", "model": "m", "bin": "web",
+               "cmd_template": "{bin} {prompt}", "capabilities": {"web_search": True, "max_effort": "low"}}
+    reg = load_registry({"providers": {"pool": [low_web]}})
+    disp = ProviderDispatcher(reg, workers=None, agent_runner=make_runner(), enabled=True)
+    assert disp.has_web_provider() is True
+    r = disp.web_search("q")                                         # effort=medium > low → route declines
+    assert r["ok"] is True and r["provider_id"] == "web-low"          # fallback runs it anyway

@@ -14,6 +14,7 @@
 const ANSI = new RegExp(String.fromCharCode(27) + '\\[[0-9;]*m', 'g');
 const TOK = /(\d+)\s*tok/;
 const PERF = '[perf]';
+const AGENT = '[agent]'; // #453: routing provenance → which coder was called (footer, not chat)
 // MPR report sentinels (skills/mpr/entry.py REPORT_OPEN/CLOSE) — machine delimiters that mark the
 // verbatim report block; they must never reach the rendered chat (#50).
 const REPORT_OPEN = '<<<MPR_REPORT>>>';
@@ -26,6 +27,7 @@ export interface Router {
   answer: string[];
   perf: string;
   tokens: number;
+  agent: string;
 }
 
 export function createRouter(): Router {
@@ -37,6 +39,7 @@ export function createRouter(): Router {
     answer,
     perf: '',
     tokens: 0,
+    agent: '',
     route: () => {},
     feed: () => {},
     flush: () => {},
@@ -50,6 +53,11 @@ export function createRouter(): Router {
       state.perf = st.slice(i + PERF.length).trim();
       const m = TOK.exec(state.perf);
       if (m) state.tokens = parseInt(m[1] ?? '0', 10);
+      return;
+    }
+    const ai = st.indexOf(AGENT); // #453: which coder was routed → footer, dropped from the chat
+    if (ai !== -1) {
+      state.agent = st.slice(ai + AGENT.length).trim();
       return;
     }
     if (st.includes('===') && (st.includes('DONE') || st.includes('✓'))) return;

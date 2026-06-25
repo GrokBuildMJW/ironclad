@@ -40,6 +40,13 @@ export function Footer({st}: {st: StatusState}): React.ReactElement {
       <Text color={DIM}> auto</Text>
       <Sep />
       <Text color={DIM}>{`${st.pending}P/${st.inProgress}IP/${st.done}D`}</Text>
+      {st.agent ? (
+        <>
+          <Sep />
+          <Text color={DIM}>coder </Text>
+          <Text color={MODEL_BLUE}>{st.agent}</Text>
+        </>
+      ) : null}
       {st.perf ? (
         <>
           <Sep />

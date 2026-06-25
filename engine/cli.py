@@ -142,7 +142,7 @@ _PLACEHOLDERS = itertools.cycle([
 _STATUS: Dict[str, Any] = {
     "model": "—", "connected": False, "watcher": None, "autopilot": None,
     "pending": 0, "in_progress": 0, "done": 0, "perf": "", "tokens": 0,
-    "thinking": False, "verb": "", "t0": 0.0, "phase": 0,
+    "thinking": False, "verb": "", "t0": 0.0, "phase": 0, "agent": "",
 }
 
 #: The single Live tail handle (set in repl()); the poller and _commit() refer to it.
@@ -197,6 +197,10 @@ def _footer() -> Text:
     t.append(" auto", style=DIM)
     t.append("  ·  ", style=SUBTLE)
     t.append(f"{s['pending']}P/{s['in_progress']}IP/{s['done']}D", style=DIM)
+    if s.get("agent"):                                    # #453: which coder was last routed
+        t.append("  ·  ", style=SUBTLE)
+        t.append("coder ", style=DIM)
+        t.append(str(s["agent"]), style=MODEL_BLUE)
     if s["perf"]:
         t.append("  ·  ", style=SUBTLE)
         t.append(s["perf"], style="ironclad.perf")
@@ -308,7 +312,7 @@ _TOK_RE = re.compile(r"(\d+)\s*tok")
 
 def _stream_turn(srv: Server, payload: str) -> None:
     _STATUS.update(thinking=True, verb=random.choice(VERBS), t0=time.time(),
-                   tokens=0, phase=0)
+                   tokens=0, phase=0, agent="")           # #453: clear last turn's coder (no stale "live")
     _refresh()
     answer_lines: list[str] = []
     buf = {"s": "", "blank": True}
@@ -324,6 +328,11 @@ def _stream_turn(srv: Server, payload: str) -> None:
             m = _TOK_RE.search(perf)
             if m:
                 _STATUS["tokens"] = int(m.group(1))
+            return
+        # 1b) [agent] → which coder is being called (status footer, NOT the chat). #453
+        j = st.find("[agent]")
+        if j != -1:
+            _STATUS["agent"] = st[j + len("[agent]"):].strip()
             return
         # 2) "======== ✓ DONE … ========" banner → drop.
         if "===" in st and ("DONE" in st or "✓" in st):
@@ -402,6 +411,43 @@ def _handle_local(srv: Server, codedir: Path, pool: ThreadPoolExecutor, claimed:
                 _commit(Text(
                     f"  {it.get('id','?'):10} {it.get('agent','?'):7} "
                     f"{it.get('type','?'):14} {it.get('title','')}", style=TEXT))
+        elif name == "coders":
+            parts = payload.split()
+            if len(parts) >= 2 and parts[1].lower() == "use":  # #454: /coders use <id>|auto
+                res = srv.set_coder_pin(parts[2] if len(parts) >= 3 else "auto")
+                pin = res.get("pinned")
+                _commit(Text(f"  → pinned coder: {pin}" if pin
+                             else "  → coder pin cleared (auto: the staged agent per task)", style="cyan"))
+            data = srv.coders()                            # #452: which coding agents are bound + providers
+            coding = data.get("coding_agents") or []
+            pinned = data.get("pinned")
+            _commit(Text(f"  pinned: {pinned}  (/coders use auto to clear)" if pinned
+                         else "  routing: auto (orchestrator's staged agent per task)", style=DIM))
+            if not coding:
+                _commit(Text("  (no coding agents configured)", style=DIM))
+            for a in coding:
+                enabled = a.get("enabled", True)            # #460: False ⇒ onboarded but not yet activated
+                mark = "◌" if not enabled else ("●" if a.get("bound") else "○")
+                is_pin = pinned and str(a.get("id", "")).upper() == str(pinned).upper()
+                if not enabled:
+                    suffix = "  (onboarded · disabled)"
+                elif is_pin:
+                    suffix = "  ← pinned"
+                else:
+                    suffix = "" if a.get("bound") else "  (binary not found)"
+                _commit(Text(f"  {mark} {str(a.get('id','?')):8} {a.get('model','—')}" + suffix, style=TEXT))
+            prov = (data.get("providers") or {})
+            pool = prov.get("pool") or []
+            if pool:
+                b = prov.get("budget") or {}
+                _commit(Text(f"  providers (fan-out): "
+                             f"{'active' if prov.get('active') else 'inactive'} · "
+                             f"spent ${b.get('spent_usd', 0):.4f}", style=DIM))
+                for p in pool:
+                    mark = "●" if p.get("reachable") else "○"
+                    tail = f"  ← {p.get('last_route_reason')}" if p.get("last_route_reason") else ""
+                    _commit(Text(f"    {mark} {str(p.get('id','?')):14} "
+                                 f"{str(p.get('kind','?')):9} {p.get('model','—')}{tail}", style=TEXT))
         elif name == "work":
             log: Callable[[str], None] = lambda s: _commit(Text(s, style=DIM))
             futs = client.dispatch_pending(srv, codedir, pool, claimed, log=log)
@@ -416,6 +462,8 @@ def _handle_local(srv: Server, codedir: Path, pool: ThreadPoolExecutor, claimed:
                 _commit(Text(f"  done: {ok}/{len(futs)} cleanly uploaded", style=SUCCESS))
         elif name == "auto":
             _handle_auto(srv, codedir, pool, claimed, max_agents, auto, payload)
+    except urllib.error.HTTPError as e:                     # #454: show the server's JSON error detail
+        _commit(Text(f"  ✗ {client.http_error_msg(e)}", style=ERROR))
     except urllib.error.URLError as e:
         _commit(Text(f"  ✗ {e}", style=ERROR))
     except Exception as e:  # noqa: BLE001

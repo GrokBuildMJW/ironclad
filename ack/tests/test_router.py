@@ -38,8 +38,14 @@ KIMI = {"provider_id": "kimi-cli", "kind": "cli", "model": "k2", "bin": "kimi",
         "cost_per_1k_in": 0.001, "cost_per_1k_out": 0.002,
         "capabilities": {"max_effort": "xhigh", "web_search": True}}
 
+# #442: Codex is an EXTERNAL cloud CLI — capabilities.local MUST be false (defaults false), like the
+# claude CLI siblings; a SENSITIVE request must never route to it (sovereignty).
+CODEX = {"provider_id": "codex", "kind": "cli", "model": "gpt-5.5", "bin": "codex",
+         "cmd_template": "{bin} exec -m {model} {prompt}", "capabilities": {"max_effort": "xhigh"}}
+
 REG = load_registry({"providers": {"pool": [SPARK, SONNET, OPUS, KIMI], "default_id": "spark-vllm"}})
 REG_NOLOCAL = load_registry({"providers": {"pool": [SONNET, OPUS, KIMI]}})
+REG_CODEX = load_registry({"providers": {"pool": [SPARK, CODEX], "default_id": "spark-vllm"}})
 IDLE = LoadSignal()
 BUSY = LoadSignal(spark_chat_busy=True)
 FULL = LoadSignal(spark_inflight=8, spark_batch_width=8)
@@ -82,6 +88,18 @@ def test_sovereignty_assertion_holds_across_states():
             d = route_one(req, REG, load, NOBUDGET)
             if d.provider_id is not None:
                 assert REG.by_id()[d.provider_id].capabilities.local is True
+
+
+def test_codex_external_never_chosen_for_sensitive():
+    # #442 regression: Codex is an EXTERNAL cloud CLI (capabilities.local false). A SENSITIVE request —
+    # even needs_web, even under load — must NEVER route to codex; the pick is either a local provider
+    # or None (sovereignty wins over capability), never the external CLI.
+    assert REG_CODEX.by_id()["codex"].capabilities.local is False
+    for load in (IDLE, BUSY, FULL):
+        d = route_one(_req(sensitivity=Sensitivity.SENSITIVE, needs_web=True), REG_CODEX, load, NOBUDGET)
+        assert d.provider_id != "codex"                                   # external never serves SENSITIVE
+        if d.provider_id is not None:
+            assert REG_CODEX.by_id()[d.provider_id].capabilities.local is True
 
 
 def test_spill_on_chat_busy_picks_external():
@@ -129,3 +147,55 @@ def test_decision_is_deterministic():
     b = route_one(req, REG, BUSY, NOBUDGET)
     assert a.model_dump() == b.model_dump()
     assert a.index == 3
+
+
+# ── #457: SOFT distinct-reviewer anti-affinity (excluded_provider_ids, FORK-F) ────────────────────
+def test_distinct_reviewer_none_when_no_exclusion():
+    # no exclusion requested → provenance is None and routing is byte-identical to before #457.
+    d = route_one(_req(effort="high"), REG_NOLOCAL, IDLE, NOBUDGET)
+    assert d.distinct_reviewer is None
+    assert d.provider_id == route_one(_req(effort="high"), REG_NOLOCAL, IDLE, NOBUDGET).provider_id
+
+
+def test_distinct_reviewer_excludes_producer_when_a_peer_remains():
+    # a review whose subject was PRODUCED by the would-be winner must route to a DIFFERENT equal peer.
+    base = route_one(_req(effort="high"), REG_NOLOCAL, IDLE, NOBUDGET)
+    excl = route_one(_req(effort="high", excluded_provider_ids=[base.provider_id]),
+                     REG_NOLOCAL, IDLE, NOBUDGET)
+    assert excl.provider_id is not None and excl.provider_id != base.provider_id   # not the producer
+    assert excl.distinct_reviewer == "applied"
+
+
+def test_distinct_reviewer_waives_when_producer_is_the_only_capable_peer():
+    # SOFT: when excluding the producer would leave NO capable agent, the route is NOT declined — the
+    # producer is kept and the waive is recorded (the rule is conditional on a 2nd agent being available).
+    everyone = ["spark-vllm", "claude-sonnet", "claude-opus", "kimi-cli"]
+    d = route_one(_req(effort="high", excluded_provider_ids=everyone), REG_NOLOCAL, IDLE, NOBUDGET)
+    assert d.provider_id in everyone                 # still routed (never None over a SOFT preference)
+    assert d.distinct_reviewer == "waived"
+
+
+def test_distinct_reviewer_never_overrides_sovereignty():
+    # HARD sovereignty outranks the SOFT anti-affinity: a SENSITIVE request whose only local provider IS
+    # the excluded producer stays LOCAL (waived) — it must never offload to an external "distinct" peer.
+    d = route_one(_req(effort="high", sensitivity=Sensitivity.SENSITIVE,
+                       excluded_provider_ids=["spark-vllm"]), REG, IDLE, NOBUDGET)
+    assert d.provider_id == "spark-vllm"             # never leaks to an external to satisfy anti-affinity
+    assert d.reason == "local-sovereign"
+    assert d.distinct_reviewer == "waived"
+
+
+def test_distinct_reviewer_noop_exclusion_is_not_reported_applied():
+    # review A (#457): an excluded id that is NOT among the candidates (unknown / case-mismatch) must NOT
+    # be reported as "applied" — nothing was dropped, so the provenance stays None (no anti-affinity event).
+    d = route_one(_req(effort="high", excluded_provider_ids=["does-not-exist", "CLAUDE-SONNET"]),
+                  REG_NOLOCAL, IDLE, NOBUDGET)
+    assert d.provider_id is not None
+    assert d.distinct_reviewer is None
+
+
+def test_distinct_reviewer_is_snapshot_stable():
+    req = _req(index=5, effort="high", excluded_provider_ids=["codex"])
+    a = route_one(req, REG_NOLOCAL, IDLE, NOBUDGET)
+    b = route_one(req, REG_NOLOCAL, IDLE, NOBUDGET)
+    assert a.model_dump() == b.model_dump()

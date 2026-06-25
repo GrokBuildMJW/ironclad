@@ -18,7 +18,7 @@ from concurrent.futures import ThreadPoolExecutor
 from threading import Semaphore
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
-from providers import ProviderKind, ProviderRegistry, ProviderSpec
+from providers import ProviderKind, ProviderRegistry, ProviderSpec, resolve_agent_bin
 from router import (  # single SSOT (§4.1) — re-exported, not redefined
     Budget,
     EFFORT_MAX_TOKENS,
@@ -124,9 +124,88 @@ class ProviderDispatcher:
         self._emt = dict(effort_max_tokens or EFFORT_MAX_TOKENS)
         self._enabled = bool(enabled)
         self._max_agents = max(1, int(max_agents))
+        # #452: read-only telemetry for GET /coders — the last routing reason per provider, the running
+        # estimated spend across dispatch() calls, and the budget cap last seen. Updated in dispatch().
+        self._last_reason: Dict[str, str] = {}
+        self._total_spent_usd: float = 0.0
+        self._budget_cap: Optional[float] = None
 
     def active(self) -> bool:
         return self._enabled and self._registry is not None and bool(self._registry.providers)
+
+    @staticmethod
+    def _is_web_runnable(p: ProviderSpec) -> bool:
+        """A provider that can actually serve a web_search: enabled + an EXTERNAL CLI (the web search runs
+        through the CLI runner — FORK-H v1) + web-capable. An in-engine or disabled spec has no runnable
+        web substrate (review A/B S3)."""
+        return bool(p.enabled and p.kind == ProviderKind.CLI
+                    and p.capabilities.web_search and not p.capabilities.local)
+
+    def has_web_provider(self) -> bool:
+        """#459: True iff the active lane has a web-RUNNABLE provider — gates the first-class websearch
+        tool (offer it only when a search can actually run). Never raises."""
+        reg = self._registry
+        return self.active() and any(
+            self._is_web_runnable(p) for p in (reg.providers if reg is not None else []))
+
+    def web_search(self, query: str, *, effort: str = "medium",
+                   max_tokens: Optional[int] = None) -> Dict[str, Any]:
+        """#459 (FORK-H): run ONE web search server-side through the provider lane. Routes a needs_web,
+        PUBLIC request to the web-capable provider and runs it via the injected CLI runner — whose
+        ``capture_output`` makes it **structurally immune** to the console-write scaling break (a shell
+        ``Invoke-WebRequest`` would draw a progress bar into the renderer-owned conhost; this never
+        touches that console). Never raises; returns ``{ok, content, error, provider_id}``."""
+        q = (query or "").strip()
+        if not q:
+            return {"ok": False, "content": None, "error": "empty-query", "provider_id": None}
+        if not self.active() or self._runner is None:
+            return {"ok": False, "content": None, "error": "no-web-substrate", "provider_id": None}
+        req = RouteRequest(index=0, effort=effort, needs_web=True,
+                           sensitivity=Sensitivity.PUBLIC, est_input_chars=len(q))
+        d = route_one(req, self._registry, LoadSignal(), Budget())
+        # route_one is the PREFERRED pick, but it can decline (effort ceiling / budget) or prefer a cheaper
+        # LOCAL web-flagged spec (idle/PUBLIC favours the cost-0 local). has_web_provider() already promised
+        # a runnable web provider exists, so the gate ⇄ call stays consistent: take route_one's pick iff it
+        # is web-runnable, else fall back to ANY runnable web CLI (the CLI caps its own effort). Only error
+        # when truly none is runnable — never route a web search to a local/in-engine spec (reviews A/B).
+        spec = self._registry.by_id().get(d.provider_id) if d.provider_id else None
+        if spec is None or not self._is_web_runnable(spec):
+            spec = next((p for p in self._registry.providers if self._is_web_runnable(p)), None)
+            if spec is None:
+                # no runnable web provider at all → route_one's own reason if it declined entirely (no web
+                # capability), else the routed pick was non-external (in-engine/disabled web spec).
+                err = d.reason if d.provider_id is None else "web-provider-not-external"
+                return {"ok": False, "content": None, "error": err, "provider_id": d.provider_id}
+        try:
+            base = self._runner(spec, q, effort=effort, max_tokens=max_tokens or d.est_max_tokens)
+            return {"ok": bool(base.get("ok")), "content": base.get("content"),
+                    "error": base.get("error"), "provider_id": spec.provider_id}   # the spec that actually ran
+        except Exception as e:  # noqa: BLE001 — one failed search ≠ a raise into the tool loop
+            return {"ok": False, "content": None, "error": repr(e), "provider_id": spec.provider_id}
+
+    def snapshot(self) -> Dict[str, Any]:
+        """Read-only view of the fan-out provider lane for GET /coders (#452): the pool with each
+        provider's last routing reason + cheap reachability, plus the running budget. Never raises."""
+        reg = self._registry
+        pool: List[Dict[str, Any]] = []
+        if reg is not None:
+            for p in reg.providers:
+                # cheap reachability: a CLI substrate resolves its bin (no spawn); an in-engine substrate
+                # is assumed reachable when the dispatcher is active (no synchronous endpoint ping here).
+                if p.kind == ProviderKind.CLI:
+                    reachable = bool(resolve_agent_bin(p))
+                else:
+                    reachable = self.active()
+                pool.append({
+                    "id": p.provider_id, "kind": p.kind.value, "model": p.model,
+                    "enabled": p.enabled, "local": p.capabilities.local, "reachable": reachable,
+                    "last_route_reason": self._last_reason.get(p.provider_id),
+                })
+        return {
+            "active": self.active(),
+            "pool": pool,
+            "budget": {"usd_cap": self._budget_cap, "spent_usd": round(self._total_spent_usd, 6)},
+        }
 
     def dispatch(self, items: Sequence[str], contexts: Optional[Sequence[Optional[str]]] = None,
                  policy: Optional[DispatchPolicy] = None, *, max_tokens: Optional[int] = None,
@@ -194,6 +273,14 @@ class ProviderDispatcher:
 
         if allow_spill:
             self._spill_failed_to_local(results, decisions, reqs, items, ctxs, by_id, system, temperature, think)
+
+        # #452: record read-only telemetry for GET /coders — last routing reason per provider + the
+        # running estimated spend + the budget cap last seen. Pure bookkeeping, never affects routing.
+        for d in decisions:
+            if d.provider_id is not None:
+                self._last_reason[d.provider_id] = d.reason
+        self._total_spent_usd += float(ledger.spent)
+        self._budget_cap = budget.usd_cap
 
         return [r if r is not None else self._unroutable(i, "no-result") for i, r in enumerate(results)]
 

@@ -31,9 +31,11 @@ class _FakeServer:
     def pending(self):
         return list(self._pending)
 
-    def feedback(self, task_id, agent, content):
+    def feedback(self, task_id, agent, content, exit_code=None, stderr=""):   # #455: accept the run signal
         with self._lock:
             self.uploaded.append((task_id, agent, content))
+        # Deliberately OMITS "classification" → exercises _process_one's `cls is None` back-compat
+        # branch (an older server that doesn't classify): feedback present ⇒ success; none ⇒ unclaim.
         return {"feedback_file": f".ironclad/agent/feedback/{task_id}_{agent}-feedback.md"}
 
 
@@ -42,7 +44,7 @@ def _items(*ids):
 
 
 def test_build_argv_default_is_claude_shape():
-    argv = client._build_agent_argv(
+    argv = client.build_agent_argv(
         client.DEFAULT_AGENT_CMD, bin="claude", model="m", effort="high",
         permission="acceptEdits", prompt="do the thing with spaces")
     assert argv == ["claude", "--model", "m", "--effort", "high",
@@ -51,17 +53,34 @@ def test_build_argv_default_is_claude_shape():
 
 
 def test_build_argv_prompt_single_arg_any_template():
-    argv = client._build_agent_argv(
+    argv = client.build_agent_argv(
         "mytool --yes {prompt}", bin="x", model="x", effort="x",
         permission="x", prompt="a b c")
     assert argv == ["mytool", "--yes", "a b c"]    # CLI with no model/effort flags
 
 
 def test_build_argv_embedded_placeholder():
-    argv = client._build_agent_argv(
+    argv = client.build_agent_argv(
         "tool --model={model} {prompt}", bin="b", model="kimi-x", effort="e",
         permission="p", prompt="hi there")
     assert argv == ["tool", "--model=kimi-x", "hi there"]
+
+
+def test_build_argv_codex_template_drops_claude_only_flags():
+    # #442 (epic #440 Phase 2): the template-driven client lane runs Codex with ZERO core change.
+    # `codex exec` REJECTS --effort/--permission-mode/-a (verified live, §C0R-8); a Codex cmd_template
+    # therefore omits {effort}/{permission}, and the builder must NOT leak the Claude-only flags/values.
+    tmpl = "{bin} exec -m {model} -s workspace-write -c 'approval_policy=\"never\"' --skip-git-repo-check {prompt}"
+    argv = client.build_agent_argv(
+        tmpl, bin="codex", model="gpt-5.5", effort="high", permission="acceptEdits",
+        prompt="analyze the repo and write feedback")
+    assert argv == ["codex", "exec", "-m", "gpt-5.5", "-s", "workspace-write",
+                    "-c", 'approval_policy="never"', "--skip-git-repo-check",
+                    "analyze the repo and write feedback"]
+    # the Claude-only flags AND their values never leak into the Codex argv
+    assert "--effort" not in argv and "--permission-mode" not in argv and "-a" not in argv
+    assert "high" not in argv and "acceptEdits" not in argv
+    assert argv[-1] == "analyze the repo and write feedback"   # prompt stays ONE arg
 
 
 def test_run_handover_passes_permission_mode(tmp_path, monkeypatch):
@@ -84,7 +103,7 @@ def test_run_handover_passes_permission_mode(tmp_path, monkeypatch):
     monkeypatch.setattr(client.subprocess, "run", _fake_run)
     item = {"id": "KGC-7", "agent": "OPUS",
             "handover_file": "KGC-7_OPUS.md", "handover": "do the thing"}
-    out = client._run_handover(item, tmp_path, log=lambda *_: None)
+    out, _meta = client._run_handover(item, tmp_path, log=lambda *_: None)
     assert out and "done" in out
     argv = captured["argv"]
     assert "--permission-mode" in argv
@@ -94,11 +113,106 @@ def test_run_handover_passes_permission_mode(tmp_path, monkeypatch):
     assert "--print" in argv and "--model" in argv
 
 
+def test_build_argv_feedback_token_substitutes():
+    # #443: the {feedback} token renders the result-capture path (e.g. Codex `-o {feedback}`); a template
+    # that omits it (the Claude default) ignores the new optional arg.
+    argv = client.build_agent_argv(
+        "{bin} exec -o {feedback} {prompt}", bin="codex", model="m", effort="e",
+        permission="p", prompt="do task", feedback=".ironclad/agent/feedback/T_CODEX-output.md")
+    assert argv == ["codex", "exec", "-o", ".ironclad/agent/feedback/T_CODEX-output.md", "do task"]
+    assert client.build_agent_argv("{bin} {prompt}", bin="x", model="m", effort="e",
+                                    permission="p", prompt="p") == ["x", "p"]
+
+
+def test_build_argv_mcp_is_a_multi_token_placeholder():
+    # #480: {mcp} expands (via shlex) to 0+ args — the gated read-only Memory MCP config, or NOTHING when
+    # not under the sealed profile (then the launch is byte-identical to today).
+    t = "{bin} exec {mcp} --print {prompt}"
+    assert client.build_agent_argv(t, bin="codex", model="m", effort="e", permission="p", prompt="go",
+                                   mcp='-c a=1 -c b=2') == ["codex", "exec", "-c", "a=1", "-c", "b=2", "--print", "go"]
+    assert client.build_agent_argv(t, bin="codex", model="m", effort="e", permission="p", prompt="go",
+                                   mcp="") == ["codex", "exec", "--print", "go"]   # empty mcp ⇒ dropped
+
+
+def _ho_item():
+    return {"id": "T9", "agent": "CODEX", "handover_file": "T9_CODEX.md", "handover": "x"}
+
+
+def test_run_handover_falls_back_to_captured_message(tmp_path, monkeypatch):
+    # #443 (FORK-A2=C): the agent skipped the in-prompt feedback file but its `-o {feedback}` capture
+    # exists → the runner returns the captured final message, not a silent no-feedback None.
+    class _R:
+        returncode = 0
+
+    def _fake_run(argv, **kw):  # writes ONLY the -o capture, not the feedback file
+        cap = tmp_path / ".ironclad" / "agent" / "feedback" / "T9_CODEX-output.md"
+        cap.parent.mkdir(parents=True, exist_ok=True)
+        cap.write_text("captured final message", encoding="utf-8")
+        return _R()
+
+    monkeypatch.setattr(client.subprocess, "run", _fake_run)
+    assert client._run_handover(_ho_item(), tmp_path, log=lambda *_: None)[0] == "captured final message"
+
+
+def test_run_handover_feedback_file_wins_over_capture(tmp_path, monkeypatch):
+    # the agent-written feedback file is PRIMARY; the capture is only a fallback.
+    class _R:
+        returncode = 0
+
+    def _fake_run(argv, **kw):
+        d = tmp_path / ".ironclad" / "agent" / "feedback"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "T9_CODEX-feedback.md").write_text("the real feedback", encoding="utf-8")
+        (d / "T9_CODEX-output.md").write_text("captured message", encoding="utf-8")
+        return _R()
+
+    monkeypatch.setattr(client.subprocess, "run", _fake_run)
+    assert client._run_handover(_ho_item(), tmp_path, log=lambda *_: None)[0] == "the real feedback"
+
+
+def test_run_handover_no_feedback_no_capture_is_none(tmp_path, monkeypatch):
+    # NEGATIVE: neither the feedback file nor a non-empty capture → None (the existing no-feedback path).
+    class _R:
+        returncode = 1
+
+    monkeypatch.setattr(client.subprocess, "run", lambda argv, **kw: _R())
+    assert client._run_handover(_ho_item(), tmp_path, log=lambda *_: None)[0] is None
+
+
+def test_run_handover_ignores_stale_capture_from_prior_run(tmp_path, monkeypatch):
+    # #443 review F-1: a leftover -output.md from a PRIOR failed attempt must NOT be read as this run's
+    # result — the runner unlinks both result files before launching. This run writes nothing → None.
+    d = tmp_path / ".ironclad" / "agent" / "feedback"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "T9_CODEX-output.md").write_text("STALE message from a previous run", encoding="utf-8")
+
+    class _R:
+        returncode = 1
+
+    monkeypatch.setattr(client.subprocess, "run", lambda argv, **kw: _R())  # writes nothing this run
+    assert client._run_handover(_ho_item(), tmp_path, log=lambda *_: None)[0] is None
+
+
+def test_run_handover_whitespace_capture_is_none(tmp_path, monkeypatch):
+    # a capture that is whitespace-only is not a usable result → None (the text.strip() guard).
+    class _R:
+        returncode = 0
+
+    def _fake_run(argv, **kw):
+        cap = tmp_path / ".ironclad" / "agent" / "feedback" / "T9_CODEX-output.md"
+        cap.parent.mkdir(parents=True, exist_ok=True)
+        cap.write_text("   \n  ", encoding="utf-8")
+        return _R()
+
+    monkeypatch.setattr(client.subprocess, "run", _fake_run)
+    assert client._run_handover(_ho_item(), tmp_path, log=lambda *_: None)[0] is None
+
+
 def test_dispatch_claims_and_runs_each_once(monkeypatch, tmp_path):
     srv = _FakeServer(_items("KGC-1", "KGC-2"))
     ran = []
     monkeypatch.setattr(client, "_run_handover",
-                        lambda item, codedir, log=print: f"fb-{item['id']}" if ran.append(item["id"]) or True else None)
+                        lambda item, codedir, log=print: (ran.append(item["id"]), (f"fb-{item['id']}", {}))[1])
     claimed: set = set()
     with ThreadPoolExecutor(max_workers=2) as pool:
         futs = client.dispatch_pending(srv, tmp_path, pool, claimed)
@@ -112,7 +226,7 @@ def test_already_claimed_not_resubmitted(monkeypatch, tmp_path):
     srv = _FakeServer(_items("KGC-1"))
     calls = []
     monkeypatch.setattr(client, "_run_handover",
-                        lambda item, codedir, log=print: calls.append(item["id"]) or "fb")
+                        lambda item, codedir, log=print: (calls.append(item["id"]), ("fb", {}))[1])
     claimed = {"KGC-1"}  # already in progress
     with ThreadPoolExecutor(max_workers=2) as pool:
         futs = client.dispatch_pending(srv, tmp_path, pool, claimed)
@@ -128,7 +242,7 @@ def test_runs_concurrently(monkeypatch, tmp_path):
     def _blocking(item, codedir, log=print):
         started.append(item["id"])
         barrier.wait()  # all three must meet here -> real parallelism
-        return f"fb-{item['id']}"
+        return f"fb-{item['id']}", {}                      # #455: (feedback, run-meta) tuple
 
     monkeypatch.setattr(client, "_run_handover", _blocking)
     srv = _FakeServer(_items("KGC-1", "KGC-2", "KGC-3"))
@@ -142,12 +256,14 @@ def test_runs_concurrently(monkeypatch, tmp_path):
 
 def test_failure_unclaims_for_retry(monkeypatch, tmp_path):
     srv = _FakeServer(_items("KGC-1"))
-    monkeypatch.setattr(client, "_run_handover", lambda item, codedir, log=print: None)  # no feedback
+    monkeypatch.setattr(client, "_run_handover", lambda item, codedir, log=print: (None, {}))  # no feedback
     claimed: set = set()
     with ThreadPoolExecutor(max_workers=1) as pool:
         wait(client.dispatch_pending(srv, tmp_path, pool, claimed))
     assert claimed == set()       # released -> next poll retries
-    assert srv.uploaded == []     # nothing uploaded
+    # #455: the client now POSTS the run signal even with no feedback (so the server can classify a
+    # budget-exhausted run + fail over) — but with EMPTY content, so no feedback file is written.
+    assert srv.uploaded == [("KGC-1", "OPUS", "")]
 
 
 def test_exception_unclaims(monkeypatch, tmp_path):

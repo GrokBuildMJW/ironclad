@@ -45,7 +45,18 @@ export class Server {
       signal: AbortSignal.timeout(this.timeoutMs),
     });
     const raw = await res.text();
-    if (!res.ok) throw new HttpError(res.status, `${method} ${path} → HTTP ${res.status}`);
+    if (!res.ok) {
+      // #454: surface the server's JSON {error: …} detail (e.g. 'unknown agent …' from POST /coders)
+      // so all four clients show the same friendly message; fall back to the generic status line.
+      let detail = `${method} ${path} → HTTP ${res.status}`;
+      try {
+        const j = JSON.parse(raw) as Json;
+        if (typeof j['error'] === 'string') detail = j['error'] as string;
+      } catch {
+        /* non-JSON body → keep the generic detail */
+      }
+      throw new HttpError(res.status, detail);
+    }
     return raw ? (JSON.parse(raw) as Json) : {};
   }
 
@@ -61,6 +72,16 @@ export class Server {
   async pending(): Promise<Json[]> {
     const r = await this.req('GET', '/pending');
     return (r['pending'] as Json[]) ?? [];
+  }
+
+  /** #452: which coding agents are bound (registry + boot probe) + the fan-out provider lane. */
+  async coders(): Promise<Json> {
+    return this.req('GET', '/coders');
+  }
+
+  /** #454: pin the runtime coding agent (`auto`/null clears it). Throws HttpError(400) on unknown. */
+  async setCoderPin(agent: string): Promise<Json> {
+    return this.req('POST', '/coders', {agent});
   }
 
   /** Loaded prompt/skill registry snapshot (#149) — backs slash autocomplete. Same

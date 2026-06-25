@@ -29,6 +29,7 @@ import re
 import sys
 import threading
 import time
+import urllib.error
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -138,7 +139,7 @@ class IroncladApp(App):
         self._loglines: list = []   # chat history renderables (a selectable Static)
         self._status: Dict[str, Any] = {
             "model": "?", "connected": False, "watcher": None, "autopilot": None,
-            "pending": 0, "in_progress": 0, "done": 0, "perf": "",
+            "pending": 0, "in_progress": 0, "done": 0, "perf": "", "agent": "",
         }
 
     # ----- layout -----------------------------------------------------------
@@ -210,6 +211,31 @@ class IroncladApp(App):
                 for it in ps:
                     self._log(f"  {it.get('id'):10} {it.get('agent','?'):7} "
                               f"{it.get('type','?'):14} {it.get('title','')}")
+            elif name == "coders":                         # #452 view + #454 `use <id>|auto` pin
+                parts = payload.split()
+                if len(parts) >= 2 and parts[1].lower() == "use":
+                    res = self.srv.set_coder_pin(parts[2] if len(parts) >= 3 else "auto")
+                    pin = res.get("pinned")
+                    self._log(Text(f"  → pinned coder: {pin}" if pin
+                                   else "  → coder pin cleared (auto: the staged agent per task)", style="cyan"))
+                data = self.srv.coders()
+                coding = data.get("coding_agents") or []
+                pinned = data.get("pinned")
+                self._log(Text(f"  pinned: {pinned}  (/coders use auto to clear)" if pinned
+                               else "  routing: auto (orchestrator's staged agent per task)", style="grey50"))
+                if not coding:
+                    self._log(Text("  (no coding agents configured)", style="grey50"))
+                for a in coding:
+                    enabled = a.get("enabled", True)        # #460: False ⇒ onboarded but not yet activated
+                    mark = "◌" if not enabled else ("●" if a.get("bound") else "○")
+                    is_pin = pinned and str(a.get("id", "")).upper() == str(pinned).upper()
+                    if not enabled:
+                        suffix = "  (onboarded · disabled)"
+                    elif is_pin:
+                        suffix = "  ← pinned"
+                    else:
+                        suffix = "" if a.get("bound") else "  (binary not found)"
+                    self._log(Text(f"  {mark} {str(a.get('id','?')):8} {a.get('model','—')}" + suffix, style="white"))
             elif name == "work":
                 futs = client.dispatch_pending(self.srv, self.codedir, self._pool, self._claimed,
                                                log=lambda s: self._safe_call(self._log, s))
@@ -217,6 +243,8 @@ class IroncladApp(App):
                                style="cyan" if futs else "grey50"))
             else:
                 self._log(Text(f"  (local command '{name}' not handled here)", style="grey50"))
+        except urllib.error.HTTPError as e:                # #454: show the server's JSON error detail
+            self._log(Text(f"  ✗ {client.http_error_msg(e)}", style="red"))
         except Exception as e:  # noqa: BLE001
             self._log(Text(f"  ✗ {e}", style="red"))
 
@@ -230,6 +258,7 @@ class IroncladApp(App):
     def _turn_thread(self, payload: str) -> None:
         self._think_t0 = time.time()
         self._thinking = True
+        self._status["agent"] = ""                        # #453: clear last turn's coder (no stale "live")
         self._safe_call(self._refresh_status)
         partial = {"buf": "", "blank": True}
         answer: list = []                    # collected answer lines → self._last_response
@@ -239,6 +268,11 @@ class IroncladApp(App):
             idx = c.find("[perf]")
             if idx != -1:
                 self._status["perf"] = c[idx:].replace("[perf]", "").strip()
+                self._safe_call(self._refresh_status)
+                return
+            jdx = c.find("[agent]")                       # #453: which coder was routed → status, not chat
+            if jdx != -1:
+                self._status["agent"] = c[jdx + len("[agent]"):].strip()
                 self._safe_call(self._refresh_status)
                 return
             if "===" in c and "DONE" in c:
@@ -320,7 +354,9 @@ class IroncladApp(App):
         if self._thinking:
             frame = _SPIN[self._spin % len(_SPIN)]
             secs = int(time.time() - self._think_t0) if self._think_t0 else 0
-            return Text(f" {frame} {s['model']} denkt… {secs}s     Esc = cancel", style="cyan")
+            # #453: the spinner replaces the footer while thinking, so surface the live coder here too
+            coder = f" · coder {s['agent']}" if s.get("agent") else ""
+            return Text(f" {frame} {s['model']} denkt… {secs}s{coder}     Esc = cancel", style="cyan")
         t = Text(" model ", style="grey50")
         t.append(s["model"], style="cyan")
         t.append("  ·  ", style="grey50")
@@ -333,6 +369,9 @@ class IroncladApp(App):
         t.append(" auto", style="grey50")
         t.append("  ·  ", style="grey50")
         t.append(f"{s['pending']}P/{s['in_progress']}IP/{s['done']}D", style="grey50")
+        if s.get("agent"):                                # #453: which coder was last routed
+            t.append("  ·  ", style="grey50")
+            t.append(f"coder {s['agent']}", style="#7fb3d5")
         if s["perf"]:
             t.append("  ·  ", style="grey50")
             t.append(s["perf"], style="grey50")

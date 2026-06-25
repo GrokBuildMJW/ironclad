@@ -6,6 +6,7 @@
 import React from 'react';
 import {Box, Text} from '../render/ink-compat.js';
 import {SUBTLE, TEXT} from './theme.js';
+import {displayBuffer} from './pasteStore.js';
 
 export function InputBox({
   buffer,
@@ -16,10 +17,10 @@ export function InputBox({
   caret?: boolean;
   hint?: string;
 }): React.ReactElement {
-  // A multi-line input (especially a paste) is shown COMPACT on one logical line: each newline becomes a
-  // ⏎ glyph so the box doesn't grow one row per line (LOK-5). The real buffer (with \n) is untouched and
-  // is sent as a single turn — this is display-only.
-  const display = buffer.includes('\n') ? buffer.replace(/\r?\n/g, ' ⏎ ') : buffer;
+  // Multi-line PASTES live in the buffer as out-of-band sentinel tokens; `displayBuffer` renders each as a
+  // friendly `[Pasted #N +L lines]` and compacts any residual typed newline to a ⏎ glyph so the box never
+  // grows a row per line (LOK-5, #438). The real buffer is untouched — display-only.
+  const display = displayBuffer(buffer);
   return (
     <Box
       flexDirection="column"

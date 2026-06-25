@@ -36,6 +36,7 @@ import threading
 import queue as _q
 import argparse
 import math
+import copy
 import urllib.request
 import urllib.error
 import urllib.parse
@@ -161,6 +162,9 @@ RAG_ENABLED     = True            # B2 switch (default ON, 06-18 decision); off 
 RAG_TOP_K       = 5               # hits per retrieval
 RAG_MAX_TOKENS  = 1024            # token budget of the injected block (enforced in real tokens, #366)
 _RAG_MARKER     = "## Relevant context (retrieved)"
+# #458 (D1): token budget of the richer Memory BRIEF appended to a handover (warm rolling summary +
+# body-keyed vector hits + optional relational hits). Enforced in real tokens. Config context.memory_brief_tokens.
+MEMORY_BRIEF_TOKENS = 1200
 LANGUAGE         = "en"          # the orchestrator's reply language (OSS default en; via GX10_LANGUAGE/config)
 MAX_FILE_CHARS   = 24_000        # PERF-05: read_file cap (head+tail)
 LIST_DIR_HARD_CAP = 200          # HV-B: hard cap in list_directory
@@ -1393,6 +1397,30 @@ PARALLEL_TOOL = {
     },
 }
 
+# #459 (epic #440 P6, §4 / FORK-H): first-class web search. Offered ONLY when a web-capable provider is
+# configured (see _effective_tools). Runs SERVER-side through the provider lane via the captured CLI
+# runner → structurally immune to the console-write scaling break. This is the tool the model must use
+# for current/latest/today information INSTEAD of improvising a shell web fetch (execute_command).
+WEBSEARCH_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "web_search",
+        "description": (
+            "Search the web for CURRENT / LATEST / real-time information (today's news, recent events, "
+            "live prices, 'what is the latest …'). ALWAYS use this for anything time-sensitive or "
+            "post-training-cutoff — do NOT try to fetch the web with execute_command (a shell web "
+            "request is blocked and corrupts the display). Returns the search result text."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "the search query (natural language)"},
+            },
+            "required": ["query"],
+        },
+    },
+}
+
 ONBOARDING_TOOLS = [
     {
         "type": "function",
@@ -1416,16 +1444,157 @@ ONBOARDING_TOOLS = [
     }
 ]
 
+def _code_agent_registry():
+    """The active code-agent registry (#449, config-driven, always-on). Rebuilt from the current
+    effective config each call (cheap: a handful of specs) so /config edits take effect. The
+    handover/launch lane resolves agent_id → spec through this; an unknown agent fails closed."""
+    from providers import load_code_agents
+    cfg = _EFFECTIVE_CFG if _EFFECTIVE_CFG is not None else _code_defaults()
+    return load_code_agents(cfg)
+
+def _agent_names() -> List[str]:
+    """Configured handover-agent tokens (e.g. OPUS/SONNET[/CODEX/KIMI]) — the dynamic schema enum."""
+    return _code_agent_registry().names()
+
+def _is_sealed_profile() -> bool:
+    """#480: True iff the configured trust profile is ``sealed`` (env GX10_PROFILE > config > 'open')."""
+    prof = (os.environ.get("GX10_PROFILE")
+            or ((_EFFECTIVE_CFG or {}).get("security") or {}).get("profile") or "open")
+    return str(prof).strip().lower() == "sealed"
+
+def _mcp_for_launch(spec) -> Tuple[str, Dict[str, str]]:
+    """#480: the (mcp_args, mcp_env) to inject into a code agent's launch — the read-only Memory MCP,
+    GATED on the sealed profile + a configured memory service + the agent's mcp_template. ("", {}) when not
+    gated (the agent launches byte-identically). Fail-soft."""
+    try:
+        import memory_mcp
+        cfg = _MEMORY_CONFIG or {}
+        return memory_mcp.render_mcp_launch(
+            getattr(spec, "mcp_template", None),
+            sealed=_is_sealed_profile(),
+            memory_url=str(cfg.get("base_url") or ""),
+            namespace=str(cfg.get("agent_id") or "ironclad"),
+        )
+    except Exception:  # noqa: BLE001 — never let the MCP seam break a launch
+        return "", {}
+
+def _code_agent_pin() -> Optional[str]:
+    """The runtime operator pin (`/coders use <id>`), upper-cased, or None. Only honoured when it
+    names a CONFIGURED agent — an unknown/disabled pin fails closed (treated as no pin)."""
+    pin = ((_EFFECTIVE_CFG or {}).get("code_agents") or {}).get("pinned")
+    pin = (pin or "").strip().upper()
+    return pin if pin and _code_agent_registry().has(pin) else None
+
+# #455: process-lifetime circuit-breaker — agents whose last run reported budget/quota EXHAUSTED
+# (classified `agent-unavailable`). Server-side, in-memory (resets on restart). Tripped agents are
+# excluded from execution/failover so we never burn a zero-budget agent on retry (turns Kimi's
+# infinite-retry into a clean failover). reason is for the /coders view + logs.
+_CODE_AGENT_BREAKER: Dict[str, str] = {}
+
+def _breaker_trip(agent: str, reason: str = "") -> None:
+    a = (agent or "").upper()
+    if a:
+        _CODE_AGENT_BREAKER[a] = reason or "agent-unavailable"
+
+def _breaker_reset(agent: str) -> None:
+    _CODE_AGENT_BREAKER.pop((agent or "").upper(), None)
+
+def _breaker_tripped(agent: str) -> bool:
+    return (agent or "").upper() in _CODE_AGENT_BREAKER
+
+def _breaker_snapshot() -> Dict[str, str]:
+    return dict(_CODE_AGENT_BREAKER)
+
+# #456 (FORK-D): task_class is derived DETERMINISTICALLY from task_json.type — never from model output.
+# Security/architecture get their own class (the OPUS matrix); verification = analysis; everything else
+# is coding. The class only SCOPES failover/peer selection to task-appropriate agents (it does NOT
+# override the orchestrator's staged pick — operator-confirmed 2026-06-25).
+_TASK_CLASS_BY_TYPE = {
+    "security": "security", "security-audit": "security",
+    "architecture": "architecture",
+    "verification": "analysis",
+}
+
+def _task_class(task: Dict[str, Any]) -> str:
+    t = str((task or {}).get("type") or "").strip().lower()
+    return _TASK_CLASS_BY_TYPE.get(t, "coding")
+
+def _class_capable_agents(task_class: Optional[str]) -> Optional[List[str]]:
+    """The configured capable agents (UPPER) for a task_class. Returns None when the class is
+    unknown/unmapped ⇒ NO restriction (fail-open, byte-identical to #455); returns the (possibly EMPTY)
+    list when the class IS mapped. An explicit empty list is an operator statement "no agent may serve
+    this class" → it must scope the failover to nothing (fail-CLOSED: keep the chosen agent), NOT
+    collapse to fail-open — so a `classes.security: []` never leaks a security task to a cheaper peer.
+    Reads code_agents.classes from the config."""
+    if not task_class:
+        return None
+    classes = ((_EFFECTIVE_CFG if _EFFECTIVE_CFG is not None else _code_defaults())
+               .get("code_agents") or {}).get("classes") or {}
+    caps = classes.get(task_class)
+    if caps is None:                       # class not mapped → no restriction (fail-open)
+        return None
+    return [str(a).upper() for a in caps]  # mapped (incl. empty []) → restrict (empty ⇒ fail-closed)
+
+def _cheapest_available_peer(exclude_tripped: bool = True, task_class: Optional[str] = None) -> Optional[str]:
+    """#455/#456: the cheapest agent that is not breaker-tripped AND (when a task_class is given and
+    mapped) CAPABLE of that task_class (cost = cost_per_1k_in+out, USD soft ordering per C0R-2; ties →
+    declaration order). Unmapped/unknown class ⇒ the whole pool (fail-open). None ⇒ nothing available."""
+    reg = _code_agent_registry()
+    capable = _class_capable_agents(task_class)          # None ⇒ no class restriction
+    cands = []
+    for i, aid in enumerate(reg.names()):
+        if exclude_tripped and _breaker_tripped(aid):
+            continue
+        if capable is not None and aid not in capable:   # #456: not capable of this task_class
+            continue
+        spec = reg.resolve(aid)
+        if spec is not None:
+            cost = (spec.cost_per_1k_in or 0.0) + (spec.cost_per_1k_out or 0.0)
+            cands.append((cost, i, aid))
+    cands.sort()
+    return cands[0][2] if cands else None
+
+def _effective_code_agent(staged: str, task_class: Optional[str] = None) -> str:
+    """#454/#455/#456: the agent that ACTUALLY runs a handover. The operator pin overrides the
+    orchestrator's task-chosen (staged) agent (the runtime switch, #454); no/invalid pin ⇒ the staged
+    agent. #455: if that chosen agent is breaker-tripped (budget exhausted), FAIL OVER to the cheapest
+    non-tripped peer — #456 restricts the failover to agents CAPABLE of the task_class (so a security
+    handover never falls back to a non-security agent); if none qualify, keep the chosen one
+    (fail-closed). The staged agent stays authoritative — task_class only scopes the failover."""
+    chosen = _code_agent_pin() or (staged or "")
+    if not chosen or not _breaker_tripped(chosen):
+        return chosen
+    return _cheapest_available_peer(exclude_tripped=True, task_class=task_class) or chosen
+
+def _tools_with_agent_enum(tools: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """#449: replace the static ``agent`` enum (OPUS/SONNET) in the handover tool schemas with the
+    LIVE registry names, so a config-added agent (CODEX/KIMI) is offerable + the model can't emit an
+    unconfigured one. Only the agent-bearing tools are deep-copied (cheap); the rest pass through."""
+    names = _agent_names()
+    out: List[Dict[str, Any]] = []
+    for t in tools:
+        props = (((t or {}).get("function") or {}).get("parameters") or {}).get("properties") or {}
+        agent = props.get("agent")
+        if isinstance(agent, dict) and "enum" in agent:
+            t = copy.deepcopy(t)
+            t["function"]["parameters"]["properties"]["agent"]["enum"] = names
+        out.append(t)
+    return out
+
 def _effective_tools() -> List[Dict[str, Any]]:
     """Tool list depending on the mode — onboarding tools only when active."""
     # Offer the tool only when memory is CONFIGURED (not just the module present) —
     # otherwise the tool would be offered even though every call would return "unavailable".
     mem = [MEMORY_TOOL, DEEP_MEMORY_TOOL] if _MEMORY is not None else []
     par = [PARALLEL_TOOL] if _WORKERS is not None else []
+    # #459: offer web_search only when a web-capable provider is actually configured (else every call
+    # would return "unavailable") — consistent with the memory-tool gating above.
+    web = [WEBSEARCH_TOOL] if (_DISPATCHER is not None and _DISPATCHER.has_web_provider()) else []
     plug = [t["schema"] for t in _PLUGIN_TOOLS.values()]
     skl = [USE_SKILL_TOOL] if _PLAYBOOKS else []
     prm = [USE_PROMPT_TOOL] if _PROMPTS else []
-    return TOOLS + mem + par + plug + skl + prm + (ONBOARDING_TOOLS if ONBOARDING_MODE else [])
+    return (_tools_with_agent_enum(TOOLS) + mem + par + web + plug + skl + prm
+            + (ONBOARDING_TOOLS if ONBOARDING_MODE else []))
 
 # ─── Macro tool: deterministic pipeline (HV-A) ─────────────
 _TASK_ID_RE = re.compile(rf"^{re.escape(TASK_PREFIX)}-[A-Za-z0-9_]+$")
@@ -1469,10 +1638,8 @@ def _advance_pipeline(task_id: str, agent: str, next_task_id: Optional[str] = No
     if not task_id or not _TASK_ID_RE.match(task_id):
         return f"ERROR: invalid task_id: {task_id!r} (expected e.g. KGC-315)"
     agent = (agent or "").upper()
-    if agent == "KIMI":
-        agent = "SONNET"                      # Kimi → Sonnet (legacy alias, 2026-06-15)
-    if agent not in ("OPUS", "SONNET"):
-        return f"ERROR: agent must be OPUS or SONNET (was: {agent!r})"
+    if not _code_agent_registry().has(agent):   # #449: config-driven membership, fail-closed (no KIMI-norm)
+        return f"ERROR: unknown agent {agent!r} (configured: {', '.join(_agent_names()) or 'none'})"
     if next_task_id and not _TASK_ID_RE.match(next_task_id):
         return f"ERROR: invalid next_task_id: {next_task_id!r}"
 
@@ -1659,10 +1826,8 @@ def _stage_handover(task_id: Optional[str], agent: str, handover_md: str,
     deterministic (no AI involvement). On a topic duplicate, fail-closed —
     nothing is created, the existing task is named."""
     agent = (agent or "").upper()
-    if agent == "KIMI":
-        agent = "SONNET"                      # Kimi → Sonnet (legacy alias, 2026-06-15)
-    if agent not in ("OPUS", "SONNET"):
-        return f"ERROR: agent must be OPUS or SONNET (was: {agent!r})"
+    if not _code_agent_registry().has(agent):   # #449: config-driven membership, fail-closed (no KIMI-norm)
+        return f"ERROR: unknown agent {agent!r} (configured: {', '.join(_agent_names()) or 'none'})"
     if not handover_md or not handover_md.strip():
         return "ERROR: handover_md is empty — the full handover text is required."
     _mpr = _mpr_blocks_tasks()
@@ -1704,12 +1869,23 @@ def _stage_handover(task_id: Optional[str], agent: str, handover_md: str,
             tid = task["id"]
             log.append(f"task created: {tid} (pending, created_at={task['created_at']})")
             ho_md = _normalize_handover_id(handover_md, tid)
-            # append memory context from past patterns (fail-soft)
+            # append the richer token-budgeted Memory brief from past patterns (#458 D1, fail-soft):
+            # body-keyed search + optional relational hits + the shared warm rolling summary.
             if _MEMORY is not None and _MEMORY.is_available():
                 try:
-                    mem_ctx = _MEMORY.get_context(
-                        fields.get("type", ""),
-                        fields.get("title", task.get("title", "")),
+                    warm_summary = ""
+                    if _WARM is not None:
+                        try:
+                            warm_summary = (_WARM.get_session(WARM_SESSION_ID, "summary") or "").strip()
+                        except Exception:
+                            warm_summary = ""
+                    mem_ctx = _MEMORY.brief(
+                        body=ho_md,
+                        task_type=fields.get("type", ""),
+                        title=fields.get("title", task.get("title", "")),
+                        warm_summary=warm_summary,
+                        budget_tokens=MEMORY_BRIEF_TOKENS,
+                        count_tokens=_count_tokens,
                     )
                     if mem_ctx:
                         ho_md = ho_md.rstrip() + "\n\n---\n\n" + mem_ctx
@@ -2075,6 +2251,76 @@ def _platform_guidance(platform: str) -> str:
         "Operating system: **Linux**. For `execute_command` use POSIX/bash syntax "
         "(e.g. `date`, `ls`, `cat`, `grep`)."
     )
+
+
+# #459 (epic #440 P6, §4): current-info intent classifier + execute_command shell guardrail. Three
+# parts jointly fix the verified scaling-break bug (#447): the model asked for current info improvised a
+# PowerShell Invoke-WebRequest, whose progress bar drew into the renderer-owned conhost and corrupted it.
+_CURRENT_INFO_KW = (
+    # EN — explicit recency markers (conservative; a hint, not a hard route). Deliberately NOT bare
+    # "current"/"currently" — those are everywhere in coding context ("current branch/directory/value")
+    # and would mis-steer (review A S3). Require an unambiguous time/news marker.
+    "latest", "today", "right now", "as of now", "breaking news", "this week", "recent news",
+    "real-time", "realtime", "up to date", "up-to-date", "live news", "current news", "current events",
+    # DE — likewise NOT bare "aktuell*" (review A: "der aktuelle Branch/Wert/Stand" is everywhere in
+    # coding context, the same trap as bare EN "current"); require an unambiguous recency phrase/marker.
+    "aktuelle lage", "aktuelle nachrichten", "aktuelle entwicklungen", "neueste", "neuesten", "heute",
+    "in echtzeit", "gerade eben", "letzte woche",
+)
+
+def _is_current_info_query(text: str) -> bool:
+    """True when the user asks for CURRENT / real-time information (#459) — used to PROACTIVELY steer the
+    model toward web_search instead of a shell web fetch. Pure EN+DE keyword heuristic; conservative
+    (matches explicit recency markers, not every question). Only a hint — the model still decides."""
+    t = (text or "").lower()
+    return any(k in t for k in _CURRENT_INFO_KW)
+
+
+def _websearch_steer(user_input: str) -> str:
+    """The per-turn proactive nudge (#459): a one-line hint steering a CURRENT-info request to web_search,
+    but ONLY when a web provider is actually available (else the hint would point at a missing tool).
+    "" otherwise. Pure over the input + the live dispatcher state."""
+    if (_is_current_info_query(user_input)
+            and _DISPATCHER is not None and _DISPATCHER.has_web_provider()):
+        return ("[note: this looks like a request for CURRENT / real-time information — use the "
+                "`web_search` tool for it, not `execute_command`.]")
+    return ""
+
+# Fail-closed deny-list for execute_command (§4 / operator 2026-06-25): a shell command that fetches the
+# web / a remote host (that is what web_search is for, and a PowerShell web fetch draws a progress bar into
+# the renderer-owned console — the verified scaling break) or that runs unbounded / streams progress
+# (sleep loops, follow/tail, watchers, schedulers) is REFUSED before it runs.
+_SHELL_DENY = (
+    # unambiguous web/remote APIs — match anywhere (these tokens have no innocuous use)
+    (re.compile(r"(?i)\b(invoke-webrequest|invoke-restmethod|start-bitstransfer|net\.webclient|"
+                r"downloadstring|downloadfile|system\.net\.(http|webclient))\b"),
+     "a remote/web fetch"),
+    # bare fetch commands — only at a COMMAND position (start / after a separator), so a filename or a
+    # search string that merely CONTAINS "curl"/"wget" (e.g. `Select-String 'wget'`, `Get-Content
+    # curl.txt`) is not wrongly blocked (review A S3). The model emits the fetch in command position.
+    (re.compile(r"(?i)(?:^|[\n;|&({`])\s*(curl|wget|iwr|irm)\b"),
+     "a remote/web fetch"),
+    # long-running / progress-emitting processes
+    (re.compile(r"(?i)(\bstart-sleep\b|while\s*\(\s*\$?true\s*\)|for\s*\(\s*;\s*;|\bping\s+-t\b|"
+                r"\bping\s+-n\s*\d{3,}|\bstart-job\b|\bstart-process\b|\bregister-scheduledtask\b|"
+                r"\bget-content\b[^\n|]*\s-wait\b|\btail\s+-f\b|\bwatch-\w|\btcpdump\b|\bhtop\b)"),
+     "a long-running / progress-emitting process"),
+)
+
+def _shell_guard(command: str) -> Optional[str]:
+    """Refuse (fail-closed) a shell command that fetches the web/a remote host or runs unbounded — the
+    verified scaling-break guardrail (#459). Returns the block reason (a short phrase) to refuse with, or
+    None when the command is allowed. Pure + side-effect-free.
+
+    Scope: this guards the MODEL's own improvisation (and is paired with the PowerShell $ProgressPreference
+    hardening that is the actual scaling-break fix), NOT an adversarial sandbox. Nested shell wrappers
+    (``pwsh -Command iwr …``, ``cmd /c curl …``) and ``-EncodedCommand`` payloads are NOT decoded — the
+    model emits the direct forms (which ARE caught); a deliberately-obfuscated fetch is out of scope."""
+    cmd = command or ""
+    for pat, why in _SHELL_DENY:
+        if pat.search(cmd):
+            return why
+    return None
 
 
 def _onboarding_guidance() -> str:
@@ -2479,6 +2725,30 @@ def _use_prompt(capability: str = "", values: str = "", lang: str = "") -> str:
     return f"ASSEMBLED PROMPT ({step['lang']}):\n\n{step['prompt']}"
 
 
+def _emit_agent_frames(results: List[Dict[str, Any]]) -> None:
+    """#453: surface routing provenance as `[agent]` control frames (the `[perf]` pattern) so the
+    client shows which coder is being called. ONE frame per DISTINCT routed provider, with its
+    route reason (+ `spilled`). Emitted via `_ui_print`, so it flows through the chat stream and is
+    parsed out by the client (cli.py `_stream_turn.route` / ink `stream/route.ts`) into the footer.
+    Fail-soft: a malformed result never breaks the fan-out (the frame is cosmetic)."""
+    try:
+        seen: set = set()
+        for r in results:
+            if not isinstance(r, dict):
+                continue
+            pid = r.get("provider_id")
+            if not pid or pid in seen:                   # no provenance (byte-identical fanout) or dup
+                continue
+            seen.add(pid)
+            reason = (r.get("route_reason") or "").strip()
+            tag = f"{pid} · {reason}" if reason else str(pid)
+            if r.get("spilled"):
+                tag += " · spilled"
+            _ui_print(col(f"  [agent] {tag}", C.GRAY))
+    except Exception:
+        pass
+
+
 def _format_parallel(results: List[Dict[str, Any]]) -> str:
     """Render governed fan-out results back into the turn — numbered, in input order,
     failures isolated so a single bad item never sinks the batch."""
@@ -2864,6 +3134,18 @@ def _derive_ctx_budget(max_model_len: int, max_tokens: int, rag_tokens: int,
 
 def run_tool(name: str, args: Dict[str, Any]) -> str:
     try:
+        # #459 (§4, review A S2): the shell guardrail fires SERVER-SIDE here, BEFORE the local-tool bridge
+        # dispatches execute_command to a client — otherwise a thin/Ink client would run the blocked
+        # command on its own console (re-breaking #447). This is the authoritative guard for every client;
+        # the per-execution-site PowerShell hardening below (and in the Ink client) is the 2nd layer.
+        if name == "execute_command":
+            blocked = _shell_guard(args.get("command", ""))
+            if blocked is not None:
+                hint = ""
+                if "remote" in blocked and _DISPATCHER is not None and _DISPATCHER.has_web_provider():
+                    hint = " Use the `web_search` tool for current/online information instead."
+                return (f"BLOCKED: execute_command refuses {blocked} — it can corrupt the display or hang "
+                        f"the session (#459).{hint}")
         # Pass code-tools THROUGH to the driving client (runs them on the local fs) when a
         # bridge is active; otherwise they fall through and run server-side as before.
         if _LOCAL_TOOL_BRIDGE is not None and name in LOCAL_TOOL_NAMES:
@@ -2933,6 +3215,8 @@ def run_tool(name: str, args: Dict[str, Any]) -> str:
         elif name == "execute_command":
             timeout = int(args.get("timeout", 30))
             command = args["command"]
+            # #459: the fail-closed shell guardrail already ran at the top of run_tool (server-side, before
+            # any bridge), so a blocked command never reaches here.
             # Platform mode determines the interpreter — consistent with the
             # syntax guidance injected into the model.
             # stdin=DEVNULL: interactive commands (e.g. cmd `date` without an arg)
@@ -2940,8 +3224,11 @@ def run_tool(name: str, args: Dict[str, Any]) -> str:
             # encoding/errors explicit: decode command output as UTF-8 lossily, so a
             # non-locale byte (cp1252 on Windows) never raises decoding the result.
             if PLATFORM == "windows":
+                # #459: harden the PowerShell invocation — silence WriteProgress so a progress bar can
+                # never draw into the renderer-owned conhost (a 2nd layer behind the deny-list above).
+                hardened = "$ProgressPreference='SilentlyContinue'; " + command
                 argv = ["powershell", "-NoProfile", "-NonInteractive",
-                        "-Command", command]
+                        "-Command", hardened]
                 r = subprocess.run(
                     argv, stdin=subprocess.DEVNULL,
                     capture_output=True, text=True, encoding="utf-8", errors="replace",
@@ -3047,6 +3334,18 @@ def run_tool(name: str, args: Dict[str, Any]) -> str:
                 int(args.get("limit", 5)),
             )
 
+        elif name == "web_search":
+            # #459 (§4 / FORK-H): run the search SERVER-side through the provider lane (captured output →
+            # immune to the console-write scaling break). Re-gated (the tool is only offered when a
+            # web-capable provider is configured, but a runtime config change could remove it).
+            if _DISPATCHER is None or not _DISPATCHER.has_web_provider():
+                return ("[web_search] unavailable — no web-capable provider is configured "
+                        "(needs the provider lane + a web-search CLI).")
+            res = _DISPATCHER.web_search(args.get("query", ""))
+            if res.get("ok") and res.get("content"):
+                return str(res["content"]).strip()
+            return f"[web_search] no result ({res.get('error') or 'empty'})."
+
         elif name == "parallel_reason":
             if _WORKERS is None:
                 return ("[parallel_reason] unavailable — this tool runs only under the "
@@ -3088,6 +3387,7 @@ def run_tool(name: str, args: Dict[str, Any]) -> str:
                     policy=DispatchPolicy(reqs, system=system, load=load, budget=budget),
                     max_tokens=int(mt) if mt else None, think=True,
                 )
+                _emit_agent_frames(results)              # #453: surface which coder(s) were routed
             else:
                 results = _WORKERS.fanout(
                     items,
@@ -3845,8 +4145,13 @@ class GX10:
         # B2: per-turn retrieval BEFORE the append (query = user message, dedup against the existing
         # window). FLAG OFF → "" → the user message is appended verbatim (byte-identical).
         rag = self._retrieve_context(user_input)
+        # #459: PROACTIVELY steer a current-info request to web_search (only when one is available), so the
+        # model doesn't improvise a shell web fetch. A per-turn hint folded into the message (like rag) —
+        # transient, non-accumulating; the model still decides.
+        steer = _websearch_steer(user_input)
+        prefix = "\n\n".join(p for p in (rag, steer) if p)
         self.messages.append({"role": "user",
-                              "content": (rag + "\n\n" + user_input) if rag else user_input})
+                              "content": (prefix + "\n\n" + user_input) if prefix else user_input})
         # New operator turn → reset the auto-plan guard. An advance_pipeline
         # in THIS turn sets it again; a following stage_handover in the
         # same turn is then blocked (as long as autoplan is off).
@@ -4676,21 +4981,22 @@ def _find_handover(task_id: str) -> Optional[Path]:
     return hits[0] if hits else None
 
 def _agent_from_handover(name: str) -> str:
+    # #449: the filename token IS the agent id (letters only, _HO_AGENT_RE). No KIMI→SONNET norm —
+    # an unconfigured token fails closed at the membership guard downstream.
     m = _HO_AGENT_RE.search(name)
-    if not m:
-        return ""
-    agent = m.group(1).upper()
-    return "SONNET" if agent == "KIMI" else agent   # legacy _KIMI.md → Sonnet
+    return m.group(1).upper() if m else ""
 
 def _task_agent(task: Dict[str, Any]) -> str:
-    """The agent ASSIGNED to the task (OPUS/SONNET) — from assigned_to, otherwise
-    from the existing handover. Prevents a foreign agent's feedback from
-    completing an OPUS task. "kimi" (legacy) is normalized to SONNET."""
+    """The agent ASSIGNED to the task — from assigned_to (matched against the configured agent
+    names, #449), otherwise from the existing handover. Prevents a foreign agent's feedback from
+    completing another agent's task. #449 (review B-3): match assigned_to on WHITESPACE-split tokens,
+    not a loose substring — so a model string like "claude-opus-4-8" does NOT mis-resolve to OPUS
+    (which would run a CODEX handover as the wrong agent); such a value falls through to the filename."""
     a = (task.get("assigned_to") or "").lower()
-    if "opus" in a:
-        return "OPUS"
-    if "sonnet" in a or "kimi" in a:          # Kimi → Sonnet (legacy alias, 2026-06-15)
-        return "SONNET"
+    toks = set(a.split())
+    for name in _agent_names():               # config-driven: OPUS/SONNET[/…], declaration order
+        if name.lower() in toks or name.lower() == a.strip():
+            return name
     ho = _find_handover(task.get("id", ""))
     return _agent_from_handover(ho.name) if ho else ""
 
@@ -4722,26 +5028,52 @@ def _do_launch(task_id: str, agent: str):
         _autopilot_release()
         _ui_print(col(f"  [AUTO] handover for {task_id} vanished — launch discarded", C.YELLOW))
         return
-    model, effort = _parse_handover_meta(ho)
-    effort = effort or AUTOPILOT_DEFAULT_EFFORT
-    # Kimi was replaced by Sonnet (2026-06-15): any remaining reference runs as Sonnet.
-    if agent == "KIMI":
-        agent = "SONNET"
+    # #449: resolve the agent through the config-driven registry (no hardcoded OPUS/SONNET model,
+    # no KIMI-norm). Unknown agent → fail-closed (release the slot + discard the launch).
+    agent = (agent or "").upper()
+    spec = _code_agent_registry().resolve(agent)
+    if spec is None:
+        _autopilot_release()
+        _ui_print(col(f"  [AUTO] unknown agent {agent!r} for {task_id} — launch discarded "
+                      f"(configured: {', '.join(_agent_names()) or 'none'})", C.YELLOW))
+        return
+    # #454 (review B): honour the handover's `to:`/`effort:` only when no pin overrode the staged agent;
+    # a pinned (different) agent runs with ITS OWN model/effort, not the staged agent's.
+    if agent == _agent_from_handover(ho.name):
+        model, effort = _parse_handover_meta(ho)
+    else:
+        model, effort = None, None
+    model  = model or spec.model                          # registry model (frontmatter `to:` overrides)
+    effort = effort or spec.effort or AUTOPILOT_DEFAULT_EFFORT
     prompt = (f"Lies und bearbeite autonom den Handover {ho.as_posix()}. "
               f"Folge den Anweisungen in .claude/CLAUDE.md.")
-    if model and str(model).startswith("kimi"):
-        model = None                          # legacy Kimi model → default (Sonnet/Opus)
-    model  = model or ("claude-opus-4-8" if agent == "OPUS" else "claude-sonnet-4-6")
-    argv = [AUTOPILOT_CLAUDE_BIN, "--model", model, "--effort", effort]
-    extra = list(AUTOPILOT_EXTRA_ARGS)
-    if AUTOPILOT_STREAM:
-        # Live streaming: stream-json NEEDS --verbose (otherwise claude aborts).
-        # Output still goes to the log FILE (no pipe read) → no deadlock.
-        if "--verbose" not in extra:
-            extra.append("--verbose")
-        if "--output-format" not in extra:
-            extra += ["--output-format", "stream-json"]
-    argv += extra + ["--print", prompt]
+    _bin = spec.bin or AUTOPILOT_CLAUDE_BIN
+    _tmpl = spec.cmd_template or ""
+    # #449 (review B-1): the Claude `--print` autopilot shape KEEPS its stream plumbing (--verbose +
+    # output-format stream-json + AUTOPILOT_EXTRA_ARGS) so the default OPUS/SONNET launch stays
+    # byte-identical — the defaults carry a cmd_template now, so branch on the SHAPE, not its presence.
+    _is_claude_print = _bin in (AUTOPILOT_CLAUDE_BIN, "claude") and "--print" in _tmpl
+    if _is_claude_print or not _tmpl:
+        argv = [_bin, "--model", str(model), "--effort", str(effort)]
+        extra = list(AUTOPILOT_EXTRA_ARGS)
+        if AUTOPILOT_STREAM:
+            # Live streaming: stream-json NEEDS --verbose (otherwise claude aborts).
+            # Output still goes to the log FILE (no pipe read) → no deadlock.
+            if "--verbose" not in extra:
+                extra.append("--verbose")
+            if "--output-format" not in extra:
+                extra += ["--output-format", "stream-json"]
+        argv += extra + ["--print", prompt]
+    else:
+        # Config-driven non-Claude agent (e.g. CODEX): render via the shared builder; the template owns
+        # its flags. #449 (review B-2): pass a {feedback} capture path — a template with `-o {feedback}`
+        # would otherwise render an EMPTY path. Point it at the feedback file the reconciler advances on,
+        # so the agent's final message lands where the autopilot already looks.
+        from commands import build_agent_argv
+        _fbd = feedback_dir(soft=True)
+        cap = str((_fbd / f"{task_id}_{agent}-feedback.md")) if _fbd else f"{task_id}_{agent}-feedback.md"
+        argv = build_agent_argv(_tmpl, bin=_bin, model=str(model), effort=str(effort),
+                                permission=spec.permission_mode or "", prompt=prompt, feedback=cap)
     # Autopilot logs are engine machinery (subprocess stdout), not an initiative artefact → under
     # state_root() (.ironclad/logs) instead of scattered in the WORKDIR root. An absolute override stays.
     _ld = Path(AUTOPILOT_LOGS_DIR)
@@ -4837,7 +5169,11 @@ def _do_launch(task_id: str, agent: str):
 # complete feedback file is sought and the completion is triggered DETERMINISTICALLY (without
 # an LLM). Misses/duplicates no FS events, is idempotent.
 # Autopilot side (optional): pending task with handover → start claude.
-_FB_RE = re.compile(r"_(\w+)-feedback\.md$")
+# #449 (review A): letters-only, SYMMETRIC with _HO_AGENT_RE. Previously `\w+` — so a multi-segment
+# filename parsed DIFFERENTLY on the two sides (`_CLAUDE_OPUS.md` → "OPUS" via _HO_AGENT_RE, but
+# `_CLAUDE_OPUS-feedback.md` → "CLAUDE_OPUS" via `\w+`). Letters-only makes both sides yield the same
+# trailing token, so an agent_id round-trips identically through BOTH regexes (charter §C0R-1).
+_FB_RE = re.compile(r"_([A-Za-z]+)-feedback\.md$")
 
 def _reconcile_once(store: "TaskStore", enqueue, seen_mtime: Dict[str, float],
                     enqueued: set, launch_enqueue=None, launched: Optional[set] = None):
@@ -4864,8 +5200,11 @@ def _reconcile_once(store: "TaskStore", enqueue, seen_mtime: Dict[str, float],
                 continue
             if AUTOPILOT_MAX_CONCURRENT and _autopilot_active() >= AUTOPILOT_MAX_CONCURRENT:
                 break                         # no free slot → retry later
-            agent = _agent_from_handover(ho.name)
-            if agent not in ("OPUS", "SONNET"):
+            # #454: operator pin override. #456: a budget failover stays within the task-class-capable
+            # agents on the autopilot launch path too (NOT just the server /pending path) — else a tripped
+            # Opus on a security task would silently fail over to a cheaper, non-security-capable agent here.
+            agent = _effective_code_agent(_agent_from_handover(ho.name), task_class=_task_class(task))
+            if not _code_agent_registry().has(agent):   # #449: config-driven membership (fail-closed)
                 continue
             launched.add(ho_key)
             _autopilot_reserve()              # reserve a slot (worker starts, monitor frees)
@@ -4893,11 +5232,26 @@ def _reconcile_once(store: "TaskStore", enqueue, seen_mtime: Dict[str, float],
                     C.YELLOW))
     for task in (store.list("pending") + store.list("in_progress")):
         tid = task.get("id") or ""
-        agent = _task_agent(task)            # expected agent (not from an arbitrary filename!)
-        if agent not in ("OPUS", "SONNET"):
-            continue
-        fb = d / f"{tid}_{agent}-feedback.md"  # ONLY the assigned agent's feedback
-        if not fb.exists():
+        staged = _task_agent(task)           # expected agent (not from an arbitrary filename!)
+        # #454 (review B): the handover may have run under a pin that has since changed/cleared — so the
+        # feedback file is named for whatever agent ACTUALLY ran, which we can no longer recompute from
+        # the current pin. Discover it: prefer the current effective agent, then the staged agent, then
+        # ANY configured agent's {tid}_*-feedback.md (a pin added OR cleared mid-handover). Only a
+        # CONFIGURED agent is accepted (fail-closed); a foreign/unconfigured token is ignored.
+        order: List[str] = []
+        # #456: derive the first-guess candidate with the same task_class scoping the launch path uses, so
+        # the most-likely feedback filename matches what would actually have run; staged + every configured
+        # agent still follow as fallbacks, so discovery never misses a file regardless of class.
+        for cand in (_effective_code_agent(staged, task_class=_task_class(task)), staged, *_agent_names()):
+            if cand and _code_agent_registry().has(cand) and cand not in order:
+                order.append(cand)
+        agent = fb = None
+        for cand in order:
+            p = d / f"{tid}_{cand}-feedback.md"
+            if p.exists():
+                agent, fb = cand, p
+                break
+        if fb is None:
             continue
         key = (tid, agent)
         if key in enqueued:
@@ -5065,6 +5419,55 @@ def _code_defaults() -> Dict[str, Any]:
             "budget":      {"usd_cap": None},
             "pool":        [],               # no default providers hard-coded (boundary); conf/ fills it
         },
+        "code_agents": {
+            # #449 (C0R-9): the handover code-AGENT registry — a SEPARATE, ALWAYS-ON surface, independent
+            # of providers.enabled (which is True in local-mode). Each entry is a providers.ProviderSpec
+            # carrying an agent_id (ASCII-letters-only filename token, C0R-1). Ironclad ships OPUS/SONNET
+            # as OVERRIDABLE defaults (public Claude model ids — already used by the handover lane); conf/
+            # re-lists the pool to add its own agents (lists replace on merge). Unknown agent → fail-closed.
+            # The default agent CLI is Claude Code (the documented default backend — same shape as
+            # client.DEFAULT_AGENT_CMD). Fully-specified so the server ships a complete spec; conf/ may
+            # override the bin/template/model freely (or drop these for a different default agent).
+            "pool": [
+                {"provider_id": "claude-opus",   "kind": "cli", "agent_id": "OPUS",
+                 "display": "Claude Opus 4.8",   "model": "claude-opus-4-8", "bin": "claude",
+                 "cmd_template": "{bin} --model {model} --effort {effort} --permission-mode {permission} --print {prompt}",
+                 "effort": "xhigh", "permission_mode": "acceptEdits"},
+                {"provider_id": "claude-sonnet", "kind": "cli", "agent_id": "SONNET",
+                 "display": "Claude Sonnet 4.6", "model": "claude-sonnet-4-6", "bin": "claude",
+                 "cmd_template": "{bin} --model {model} --effort {effort} --permission-mode {permission} --print {prompt}",
+                 "effort": "high", "permission_mode": "acceptEdits"},
+            ],
+            # #454: runtime operator OVERRIDE — `/coders use <id>` pins one agent so ALL handovers run
+            # on it (the runtime switch); None ⇒ use the orchestrator's task-chosen (staged) agent. An
+            # unknown/disabled pin fails closed (kept None / ignored). task-aware auto-routing is Phase 5.
+            "pinned": None,
+            # #455 (FORK-C=C): signals that mean an agent is OUT OF BUDGET/QUOTA → classify the run as
+            # `agent-unavailable` (trip the circuit-breaker + fail over to the cheapest capable peer),
+            # NOT a normal task failure. Layered JSON→stderr→exit; conservative. GENERIC, public-safe
+            # defaults here; a deployment refines per-agent in conf/ — an agent's EXACT exhausted signal
+            # is calibrated from ONE real run with operator consent (e.g. Kimi at #460).
+            "exhausted": {
+                "stderr_patterns": [
+                    r"(?i)\b(quota|usage limit|rate limit|insufficient (credit|balance|quota))\b",
+                    r"(?i)\b(out of|exceeded)\b.{0,24}\b(quota|credit|budget|tokens?)\b",
+                    r"(?i)\b429\b.{0,20}too many requests",
+                ],
+                "exit_codes": [],
+                "json_event_types": [],
+            },
+            # #456: task_class → the agents CAPABLE of that class (the operator matrix: OPUS for
+            # security/architecture, all-rounders for coding, the cheaper/broad set for analysis). This
+            # SCOPES failover (#455) + distinct-reviewer (#457) to task-appropriate agents — it does NOT
+            # override the orchestrator's staged pick. Public default lists only OPUS/SONNET; conf/ adds
+            # CODEX/KIMI. An unknown/missing class ⇒ no restriction (fail-open, byte-identical to #455).
+            "classes": {
+                "security":     ["OPUS"],
+                "architecture": ["OPUS"],
+                "coding":       ["OPUS", "SONNET"],
+                "analysis":     ["SONNET"],
+            },
+        },
         "onboarding": {
             "enabled": ONBOARDING_MODE,
         },
@@ -5108,6 +5511,7 @@ def _code_defaults() -> Dict[str, Any]:
             "token_budget":       TOKEN_BUDGET,     # MEM-9: couple the trim to the window (default ON)
             "chars_per_token":    CHARS_PER_TOKEN,  # #366: calibrated chars/token FALLBACK (live tokenizer is primary)
             "thinking_reserve":   THINKING_RESERVE, # #366 D5: output headroom reserved when think=True
+            "memory_brief_tokens": MEMORY_BRIEF_TOKENS,  # #458 D1: token budget of the handover memory brief
             "max_file_chars":     MAX_FILE_CHARS,
             "list_dir_hard_cap":  LIST_DIR_HARD_CAP,
             "summarize_evicted":  SUMMARIZE_EVICTED,   # B1: default ON (06-18); off → byte-identical trim
@@ -5278,6 +5682,7 @@ def _apply_env(cfg: Dict[str, Any]) -> Dict[str, Any]:
     setif("GX10_MAX_MODEL_LEN",      "context", "max_model_len",      int)
     setif("GX10_TOKEN_BUDGET",       "context", "token_budget",       _truthy)
     setif("GX10_CHARS_PER_TOKEN",    "context", "chars_per_token",    float)   # #366: calibrated fallback ratio
+    setif("GX10_MEMORY_BRIEF_TOKENS", "context", "memory_brief_tokens", int)   # #458 D1: handover brief budget
     setif("GX10_THINKING_RESERVE",   "context", "thinking_reserve",   int)     # #366 D5: thinking output reserve
     setif("GX10_AUTOPILOT",  "autopilot",  "enabled", _truthy)
     setif("GX10_AUTOPILOT_STREAM",    "autopilot", "stream",          _truthy)
@@ -5314,7 +5719,7 @@ def _apply_config(cfg: Dict[str, Any]):
     global TEMPERATURE, MAX_TOKENS, RETRY_BACKOFF, LANGUAGE
     global MAX_ITERATIONS, MAX_CTX_CHARS, TRIM_TARGET_CHARS, MAX_FILE_CHARS, LIST_DIR_HARD_CAP
     global SUMMARIZE_EVICTED, SUMMARY_MAX_TOKENS, RAG_ENABLED, RAG_TOP_K, RAG_MAX_TOKENS
-    global MAX_MODEL_LEN, TOKEN_BUDGET, CHARS_PER_TOKEN, THINKING_RESERVE
+    global MAX_MODEL_LEN, TOKEN_BUDGET, CHARS_PER_TOKEN, THINKING_RESERVE, MEMORY_BRIEF_TOKENS
     global WORKER_MEMORY, WORKER_WRITE, WORKER_WRITE_MODE, WARM_SESSION_ID
     global _PLANNING_KW, _ROUTINE_KW, WORKSPACE_DIRS, _IDLE_ACTIVE
     global WATCHER_FEEDBACK_DIR, _WATCHER_ENABLED, RECONCILER_INTERVAL
@@ -5378,6 +5783,7 @@ def _apply_config(cfg: Dict[str, Any]):
     TOKEN_BUDGET       = bool(ctx.get("token_budget", True))
     CHARS_PER_TOKEN    = float(ctx.get("chars_per_token", CHARS_PER_TOKEN))   # #366 calibrated fallback
     THINKING_RESERVE   = int(ctx.get("thinking_reserve", THINKING_RESERVE))   # #366 D5
+    MEMORY_BRIEF_TOKENS = int(ctx.get("memory_brief_tokens", MEMORY_BRIEF_TOKENS))   # #458 D1 handover brief budget
     if TOKEN_BUDGET:
         MAX_CTX_CHARS, TRIM_TARGET_CHARS = _derive_ctx_budget(
             MAX_MODEL_LEN, MAX_TOKENS, RAG_MAX_TOKENS, SUMMARY_MAX_TOKENS, CHARS_PER_TOKEN)

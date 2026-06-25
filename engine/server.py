@@ -23,6 +23,7 @@ Endpoints (all JSON; trust model = the configured security.profile — see secur
   GET  /health        → liveness + effective config summary
   GET  /tasks         → TaskStore snapshot (all statuses)
   GET  /pending       → tasks awaiting a local code-agent (pending + handover present)
+  GET  /coders        → which coding agents are bound (registry + boot probe) + the fan-out lane
   GET  /doctor        → runtime ACK/registry self-check (read-only)
   GET  /catalogue     → loaded prompt/skill registry snapshot (for client autocomplete)
   POST /chat          → ``{"message": str}`` → run one orchestrator turn, return captured output
@@ -30,6 +31,7 @@ Endpoints (all JSON; trust model = the configured security.profile — see secur
                         ``\x00TR\x00`` frames (+ ``\x00HB\x00`` heartbeats) for the client tool-bridge
   POST /tool-result   → ``{"id","result"}`` → the client returns a passed-through code-tool result
   POST /feedback      → ``{"task_id","agent","content"}`` → drop the feedback file the reconciler advances on
+  POST /coders        → ``{"agent": <id>|"auto"|null}`` → pin/clear the runtime code-agent (#454)
   POST /cancel        → set the engine cancel event; the running turn aborts at its next iteration
   POST /fanout        → ``{"prompts":[...], "system"?, "max_tokens"?, "temperature"?, "think"?}`` → run
                         independent reasoning prompts CONCURRENTLY against the local model; input order.
@@ -44,9 +46,9 @@ from __future__ import annotations
 import json
 import os
 import secrets
-import shutil
 import socket
 import sys
+import time
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -64,6 +66,7 @@ if str(_HERE) not in sys.path:
     sys.path.insert(0, str(_HERE))
 
 import gx10  # noqa: E402  (also puts core/ on sys.path → ack importable)
+import providers  # noqa: E402  (#455: result classifier; #449/#452 registry helpers)
 from workers import ReasoningWorkers  # noqa: E402
 from security import SecurityPolicy, SessionRegistry  # noqa: E402
 from ack import doctor  # noqa: E402
@@ -278,28 +281,147 @@ def _pending_handovers() -> list[Dict[str, Any]]:
     """Tasks awaiting a local code-agent: status pending AND a handover file present.
     The client pulls these, runs ``claude --print`` locally, posts feedback back."""
     store = gx10._store()
+    reg = gx10._code_agent_registry()          # #449: config-driven code-agent registry
     out: list[Dict[str, Any]] = []
     for task in store.list("pending"):
         tid = task.get("id") or ""
         ho = gx10._find_handover(tid)
         if not ho:
             continue
-        model, effort = gx10._parse_handover_meta(ho)
+        staged = gx10._task_agent(task) or gx10._agent_from_handover(ho.name)
+        # #454: operator pin overrides the staged agent. #456: a budget failover stays within the agents
+        # capable of the task's class (security/architecture → OPUS, etc.) — the staged pick is unchanged.
+        agent = gx10._effective_code_agent(staged, task_class=gx10._task_class(task))
+        spec = reg.resolve(agent)
+        if spec is None:                       # #449: unknown agent → fail-closed (not dispatchable)
+            continue
+        # #454 (review B): the staged handover's `to:`/`effort:` frontmatter is the orchestrator's choice
+        # for the STAGED agent — honour it only when no pin overrode it. When the operator PINNED a
+        # different agent, use THAT agent's own model/effort (else the pinned agent would run the staged
+        # agent's model, masking which agent really ran + breaking the per-agent model contract).
+        if agent == staged:
+            model, effort = gx10._parse_handover_meta(ho)
+        else:
+            model, effort = None, None
         try:
             content = ho.read_text(encoding="utf-8")
         except OSError:
             content = ""
         out.append({
             "id": tid,
-            "agent": gx10._task_agent(task) or gx10._agent_from_handover(ho.name),
+            "agent": agent,
             "title": task.get("title"),
             "type": task.get("type"),
             "handover_file": ho.name,
             "handover": content,
-            "model": model,
-            "effort": effort,
+            # #449 (C0R-9): the SERVER resolves the FULL agent spec from the registry; the client is a
+            # thin renderer (it runs `bin`+`cmd_template` as sent, no client-side registry). None values
+            # let the client fall back byte-identically to its Claude defaults (CLAUDE_BIN/AGENT_CMD).
+            "model": model or spec.model,
+            "effort": effort or spec.effort,
+            "bin": spec.bin,
+            "cmd_template": spec.cmd_template,
+            "permission": spec.permission_mode,
+            # #480: the read-only Memory MCP, gated server-side on the sealed profile + a configured memory
+            # service + the agent's mcp_template. The client fills the {mcp} placeholder with `mcp` and sets
+            # `mcp_env` on the agent subprocess (the spawned MCP inherits the memory connection). ("",{})
+            # under open/token ⇒ the launch is byte-identical to today.
+            **dict(zip(("mcp", "mcp_env"), gx10._mcp_for_launch(spec))),
         })
     return out
+
+
+#: #452 (review A perf): the boot probe (`shutil.which` + glob per agent) is cheap but not free, and
+#: /health re-derives the coders count on every 2s poll. Cache the probe for a short TTL so the poll
+#: reuses it; agent availability does not change second-to-second, and the full GET /coders stays fresh
+#: enough. A benign cross-thread race (two probes, idempotent dict write) is fine here.
+_PROBE_CACHE: Dict[str, Any] = {"at": -1e9, "data": None}
+_PROBE_TTL_S = 10.0
+
+
+def _probe_cached() -> Dict[str, Any]:
+    from providers import probe_code_agents
+    now = time.monotonic()
+    data = _PROBE_CACHE["data"]
+    if data is None or (now - _PROBE_CACHE["at"]) > _PROBE_TTL_S:
+        data = probe_code_agents(gx10._code_agent_registry())
+        _PROBE_CACHE["data"] = data
+        _PROBE_CACHE["at"] = now
+    return data
+
+
+def _coders_snapshot() -> Dict[str, Any]:
+    """#452: which CODING agents are bound (the code-agent registry + the prompt-free boot probe) plus
+    the fan-out provider lane (the dispatcher snapshot). Answers '/coders zeigt welche agents aktuell
+    aktiv angebunden sind'. Never raises — a probe/dispatcher hiccup degrades to an empty view."""
+    coding: list[Dict[str, Any]] = []
+    try:
+        reg = gx10._code_agent_registry()
+        probe = _probe_cached()
+        breaker = gx10._breaker_snapshot()                 # #455: budget-exhausted agents (failed over)
+        enabled_ids = set(reg.names())
+        # #460: show ALL onboarded agents, including a disabled one (e.g. KIMI pending exhausted-signal
+        # calibration) — it is inert (not probed/launchable) but visible as registered. enabled-only agents
+        # keep their boot-probe binding; a disabled one is enabled:false / bound:false.
+        for aid in reg.all_ids():
+            is_enabled = aid in enabled_ids
+            spec = reg.spec_of(aid)
+            path = probe.get(aid) if is_enabled else None
+            coding.append({
+                "id": aid,
+                "display": spec.agent_display() if spec else aid,
+                "model": spec.model if spec else None,
+                "enabled": is_enabled,                     # #460: False ⇒ onboarded but not yet activated
+                "bound": bool(path),                       # bin resolved on this machine = bound/active
+                "bin": path,
+                "unavailable": aid in breaker,             # #455: breaker-tripped (budget exhausted)
+                "unavailable_reason": breaker.get(aid),
+            })
+    except Exception:
+        coding = []
+    providers_block = {"active": False, "pool": [], "budget": {"usd_cap": None, "spent_usd": 0.0}}
+    try:
+        if gx10._DISPATCHER is not None:
+            providers_block = gx10._DISPATCHER.snapshot()
+    except Exception:
+        pass
+    # #454: the runtime operator pin (None ⇒ auto = the orchestrator's task-chosen staged agent).
+    try:
+        pinned = gx10._code_agent_pin()
+    except Exception:
+        pinned = None
+    return {"coding_agents": coding, "providers": providers_block, "pinned": pinned}
+
+
+def _set_coder_pin(agent: Optional[str]) -> Dict[str, Any]:
+    """#454: set/clear the runtime `/coders use <id>` pin. ``None``/``"auto"`` clears it; any other
+    value must name a CONFIGURED agent (fail-closed). Mutates the live ``code_agents.pinned`` config."""
+    raw = (agent or "").strip().upper()
+    if raw in ("", "AUTO", "NONE", "OFF"):
+        target = None
+    elif gx10._code_agent_registry().has(raw):
+        target = raw
+        gx10._breaker_reset(raw)   # #455: explicitly choosing an agent clears its budget breaker (recovery)
+    else:
+        names = ", ".join(gx10._agent_names()) or "none"
+        raise ValueError(f"unknown agent {raw!r} (configured: {names})")
+    cfg = gx10._EFFECTIVE_CFG
+    if cfg is None:
+        cfg = gx10._EFFECTIVE_CFG = gx10._code_defaults()
+    cfg.setdefault("code_agents", {})["pinned"] = target
+    return {"pinned": gx10._code_agent_pin()}
+
+
+def _coders_health() -> Dict[str, int]:
+    """Compact bound/total for the /health 2s poller (the full view is GET /coders). Uses ONLY the
+    cached probe + registry names — NOT the full snapshot — so the hot path skips the dispatcher
+    snapshot and its per-provider bin resolution (review B S3). Never raises."""
+    try:
+        names = gx10._code_agent_registry().names()
+        probe = _probe_cached()
+        return {"bound": sum(1 for a in names if probe.get(a)), "total": len(names)}
+    except Exception:
+        return {"bound": 0, "total": 0}
 
 
 def _doctor_report() -> Dict[str, Any]:
@@ -325,7 +447,7 @@ def _write_feedback(task_id: str, agent: str, content: str) -> str:
     and advances the task. Fail-closed: requires an active initiative (B3)."""
     d = gx10.feedback_dir()
     d.mkdir(parents=True, exist_ok=True)
-    agent_u = (agent or "OPUS").upper()
+    agent_u = (agent or "").upper()            # #449: the /feedback handler validates the agent first
     fb = d / f"{task_id}_{agent_u}-feedback.md"
     fb.write_text(content, encoding="utf-8")
     return str(fb)
@@ -401,6 +523,7 @@ class _Handler(BaseHTTPRequestHandler):
                                else ("up" if gx10._MEMORY.is_available() else "down")),
                     "security": self.policy.summary(),
                     "sealed": self.sessions.is_sealed(),
+                    "coders": _coders_health(),            # #452: compact bound/total for the 2s poller
                 })
             elif self.path == "/tasks":
                 if not self._guard():
@@ -410,6 +533,11 @@ class _Handler(BaseHTTPRequestHandler):
                 if not self._guard():
                     return
                 self._send(200, {"pending": _pending_handovers()})
+            elif self.path == "/coders":
+                # #452: which coding agents are bound + the fan-out provider lane. Guarded like /tasks.
+                if not self._guard():
+                    return
+                self._send(200, _coders_snapshot())
             elif self.path == "/doctor":
                 if not self._guard():
                     return
@@ -545,12 +673,45 @@ class _Handler(BaseHTTPRequestHandler):
                 data = self._read_json()
                 tid = (data.get("task_id") or "").strip()
                 content = data.get("content") or ""
-                agent = (data.get("agent") or "OPUS").strip()
-                if not tid or not content:
-                    self._send(400, {"ok": False, "error": "need 'task_id' and 'content'"})
+                agent = (data.get("agent") or "").strip().upper()
+                # #455: content may be EMPTY now — a no-feedback run still reports its raw signal
+                # (exit_code + stderr) so the server can classify it. Require only task_id + agent.
+                if not tid:
+                    self._send(400, {"ok": False, "error": "need 'task_id'"})
+                    return
+                # #449 (review B-6): fail-closed at the boundary — validate the agent against the
+                # config-driven registry instead of silently defaulting an unknown/missing one to OPUS.
+                if not gx10._code_agent_registry().has(agent):
+                    self._send(400, {"ok": False,
+                                     "error": f"unknown agent {agent!r} (configured: "
+                                              f"{', '.join(gx10._code_agent_registry().names()) or 'none'})"})
+                    return
+                # #455: classify the raw run signal (layered JSON→stderr→exit; conf patterns) →
+                # budget-exhausted ⇒ trip the breaker (the next /pending fails over to a peer); a
+                # plain failure ⇒ no feedback written (retry); a real result ⇒ advance.
+                patterns = ((gx10._EFFECTIVE_CFG or {}).get("code_agents") or {}).get("exhausted")
+                cls = providers.classify_agent_result(
+                    exit_code=data.get("exit_code"), stderr=data.get("stderr") or "",
+                    has_feedback=bool(content.strip()), patterns=patterns)
+                if cls == providers.RESULT_UNAVAILABLE:
+                    gx10._breaker_trip(agent, "budget/quota exhausted")
+                    self._send(200, {"ok": True, "classification": cls,
+                                     "action": "breaker-tripped → failover on the next poll"})
+                    return
+                if cls == providers.RESULT_FAILED:
+                    self._send(200, {"ok": True, "classification": cls, "action": "no-feedback"})
                     return
                 path = _write_feedback(tid, agent, content)
-                self._send(200, {"ok": True, "feedback_file": path})
+                self._send(200, {"ok": True, "classification": cls, "feedback_file": path})
+            elif self.path == "/coders":
+                # #454: `/coders use <id>` pins the coding agent at runtime (`auto`/null clears it).
+                data = self._read_json()
+                try:
+                    res = _set_coder_pin(data.get("agent"))
+                except ValueError as e:
+                    self._send(400, {"ok": False, "error": str(e)})
+                    return
+                self._send(200, {"ok": True, **res})
             elif self.path == "/fanout":
                 data = self._read_json()
                 prompts = data.get("prompts")
@@ -628,10 +789,20 @@ def serve(host: str = "0.0.0.0", port: int = 8100,
     # runner (engine + agents co-located on the desktop). Orchestrator + agents are always co-located —
     # no cross-machine offload. The dispatcher code is unchanged; only WHICH runner closure we inject differs.
     pcfg = cfg.get("providers") or {}
+    # #451: per-enabled-agent boot probe (prompt-free path resolution) instead of a single
+    # which(CLAUDE_BIN). cli-available = AT LEAST ONE enabled code-agent resolves; fail-closed only
+    # when ZERO resolve. Each agent's bin is resolved via PATH (a shim) or its private-layer bin_glob.
     try:
-        from client import CLAUDE_BIN
-        _cli_ok = shutil.which(CLAUDE_BIN) is not None
-    except Exception:
+        from providers import probe_code_agents
+        _probe = probe_code_agents(gx10._code_agent_registry())
+        for _aid, _path in _probe.items():
+            print(f"  [agents] {_aid}: {'resolved → ' + _path if _path else 'NOT resolved'}", flush=True)
+        _cli_ok = any(_probe.values())
+        if not _cli_ok:
+            print("  [agents] WARNING: no code-agent binary resolved — the local handover lane is "
+                  "unavailable (set GX10_CLAUDE_BIN / a code_agents bin or bin_glob in conf/).", flush=True)
+    except Exception as _pe:
+        print(f"  [agents] probe failed ({_pe!r}) — assuming no local agent", flush=True)
         _cli_ok = False
     try:
         topo = gx10.resolve_offload_topology(cfg, cli_available=_cli_ok)   # FAIL-CLOSED on bad topology
@@ -679,7 +850,7 @@ def serve(host: str = "0.0.0.0", port: int = 8100,
     except Exception as e:  # noqa: BLE001 — diagnostics must never block startup
         print(f"  Doctor : self-check skipped ({e!r})", flush=True)
     print(f"  Listen : http://{host}:{port}  "
-          f"(GET /health /tasks /pending /doctor · POST /chat /chat/stream /cancel "
+          f"(GET /health /tasks /pending /coders /doctor · POST /chat /chat/stream /coders /cancel "
           f"/feedback /fanout /session/open|heartbeat|close)",
           flush=True)
     try:

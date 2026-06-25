@@ -18,8 +18,37 @@ in the monolithic CLI) under a single, predictable ``/command`` convention.
 from __future__ import annotations
 
 import os
+import shlex
 import sys
-from typing import Tuple
+from typing import List, Tuple
+
+
+def build_agent_argv(template: str, *, bin: str, model: str, effort: str,
+                     permission: str, prompt: str, feedback: str = "", mcp: str = "") -> List[str]:
+    """Render a code-agent command template into an argv list (#449, C0R-9). ONE renderer shared by
+    both launch paths — ``client._run_handover``/``default_cli_runner`` and ``gx10._do_launch`` —
+    so neither re-implements template substitution. Lives here (stdlib-only: ``shlex``) rather than
+    in ``providers.py`` so the zero-dependency headless client can import it without pulling pydantic.
+
+    Tokens are split with shlex (POSIX), then placeholders are substituted **per token** so
+    ``{prompt}`` (which contains spaces) stays exactly one argument. Unknown ``{x}`` are left as-is.
+    ``{feedback}`` (#443) is the agent's deterministic result-capture path (e.g. Codex
+    ``-o {feedback}``); a template that omits it (the Claude default) ignores it. ``{mcp}`` (#480) is a
+    MULTI-token placeholder — it expands (via shlex) to 0+ args (the gated read-only Memory MCP config, or
+    nothing when not under the sealed profile), so a template can carry it at the right position."""
+    subs = {"bin": bin, "model": model, "effort": effort,
+            "permission": permission, "prompt": prompt, "feedback": feedback}
+    argv: List[str] = []
+    for tok in shlex.split(template):
+        if tok == "{mcp}":
+            argv.extend(shlex.split(mcp or ""))        # #480: multi-token — empty mcp ⇒ no args
+        elif tok.startswith("{") and tok.endswith("}") and tok[1:-1] in subs:
+            argv.append(str(subs[tok[1:-1]]))          # whole token is a placeholder
+        else:
+            for k, v in subs.items():                  # placeholder(s) embedded in token
+                tok = tok.replace("{" + k + "}", str(v))
+            argv.append(tok)
+    return argv
 
 
 def setup_output() -> None:
@@ -35,7 +64,7 @@ def setup_output() -> None:
 
 
 #: Handled on the client side (connection / local code-agents).
-LOCAL_COMMANDS = {"tasks", "pending", "work", "auto", "health", "help", "exit", "quit"}
+LOCAL_COMMANDS = {"tasks", "pending", "coders", "work", "auto", "health", "help", "exit", "quit"}
 
 #: Known orchestrator commands — forwarded to the server verbatim (minus the slash).
 #: (Used for help + so `/help` can advertise them; unknown `/x` is still forwarded,
@@ -53,6 +82,8 @@ Commands (with a / prefix) — plain text without / is sent to the orchestrator 
     /help              this help
     /tasks             TaskStore overview
     /pending           staged handovers for local code-agents
+    /coders            which coding agents are bound/active (registry + boot probe) + providers
+    /coders use <id>   pin all handovers to a coding agent at runtime (use auto to clear)
     /work              run all open handovers ONCE locally (in parallel)
     /auto on|off       background poller for handovers
     /health            server status

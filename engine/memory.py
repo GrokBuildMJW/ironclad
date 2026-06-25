@@ -21,7 +21,8 @@ hard-coded. Talks to a Mem0-style service over plain HTTP:
 The contract the engine relies on (see ``gx10.py`` call sites):
 ``is_available() -> bool``, ``store_task_completion(task_id, task, feedback) -> None``,
 ``add_bulk(text, metadata) -> None``, ``chunk_and_store(text, metadata) -> None``,
-``get_context(task_type, title) -> str``, ``search(query, limit) -> List[str]``,
+``get_context(task_type, title) -> str``, ``brief(...) -> str`` (the richer token-budgeted handover
+brief, #458 D1), ``search(query, limit) -> List[str]``,
 ``query(query, limit) -> str``, ``deep_query(query, limit) -> str`` (opt-in graph path).
 """
 from __future__ import annotations
@@ -221,7 +222,8 @@ class MemoryManager:
             return []
         try:
             d = self._post("/search", {"query": query, "limit": int(limit),
-                                       "graph": bool(graph), **self._ids()}, timeout or self.read_timeout)
+                                       "graph": bool(graph), **self._ids()},
+                           self.read_timeout if timeout is None else timeout)
         except Exception:  # noqa: BLE001
             return []
         results = d.get("results") or []
@@ -260,12 +262,94 @@ class MemoryManager:
         return self._search(query, limit)
 
     def get_context(self, task_type: str, title: str) -> str:
-        """Past-pattern context appended to a handover at stage time (or "")."""
+        """Past-pattern context appended to a handover at stage time (or ""). Simple type:title lookup —
+        the richer, token-budgeted handover brief is ``brief`` (#458 D1); kept for plain callers."""
         q = f"{task_type}: {title}".strip(" :")
         hits = self._search(q, 5)
         if not hits:
             return ""
         return "## Relevant context from memory\n" + "\n".join(f"- {h}" for h in hits)
+
+    #: brief composition knobs (#458 D1)
+    _BRIEF_QUERY_CHARS = 2000   # the handover body is truncated to this before it is used as the search query
+    _BRIEF_VEC_LIMIT = 6        # body-keyed vector hits requested
+    _BRIEF_DEEP_LIMIT = 4       # relational (graph) hits requested
+    _BRIEF_DEEP_TIMEOUT = 8.0   # the brief's relational query is a BACKGROUND enrichment, not the deliberate
+                                # deep_query tool — cap its timeout so a slow/unreachable graph store can never
+                                # stall a handover stage for the full deep_timeout (review A S3-1).
+
+    @staticmethod
+    def _norm(s: str) -> str:
+        return " ".join((s or "").split()).lower()
+
+    def brief(self, *, body: str = "", task_type: str = "", title: str = "",
+              warm_summary: str = "", budget_tokens: int = 1200,
+              count_tokens: Optional[Any] = None, deep: bool = True) -> str:
+        """#458 (D1): a richer, token-budgeted Memory brief for a handover — replaces the plain
+        type:title ``get_context``. Composes, in priority order and trimmed to stay within
+        ``budget_tokens``:
+          1) the shared warm rolling summary (the main loop's common ground), when provided,
+          2) **body-keyed** vector hits (the handover BODY is a far richer query than 'type: title'),
+          3) optional relational hits (a short-timeout ``graph=true`` search — NOT the deliberate
+             ``deep_query`` tool), deduped against the vector hits.
+        The token counter is INJECTED (``count_tokens: str -> int``) so this module stays free of the
+        engine tokenizer; it falls back to a conservative chars/4 estimate. Fail-soft: any error or an
+        empty result yields "" (the handover is simply staged without a brief)."""
+        try:
+            count = count_tokens if callable(count_tokens) else (lambda s: len(s or "") // 4 + 1)
+            q = "\n".join(x for x in (title, body) if x).strip()[: self._BRIEF_QUERY_CHARS]
+            if not q:
+                q = f"{task_type}: {title}".strip(" :")
+            try:
+                vec = self._search(q, self._BRIEF_VEC_LIMIT) if q else []
+            except Exception:  # noqa: BLE001 — a vector hiccup must not discard a warm summary already in hand
+                vec = []
+            deep_hits: List[str] = []
+            deep_to = min(self.deep_timeout, self._BRIEF_DEEP_TIMEOUT)
+            if deep and q and deep_to > 0:   # deep_timeout<=0 ⇒ relational disabled (don't pass 0 to urlopen)
+                try:
+                    seen = {self._norm(h) for h in vec}
+                    for h in self._search(q, self._BRIEF_DEEP_LIMIT, graph=True, timeout=deep_to):
+                        if self._norm(h) not in seen:
+                            deep_hits.append(h)
+                            seen.add(self._norm(h))
+                except Exception:  # noqa: BLE001 — relational path is best-effort
+                    deep_hits = []
+            # ordered (heading, lines) sections; greedily filled so the WHOLE brief stays within budget
+            sections: List[tuple] = []
+            ws = (warm_summary or "").strip()
+            if ws:
+                sections.append(("### Recent context (rolling summary)", [ws]))
+            if vec:
+                sections.append(("### Related past work", [f"- {h}" for h in vec]))
+            if deep_hits:
+                sections.append(("### Connections (relational)", [f"- {h}" for h in deep_hits]))
+            if not sections:
+                return ""
+            head = "## Relevant context from memory"
+            out_lines = [head]
+            # account for the rendered "\n".join separators (review B S3-1): every piece after the head is
+            # joined with a leading newline, so measure count("\n"+piece) — the running total then tracks the
+            # ACTUAL rendered cost, and the brief can't slip over budget by the omitted separator tokens.
+            used = count(head)
+            for heading, lines in sections:
+                htok = count("\n" + heading)
+                if used + htok > budget_tokens:
+                    break
+                pending = [heading]
+                ptok = htok
+                for ln in lines:
+                    t = count("\n" + ln)
+                    if used + ptok + t > budget_tokens:
+                        break
+                    pending.append(ln)
+                    ptok += t
+                if len(pending) > 1:          # the heading plus at least one line actually fit
+                    out_lines.extend(pending)
+                    used += ptok
+            return "\n".join(out_lines) if len(out_lines) > 1 else ""
+        except Exception:  # noqa: BLE001 — fail-soft: never block a handover on a memory hiccup
+            return ""
 
     def query(self, query: str, limit: int = 8) -> str:
         """Formatted result for the ``query_memory`` tool (vector-only hot path)."""

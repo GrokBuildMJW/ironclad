@@ -41,7 +41,7 @@ PROFILES = ("open", "token", "sealed")
 #: likewise gated: the loaded prompt/skill registry snapshot (names + descriptions) is deployment
 #: detail that must not be readable without the secret.
 GATED_PATHS = ("/chat", "/chat/stream", "/tool-result", "/fanout", "/cancel",
-               "/tasks", "/pending", "/feedback", "/doctor", "/catalogue")
+               "/tasks", "/pending", "/feedback", "/doctor", "/catalogue", "/coders")
 
 
 class SecurityPolicy:
