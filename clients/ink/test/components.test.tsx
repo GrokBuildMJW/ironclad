@@ -25,6 +25,7 @@ test('Footer — model · conn · mem · tasks · perf', () => {
     done: 4,
     perf: 'TTFT 0.5s · 62 tok/s',
     agent: 'codex · cheapest-capable',
+    search: 'n=2 ms=153',
   };
   const {frame, unmount} = renderToString(<Footer st={st} />, 200, 3);
   const f = frame();
@@ -36,13 +37,14 @@ test('Footer — model · conn · mem · tasks · perf', () => {
   assert.match(f, /1P\/0IP\/4D/);
   assert.match(f, /TTFT 0\.5s/);
   assert.match(f, /coder codex/, '#453: shows which coder was routed');
+  assert.match(f, /web 2 · 153ms/, '#505 S9: shows the web-search summary chip');
   unmount();
 });
 
 test('Footer — memory off/down render their state', () => {
   const base: StatusState = {
     model: 'm', connected: true, memory: 'off', warm: 'off', watcher: false, autopilot: false,
-    pending: 0, inProgress: 0, done: 0, perf: '', agent: '',
+    pending: 0, inProgress: 0, done: 0, perf: '', agent: '', search: '',
   };
   const off = renderToString(<Footer st={base} />, 120, 3);
   assert.match(off.frame(), /mem off/);

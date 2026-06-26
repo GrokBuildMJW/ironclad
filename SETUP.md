@@ -54,6 +54,9 @@ python engine/server.py &              # the orchestrator
 python engine/client.py --codedir .    # the client (drives it; code-tools run on your files)
 ```
 
+- **Optional web search:** set `GX10_SEARCH_API_KEY` (your search API key) and `search.adapter=brave`
+  on a **local** setup to enable native web search — see [`docs/web-search.md`](docs/web-search.md).
+  The value is read from the environment at boot; never put the key in a config file.
 - **Recommended interactive client** (purpose-built renderer: ghost-free resize, native
   scrollback/selection/copy, smooth streaming): the TypeScript client in
   [`clients/ink/`](clients/ink/) — see [§4 Run](#4-run--orchestrator--client). The

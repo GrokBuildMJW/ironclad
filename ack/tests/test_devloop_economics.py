@@ -78,3 +78,31 @@ def test_delivery_stage_poison_cap_is_distinct_and_lower(monkeypatch):
     assert any("delivery-stage poison-cap" in r for r in aborts)                    # cap reached => ABORT the stage
     assert any("delivery-stage cost" in r
                for r in e.delivery_stage_should_abort(attempt=0, spent=5.0, ceiling=1.0))
+
+
+def test_review_cost_entry_normalizes_and_rejects_bad_type():
+    # #493 P6: a per-iteration review-cost record, normalized; an unknown change_type must raise
+    # so a typo can't silently skew the by-type summary.
+    e = _load()
+    rec = e.review_cost_entry(497, "Doc", rounds=1, agents=["claude"], approx_tokens=1200)
+    assert rec["change_type"] == "doc" and rec["rounds"] == 1 and rec["issue"] == 497
+    assert rec["agents"] == ["claude"] and rec["approx_tokens"] == 1200 and rec["efforts"] == []
+    assert e.review_cost_entry(1, "code", rounds=-5, agents=[])["rounds"] == 0   # clamped non-negative
+    with pytest.raises(ValueError):
+        e.review_cost_entry(1, "essay", rounds=1, agents=[])                     # unknown type => raise
+
+
+def test_summarize_review_cost_breaks_down_by_change_type():
+    # The tiering (#493 P1) should show: doc iterations cost fewer rounds than code.
+    e = _load()
+    entries = [
+        e.review_cost_entry(1, "doc", rounds=1, agents=["claude"], approx_tokens=500),
+        e.review_cost_entry(2, "code", rounds=3, agents=["claude", "codex"], approx_tokens=8000),
+        e.review_cost_entry(3, "doc", rounds=1, agents=["claude"], approx_tokens=400),
+    ]
+    s = e.summarize_review_cost(entries)
+    assert s["iterations"] == 3 and s["total_rounds"] == 5 and s["total_approx_tokens"] == 8900
+    assert s["by_change_type"]["doc"] == {"iterations": 2, "rounds": 2, "approx_tokens": 900}
+    assert s["by_change_type"]["code"]["rounds"] == 3
+    assert e.summarize_review_cost([]) == {"iterations": 0, "total_rounds": 0,
+                                           "total_approx_tokens": 0, "by_change_type": {}}

@@ -275,6 +275,11 @@ class IroncladApp(App):
                 self._status["agent"] = c[jdx + len("[agent]"):].strip()
                 self._safe_call(self._refresh_status)
                 return
+            sdx = c.find("[search]")                       # S9: web-search summary → status footer, not chat
+            if sdx != -1:
+                self._status["search"] = c[sdx + len("[search]"):].strip()
+                self._safe_call(self._refresh_status)
+                return
             if "===" in c and "DONE" in c:
                 return
             if _is_scaffold(c):

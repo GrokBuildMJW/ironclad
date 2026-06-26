@@ -832,10 +832,24 @@ def serve(host: str = "0.0.0.0", port: int = 8100,
             effort_max_tokens=pcfg.get("effort_max_tokens"),
             max_agents=int(pcfg.get("max_agents", 3)),     # providers.max_agents (server cap, ≠ --max-agents)
         )
+        # epic #505 S3: the standalone web-search adapter seam, selected from the `search` config
+        # block (cli / brave / mock) independent of the dispatcher registry. runner_mode gates the
+        # native brave adapter to a local setup (Fork 2); server mode falls back to the CLI lane.
+        from websearch_adapters import build_web_search_adapter
+        gx10._WEBSEARCH = build_web_search_adapter(cfg, gx10._DISPATCHER, runner_mode=topo["runner_mode"])
+        # epic #505 S8: boot-time visibility. Web search stays OFF (fail-soft) rather than blocking
+        # boot when its adapter is unusable (e.g. the native adapter on a local setup with no key) —
+        # the fail-closed posture of SecurityPolicy, minus refusing to boot (search is optional).
+        _scfg = (cfg or {}).get("search") or {}
+        if _scfg.get("enabled", True) and gx10._WEBSEARCH is not None and not gx10._WEBSEARCH.available():
+            print(f"  [search] web_search OFF — adapter {_scfg.get('adapter', 'cli')!r} is not usable "
+                  f"(for the native adapter on a local setup, set ${_scfg.get('api_key_env', 'GX10_SEARCH_API_KEY')}).",
+                  flush=True)
     except SystemExit:
         raise
     except Exception:
         gx10._DISPATCHER = None                            # fail-soft: any wiring error → today's path
+        gx10._WEBSEARCH = None
     httpd = ThreadingHTTPServer((host, port), _Handler)
 
     print(f"  Ironclad Orchestrator-Server  (version {gx10.orchestrator_version()})", flush=True)

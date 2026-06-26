@@ -15,6 +15,7 @@ const ANSI = new RegExp(String.fromCharCode(27) + '\\[[0-9;]*m', 'g');
 const TOK = /(\d+)\s*tok/;
 const PERF = '[perf]';
 const AGENT = '[agent]'; // #453: routing provenance → which coder was called (footer, not chat)
+const SEARCH = '[search]'; // epic #505 S9: web-search summary (n batches + ms) → footer, not chat
 // MPR report sentinels (skills/mpr/entry.py REPORT_OPEN/CLOSE) — machine delimiters that mark the
 // verbatim report block; they must never reach the rendered chat (#50).
 const REPORT_OPEN = '<<<MPR_REPORT>>>';
@@ -28,6 +29,7 @@ export interface Router {
   perf: string;
   tokens: number;
   agent: string;
+  search: string;
 }
 
 export function createRouter(): Router {
@@ -40,6 +42,7 @@ export function createRouter(): Router {
     perf: '',
     tokens: 0,
     agent: '',
+    search: '',
     route: () => {},
     feed: () => {},
     flush: () => {},
@@ -58,6 +61,11 @@ export function createRouter(): Router {
     const ai = st.indexOf(AGENT); // #453: which coder was routed → footer, dropped from the chat
     if (ai !== -1) {
       state.agent = st.slice(ai + AGENT.length).trim();
+      return;
+    }
+    const si = st.indexOf(SEARCH); // S9: web-search summary → footer, dropped from the chat
+    if (si !== -1) {
+      state.search = st.slice(si + SEARCH.length).trim();
       return;
     }
     if (st.includes('===') && (st.includes('DONE') || st.includes('✓'))) return;

@@ -258,6 +258,16 @@ deterministisch weiter (manuelles „done" bleibt Fallback).
 
 ---
 
+## Web search & sources (the `web_search` tool)
+
+- When information may be **current, time-sensitive, or past your knowledge cutoff** (today's news,
+  recent events, live prices, "what is the latest …"), use the `web_search` tool — never improvise a
+  shell web fetch (it is blocked and corrupts the display).
+- `web_search` accepts optional `allowDomains` / `blockDomains` filters (mutually exclusive, concrete
+  domains, no wildcards) to scope the search to, or exclude, specific sites.
+- **Whenever you used `web_search`, end your answer with a `Sources:` list** of the relevant URLs as
+  Markdown links. The tool already appends a sources reminder to every result — honour it.
+
 ## Wichtige Prinzipien (unverhandelbar)
 
 - **Fail-closed ist Standard** — im Zweifel ablehnen/nachfragen statt unsicher handeln.

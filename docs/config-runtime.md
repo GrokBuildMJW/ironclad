@@ -60,15 +60,38 @@ Example:
 ## Frozen (boot-only) keys
 
 Some keys wire something at **startup** that a later write cannot re-thread. Currently frozen
-(`_FROZEN_CONFIG_KEYS`): **`setup.type`** (selects the offload runner — see [`setup-types.md`](setup-types.md))
-and **`security.profile`** (builds the trust policy + the effective bind host, e.g. `sealed`→loopback — see
-[`security.md`](security.md)). Mutating either at runtime would be incoherent, so `/config get <key>` still
-reads them but `/config set <key> …` is **refused** with a clear message ("boot-only — set it in the
-deploy"). The frozen set lives in core, generic and extensible. Change a frozen key in the config file /
-env and restart.
+(`_FROZEN_CONFIG_KEYS`): **`setup.type`** (selects the offload runner — see [`setup-types.md`](setup-types.md)),
+**`security.profile`** (builds the trust policy + the effective bind host, e.g. `sealed`→loopback — see
+[`security.md`](security.md)), **`security.web_in_sealed`** (the sealed-profile web-search opt-in — a runtime
+write must not lift the seal without a restart), and **`search.enabled` / `search.adapter` /
+`search.api_key_env`** (the web-search seam is boot-wired; re-pointing the adapter or its key at runtime
+would not re-thread it). Mutating a frozen key at runtime would be incoherent, so `/config get <key>` still
+reads it but `/config set <key> …` is **refused** with a clear message ("boot-only — set it in the deploy").
+The frozen set lives in core, generic and extensible. Change a frozen key in the config file / env and restart.
 
 > **When does an override take effect?** Core globals: immediately (step 2). Plugin sections: on their
 > next read of `_EFFECTIVE_CFG` (most plugins re-read per request, so effectively the next call).
+
+## Web search (`search.*`)
+
+The `web_search` tool is configured under the `search.*` block; the corresponding `GX10_SEARCH_*`
+env vars override it (non-secret knobs only).
+
+| Key | Env | Default | Meaning |
+|---|---|---|---|
+| `search.enabled` | `GX10_SEARCH_ENABLED` | `true` | master on/off (frozen, boot-only) |
+| `search.adapter` | `GX10_SEARCH_ADAPTER` | `cli` | `cli` (delegate to a web-capable CLI provider), `brave` (native HTTP, **local setup only**), or `mock` (tests) — frozen, boot-only |
+| `search.api_key_env` | — | `GX10_SEARCH_API_KEY` | the **name** of the env var holding the search API key; frozen, boot-only |
+| `search.count` | `GX10_SEARCH_COUNT` | `10` | results per native (http) search request |
+| `search.max_output_chars` | `GX10_SEARCH_MAX_OUTPUT_CHARS` | `100000` | cap on the model-facing result text |
+| `security.web_in_sealed` | — | `false` | opt-in to allow outbound web search under the `sealed` trust profile (frozen, boot-only) |
+
+**The API key is never config.** Its VALUE is read from the environment named by `search.api_key_env`
+(default `GX10_SEARCH_API_KEY`) at server boot — the config holds only the name, never the secret. The
+native (`brave`) adapter is **local-only**: in `server` mode web search falls back to the `cli` adapter.
+If the configured adapter is unusable (e.g. `brave` on a local setup with no key), web search stays **off**
+fail-soft (a `[search]` boot note explains why) — the server still boots. Supply the key in the
+deployment environment (for a desktop/local setup, the user environment, like `GX10_WARM_URL`).
 
 ## Scope & persistence
 

@@ -9,7 +9,21 @@ Released versions are listed below; upcoming work accumulates under *Unreleased*
 
 ## [Unreleased]
 
+## [0.0.20] - 2026-06-26
+
 ### Added
+- **Proper `web_search` tool** (epic #505): the model runs web search natively from Ironclad with a
+  strict input contract (`query`, optional `allowDomains`/`blockDomains` — mutually exclusive,
+  normalized, wildcard-rejected), a **vendor-neutral adapter seam** (`cli` delegate · a native HTTP
+  `brave` adapter on the standard library, **local-only** · a `mock` for tests), structured results
+  with a measured duration, a **deterministic `Sources:`** block on every result, and a "web N · Xms"
+  status-footer chip (stripped from the chat in every client). Outbound search is **blocked under the
+  `sealed` trust profile** unless the operator opts in (`security.web_in_sealed`). Configured via the
+  `search.*` block + `GX10_SEARCH_*` env; the API key is name-indirected from the environment, never
+  config. `core/` stays standard-library-only (no new dependency). Robust against the model running a
+  tool as a shell command (`execute_command` redirects a known tool name — e.g. `web_search "…"` — to
+  the tool instead of a shell error), and the current-info steer covers news/headline phrasings. New
+  `docs/web-search.md` + `docs/adr/0008-web-search-tool.md`.
 - **`/health` reports the Warm tier separately (Cold ⇏ Warm)** (#385): `/health` reported a single
   `memory` field that reflected only **Cold** (Mem0), so a silent **Warm** (Valkey) outage — the tier is
   fail-soft and degrades to a no-op when unreachable — read as a healthy `memory: up` and could regress

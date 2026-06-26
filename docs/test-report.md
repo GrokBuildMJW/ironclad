@@ -9,10 +9,10 @@
 
 | | |
 |---|---|
-| Automated tests (offline, no model) | **1592 passed** |
+| Automated tests (offline, no model) | **1691 passed** |
 | Live smoke tests (skipped without a model) | **9** |
-| **Total Python** | **1601** |
-| TypeScript client tests (`node:test`) | **359 passed** (363 total, 4 skipped) |
+| **Total Python** | **1700** |
+| TypeScript client tests (`node:test`) | **360 passed** (364 total, 4 skipped) |
 | Full agentic loop, end to end, with a **real** code-agent | **verified** |
 | Issues found during the campaign | **1 functional gap + 5 review findings — all found and fixed** (see below) |
 
@@ -24,7 +24,7 @@ default** and only runs when pointed at a real server.
 
 ```bash
 # 1) offline suite — deterministic, no model needed
-pytest -q                                   # from core/  → 1592 passed, 9 skipped
+pytest -q                                   # from core/  → 1691 passed, 9 skipped
 
 # 2) live smoke — against your own running orchestrator
 GX10_LIVE_URL=http://<your-host>:8100 pytest -k live -q     # 9 passed
@@ -34,7 +34,7 @@ GX10_LIVE_URL=http://<your-host>:8100 pytest -k live -q     # 9 passed
 ## Coverage by area
 
 The breakdown below groups the suite by capability area and sums to
-the **1601** total (1592 offline + 9 live). It is a high-level view of internal QA
+the **1700** total (1691 offline + 9 live). It is a high-level view of internal QA
 coverage; the granular test names and the maintainers' internal tracker are
 intentionally not enumerated here.
 
@@ -44,7 +44,7 @@ intentionally not enumerated here.
 | **Function-calling robustness** — tool-argument validation and model-agnostic call recovery | 24 |
 | **Server / client split & security** — HTTP surface, trust profiles, sessions, sealing, the config tree + runtime config, command router, doctor, catalogue endpoint, the server-side tool bridge, and the coders / health observability blocks | 117 |
 | **Provider-router / dispatch** — backend registry, routing policy, artifact routing, spill / fallback, setup-type resolution, reviewer anti-affinity, and first-class web-search routing | 89 |
-| **Web search & current-info routing** — the web-search tool gating + handler, the current-info intent classifier (English + German), and a fail-closed shell guardrail | 50 |
+| **Web search & current-info routing** — the web-search tool gating + handler, the current-info intent classifier (English + German), the strict input contract + domain normalizer, the standalone adapter seam + a native HTTP adapter, the model-facing Sources formatter, the web_search prompt + tool-description, the sealed trust gate, the config + secret surface, the search-progress renderer, the 16-test spec consolidation, the tool-as-shell guard, and a fail-closed shell guardrail | 147 |
 | **Memory & context** — Mem0 client, chunking, RAG, the rolling summary, bounded summarizer input, deep query, vault reconcile, the warm tier, and the token-budgeted handover brief | 98 |
 | **Read-only Memory MCP** — a dependency-free stdio JSON-RPC server exposing project memory as read-only search + deep-query tools, with a sealed-gated launch | 10 |
 | **Open plugin surface** — discover and expose `skills/*` plugins with no core patch | 7 |
@@ -73,7 +73,7 @@ intentionally not enumerated here.
 | **Token budget / context trimming** — token-accurate budgeting, a pre-flight overflow guard with emergency trim, and live context-length discovery | 56 |
 | **Misc** — manual cat tool, orchestrator version | 7 |
 | **Demo vessel** — the example-workspace doctor preflight | 1 |
-| **Documentation & release integrity (internal QA)** — documentation-reality checks, the generated roadmap and test counts, export-sync verification, the clean-room pre-publish proof, deploy-consistency checks, and the maintainers' release-process guards | 346 |
+| **Documentation & release integrity (internal QA)** — documentation-reality checks, the generated roadmap and test counts, export-sync verification, the clean-room pre-publish proof, deploy-consistency checks, and the maintainers' release-process guards | 348 |
 | **Live smoke** — real model, all endpoints | 9 |
 
 ## Live end-to-end verification

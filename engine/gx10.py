@@ -699,6 +699,10 @@ _WORKERS: Optional[Any] = None
 #: P0 provider router — set at server boot beside _WORKERS (server.py). None or inactive ⇒
 #: parallel_reason uses today's _WORKERS.fanout path, byte-identically.
 _DISPATCHER: Optional[Any] = None
+#: Web-search adapter seam (epic #505) — set at server boot from the `search` config block,
+#: standalone from the provider dispatcher so a native-search deployment with no CLI provider
+#: still offers web_search. None ⇒ no adapter wired (offer/exec gates fail closed).
+_WEBSEARCH: Optional[Any] = None
 #: §3c MAP — when True, each fan-out worker gets its own per-item retrieved context (memory
 #: read-citizen) PLUS the shared rolling-summary floor. Default ON (06-18); set False /
 #: GX10_WORKER_MEMORY=0 for the stateless fan-out. Config workers.memory_read.
@@ -1401,6 +1405,8 @@ PARALLEL_TOOL = {
 # configured (see _effective_tools). Runs SERVER-side through the provider lane via the captured CLI
 # runner → structurally immune to the console-write scaling break. This is the tool the model must use
 # for current/latest/today information INSTEAD of improvising a shell web fetch (execute_command).
+# (epic #505 R2: the spec's `deferByDefault` is N/A here — tools are offered wholesale via
+# _effective_tools with plain function-JSON schemas; there is no defer / lazy-context tool registry.)
 WEBSEARCH_TOOL = {
     "type": "function",
     "function": {
@@ -1409,12 +1415,31 @@ WEBSEARCH_TOOL = {
             "Search the web for CURRENT / LATEST / real-time information (today's news, recent events, "
             "live prices, 'what is the latest …'). ALWAYS use this for anything time-sensitive or "
             "post-training-cutoff — do NOT try to fetch the web with execute_command (a shell web "
-            "request is blocked and corrupts the display). Returns the search result text."
+            "request is blocked and corrupts the display). Optionally scope the search with "
+            "allowDomains/blockDomains (mutually exclusive, concrete domains, no wildcards). Returns "
+            "the search result text; after searching, cite the relevant sources as Markdown links."
         ),
         "parameters": {
             "type": "object",
             "properties": {
                 "query": {"type": "string", "description": "the search query (natural language)"},
+                # Optional domain filters. Kept grammar-clean (plain array of strings, no
+                # minLength/pattern/minItems) so the structured-outputs path never 400s; the
+                # real rules (>=2-char query, allow XOR block, normalization, wildcard reject)
+                # are enforced in the websearch validator at the tool boundary, not here.
+                "allowDomains": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": ("optional: restrict the search to ONLY these domains "
+                                    "(e.g. ['docs.python.org']); mutually exclusive with "
+                                    "blockDomains; concrete domains, no wildcards"),
+                },
+                "blockDomains": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": ("optional: exclude these domains from the search; mutually "
+                                    "exclusive with allowDomains; concrete domains, no wildcards"),
+                },
             },
             "required": ["query"],
         },
@@ -1581,15 +1606,36 @@ def _tools_with_agent_enum(tools: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         out.append(t)
     return out
 
+def _all_tool_names() -> frozenset:
+    """Every tool name the model might know — independent of whether it is offered this turn — used
+    to catch a tool invoked as a shell command via execute_command (S12). Defensive over globals so a
+    conditionally-absent tool constant never raises."""
+    g = globals()
+    names = set()
+    for ln in ("TOOLS", "ONBOARDING_TOOLS"):
+        for t in (g.get(ln) or []):
+            n = ((t or {}).get("function") or {}).get("name")
+            if n:
+                names.add(n)
+    for sn in ("MEMORY_TOOL", "DEEP_MEMORY_TOOL", "PARALLEL_TOOL", "WEBSEARCH_TOOL",
+               "USE_SKILL_TOOL", "USE_PROMPT_TOOL"):
+        t = g.get(sn)
+        n = ((t or {}).get("function") or {}).get("name") if isinstance(t, dict) else None
+        if n:
+            names.add(n)
+    names.update((g.get("_PLUGIN_TOOLS") or {}).keys())
+    return frozenset(names)
+
+
 def _effective_tools() -> List[Dict[str, Any]]:
     """Tool list depending on the mode — onboarding tools only when active."""
     # Offer the tool only when memory is CONFIGURED (not just the module present) —
     # otherwise the tool would be offered even though every call would return "unavailable".
     mem = [MEMORY_TOOL, DEEP_MEMORY_TOOL] if _MEMORY is not None else []
     par = [PARALLEL_TOOL] if _WORKERS is not None else []
-    # #459: offer web_search only when a web-capable provider is actually configured (else every call
-    # would return "unavailable") — consistent with the memory-tool gating above.
-    web = [WEBSEARCH_TOOL] if (_DISPATCHER is not None and _DISPATCHER.has_web_provider()) else []
+    # #459 / epic #505: offer web_search only when a usable search adapter is configured (else every
+    # call would return "unavailable"). Adapter-aware (cli / brave / mock) — not dispatcher-only.
+    web = [WEBSEARCH_TOOL] if _web_search_available() else []
     plug = [t["schema"] for t in _PLUGIN_TOOLS.values()]
     skl = [USE_SKILL_TOOL] if _PLAYBOOKS else []
     prm = [USE_PROMPT_TOOL] if _PROMPTS else []
@@ -2257,6 +2303,9 @@ def _platform_guidance(platform: str) -> str:
 # parts jointly fix the verified scaling-break bug (#447): the model asked for current info improvised a
 # PowerShell Invoke-WebRequest, whose progress bar drew into the renderer-owned conhost and corrupted it.
 _CURRENT_INFO_KW = (
+    # Bilingual EN+DE: these match the USER's input language, not code — a documented exception to the
+    # english-only rule (epic #505 R1: keep the DE markers; this is deliberate language-aware INPUT
+    # matching, like the language=de output exemption, NOT a German identifier/string in the codebase).
     # EN — explicit recency markers (conservative; a hint, not a hard route). Deliberately NOT bare
     # "current"/"currently" — those are everywhere in coding context ("current branch/directory/value")
     # and would mis-steer (review A S3). Require an unambiguous time/news marker.
@@ -2266,6 +2315,8 @@ _CURRENT_INFO_KW = (
     # coding context, the same trap as bare EN "current"); require an unambiguous recency phrase/marker.
     "aktuelle lage", "aktuelle nachrichten", "aktuelle entwicklungen", "neueste", "neuesten", "heute",
     "in echtzeit", "gerade eben", "letzte woche",
+    # S12: news/headline markers surfaced by operator testing ("aktuelle meldungen zum …").
+    "aktuelle meldungen", "schlagzeilen", "headlines",
 )
 
 def _is_current_info_query(text: str) -> bool:
@@ -2276,12 +2327,34 @@ def _is_current_info_query(text: str) -> bool:
     return any(k in t for k in _CURRENT_INFO_KW)
 
 
+def _web_search_trust_ok() -> bool:
+    """Trust gate for web_search (epic #505 S7): outbound web search is BLOCKED under the ``sealed``
+    (sovereign/loopback) trust profile unless the operator opts in via ``security.web_in_sealed``;
+    ``open``/``token`` allow it. Never raises. Without this gate a sealed deployment would still
+    egress web search — the dispatcher pins Sensitivity.PUBLIC and the sovereignty filter only forces
+    local for SENSITIVE/LOCAL_ONLY routes."""
+    if not _is_sealed_profile():
+        return True
+    return bool(((_EFFECTIVE_CFG or {}).get("security") or {}).get("web_in_sealed", False))
+
+
+def _web_search_available() -> bool:
+    """Central capability check for web_search (epic #505) — the adapter-aware replacement for the
+    dispatcher-only ``has_web_provider`` gate. True iff a usable search adapter is wired (cli → a
+    web-capable CLI provider; mock → always; brave → key present) AND the trust profile permits it
+    (S7). Never raises."""
+    ws = _WEBSEARCH
+    try:
+        return ws is not None and bool(ws.available()) and _web_search_trust_ok()
+    except Exception:  # noqa: BLE001 — a flaky availability probe must never break the turn
+        return False
+
+
 def _websearch_steer(user_input: str) -> str:
     """The per-turn proactive nudge (#459): a one-line hint steering a CURRENT-info request to web_search,
-    but ONLY when a web provider is actually available (else the hint would point at a missing tool).
-    "" otherwise. Pure over the input + the live dispatcher state."""
-    if (_is_current_info_query(user_input)
-            and _DISPATCHER is not None and _DISPATCHER.has_web_provider()):
+    but ONLY when a search adapter is actually available (else the hint would point at a missing tool).
+    "" otherwise. Pure over the input + the live adapter state."""
+    if _is_current_info_query(user_input) and _web_search_available():
         return ("[note: this looks like a request for CURRENT / real-time information — use the "
                 "`web_search` tool for it, not `execute_command`.]")
     return ""
@@ -3139,10 +3212,23 @@ def run_tool(name: str, args: Dict[str, Any]) -> str:
         # command on its own console (re-breaking #447). This is the authoritative guard for every client;
         # the per-execution-site PowerShell hardening below (and in the Ink client) is the 2nd layer.
         if name == "execute_command":
+            # S12: catch a TOOL invoked as a shell command — the model sometimes types e.g.
+            # `web_search "…"` into execute_command (especially when the tool is not currently
+            # offered), which the shell rejects ("not recognized"). Redirect to the tool instead of
+            # letting the shell error. None of our tool names is a real shell executable, so this is
+            # safe.
+            _cmd = (args.get("command") or "").strip()
+            _first = _cmd.split(None, 1)[0].strip("\"'").lower() if _cmd else ""
+            if _first in _all_tool_names():
+                extra = (" If it is not offered, configure it (web_search needs search.adapter + "
+                         "GX10_SEARCH_API_KEY on a local setup, or a web-capable provider)."
+                         if _first == "web_search" else "")
+                return (f"BLOCKED: '{_first}' is a tool, not a shell command — call the {_first} tool "
+                        f"directly, do not run it via execute_command.{extra}")
             blocked = _shell_guard(args.get("command", ""))
             if blocked is not None:
                 hint = ""
-                if "remote" in blocked and _DISPATCHER is not None and _DISPATCHER.has_web_provider():
+                if "remote" in blocked and _web_search_available():
                     hint = " Use the `web_search` tool for current/online information instead."
                 return (f"BLOCKED: execute_command refuses {blocked} — it can corrupt the display or hang "
                         f"the session (#459).{hint}")
@@ -3335,16 +3421,40 @@ def run_tool(name: str, args: Dict[str, Any]) -> str:
             )
 
         elif name == "web_search":
-            # #459 (§4 / FORK-H): run the search SERVER-side through the provider lane (captured output →
-            # immune to the console-write scaling break). Re-gated (the tool is only offered when a
-            # web-capable provider is configured, but a runtime config change could remove it).
-            if _DISPATCHER is None or not _DISPATCHER.has_web_provider():
-                return ("[web_search] unavailable — no web-capable provider is configured "
-                        "(needs the provider lane + a web-search CLI).")
-            res = _DISPATCHER.web_search(args.get("query", ""))
-            if res.get("ok") and res.get("content"):
-                return str(res["content"]).strip()
-            return f"[web_search] no result ({res.get('error') or 'empty'})."
+            # #459 / epic #505: run the search through the standalone adapter seam (cli-delegate runs
+            # SERVER-side via the captured CLI runner → immune to the console-write scaling break;
+            # brave/mock run directly). Re-gated: the tool is only offered when available, but a
+            # runtime config change could remove it.
+            # S7 exec re-gate (mandatory): the offer-gate is bypassed by a manual `/tool web_search`
+            # call and by hallucinated/continued-context calls, so the sealed trust block MUST also
+            # sit here — a deterministic refusal, never a silent egress.
+            if not _web_search_trust_ok():
+                return ("[web_search] blocked under the sealed (sovereign) trust profile — outbound "
+                        "web search is off; set security.web_in_sealed=true to allow it.")
+            if not _web_search_available():
+                return ("[web_search] unavailable — no usable search adapter is configured "
+                        "(set search.adapter and, for brave, GX10_SEARCH_API_KEY).")
+            # Validate + normalize the input at the tool boundary (Validate->Reask): a violation
+            # returns a model-readable error so the call is re-emitted rather than swallowed.
+            from websearch import validate_web_search_input
+            req, verr = validate_web_search_input(args)
+            if verr is not None:
+                return verr
+            out = _WEBSEARCH.run(req.query, req.allow_domains, req.block_domains)
+            # S9: emit a `[search]` control frame (the [perf]/[agent] pattern) → the client footer
+            # ("web N · Xms"), stripped from the chat by every client. n = result batches, ms = the
+            # measured duration. Fail-soft: a frame error must never break the turn.
+            try:
+                _q = (req.query or "").replace('"', "'").replace("\n", " ")[:60]
+                _ui_print(col(f'  [search] q="{_q}" n={out.batch_count()} ms={out.duration_ms}', C.GRAY))
+            except Exception:
+                pass
+            # S5: deterministic `Sources:` block + the max-output cap; the structured SearchOutput
+            # stays internal to the renderer/sentinel path. The model receives clean text + sources,
+            # never JSON (D5). max_output_chars comes from config (S8); default otherwise.
+            from websearch_adapters import format_for_model
+            _scfg = (_EFFECTIVE_CFG or {}).get("search") or {}
+            return format_for_model(out, max_output_chars=_scfg.get("max_output_chars"))
 
         elif name == "parallel_reason":
             if _WORKERS is None:
@@ -4440,7 +4550,12 @@ def _render_config() -> str:
 # + the effective bind host (security.profile, e.g. sealed→loopback). A runtime change would
 # NOT re-wire the already-built dispatcher/policy/socket → `/config set` refuses it
 # with the boot-only message. Set it in the deploy config + restart. See config-runtime.md.
-_FROZEN_CONFIG_KEYS = frozenset({"setup.type", "security.profile"})
+_FROZEN_CONFIG_KEYS = frozenset({
+    "setup.type", "security.profile",
+    # epic #505: boot-only so a runtime `/config set` cannot lift the seal or re-point the search
+    # adapter/key without a restart (else it defeats the boot-time fail-closed guarantees).
+    "security.web_in_sealed", "search.enabled", "search.adapter", "search.api_key_env",
+})
 
 
 def _coerce_cfg_value(raw: str):
@@ -5360,6 +5475,16 @@ def _code_defaults() -> Dict[str, Any]:
             "model":       DEFAULT_MODEL,
             "api_key_env": API_KEY_ENV,
         },
+        # epic #505 S3: minimal web-search seam selector. The FULL surface — env vars, the
+        # frozen/runtime split, max_searches / max_output_chars / default_permission / domains and
+        # boot key resolution — lands in S8 (#513). adapter: "cli" | "brave" | "mock".
+        "search": {
+            "enabled":          True,
+            "adapter":          "cli",                  # backward-compatible default = today's CLI-delegate
+            "api_key_env":      "GX10_SEARCH_API_KEY",  # NAME only; the secret VALUE is read from env at boot
+            "count":            10,                     # results per native (http) search request
+            "max_output_chars": 100_000,                # cap on the model-facing tool result (S5)
+        },
         "platform": {
             "mode": PLATFORM_MODE,   # "auto" | "windows" | "linux"
         },
@@ -5381,6 +5506,7 @@ def _code_defaults() -> Dict[str, Any]:
             "token_env":           "GX10_SERVER_TOKEN",
             "session_heartbeat_s": 30,
             "code_locality":       "mount",   # sealed forces "local"
+            "web_in_sealed":       False,     # epic #505 S7: opt-in to allow outbound web_search under sealed
         },
         "setup": {
             # Boot-fixed deployment topology (docs/setup-types.md). NOT runtime-switchable — a frozen
@@ -5659,6 +5785,12 @@ def _apply_env(cfg: Dict[str, Any]) -> Dict[str, Any]:
     setif("GX10_WORKERS_MAX_BATCH_TOKENS","workers", "max_batch_tokens", int)
     _truthy = lambda v: v.strip().lower() in ("1", "true", "yes", "on")
     setif("GX10_ONBOARDING", "onboarding", "enabled", _truthy)
+    # epic #505 S8: web-search knobs (the secret VALUE GX10_SEARCH_API_KEY is read from env at boot,
+    # NOT here — non-secret only). search.web_in_sealed lives under security (S7).
+    setif("GX10_SEARCH_ENABLED",          "search", "enabled", _truthy)
+    setif("GX10_SEARCH_ADAPTER",          "search", "adapter")
+    setif("GX10_SEARCH_COUNT",            "search", "count", int)
+    setif("GX10_SEARCH_MAX_OUTPUT_CHARS", "search", "max_output_chars", int)
     setif("GX10_PROVIDERS",              "providers", "enabled",   _truthy)   # P0 router on/off (A/B switch)
     setif("GX10_PROVIDERS_DEFAULT",      "providers", "default_id")           # default provider id
     setif("GX10_PROVIDERS_BUDGET_USD",   "providers", "budget", lambda v: {"usd_cap": float(v)})  # run budget

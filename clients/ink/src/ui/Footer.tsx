@@ -16,6 +16,16 @@ function Sep(): React.ReactElement {
   return <Text color={SUBTLE}> · </Text>;
 }
 
+// epic #505 S9: render the `[search]` summary frame ("n=2 ms=153") as a compact "2 · 153ms" chip.
+function fmtSearch(s: string): string {
+  const n = /n=(\d+)/.exec(s);
+  const ms = /ms=(\d+)/.exec(s);
+  const parts: string[] = [];
+  if (n) parts.push(n[1] ?? '0');
+  if (ms) parts.push(`${ms[1]}ms`);
+  return parts.join(' · ') || s;
+}
+
 export function Footer({st}: {st: StatusState}): React.ReactElement {
   // memory tri-state: up = reachable (green), down = configured-but-unreachable (red), off = none (dim)
   const memColor = st.memory === 'up' ? SUCCESS : st.memory === 'down' ? ERROR : DIM;
@@ -52,6 +62,13 @@ export function Footer({st}: {st: StatusState}): React.ReactElement {
           <Sep />
           <Text color={DIM}>coder </Text>
           <Text color={MODEL_BLUE}>{st.agent}</Text>
+        </>
+      ) : null}
+      {st.search ? (
+        <>
+          <Sep />
+          <Text color={DIM}>web </Text>
+          <Text color={MODEL_BLUE}>{fmtSearch(st.search)}</Text>
         </>
       ) : null}
       {st.perf ? (

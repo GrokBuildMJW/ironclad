@@ -334,6 +334,11 @@ def _stream_turn(srv: Server, payload: str) -> None:
         if j != -1:
             _STATUS["agent"] = st[j + len("[agent]"):].strip()
             return
+        # 1c) [search] → web-search summary in the status footer, NOT the chat. (S9)
+        s = st.find("[search]")
+        if s != -1:
+            _STATUS["search"] = st[s + len("[search]"):].strip()
+            return
         # 2) "======== ✓ DONE … ========" banner → drop.
         if "===" in st and ("DONE" in st or "✓" in st):
             return

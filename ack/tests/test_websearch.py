@@ -39,42 +39,129 @@ class _FakeDispatcher:
         return self._result
 
 
+from websearch_adapters import CliDelegateAdapter, MockAdapter   # noqa: E402
+
+
 @pytest.fixture(autouse=True)
 def _restore_dispatcher():
-    prev = gx10._DISPATCHER
+    prev_d, prev_w = gx10._DISPATCHER, gx10._WEBSEARCH
     yield
-    gx10._DISPATCHER = prev
+    gx10._DISPATCHER, gx10._WEBSEARCH = prev_d, prev_w
 
 
-# ── tool gating (offered only with a web provider) ───────────────────────────
-def test_web_search_tool_offered_only_with_a_web_provider(monkeypatch):
-    monkeypatch.setattr(gx10, "_DISPATCHER", None)
+def _wire(monkeypatch, disp):
+    """Wire the web_search seam (epic #505 S3) to a CLI-delegate over the fake dispatcher."""
+    monkeypatch.setattr(gx10, "_DISPATCHER", disp)
+    monkeypatch.setattr(gx10, "_WEBSEARCH", CliDelegateAdapter(disp) if disp is not None else None)
+    return disp
+
+
+# ── tool gating (offered only when a usable adapter is available) ─────────────
+def test_web_search_tool_offered_only_when_adapter_available(monkeypatch):
+    monkeypatch.setattr(gx10, "_WEBSEARCH", None)
     assert all(t["function"]["name"] != "web_search" for t in gx10._effective_tools())
-    monkeypatch.setattr(gx10, "_DISPATCHER", _FakeDispatcher(web=False))
-    assert all(t["function"]["name"] != "web_search" for t in gx10._effective_tools())   # no web cap → not offered
-    monkeypatch.setattr(gx10, "_DISPATCHER", _FakeDispatcher(web=True))
+    monkeypatch.setattr(gx10, "_WEBSEARCH", CliDelegateAdapter(_FakeDispatcher(web=False)))
+    assert all(t["function"]["name"] != "web_search" for t in gx10._effective_tools())   # cli adapter not available
+    monkeypatch.setattr(gx10, "_WEBSEARCH", CliDelegateAdapter(_FakeDispatcher(web=True)))
     assert any(t["function"]["name"] == "web_search" for t in gx10._effective_tools())    # offered
 
 
-# ── handler ──────────────────────────────────────────────────────────────────
-def test_web_search_handler_runs_server_side_and_returns_content(monkeypatch):
-    disp = _FakeDispatcher(web=True)
-    monkeypatch.setattr(gx10, "_DISPATCHER", disp)
+def test_web_search_offered_without_a_dispatcher_when_adapter_is_standalone(monkeypatch):
+    # epic #505 #1 acceptance: a native/mock adapter offers web_search even with NO provider lane.
+    monkeypatch.setattr(gx10, "_DISPATCHER", None)
+    monkeypatch.setattr(gx10, "_WEBSEARCH", MockAdapter())
+    assert any(t["function"]["name"] == "web_search" for t in gx10._effective_tools())
+
+
+# ── handler (runs through the standalone seam) ───────────────────────────────
+def test_web_search_handler_runs_through_the_seam(monkeypatch):
+    disp = _wire(monkeypatch, _FakeDispatcher(web=True))
     out = gx10.run_tool("web_search", {"query": "aktuelle Lage X"})
-    assert out == "SEARCH RESULTS: ..." and disp.calls == ["aktuelle Lage X"]
+    assert "SEARCH RESULTS: ..." in out and disp.calls == ["aktuelle Lage X"]
+    assert 'Web search results for: "aktuelle Lage X"' in out   # structured SearchOutput rendering
 
 
 def test_web_search_handler_unavailable_without_web(monkeypatch):
-    monkeypatch.setattr(gx10, "_DISPATCHER", _FakeDispatcher(web=False))
-    out = gx10.run_tool("web_search", {"query": "x"})
+    _wire(monkeypatch, _FakeDispatcher(web=False))
+    out = gx10.run_tool("web_search", {"query": "xy"})
     assert out.startswith("[web_search] unavailable")
 
 
 def test_web_search_handler_reports_no_result(monkeypatch):
-    monkeypatch.setattr(gx10, "_DISPATCHER", _FakeDispatcher(
+    _wire(monkeypatch, _FakeDispatcher(
         web=True, result={"ok": False, "content": None, "error": "no-capable-provider"}))
-    out = gx10.run_tool("web_search", {"query": "x"})
+    out = gx10.run_tool("web_search", {"query": "xy"})
     assert "[web_search] no result" in out and "no-capable-provider" in out
+
+
+# ── S2 (#507): tool schema + Validate->Reask in the handler ──────────────────
+def test_web_search_schema_exposes_grammar_clean_domain_filters():
+    props = gx10.WEBSEARCH_TOOL["function"]["parameters"]["properties"]
+    assert "allowDomains" in props and "blockDomains" in props
+    for k in ("allowDomains", "blockDomains"):
+        assert props[k]["type"] == "array" and props[k]["items"]["type"] == "string"
+    assert gx10.WEBSEARCH_TOOL["function"]["parameters"]["required"] == ["query"]
+    # grammar-clean: no constructs XGrammar V1 rejects (the strict rules live in the validator)
+    import json
+    blob = json.dumps(gx10.WEBSEARCH_TOOL)
+    for banned in ("minLength", "pattern", "minItems", "maxItems", "oneOf", "anyOf"):
+        assert banned not in blob
+
+
+def test_web_search_handler_rejects_short_query_without_dispatch(monkeypatch):
+    disp = _wire(monkeypatch, _FakeDispatcher(web=True))
+    out = gx10.run_tool("web_search", {"query": "a"})
+    assert "at least 2" in out and disp.calls == []          # reask, never dispatched
+
+
+def test_web_search_handler_rejects_allow_and_block(monkeypatch):
+    disp = _wire(monkeypatch, _FakeDispatcher(web=True))
+    out = gx10.run_tool("web_search",
+                        {"query": "hello", "allowDomains": ["a.com"], "blockDomains": ["b.com"]})
+    assert "mutually exclusive" in out and disp.calls == []
+
+
+def test_web_search_handler_rejects_wildcard_domain(monkeypatch):
+    disp = _wire(monkeypatch, _FakeDispatcher(web=True))
+    out = gx10.run_tool("web_search", {"query": "hello", "allowDomains": ["*.foo.com"]})
+    assert "wildcard" in out.lower() and disp.calls == []
+
+
+def test_web_search_handler_accepts_and_normalizes_then_dispatches(monkeypatch):
+    disp = _wire(monkeypatch, _FakeDispatcher(web=True))
+    # query is trimmed; domains are accepted here and threaded into the adapter in S4 (#509)
+    out = gx10.run_tool("web_search", {"query": "  hello  ", "allowDomains": ["HTTPS://Example.com/x"]})
+    assert "SEARCH RESULTS: ..." in out and disp.calls == ["hello"]
+
+
+def test_web_search_handler_appends_sources_and_reminder(monkeypatch):
+    # S5 (#510): every web_search result ends with the deterministic sources reminder, and a
+    # hit-bearing adapter contributes a Sources list.
+    from websearch_adapters import _SOURCES_REMINDER
+    monkeypatch.setattr(gx10, "_WEBSEARCH", MockAdapter())
+    out = gx10.run_tool("web_search", {"query": "latest ai news"})
+    assert out.endswith(_SOURCES_REMINDER) and "Sources:" in out and "http" in out
+
+
+# ── S6 (#511): prompt + tool-description refresh ─────────────────────────────
+def test_steer_fires_under_a_native_adapter(monkeypatch):
+    # epic #505 R1: the current-info steer must fire under a native (non-CLI) adapter too — the
+    # availability gate is adapter-aware, not dispatcher-only.
+    monkeypatch.setattr(gx10, "_DISPATCHER", None)
+    monkeypatch.setattr(gx10, "_WEBSEARCH", MockAdapter())
+    assert "web_search" in gx10._websearch_steer("what is the latest ai news")
+
+
+def test_tool_description_mentions_domains_and_sources():
+    desc = gx10.WEBSEARCH_TOOL["function"]["description"].lower()
+    assert "domains" in desc and "sources" in desc
+
+
+def test_orchestrator_prompt_has_web_search_sources_rule():
+    import pathlib
+    p = pathlib.Path(gx10.__file__).resolve().parent / "prompts" / "GX10_Orchestrator_SystemPrompt.md"
+    text = p.read_text(encoding="utf-8")
+    assert "web_search" in text and "Sources:" in text
 
 
 # ── current-info classifier (pure) ───────────────────────────────────────────
@@ -100,12 +187,12 @@ def test_current_info_classifier_ignores_coding_queries(q):
 
 # ── proactive steer (only when web is available) ─────────────────────────────
 def test_steer_only_when_current_info_and_web_available(monkeypatch):
-    monkeypatch.setattr(gx10, "_DISPATCHER", _FakeDispatcher(web=True))
+    monkeypatch.setattr(gx10, "_WEBSEARCH", CliDelegateAdapter(_FakeDispatcher(web=True)))
     assert "web_search" in gx10._websearch_steer("was ist die aktuelle Lage")
     assert gx10._websearch_steer("refactor this function") == ""           # not current-info → no steer
-    monkeypatch.setattr(gx10, "_DISPATCHER", _FakeDispatcher(web=False))
-    assert gx10._websearch_steer("latest news") == ""                      # no web provider → no steer (no dead hint)
-    monkeypatch.setattr(gx10, "_DISPATCHER", None)
+    monkeypatch.setattr(gx10, "_WEBSEARCH", CliDelegateAdapter(_FakeDispatcher(web=False)))
+    assert gx10._websearch_steer("latest news") == ""                      # adapter not available → no dead hint
+    monkeypatch.setattr(gx10, "_WEBSEARCH", None)
     assert gx10._websearch_steer("latest news") == ""
 
 
@@ -134,13 +221,13 @@ def test_shell_guard_allows_normal_commands(cmd):
 
 # ── execute_command: fail-closed block + web_search redirect + PowerShell hardening ──────────────────
 def test_execute_command_blocks_web_fetch_and_redirects(monkeypatch):
-    monkeypatch.setattr(gx10, "_DISPATCHER", _FakeDispatcher(web=True))
+    _wire(monkeypatch, _FakeDispatcher(web=True))
     out = gx10.run_tool("execute_command", {"command": "Invoke-WebRequest https://example.com"})
     assert out.startswith("BLOCKED") and "web_search" in out          # redirected to the tool (web available)
 
 
 def test_execute_command_blocks_without_redirect_when_no_web(monkeypatch):
-    monkeypatch.setattr(gx10, "_DISPATCHER", _FakeDispatcher(web=False))
+    _wire(monkeypatch, _FakeDispatcher(web=False))
     out = gx10.run_tool("execute_command", {"command": "curl https://x"})
     assert out.startswith("BLOCKED") and "web_search" not in out      # still blocked, but no dead redirect
 

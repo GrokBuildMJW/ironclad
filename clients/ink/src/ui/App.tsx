@@ -53,7 +53,7 @@ export function App({
   const {exit} = useApp();
   const {stdout} = useStdout();
   const width = stdout?.columns ?? 80;
-  const [status, setPerf, setAgent] = useStatusPoller(srv);
+  const [status, setPerf, setAgent, setSearch] = useStatusPoller(srv);
   const [items, setItems] = useState<Item[]>([]);
   const [buffer, setBuffer] = useState('');
   const [menuSel, setMenuSel] = useState(0); // MEM-16(2): selected slash-command suggestion
@@ -175,6 +175,7 @@ export function App({
     setTokens(0);
     setThinking(true);
     setAgent(''); // #453: clear last turn's coder so a non-routed turn shows no stale "live" indicator
+    setSearch(''); // S9: clear last turn's web-search summary
     setLiveAnswer('');
     const stream = new StreamMarkdown(Math.max(20, width - 4));
     let lastRender = 0;
@@ -191,6 +192,7 @@ export function App({
             if (router.tokens) setTokens(router.tokens);
             if (router.perf) setPerf(router.perf);
             if (router.agent) setAgent(router.agent); // #453: live "which coder" indicator
+            if (router.search) setSearch(router.search); // S9: live web-search summary
             // live preview, throttled to ~30fps so a fast stream doesn't re-render every token
             const now = Date.now();
             if (now - lastRender > 33) {
@@ -212,6 +214,7 @@ export function App({
     router.flush();
     if (router.perf) setPerf(router.perf);
     if (router.agent) setAgent(router.agent); // #453
+    if (router.search) setSearch(router.search); // S9
     setLiveAnswer(''); // drop the live preview; the exact whole-document render is committed below
     const body = answerBody(router);
     if (body) {

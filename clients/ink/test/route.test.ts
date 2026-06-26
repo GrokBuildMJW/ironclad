@@ -25,6 +25,14 @@ test('route — #453 [agent] goes to the agent status, not the answer', () => {
   assert.equal(r.answer.length, 0);
 });
 
+test('route — #505 S9 [search] goes to the search status, not the answer', () => {
+  const r = createRouter();
+  assert.equal(r.search, ''); // fresh per-turn router carries no stale web-search summary
+  r.route('  [search] n=2 ms=153');
+  assert.equal(r.search, 'n=2 ms=153');
+  assert.equal(r.answer.length, 0); // stripped from the chat (footer chip only)
+});
+
 test('route — DONE banner + role labels are dropped', () => {
   const r = createRouter();
   r.route('  ======== ✓ DONE · ready · 1 gen · 2s · 117 tok ========');
