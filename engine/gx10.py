@@ -2344,6 +2344,23 @@ def _task_class(task: Dict[str, Any]) -> str:
     t = str((task or {}).get("type") or "").strip().lower()
     return _TASK_CLASS_BY_TYPE.get(t, "coding")
 
+# #500 (FORK-D follow-up, token-balancing): auto-tier the handover reasoning effort by the derived
+# task_class — security/architecture get xhigh (the OPUS matrix), routine work (coding/analysis) gets high.
+# An UNMAPPED class returns None ⇒ fail-open: the effort chain is left unchanged (a future class cannot
+# silently force an effort until it is mapped here).
+_EFFORT_BY_CLASS = {"security": "xhigh", "architecture": "xhigh", "coding": "high", "analysis": "high"}
+
+def _effort_for_class(task_class: Optional[str]) -> Optional[str]:
+    return _EFFORT_BY_CLASS.get(task_class or "")
+
+def _resolve_handover_effort(explicit: Optional[str], task_class: Optional[str],
+                             spec_effort: Optional[str]) -> str:
+    """#500: the handover reasoning-effort precedence. An explicit handover ``effort:`` (the operator's /
+    method's per-handover override) ALWAYS wins; else auto-tier by ``task_class`` (``_effort_for_class``);
+    else the agent's configured ``spec.effort``; else the global ``AUTOPILOT_DEFAULT_EFFORT``. Deterministic
+    and fail-open — an unmapped/None class falls straight through to the pre-#500 spec/default chain."""
+    return explicit or _effort_for_class(task_class) or spec_effort or AUTOPILOT_DEFAULT_EFFORT
+
 def _class_capable_agents(task_class: Optional[str]) -> Optional[List[str]]:
     """The configured capable agents (UPPER) for a task_class. Returns None when the class is
     unknown/unmapped ⇒ NO restriction (fail-open, byte-identical to #455); returns the (possibly EMPTY)
@@ -6868,7 +6885,14 @@ def _do_launch(task_id: str, agent: str):
     else:
         model, effort = None, None
     model  = model or spec.model                          # registry model (frontmatter `to:` overrides)
-    effort = effort or spec.effort or AUTOPILOT_DEFAULT_EFFORT
+    # #500: when the handover carries no explicit `effort:`, auto-tier it by the task's class (security/
+    # architecture → xhigh, routine → high) instead of the flat default; an explicit `effort:` still wins,
+    # and a task that can't be loaded / an unmapped class falls through unchanged (fail-open).
+    try:
+        _rec = _store().get(task_id)
+    except Exception:  # noqa: BLE001 — effort tiering must never block a launch
+        _rec = None
+    effort = _resolve_handover_effort(effort, _task_class(_rec) if _rec else None, spec.effort)
     prompt = (f"Autonomously read and work the handover {ho.as_posix()}. "
               f"Follow the instructions in .claude/CLAUDE.md.")
     _bin = spec.bin or AUTOPILOT_CLAUDE_BIN

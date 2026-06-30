@@ -81,12 +81,4 @@ Maturing the project itself toward a dependable, versioned release.
 - **A stable (1.0) release** once the APIs settle (today: tagged `0.0.x` alpha
   previews on PyPI `ironclad-ai` + GitHub Releases).
 
-## Self-maintaining dev-process
-
-The framework's own agents help build and evolve Ironclad — and projects built on it — through a gated stage → review → deliver development loop. The public face is a versioned dev-process facade plus a bring-your-own code-agent runner, exposed over the plugin/extension seam, so you can drive a hardened, self-maintaining dev-loop in your own repo without forking the core.
-
-## Tool-wide sweep & README coverage
-
-A hardening pass toward release maturity: tool-wide bug & gap fixes and a README/docs feature-coverage refresh (web search, the prompt/skill library, project commands), surfaced by a read-only adversarial audit.
-
 Issues and discussions are welcome — this is an early, openly-developed project.

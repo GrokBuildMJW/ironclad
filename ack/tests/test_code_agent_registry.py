@@ -549,3 +549,37 @@ def test_disabled_agent_is_never_a_failover_peer(monkeypatch):
     # OPUS+SONNET tripped, TOOLX disabled → no available peer → keep the chosen agent (never the disabled one)
     assert gx10._effective_code_agent("OPUS", task_class="coding") == "OPUS"
     gx10._CODE_AGENT_BREAKER.clear()
+
+
+# ── #500: auto-tier the handover reasoning effort by the derived task_class ──────────────────────────
+def test_effort_for_class_maps_security_and_architecture_to_xhigh():
+    assert gx10._effort_for_class("security") == "xhigh"
+    assert gx10._effort_for_class("architecture") == "xhigh"
+
+
+def test_effort_for_class_maps_routine_classes_to_high():
+    assert gx10._effort_for_class("coding") == "high"
+    assert gx10._effort_for_class("analysis") == "high"
+
+
+def test_effort_for_class_unmapped_is_none_fail_open():
+    # an unknown/future class is unmapped → None, so the caller leaves the effort chain unchanged.
+    assert gx10._effort_for_class("something-new") is None
+    assert gx10._effort_for_class(None) is None
+
+
+def test_resolve_handover_effort_explicit_override_wins():
+    # an explicit handover `effort:` (operator/method) beats the class tiering — even for a security task.
+    assert gx10._resolve_handover_effort("low", "security", "medium") == "low"
+
+
+def test_resolve_handover_effort_auto_tiers_by_class_when_no_explicit():
+    assert gx10._resolve_handover_effort(None, "security", "medium") == "xhigh"
+    assert gx10._resolve_handover_effort(None, "architecture", None) == "xhigh"
+    assert gx10._resolve_handover_effort(None, "coding", "medium") == "high"
+
+
+def test_resolve_handover_effort_fail_open_to_spec_then_default():
+    # unmapped/None class → fall through to spec.effort, else the global default (pre-#500 chain, unchanged).
+    assert gx10._resolve_handover_effort(None, None, "medium") == "medium"
+    assert gx10._resolve_handover_effort(None, "future-class", None) == gx10.AUTOPILOT_DEFAULT_EFFORT

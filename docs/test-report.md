@@ -9,9 +9,9 @@
 
 | | |
 |---|---|
-| Automated tests (offline, no model) | **2200 passed** |
+| Automated tests (offline, no model) | **2207 passed** |
 | Live smoke tests (skipped without a model) | **9** |
-| **Total Python** | **2209** |
+| **Total Python** | **2216** |
 | TypeScript client tests (`node:test`) | **355 passed** (359 total, 4 skipped) |
 | Full agentic loop, end to end, with a **real** code-agent | **verified** |
 | Issues found during the campaign | **1 functional gap + 5 review findings — all found and fixed** (see below) |
@@ -24,7 +24,7 @@ default** and only runs when pointed at a real server.
 
 ```bash
 # 1) offline suite — deterministic, no model needed
-pytest -q                                   # from core/  → 2200 passed, 9 skipped
+pytest -q                                   # from core/  → 2207 passed, 9 skipped
 
 # 2) live smoke — against your own running orchestrator
 GX10_LIVE_URL=http://<your-host>:8100 pytest -k live -q     # 9 passed
@@ -34,7 +34,7 @@ GX10_LIVE_URL=http://<your-host>:8100 pytest -k live -q     # 9 passed
 ## Coverage by area
 
 The breakdown below groups the suite by capability area and sums to
-the **2209** total (2200 offline + 9 live). It is a high-level view of internal QA
+the **2216** total (2207 offline + 9 live). It is a high-level view of internal QA
 coverage; the granular test names and the maintainers' internal tracker are
 intentionally not enumerated here.
 
@@ -52,9 +52,9 @@ intentionally not enumerated here.
 | **Closed-loop e2e** (#602 C2 done-gate) — the reflection loop proven LIVE end-to-end on the dev-task pipeline: a staged handover is scored (Verifier) → fed to the Quality breaker + trips → a run failure is classified (FailureClass) → the Strategy Revisor escalates on a spent budget; all-flags-off is a byte-identical no-op; plus the 8b `eval` per-type verifier selection (#602 / #809) | 3 |
 | **Function-calling robustness** — tool-argument validation and model-agnostic call recovery | 24 |
 | **Server / client split & security** — HTTP surface, trust profiles, sessions, sealing, the config tree + runtime config, command router, doctor, catalogue endpoint, the server-side tool bridge, the coders / health observability blocks, and the client<->commands.py command-parity guard | 121 |
-| **Provider-router / dispatch** — backend registry, routing policy, artifact routing, spill / fallback, setup-type resolution, reviewer anti-affinity, and first-class web-search routing | 96 |
+| **Provider-router / dispatch** — backend registry, routing policy, artifact routing, spill / fallback, setup-type resolution, reviewer anti-affinity, first-class web-search routing, and the **handover effort auto-tiering by task class** (#500: security/architecture → xhigh, routine → high; explicit `effort:` wins; fail-open on an unmapped/unloadable class) | 102 |
 | **Web search & current-info routing** — the web-search tool gating + handler, the current-info intent classifier (English + German), the strict input contract + domain normalizer, the standalone adapter seam + a native HTTP adapter, the model-facing Sources formatter, the web_search prompt + tool-description, the sealed trust gate, the config + secret surface, the search-progress renderer, the 16-test spec consolidation, the tool-as-shell guard, and a fail-closed shell guardrail | 147 |
-| **Memory & context** — Mem0 client, chunking, RAG, the rolling summary, bounded summarizer input, deep query, vault reconcile, the warm tier, and the token-budgeted handover brief | 100 |
+| **Memory & context** — Mem0 client, chunking, RAG, the rolling summary, bounded summarizer input, deep query, vault reconcile, the warm tier, and the token-budgeted handover brief | 101 |
 | **Lesson store / provider API** — the curated, versioned `ack.lessons` delegation seam (AD-10, #601 S14-3): a `runtime_checkable LessonProvider` (get_lessons / report_lesson / brief) + set/get_provider; fail-soft no-op when no provider is wired (reads `[]`, writes no-op, a provider error never breaks a turn); a scope-priority `brief()` merge (provider-or-composed, dedup + limit); and the **fail-closed redaction-gated `promote()`** (AD-9 — a project-private lesson is promoted to a broader scope ONLY through an approving redactor). The #602-unblocking surface; lesson semantics are the provider's | 20 |
 | **Lesson seam wiring** — the engine integration of `ack.lessons` (AD-10, #601 S14-4): the handover read-site appends an advisory, scope-keyed lesson brief alongside the Memory brief, and the task-completion write-site reports the feedback as a scoped lesson (tagged with the task id) — both lazy-imported, both scoped to the active project/track `mem_scope`, and both byte-identical no-ops with no provider wired (the read returns nothing, the write does not even touch the feedback file), plus the **`post_feedback` Hook-Bus re-home** of the write site (#602 2.3/#804): the task-completion lesson write is driven by `gx10._lessons_consumer_hook` through the real `_advance_pipeline` wrapper (registered on **provider presence**, outside the vault lock), reporting on a fresh completion only (no double-report on an already-done re-advance), byte-identical no-op with no provider, fail-soft on a raising provider | 10 |
 | **Scope-aware forget + scope tagging** — the substrate delete path (AD-10 / #601 S14-5): cold writes self-describe their origin `scope` in metadata (only when a project scope is bound — byte-identical for the base partition); `MemoryManager.forget(scope)` deletes a partition via the Mem0 `/delete_all` route (synchronous, fail-soft, fail-closed on an empty scope); the warm tier's `forget_scope(scope)` deletes the **exact**-scope session + retrieval-cache keys without cascading into deeper track scopes (fail-closed on an empty / glob-bearing scope); `ack.lessons.forget(scope)` is an optional, fail-soft provider verb; and `gx10._forget_scope` fans out across all three layers, fail-closed on an empty scope | 21 |

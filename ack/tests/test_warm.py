@@ -115,3 +115,25 @@ def test_dead_client_clears_the_tried_latch_so_conn_retries() -> None:
     assert wt._tried is True                       # _wired pre-sets the latch (lazy connect bypassed)
     assert wt.is_available() is False              # ping raises → unavailable
     assert wt._client is None and wt._tried is False   # dead client dropped AND latch cleared → _conn retries
+
+
+def test_public_valkey_default_is_loopback_no_auth() -> None:
+    # #488: the PUBLIC docker-compose.yml valkey service MUST keep the safe default — loopback-only bind and
+    # NO requirepass. A LAN bind + auth is layered via a deploy-local compose override kept OUTSIDE the synced
+    # tree (so a re-deploy can't wipe it); this guards that the shipped public file never accidentally ships a
+    # LAN-bound or unauthenticated-on-LAN Valkey, which was the #488 / #385 drift risk.
+    compose = Path(__file__).resolve().parents[2] / "docker-compose.yml"
+    if not compose.is_file():
+        import pytest
+        pytest.skip("docker-compose.yml not present in this tree")
+    text = compose.read_text(encoding="utf-8")
+    # exclude comment lines: a comment may legitimately *describe* the deploy-local LAN/--requirepass pattern;
+    # the guard is about the actual shipped config (port mappings + the valkey-server command), not prose.
+    config_lines = [ln for ln in text.splitlines() if not ln.strip().startswith("#")]
+    port_lines = [ln.strip() for ln in config_lines if "6379:6379" in ln and ln.strip().startswith("-")]
+    assert port_lines, "valkey 6379 port mapping not found in the public compose"
+    for ln in port_lines:
+        assert "127.0.0.1:6379:6379" in ln, f"public valkey must bind loopback only, got: {ln}"
+        assert "0.0.0.0" not in ln, f"public valkey must not bind all interfaces, got: {ln}"
+    assert not any("--requirepass" in ln for ln in config_lines), \
+        "the public compose must not hardcode a Valkey requirepass (auth is deploy-local, #488)"

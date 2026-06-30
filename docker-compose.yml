@@ -150,9 +150,10 @@ services:
     command: ["valkey-server", "--appendonly", "yes", "--save", "60", "1000"]
     ports:
       # Loopback only by default (safe — a co-located/server-mode orchestrator reaches it here). To serve a
-      # local-mode orchestrator on ANOTHER machine (#385): bind on the LAN AND add `--requirepass <secret>`
-      # to the command above (Valkey has no default auth) + firewall-pin to that desktop. Keep the default
-      # loopback unless you have done both — never expose an unauthenticated Valkey on the LAN.
+      # local-mode orchestrator on ANOTHER machine (#385): do NOT edit this public default — layer a separate
+      # deploy-local compose override (kept outside the synced tree so a re-deploy can't wipe it) that binds
+      # on the LAN AND adds `--requirepass <secret>` (Valkey has no default auth) + firewall-pin to that
+      # desktop. Never expose an unauthenticated Valkey on the LAN.
       - "127.0.0.1:6379:6379"
     volumes:
       - valkey-data:/data

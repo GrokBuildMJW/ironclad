@@ -20,6 +20,12 @@ Released versions are listed below; upcoming work accumulates under *Unreleased*
   review. All ledger consumers (merge-walk / published-issues / Test-PyPI-first guard) filter on
   `surface == "DELIVER"`, so the added transition records are inert to them and the merge-walk high-water
   mark stays intact.
+- **Handover reasoning effort is auto-tiered by task class** (`engine`, #500 / #456 follow-up): when a
+  staged handover carries no explicit `effort:`, the autopilot launch now derives it from the deterministic
+  task class — **security / architecture → `xhigh`**, **routine (coding / analysis) → `high`** — instead of
+  the flat default. An explicit handover `effort:` still wins; an unmapped class or an unreadable task falls
+  through to the previous spec/default chain unchanged (**fail-open**). Token-balancing: the hardest tasks
+  automatically get more reasoning budget without relying on the operator/method setting `effort:` by hand.
 
 ## [0.0.21] - 2026-06-30
 
