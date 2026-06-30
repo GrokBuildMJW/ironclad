@@ -17,6 +17,7 @@ import {App} from './ui/App.js';
 import {loadConfig, parseArgs} from './config.js';
 import {load as loadSession, exitMessage, statePath} from './state/persist.js';
 import {Server} from './net/server.js';
+import {establishSession} from './net/session.js';
 
 // The Windows console defaults to a non-UTF-8 OEM code page, which renders our UTF-8 output
 // (box-drawing borders, ◆/●/○ status dots, the █▚▞█ banner, …/≤) as cp1252 mojibake. Force the
@@ -38,12 +39,19 @@ const workdir = resolve(args.codedir);
 chdir(workdir);
 const srv = new Server(args.server, {token: cfg.serverToken});
 
+// INK-SESSION (#503): mirror client.py — under the sealed profile every gated route needs an
+// X-Session-Id, so open a Phase-d session + heartbeat BEFORE the first turn (else each turn and the 2s
+// status poll 401). No-op + fail-soft on the open/token profile or an unreachable server. Done before
+// render so the very first turn is already authorized.
+const session = await establishSession(srv, (m) => process.stdout.write(`${m}\n`));
+
 const app = render(<App srv={srv} codedir={workdir} maxAgents={args.maxAgents} resume={args.resume} />);
 
 // MEM-18: on exit (after the TUI tears down), tell the user the session is saved + how to resume —
 // like other code CLIs. Only when there's a non-empty saved session. MEM-19: read this project's
 // per-directory state file (<codedir>/.ironclad-cli/session.json).
-void app.waitUntilExit().then(() => {
+void app.waitUntilExit().then(async () => {
+  await session.stop(); // INK-SESSION (#503): heartbeat off + session closed on exit (fail-soft)
   const msg = exitMessage(loadSession(statePath(workdir)));
   if (msg) process.stdout.write(`\n${msg}\n`);
 });

@@ -1,16 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {renderPatches, flush, eraseRows, withSync, BSU, ESU} from '../src/render/flush.js';
+import {renderPatches, withSync, BSU, ESU} from '../src/render/flush.js';
 import {Palette} from '../src/render/palette.js';
 import {WIDE, WIDE_CONT} from '../src/render/surface.js';
 import type {Patch} from '../src/render/diff.js';
 
 const ESC = '\x1b';
-
-test('eraseRows — cursor-up + CR + clear-to-end-of-screen', () => {
-  assert.equal(eraseRows(4), `${ESC}[3A\r${ESC}[J`);
-  assert.equal(eraseRows(1), `\r${ESC}[J`); // single row: no up-move
-});
 
 test('withSync — wraps non-empty body in BSU/ESU; empty stays empty', () => {
   assert.equal(withSync(''), '');
@@ -59,10 +54,4 @@ test('renderPatches — multi-row uses a relative vertical move + column reset',
   const r = renderPatches(patches, pal);
   // 'A' advances cursor to col 1; next patch at (2,0): down 2 rows, back to col 1, 'B'
   assert.equal(r.body, `A${ESC}[2B${ESC}[1GB`);
-});
-
-test('flush — full frame is BSU + body + ESU', () => {
-  const pal = new Palette();
-  const patches: Patch[] = [{y: 0, x: 0, cells: [{cp: 0x41, style: 0, flag: 0}]}];
-  assert.equal(flush(patches, pal), BSU + 'A' + ESU);
 });

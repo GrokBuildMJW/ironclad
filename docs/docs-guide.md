@@ -9,7 +9,7 @@ Ironclad's docs have **one responsibility each, no overlap**. This keeps them ho
 |-----|------|------------------|
 | **`README.md`** | Intro, value proposition, quickstart / install, pointers. | The exhaustive feature/wiring matrix (link to `status.md` instead). |
 | **`docs/status.md`** | The **wiring SSOT** — what actually works *right now*, per component. | Future/aspirational wording (`planned`, `coming soon`, `roadmap`, `will ship`). |
-| **`docs/roadmap.md`** | **Future / unrealized only** — what's planned or in progress. **Generated** from open epics (do not hand-edit). | Realized wording (`shipped`, `available`, `delivered`, `done`, `wired + tested`, `Delivered:`). |
+| **`docs/roadmap.md`** | **Future / unrealized only** — what's planned or in progress. **Generated** from open milestones (do not hand-edit). | Realized wording (`shipped`, `available`, `delivered`, `done`, `wired + tested`, `Delivered:`). |
 | **`CHANGELOG.md`** | History — Keep-a-Changelog, per release + `[Unreleased]`. | Roadmap/aspiration; only what changed. |
 | **`docs/*` (guides)** | Task / reference / explanation (Diátaxis, adopted incrementally). | Duplicated status/roadmap content. |
 | **`docs/adr/*`** | Design **decisions** (context → decision → consequences). | Status tracking (link to `status.md`). |

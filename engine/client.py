@@ -47,7 +47,7 @@ import urllib.parse
 import urllib.request
 from concurrent.futures import Future, ThreadPoolExecutor, wait
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from commands import HELP_TEXT, build_agent_argv, classify, setup_output
 
@@ -92,6 +92,9 @@ DEFAULT_MAX_AGENTS = int(os.environ.get("GX10_MAX_AGENTS", "3"))
 #: #455: how much of a code-agent's stderr to upload for the server-side exhausted classifier (a
 #: bounded tail — the budget/quota signal is at the end; never ship an unbounded log over the wire).
 _STDERR_TAIL_CHARS = 4000
+#: CLI-3 (#503): serializes the check-then-claim in dispatch_pending so an overlapping /auto poll + /work
+#: (or two poll ticks) can't both claim+launch the same handover.
+_CLAIM_LOCK = threading.Lock()
 # #449: the client-side OPUS/SONNET→model table is retired. The server now resolves the agent's
 # full spec (bin/cmd_template/model/effort/permission) from the config-driven registry and ships it
 # in the /pending item; this client only renders what it is sent (see _run_handover).
@@ -205,6 +208,9 @@ class Server:
 
     def health(self) -> Dict[str, Any]:
         return self._req("GET", "/health")
+
+    def doctor(self) -> Dict[str, Any]:
+        return self._req("GET", "/doctor")   # DOCTOR (#503): gated read-only preflight report
 
     # ── session lifecycle (Phase d; no-op transport-wise on the open profile) ──
     def session_open(self) -> Dict[str, Any]:
@@ -424,7 +430,7 @@ def _read_input(prompt: str) -> str:
     return "\n".join(lines)
 
 
-def _run_handover(item: Dict[str, Any], codedir: Path, log=print) -> Optional[str]:
+def _run_handover(item: Dict[str, Any], codedir: Path, log=print) -> Tuple[Optional[str], Dict[str, Any]]:
     """Run a single staged handover LOCALLY with ``claude --print`` and return the
     feedback text it wrote (or None if it produced none).
 
@@ -560,9 +566,12 @@ def dispatch_pending(srv: Server, codedir: Path, pool: ThreadPoolExecutor,
     futures: List[Future] = []
     for item in pending:
         tid = item.get("id") or ""
-        if not tid or tid in claimed:
-            continue
-        claimed.add(tid)  # claim immediately → no double-launch on the next poll
+        # CLI-3 (#503): atomic check-then-claim under a lock — an overlapping /auto poll + /work (or two
+        # poll ticks) could otherwise both pass `tid in claimed` and double-launch the same handover.
+        with _CLAIM_LOCK:
+            if not tid or tid in claimed:
+                continue
+            claimed.add(tid)  # claim immediately → no double-launch on the next poll
         futures.append(pool.submit(_process_one, srv, codedir, item, claimed, log))
     return futures
 
@@ -678,6 +687,11 @@ def repl(srv: Server, codedir: Path, max_agents: int = DEFAULT_MAX_AGENTS) -> No
             elif name == "health":
                 try:
                     print("  " + json.dumps(srv.health(), ensure_ascii=False))
+                except urllib.error.URLError as e:
+                    print(f"  ✗ {e}")
+            elif name == "doctor":   # DOCTOR (#503): local — GET /doctor, don't forward (no billed turn)
+                try:
+                    print("  " + json.dumps(srv.doctor(), ensure_ascii=False))
                 except urllib.error.URLError as e:
                     print(f"  ✗ {e}")
             elif name == "tasks":

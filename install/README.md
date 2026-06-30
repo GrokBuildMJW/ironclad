@@ -5,6 +5,10 @@ command: a Python venv with the engine, the optional TypeScript client, a per-pr
 `ironclad` shell command. All endpoints default to **localhost** and are overridable — nothing about your
 deployment is baked into the repo.
 
+**Prerequisites:** **Python ≥ 3.10** (required). The optional TypeScript client additionally needs
+**Node ≥ 22** — on older Node the installer skips the client build with a message and you fall back to the
+zero-dependency Python client.
+
 ## Install (run once, from the project folder you want to drive)
 
 **Linux / macOS**
@@ -32,7 +36,7 @@ ironclad-doctor    # read-only status: engine version + endpoint reachability
 
 | Script | Role |
 |---|---|
-| `ironclad-install.{sh,ps1}` | One-shot: prereq check → venv + `pip install -e .[engine]` → build the ink client (if Node present) → write `<project>/.ironclad/config.json` → wire the `ironclad` command into your shell profile. |
+| `ironclad-install.{sh,ps1}` | One-shot: prereq check → venv + `pip install -e .[engine,memory]` (the `memory` extra adds the warm-cache client so the warm tier works once `GX10_WARM_URL` is set) → build the ink client (if Node present) → write `<project>/.ironclad/config.json` → wire the `ironclad` command into your shell profile. |
 | `ironclad.{sh,ps1}` | Launcher (`ironclad`): ensure the engine is healthy (version-aware restart), then run the client against `http://127.0.0.1:<port>`. |
 | `ironclad-doctor.{sh,ps1}` | Read-only status of the install and its endpoints. |
 
@@ -44,7 +48,8 @@ flags or environment variables — never by editing the scripts:
 | Flag (`.sh` / `.ps1`) | Env | Default |
 |---|---|---|
 | `--base-url` / `-BaseUrl` | `GX10_BASE_URL` | `http://127.0.0.1:8000/v1` |
-| `--memory-url` / `-MemoryUrl` | `GX10_MEMORY_URL` | *(empty → memory off)* |
+| `--memory-url` / `-MemoryUrl` | `GX10_MEMORY_URL` | *(empty → Cold memory off)* |
+| `--warm-url` / `-WarmUrl` | `GX10_WARM_URL` | *(empty → Warm tier off)* — a Valkey/Redis URL for the warm cache; the client is always installed, so setting this (here or in the environment) is enough to enable it |
 | `--model` / `-Model` | `GX10_MODEL` | `qwen3.6-35b` |
 | `--port` / `-Port` | `GX10_PORT` | `8100` |
 | `--language` / `-Language` | `GX10_LANGUAGE` | `en` |

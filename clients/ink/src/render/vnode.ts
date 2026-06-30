@@ -51,7 +51,7 @@ export function markDirty(node: HostNode): void {
   }
 }
 
-/** Clear a single node's dirty flag (done during render/blit once it's been drawn). */
+/** Clear a single node's dirty flag (done during render once it's been drawn). */
 export function clearDirty(node: VNode): void {
   node.dirty = false;
 }

@@ -26,6 +26,14 @@ REPORT_OPEN = "<<<MPR_REPORT>>>"
 REPORT_CLOSE = "<<<END>>>"
 _PANEL_DIRECT_TOKENS = 4096   # "direct" panel mode: flat budget for a substantive thinking-off analysis/lens
 _VALID_AUDIT_LEVELS = ("full-per-perspective", "manifest-only")   # allowlist for the model-facing audit_level (§7)
+_MPR_ENV_SEEDED = False   # MPR-ENV-1 (#503): GX10_MPR_* is seeded onto the live tree ONCE per process
+
+
+def _clamp_audit_level(level: str) -> str:
+    """MPR-2 (#503): a typo'd config/env audit_level was used verbatim and silently dropped the
+    synthesis/perspective artifacts (the sovereignty proof). Clamp an unknown value to the safe default
+    (full-per-perspective = most artifacts / sovereignty proof kept)."""
+    return level if level in _VALID_AUDIT_LEVELS else "full-per-perspective"
 
 # CASE-Dict (§3) — name == capability per Spec 10 §3 (packaging spec is authoritative; reconciles the
 # 'mpr.research' form in Spec 09 §9.0). The description IS the layer-1 gate + the sentinel instruction.
@@ -74,7 +82,7 @@ class Deps:
     runs_dir: str = "runs/mpr"
     audit_level: str = "full-per-perspective"
     operator_permission: str = "acceptEdits"
-    enabled: bool = True                         # runtime active-gate; live default off (cfg) → /config set mpr.enabled on
+    enabled: bool = True                         # runtime active-gate; default ON (cfg) → /config set mpr.enabled off to pause
     panel_mode: str = "direct"                   # in-engine panel: "direct" (thinking-off) | "deep" (thinking-on + effort budgets)
     pool: dict = field(default_factory=dict)
     routing: dict = field(default_factory=dict)
@@ -83,6 +91,8 @@ class Deps:
     language: str = "en"                          # #18-4c: active output language (en source; de/… via locale overlay)
     index_runs: bool = True                       # #52: register the run in the TaskStore? off when #15 blocks the
                                                   # pipeline (mpr initiative) — runs/manifest+INDEX.md are the record there
+    budget: Any = None                            # MPR-1 (#503): per-run RunBudget (from cfg.budget) — enforced on the
+                                                  # provider lane (a router usd_cap) + charged per perspective into the manifest
 
 
 _MPR_ROOT = Path(__file__).resolve().parent   # skills/mpr/ — panel discovery root
@@ -129,18 +139,32 @@ def _engine_deps() -> Deps:
     d = Deps()
     try:  # noqa: BLE001 — every binding step is best-effort
         import gx10  # engine module (server-side; core/engine on sys.path at runtime)
-        from .mpr_config import _apply_mpr_env, load_mpr_config
+        from .mpr_config import RunBudget, _apply_mpr_env, load_mpr_config
         from .registry.loader import get_registry
 
         # Read the LIVE config tree each call (so a runtime `/config set mpr.*` takes effect on the next
         # run — entry.py is re-entered per request). Seed the mpr.* section from GX10_MPR_* env ONCE into
         # the live tree (the engine core has no mpr awareness, so without this the env knobs are dead);
         # afterwards `/config set` mutations to _EFFECTIVE_CFG['mpr'] persist and override (env < runtime-set).
+        global _MPR_ENV_SEEDED
         tree = getattr(gx10, "_EFFECTIVE_CFG", None)
-        if isinstance(tree, dict) and "mpr" not in tree:
+        # MPR-ENV-1 (#503): seed env ONCE via a process latch — NOT only when the tree lacks an `mpr` key.
+        # The old guard meant ANY conf-file `mpr.*` made every GX10_MPR_* read dead (file beat env, inverting
+        # the documented file<env precedence). The latch keeps env > file while a later runtime `/config set`
+        # still persists (env is not re-applied over it).
+        if isinstance(tree, dict) and not _MPR_ENV_SEEDED:
             _apply_mpr_env(tree)
+            _MPR_ENV_SEEDED = True
         cfg = load_mpr_config(tree if isinstance(tree, dict) else {})
-        d.runs_dir, d.audit_level, d.panel_mode = cfg.runs_dir, cfg.audit_level, cfg.panel_mode
+        # MPR-1 (#503): build the per-run RunBudget from cfg.budget so the cap is actually USED — enforced on
+        # the provider lane (a router usd_cap, below) and charged per perspective into the manifest. It was
+        # parsed but never bound, so GX10_MPR_MAX_COST_USD/_MAX_TOKENS/_ON_EXCEED had no effect.
+        d.budget = RunBudget(max_cost_usd=cfg.budget.max_cost_usd_per_run,
+                             max_tokens=cfg.budget.max_tokens_per_run,
+                             per_provider=dict(cfg.budget.per_provider),
+                             on_exceed=cfg.budget.on_exceed)
+        d.audit_level = _clamp_audit_level(cfg.audit_level)   # MPR-2 (#503): clamp a typo'd level
+        d.runs_dir, d.panel_mode = cfg.runs_dir, cfg.panel_mode
         d.language = getattr(gx10, "LANGUAGE", "en") or "en"   # #18-4c: role lens_prompts localize to this
         # B3 (STATE layout): MPR runs are initiative artifacts → route them under the ACTIVE initiative
         # (vault/<slug>/runs) instead of the WORKDIR root. Without an active initiative the config
@@ -150,7 +174,7 @@ def _engine_deps() -> Deps:
         _vp = _arootsoft() if callable(_arootsoft) else None
         if _vp is not None:
             d.runs_dir = (_vp / "runs").as_posix()
-        d.enabled = cfg.enabled                       # runtime active-gate (default off; /config set mpr.enabled on)
+        d.enabled = cfg.enabled                       # runtime active-gate (default ON; /config set mpr.enabled off to pause)
         d.pool = cfg.providers.pool
         d.routing = cfg.providers.routing.model_dump()
         d.default_offload = cfg.providers.default_offload
@@ -201,15 +225,15 @@ def mpr_research_run(query: str, *, route_hint: str = "", domain_hint: str = "",
     try:
         import gx10 as _gx  # type: ignore
         if _gx.artifact_root_soft() is None:
-            return ("ERROR: mpr_research: kein aktives Initiative — Artefakte hätten kein Zuhause. "
-                    "`/initiative new <name> --type mpr` (oder `--type software`) zuerst.")
+            return ("ERROR: mpr_research: no active initiative — the artifacts would have no home. "
+                    "Run `/initiative new <name> --type mpr` (or `--type software`) first.")
     except Exception:  # noqa: BLE001 — no engine context (standalone) → normal run
         _gx = None
     out = run_mpr(query, route_hint=route_hint, domain_hint=domain_hint, mode_hint=mode_hint,
                   files=files, audit_level=audit_level, deps=_engine_deps())
     # C2: after a real run, keep the active initiative's INDEX.md fresh (fail-soft, index only;
     # not on ERROR/decline/disabled — no artifact was created there).
-    if _gx is not None and out and not out.startswith(("ERROR", "MPR declined", "MPR ist deaktiviert")):
+    if _gx is not None and out and not out.startswith(("ERROR", "MPR declined", "MPR is disabled")):
         try:
             _slug = _gx.active_slug()
             if _slug:
@@ -238,12 +262,16 @@ def _execute(prompts, perspectives, choices, deps) -> List[dict]:
             # P0 engine types (NOT an own dispatcher — guard-allowed). Lazy + fail-soft: resolves to
             # engine/* which is on sys.path because MPR runs co-resident with the engine (import gx10
             # in _engine_deps succeeded to bind the dispatcher). An ImportError here → in-engine fallback.
-            from router import RouteRequest
+            from router import RouteRequest, Budget
             from dispatch import DispatchPolicy
             reqs = [RouteRequest(index=i, effort=(ch.effort or "medium"), provider_policy=ch.policy,
                                  sensitivity=("sensitive" if ch.policy == "local-only" else "internal"))
                     for i, ch in enumerate(choices)]
-            results = list(deps.dispatcher.dispatch(prompts, None, DispatchPolicy(reqs, system=None)))
+            # MPR-1 (#503): pass the run budget cap so the dispatcher's router gate drops unaffordable
+            # candidates (hard pre-admission) instead of running unbounded on its own default Budget().
+            pol_budget = Budget(usd_cap=deps.budget.max_cost_usd) if getattr(deps, "budget", None) else None
+            results = list(deps.dispatcher.dispatch(prompts, None,
+                                                    DispatchPolicy(reqs, system=None, budget=pol_budget)))
         except Exception:  # noqa: BLE001 — P0 unavailable/build fault → in-engine fallback
             results = None
     if results is None:
@@ -254,6 +282,18 @@ def _execute(prompts, perspectives, choices, deps) -> List[dict]:
         deep = getattr(deps, "panel_mode", "direct") == "deep"
         budget = (max((EFFORT_MAX_TOKENS.get(ch.effort, _PANEL_DIRECT_TOKENS) for ch in choices),
                       default=_PANEL_DIRECT_TOKENS) if deep else _PANEL_DIRECT_TOKENS)
+        # MPR-1 (#503): enforce the run TOKEN cap on the in-engine lane — the DEFAULT path (the dispatcher
+        # lane above is opt-in via GX10_MPR_USE_DISPATCHER). fanout applies ONE max_tokens to every lens, so
+        # clamp the per-lens budget to floor(cap / n): the panel's completion then stays within the run cap.
+        # A model call needs >=1 token, so the hard guarantee is total completion <= max(cap, n) — an absolute
+        # <= max_tokens_per_run for any cap >= n (the only realistic regime; the default cap is 200k vs a
+        # handful of lenses), and a degenerate sub-lens-count or non-positive cap is floored to 1 token/lens
+        # (bounded to n — NEVER the pre-fix unbounded run; on_exceed=degrade). This is the binding control on
+        # this lane: the in-engine fanout runs on the local host at $0, so the COST cap is structurally
+        # satisfied here and the TOKEN cap is what bites; real cost is gated by the router usd_cap on the
+        # offload lane, and the real spend on either lane is charged in _write_audit.
+        if getattr(deps, "budget", None) is not None and n > 0:
+            budget = max(1, min(budget, deps.budget.max_tokens // n))
         results = deps.fanout(prompts, system=None, max_tokens=budget, think=deep) if deps.fanout else \
             [{"ok": True, "content": "", "error": None, "completion_tokens": None, "latency": None}
              for _ in prompts]
@@ -272,13 +312,13 @@ def run_mpr(query: str, *, route_hint: str = "", domain_hint: str = "", mode_hin
             files: Optional[List[str]] = None, audit_level: str = "", deps: Deps) -> str:
     """The orchestration (§4). Returns a string ALWAYS; never raises (§4 fail-soft)."""
     if not (query or "").strip():
-        return "ERROR: mpr_research: 'query' darf nicht leer sein."
+        return "ERROR: mpr_research: 'query' must not be empty."
 
     # Runtime active-gate (the only gate now): MPR is a core built-in, always loaded; this pauses it
     # live (default ON). Off → a clear, sentinel-free note (the model answers directly). Toggle via
     # `/config set mpr.enabled on|off` (no redeploy). ADR-0002 #115.
     if not deps.enabled:
-        return "MPR ist deaktiviert — aktivieren mit:  /config set mpr.enabled on"
+        return "MPR is disabled — enable it with:  /config set mpr.enabled on"
 
     # 1. classify (router, layer-2 gate) ----------------------------------------------------------
     try:
@@ -398,6 +438,11 @@ def _write_audit(run_dir, run_id, query, decision, perspectives, choices, render
                  "provider_policy": ch.policy, "rendered": rend, "context_sources": [],
                  "max_tokens": None, "cost": {"amount": float(res.get("real_cost_usd") or 0.0)},
                  "spilled": bool(res.get("spilled", False)), "route_reason": res.get("route_reason")}
+        if deps.budget is not None:  # MPR-1 (#503): charge the run budget from the REAL per-perspective spend
+            _c = res.get("real_cost_usd"); _t = res.get("completion_tokens")
+            deps.budget.charge(exec_provider,
+                               float(_c) if isinstance(_c, (int, float)) and not isinstance(_c, bool) else 0.0,
+                               int(_t) if isinstance(_t, (int, float)) and not isinstance(_t, bool) else 0)
         entries.append(audit.record_perspective(run_dir, i, persp, res, level, writer=deps.writer))
         metas.append({"index": i, "provider": exec_provider,
                       "substrate": exec_substrate, "provider_policy": ch.policy,
@@ -425,9 +470,16 @@ def _write_audit(run_dir, run_id, query, decision, perspectives, choices, render
         input=[audit.SynthInputRef(index=e.index, role=e.role, prompt_hash=e.prompt_hash) for e in ok_entries],
         output=(out.body or None),
     )
+    budget_summary = None
+    if deps.budget is not None:  # MPR-1 (#503): record the run budget cap + REAL spend into the manifest
+        sp = deps.budget.spent()
+        budget_summary = audit.BudgetSummary(
+            max_cost_usd_per_run=deps.budget.max_cost_usd, max_tokens_per_run=deps.budget.max_tokens,
+            spent_cost_usd=sp["cost_usd"], spent_tokens=sp["tokens"], per_provider_spent=sp["per_provider"],
+            cost_estimated=True)
     manifest = audit.Manifest(
         run_id=run_id, created_at=audit.now_iso(), status=status, audit_level=level,
-        query=audit.Query(text=query),
+        query=audit.Query(text=query), budget=budget_summary,
         router_decision=audit.RouterDecisionSnapshot(
             decision="run", route=(decision.route.value if decision.route else None),
             domain=decision.domain, mode=(decision.mode.value if decision.mode else None),

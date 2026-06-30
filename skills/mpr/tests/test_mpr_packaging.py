@@ -115,7 +115,7 @@ def test_disabled_runtime_gate_returns_note(tmp_path):
     deps = _deps(tmp_path, llm)
     deps.enabled = False
     out = run_mpr("Sollen wir umbauen und die Optionen abwägen?", deps=deps)
-    assert out.startswith("MPR ist deaktiviert") and "/config set mpr.enabled on" in out
+    assert out.startswith("MPR is disabled") and "/config set mpr.enabled on" in out
     assert "<<<MPR_REPORT>>>" not in out and llm.calls == 0   # no classify, no work when disabled
 
 

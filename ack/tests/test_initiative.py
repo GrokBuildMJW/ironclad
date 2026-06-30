@@ -178,16 +178,25 @@ def test_cmd_new_creates_and_reports(tmp_path):
     assert gx10.active_slug() == "order-service"
 
 
-def test_cmd_new_message_is_type_aware(tmp_path):
-    # #13: message names the artefacts actually seeded for the type (no Tasks/Handovers for mpr),
-    # and mpr appends the activation hint (mpr.enabled defaults off in tests).
+def test_cmd_new_message_is_type_aware(tmp_path, monkeypatch):
+    # #13: message names the artefacts actually seeded for the type (no Tasks/Handovers for mpr).
+    # #503 MPR-ENV-2: mpr.enabled defaults ON, so a fresh mpr initiative does NOT nag "MPR not active"
+    # when the key is unset — the activation hint appears ONLY when it is EXPLICITLY disabled.
+    monkeypatch.setattr(gx10, "_EFFECTIVE_CFG", {}, raising=False)   # mpr.enabled unset → default ON
     mpr = gx10._initiative_command("new Risk Panel --type mpr")
     assert "runs" in mpr and "decisions" in mpr
     assert "Tasks" not in mpr and "Handovers" not in mpr
-    assert "mpr.enabled" in mpr
+    assert "mpr.enabled" not in mpr                                  # default ON → no spurious hint
     soft = gx10._initiative_command("new Order Svc --type software")
     assert "tasks" in soft and "reviews" in soft
     assert "mpr.enabled" not in soft
+
+
+def test_cmd_new_mpr_hint_only_when_explicitly_disabled(tmp_path, monkeypatch):
+    # #503 MPR-ENV-2: the activation hint appears only when mpr.enabled is EXPLICITLY off, never on unset.
+    monkeypatch.setattr(gx10, "_EFFECTIVE_CFG", {"mpr": {"enabled": False}}, raising=False)
+    mpr = gx10._initiative_command("new Risk Panel --type mpr")
+    assert "mpr.enabled" in mpr                                      # explicitly disabled → hint shown
 
 
 def test_cmd_new_typ_position_independent_and_eq():
@@ -217,8 +226,8 @@ def test_cmd_list_marks_active():
 
 
 def test_cmd_list_empty():
-    assert "keine" in gx10._initiative_command("list")
-    assert "keine" in gx10._initiative_command("")    # bare → list
+    assert "none" in gx10._initiative_command("list")
+    assert "none" in gx10._initiative_command("")    # bare → list
 
 
 def test_cmd_use_and_unknown():
@@ -231,11 +240,11 @@ def test_cmd_use_and_unknown():
 
 
 def test_cmd_active_and_reconcile():
-    assert "keins active" in gx10._initiative_command("active")
+    assert "none active" in gx10._initiative_command("active")
     gx10._initiative_command("new Solo --type software")
     assert "solo" in gx10._initiative_command("active")
     # reconcile_vault is wired (Unit C) → the command actually reconciles now
-    assert "indiziert" in gx10._initiative_command("reconcile")
+    assert "indexed" in gx10._initiative_command("reconcile")
 
 
 def test_cmd_unknown_sub_shows_usage():

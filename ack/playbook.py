@@ -25,8 +25,6 @@ logger = logging.getLogger(__name__)
 KIND = "playbook"
 _REQUIRED = ("capability", "kind", "description")
 _LIST_FIELDS = ("trigger", "not_for")
-_SCALAR_FIELDS = ("capability", "name", "description", "kind", "type", "domain",
-                  "version", "provenance")
 
 
 class PlaybookError(Exception):

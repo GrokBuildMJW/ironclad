@@ -84,6 +84,37 @@ effort:
   default: "high"
   choices: ["low", "medium", "high", "xhigh"]
 
-non_negotiable:
+non_negotiable_flag:
   type: bool
+  help: "Is this capability non-negotiable?"
   default: false
+
+# TPL-1/TPL-2 (#503): the rendered tree references {{date}} + {{tags_yaml}}/{{tags_csv}} and embeds
+# {{non_negotiable}} INSIDE a JSON object — values the canonical `ack.generator` CLI fills via
+# build_context. Declare them here too (computed, when:false) so a raw `copier copy` produces VALID
+# frontmatter/JSON, mirroring build_context. `non_negotiable` renders a LOWERCASE json string — a copier
+# `bool` would emit `True`/`False` and break the gap-tracking JSON.
+non_negotiable:
+  type: str
+  default: "{{ 'true' if non_negotiable_flag else 'false' }}"
+  when: false
+
+tags:
+  type: str
+  help: "Comma-separated frontmatter tags"
+  default: "tracking, {{ domain_name }}, planning, gx10"
+
+tags_csv:
+  type: str
+  default: "{{ tags.split(',') | map('trim') | select | join(', ') }}"   # select drops empties, mirroring build_context's `if t.strip()`
+  when: false
+
+tags_yaml:
+  type: str
+  default: "[{{ tags.split(',') | map('trim') | select | join(', ') }}]"
+  when: false
+
+date:
+  type: str
+  help: "ISO date YYYY-MM-DD (the ack.generator CLI auto-fills today; copier leaves it empty unless given)"
+  default: ""

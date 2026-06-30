@@ -87,7 +87,7 @@ def test_related_block_injected_on_shared_tag_and_title_ref(tmp_path):
     gx10.reconcile_vault("proj")
     cache = (tmp_path / "vault" / "proj" / "decisions" / "cache.md").read_text(encoding="utf-8")
     db = (tmp_path / "vault" / "proj" / "decisions" / "db.md").read_text(encoding="utf-8")
-    assert "## Verwandt (auto)" in cache and "[[decisions/db|Datenbank-Wahl]]" in cache
+    assert "## Related (auto)" in cache and "[[decisions/db|Datenbank-Wahl]]" in cache
     assert "[[decisions/cache|Cache-Wahl]]" in db            # shared "infra" tag → mutual
 
 
@@ -100,7 +100,7 @@ def test_related_injection_idempotent(tmp_path):
     first = dbp.read_text(encoding="utf-8")
     gx10.reconcile_vault("proj")
     assert dbp.read_text(encoding="utf-8") == first          # related set does not grow / churn
-    assert first.count("## Verwandt (auto)") == 1            # exactly one managed block
+    assert first.count("## Related (auto)") == 1            # exactly one managed block
 
 
 def test_related_block_removed_when_no_longer_related(tmp_path):
@@ -112,7 +112,7 @@ def test_related_block_removed_when_no_longer_related(tmp_path):
     _decision("proj", "cache", "Cache-Wahl", "2026-06-19", "[cache]")
     gx10.reconcile_vault("proj")
     db = (tmp_path / "vault" / "proj" / "decisions" / "db.md").read_text(encoding="utf-8")
-    assert "## Verwandt (auto)" not in db                    # tidy: stale block stripped
+    assert "## Related (auto)" not in db                    # tidy: stale block stripped
 
 
 def test_meta_and_links_false_do_not_touch_bodies(tmp_path):
@@ -129,7 +129,7 @@ def test_meta_and_links_false_do_not_touch_bodies(tmp_path):
 
 
 def test_reconcile_unknown_slug_is_friendly():
-    assert "kein Initiative" in gx10.reconcile_vault("does-not-exist")
+    assert "no initiative" in gx10.reconcile_vault("does-not-exist")
 
 
 # ── /initiative reconcile command now wired ─────────────────────
@@ -138,7 +138,7 @@ def test_cmd_reconcile_runs_now(tmp_path):
     _decision("proj", "db", "DB-Wahl", "2026-06-20", "[infra]")
     out = gx10._initiative_command("reconcile")
     assert "Unit C" not in out                               # no longer the pending placeholder
-    assert "indiziert" in out
+    assert "indexed" in out
     assert (tmp_path / "vault" / "proj" / "INDEX.md").is_file()
 
 

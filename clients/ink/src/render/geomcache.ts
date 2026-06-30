@@ -1,13 +1,12 @@
 /**
- * geomcache — per-node absolute geometry + contamination tracking (R4, pattern §4).
+ * geomcache — per-node absolute geometry (R4, pattern §4).
  *
- * Blit needs to know each subtree's rectangle in absolute screen coordinates to copy its cells
- * from the front buffer. Yoga stores geometry *relative to the parent*, so `build()` walks the
- * laid-out tree once, accumulating offsets, and records every element's absolute `{x,y,w,h}`.
+ * Hit-testing (mouse → component) needs each element's rectangle in absolute screen coordinates.
+ * Yoga stores geometry *relative to the parent*, so `build()` walks the laid-out tree once,
+ * accumulating offsets, and records every element's absolute `{x,y,w,h}`.
  *
- * `contaminate(node)` marks a subtree whose front-buffer cells were overdrawn by a later sibling
- * or an absolutely-positioned overlay — those cells no longer represent the node, so it must be
- * repainted, not blitted. Contamination is per-frame; the renderer resets it each pass.
+ * (The contamination-tracking that fed the partial-repaint `blit` path was removed with that unwired
+ * subsystem — #503 INK-R-2; the renderer full-repaints dirty subtrees.)
  */
 import type {VNode} from './vnode.js';
 
@@ -28,7 +27,6 @@ interface YogaGeom {
 
 export class GeomCache {
   private rects = new Map<VNode, Rect>();
-  private contaminated = new Set<VNode>();
 
   set(node: VNode, rect: Rect): void {
     this.rects.set(node, rect);
@@ -44,37 +42,20 @@ export class GeomCache {
 
   delete(node: VNode): void {
     this.rects.delete(node);
-    this.contaminated.delete(node);
   }
 
-  /** Drop all cached geometry and contamination (e.g. on a full rebuild). */
+  /** Drop all cached geometry (e.g. on a full rebuild). */
   clear(): void {
     this.rects.clear();
-    this.contaminated.clear();
-  }
-
-  /** Mark a node whose front-buffer region was overdrawn — it cannot be safely blitted. */
-  contaminate(node: VNode): void {
-    this.contaminated.add(node);
-  }
-
-  isContaminated(node: VNode): boolean {
-    return this.contaminated.has(node);
-  }
-
-  /** Clear contamination for the next frame, keeping cached rects. */
-  resetContamination(): void {
-    this.contaminated.clear();
   }
 
   /**
-   * Walk a laid-out tree and (re)record every element's absolute rect. Clears prior rects and
-   * contamination first (positions change with each layout). Nodes without a Yoga node (not yet
-   * laid out) are skipped along with their subtree.
+   * Walk a laid-out tree and (re)record every element's absolute rect. Clears prior rects first
+   * (positions change with each layout). Nodes without a Yoga node (not yet laid out) are skipped
+   * along with their subtree.
    */
   build(root: VNode): void {
     this.rects.clear();
-    this.contaminated.clear();
     const walk = (node: VNode, ax: number, ay: number): void => {
       const yn = node.yoga as YogaGeom | null;
       if (!yn) return;

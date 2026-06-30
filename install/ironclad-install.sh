@@ -5,10 +5,12 @@
 #
 #   bash install/ironclad-install.sh            # localhost endpoint defaults
 #   bash install/ironclad-install.sh --base-url http://my-host:8000/v1 --model my-model
+#   bash install/ironclad-install.sh --warm-url redis://host:6379   # bind the Valkey/Redis warm tier
 #
-# It builds a venv, installs the engine, builds the optional TypeScript client, writes a project
-# config (.ironclad/config.json) and wires an `ironclad` shell command. Defaults point at localhost;
-# override any endpoint with a flag or a GX10_* env var. No host/IP/path is ever baked into the repo.
+# It builds a venv, installs the engine (incl. the warm-cache client so the warm tier works whenever
+# GX10_WARM_URL / --warm-url is set), builds the optional TypeScript client, writes a project config
+# (.ironclad/config.json) and wires an `ironclad` shell command. Defaults point at localhost; override
+# any endpoint with a flag or a GX10_* env var. No host/IP/path is ever baked into the repo.
 set -euo pipefail
 
 say() { printf '[install] %s\n' "$*"; }
@@ -31,6 +33,7 @@ INK_DIR="$(find_dir "$ROOT/clients/ink" "$ROOT/../clients/ink" "$PKG_ROOT/client
 # --- defaults (localhost; override via flags / GX10_* env) ---------------------------------------
 BASE_URL="${GX10_BASE_URL:-http://127.0.0.1:8000/v1}"
 MEMORY_URL="${GX10_MEMORY_URL:-}"          # empty → memory off (fail-soft)
+WARM_URL="${GX10_WARM_URL:-}"              # Valkey/Redis warm cache; empty → warm off (fail-soft)
 MODEL="${GX10_MODEL:-qwen3.6-35b}"
 PORT="${GX10_PORT:-8100}"
 LANGUAGE="${GX10_LANGUAGE:-en}"
@@ -42,13 +45,14 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --base-url)   BASE_URL="$2"; shift 2;;
     --memory-url) MEMORY_URL="$2"; shift 2;;
+    --warm-url)   WARM_URL="$2"; shift 2;;
     --model)      MODEL="$2"; shift 2;;
     --port)       PORT="$2"; shift 2;;
     --language)   LANGUAGE="$2"; shift 2;;
     --project)    PROJECT="$(cd "$2" && pwd)"; shift 2;;
     --connection) CONNECTION="$2"; shift 2;;
     -h|--help)
-      sed -n '2,12p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0;;
+      sed -n '2,13p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0;;
     *) die "unknown option: $1 (see --help)";;
   esac
 done
@@ -82,17 +86,27 @@ say "root=$ROOT  project=$PROJECT  model=$MODEL  base_url=$BASE_URL"
 VENV="$ROOT/.venv"
 venv_py "$VENV" >/dev/null 2>&1 || { say "creating venv ($VENV) ..."; python3 -m venv "$VENV"; }
 VENV_PY="$(venv_py "$VENV")" || die "venv python not found after creation"
-say "installing the engine (pip install -e .[engine]) ..."
+say "installing the engine (pip install -e .[engine,memory]) ..."
 "$VENV_PY" -m pip install --quiet --upgrade pip
-( cd "$PKG_ROOT" && "$VENV_PY" -m pip install --quiet -e ".[engine]" )   # ".[extra]" from the pkg dir — pip rejects "/abs/path[extra]"
+# Install the warm-cache client (the `memory` extra → redis>=5) alongside the engine so the warm tier
+# works whenever GX10_WARM_URL is set (via env or --warm-url), matching the Docker image; warm stays
+# OFF at runtime until a URL is configured. ".[extra]" from the pkg dir — pip rejects "/abs/path[extra]".
+( cd "$PKG_ROOT" && "$VENV_PY" -m pip install --quiet -e ".[engine,memory]" )
 "$VENV_PY" -c 'import ack, pydantic' || die "engine import check failed"
 
 # --- optional TypeScript client -----------------------------------------------------------------
 CLIENT_CLI=""
 if [ -n "${INK_DIR:-}" ] && command -v node >/dev/null 2>&1; then
-  say "building the ink client ..."
-  ( cd "$INK_DIR" && npm install --silent && npm run build --silent )
-  CLIENT_CLI="$INK_DIR/dist/cli.js"
+  # The ink client needs Node >= 22 (clients/ink package.json engines); npm does NOT enforce `engines` by
+  # default, so gate it here and skip with a clear message on older Node rather than emit a cryptic build error.
+  NODE_MAJOR="$(node -p 'process.versions.node.split(".")[0]' 2>/dev/null || echo 0)"
+  if [ "${NODE_MAJOR:-0}" -ge 22 ]; then
+    say "building the ink client ..."
+    ( cd "$INK_DIR" && npm install --silent && npm run build --silent )
+    CLIENT_CLI="$INK_DIR/dist/cli.js"
+  else
+    say "skipping ink client — Node >= 22 required (have $(node -v 2>/dev/null)); the legacy Python client still works."
+  fi
 else
   say "skipping ink client (no Node or clients/ink absent) — the legacy Python client still works."
 fi
@@ -108,6 +122,7 @@ cat > "$PROJECT/.ironclad/config.json" <<JSON
   "clientCli": "$CLIENT_CLI",
   "baseUrl": "$BASE_URL",
   "memoryUrl": "$MEMORY_URL",
+  "warmUrl": "$WARM_URL",
   "model": "$MODEL",
   "port": $PORT,
   "language": "$LANGUAGE"

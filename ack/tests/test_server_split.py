@@ -155,6 +155,8 @@ def test_http_health_and_chat_capture(tmp_path, monkeypatch):
         # #385: Cold (memory) and Warm tiers are reported SEPARATELY; with neither configured in the stub
         # both read "off" (a Warm outage can no longer hide behind a Cold-only `memory: up`).
         assert health["memory"] == "off" and health["warm"] == "off"
+        # #601 isolation observability: /health surfaces the project-registry binding (status/active/home).
+        assert isinstance(health.get("registry"), dict) and "status" in health["registry"]
 
         res = _post(port, "/chat", {"message": "ping"})
         assert res["ok"] and "echo:ping" in res["output"]

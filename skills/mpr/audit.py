@@ -406,21 +406,9 @@ def index_in_taskstore(run_id: str, query_text: str, domain: str, status: str, *
         return None
 
 
-# ── §6 memory mirror (only distilled insight, via the single-writer reducer) ──────────────────────
-def mirror_to_memory(insight: str, domain: str, query_text: str, *, reducer: Any) -> int:
-    """Hand ONE distilled insight to ironclad's single-writer reducer (``_reduce_worker_results``).
-
-    NEVER raw perspectives/prompts/provenance — only the synthesis essence (§6). Returns ``n_written``
-    for ``metrics.n_written``; ``reducer is None`` (or globally flag-gated off) → 0 (legit, not error).
-    """
-    if reducer is None or not (insight or "").strip():
-        return 0
-    items = [{"ok": True, "content": insight}]   # exactly one consolidated entry
-    try:
-        n = reducer(items, topic=f"MPR/{domain}: {query_text[:120]}")
-        return int(n) if isinstance(n, int) else 0
-    except Exception:  # noqa: BLE001 — memory write-back is fail-soft (§6)
-        return 0
+# (§6 memory mirror lives in synthesis.write_back — the single §6 write-back path, INJECTED with
+#  ironclad's reducer and called from run() (entry.py). An older stand-alone `mirror_to_memory` here was
+#  a dead duplicate with no caller and has been removed; do not re-add a second write-back surface.)
 
 
 # ── §9 retention (prune run-dirs + their TaskStore entry) ─────────────────────────────────────────
@@ -438,6 +426,10 @@ def prune_runs(runs_root: Any, *, keep_runs: int = 500, keep_days: Optional[int]
     ``created_at``). ``protect_violations`` keeps any run with ``provenance.violations != []`` forever
     (proof obligation, §9). Returns the deleted run_ids. TaskStore has no delete → ``store_delete`` is
     injected (run()/1f binds a locked delete or a named TaskStore.delete core-change).
+
+    Reserved (#503 MPR-DEAD-3): a complete, unit-tested §9 retention utility that is not yet wired into
+    run() — auto-pruning is an operator policy decision (which runs to keep, the proof-obligation carve-out
+    for violations), not an always-on default. Kept as the canonical retention API for an operator/CLI seam.
     """
     root = Path(runs_root)
     if not root.is_dir():

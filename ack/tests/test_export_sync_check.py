@@ -1,9 +1,9 @@
 """export-sync-check classification (#195, ADR-0007), offline.
 
-Pins the pure `classify()` + the LF-normalisation: a hand-added public file is always drift; at the
-same source commit the trees must be byte-identical; when main is ahead the extra/changed files are
-expected (info, not failure); a CRLF-only difference is never drift. Lives in `scripts/ci/` (private)
--> skips in an installed/clean-room tree.
+Pins the pure `classify()` + the LF-normalisation: at the same source commit the trees must be
+byte-identical (a public-only file is drift); when main is ahead the extra/changed AND removed/renamed
+files are expected (info, not failure); a CRLF-only difference is never drift. Lives in `scripts/ci/`
+(private) -> skips in an installed/clean-room tree.
 """
 from __future__ import annotations
 
@@ -30,16 +30,18 @@ def _load():
     return mod
 
 
-def test_hand_added_public_file_is_drift_in_both_regimes():
+def test_public_only_file_is_drift_in_strict_but_info_when_main_ahead():
     es = _load()
     ex = {"a.py": b"x"}
     pub = {"a.py": b"x", "evil.txt": b"hand-added"}
-    # main-ahead regime
-    f, _ = es.classify(ex, pub, source_sha="OLD", head_sha="HEAD")
-    assert any("evil.txt" in x for x in f)
-    # strict regime
-    f2, _ = es.classify(ex, pub, source_sha="HEAD", head_sha="HEAD")
-    assert any("evil.txt" in x for x in f2)
+    # strict regime (public's stamped source == HEAD): a public file the export doesn't produce is drift
+    f_strict, _ = es.classify(ex, pub, source_sha="HEAD", head_sha="HEAD")
+    assert any("evil.txt" in x for x in f_strict)
+    # main-ahead regime: a removed/renamed-but-unreleased file is expected work (info, not failure) —
+    # it only reaches public at the next gated release; the strict regime catches a real hand-edit then
+    f_ahead, info = es.classify(ex, pub, source_sha="OLD", head_sha="HEAD")
+    assert f_ahead == []
+    assert info and "removed/renamed" in info[0]
 
 
 def test_strict_regime_requires_byte_identity():

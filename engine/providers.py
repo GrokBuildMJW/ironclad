@@ -43,6 +43,15 @@ class Capabilities(BaseModel):
     local: bool = False             # runs on sovereign infra (Spark/loopback) → local-only capable
     max_effort: str = "xhigh"       # highest effort tier it can serve (low|medium|high|xhigh)
 
+    @field_validator("max_effort")
+    @classmethod
+    def _norm_max_effort(cls, v: str) -> str:
+        # ROUTER-1 (#503): a conf value outside the enum would raise KeyError on EFFORT_RANK[max_effort]
+        # deep in route_one (violating never-raises-into-the-tool-loop). Normalize an unknown tier to the
+        # conservative FLOOR "low" at load — so routing never raises AND a typo can never OVER-claim
+        # capability (an unknown value only makes the provider eligible for low-effort requests).
+        return v if v in ("low", "medium", "high", "xhigh") else "low"
+
 
 class RateLimit(BaseModel):
     max_concurrent: int = 4         # concurrent in-flight calls/agents for this provider
@@ -320,3 +329,39 @@ def classify_agent_result(*, exit_code: Optional[int], stderr: str,
     if exit_code is not None and int(exit_code) in {int(c) for c in (pats.get("exit_codes") or [])}:
         return RESULT_UNAVAILABLE
     return RESULT_FAILED
+
+
+def result_failure_class(result: str):
+    """Re-map a code-agent run result onto the shared :class:`~ack.failure_class.FailureClass`
+    taxonomy (#602 S602-3) — keeping a SINGLE failure vocabulary across the engine.
+
+    The three run results stay the wire contract (``classify_agent_result`` + the server
+    reconciler depend on the exact strings); this is the *bridge* the reflection layer
+    (the Strategy Revisor / Quality breaker, #602 SUB-7/SUB-9) reads instead of re-deriving
+    a taxonomy: ``RESULT_UNAVAILABLE`` → ``UNAVAILABLE`` (budget/quota exhausted),
+    ``RESULT_FAILED`` → ``INCOMPLETE_OUTPUT`` (ran but produced no usable result),
+    ``RESULT_OK`` → ``None`` (not a failure). Lazy-imports ``ack`` so engine import order
+    and the clean-room export stay unaffected. Pure; an unknown result → ``None``.
+    """
+    from ack.failure_class import FailureClass  # lazy: engine→ack one-way, no import cycle
+
+    return {
+        RESULT_UNAVAILABLE: FailureClass.UNAVAILABLE,
+        RESULT_FAILED: FailureClass.INCOMPLETE_OUTPUT,
+    }.get(result)
+
+
+def code_agent_strategy(result: str, *, attempt: int = 1, budget: int = 3):
+    """Engine-side application of the Strategy Revisor to a code-agent run result (#602 S602-7).
+
+    Maps the run result onto the shared :class:`~ack.failure_class.FailureClass` (:func:`result_failure_class`)
+    then through the pure SSOT policy (:func:`ack.strategy.revise`) to a :class:`~ack.strategy.Strategy` — so
+    the failover / retry path consults ONE policy instead of re-deriving its own (``RESULT_UNAVAILABLE`` →
+    ``FAIL_OVER``, etc.). ``RESULT_OK`` (not a failure) → ``None``. The default ``budget=3`` keeps a single
+    classification NON-terminal (the targeted action, not an immediate human-escalation); pass the real
+    attempt/budget to drive escalation. Pure + additive; lazy-imports ``ack``."""
+    fc = result_failure_class(result)
+    if fc is None:
+        return None
+    from ack.strategy import revise  # lazy: engine→ack one-way, no import cycle
+    return revise(fc, attempt, budget)

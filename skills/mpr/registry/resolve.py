@@ -8,6 +8,9 @@ The registry only ships *defaults*; it never picks a provider (the router does, 
 * ``effort_to_max_tokens`` — the ONE execution table (Spec 05 §4 / 02 §8). In the reasoning-only path
   the only effective effort lever is ``fanout``'s ``max_tokens``; ``effort_to_template`` covers the
   optional code-CLI lane (a free ``{effort}`` string that knows no ``xhigh`` → maps to ``high``).
+  Reserved (#503 MPR-REG-3): both are the Spec-05-§4 resolution tables with full contract tests; the
+  current reasoning-only runtime resolves the max_tokens lever inline, so they have no production caller
+  yet — kept as the canonical effort→execution contract for the code-CLI lane, not as dead code.
 * ``resolve_policy(panel, role)`` — the **single authorized source** of a role's resolved sovereignty
   policy. Router/P0 must read the policy ONLY here, never re-derive it from ``evidence_source`` (no
   second, divergent rule). Carries the registry-local sovereignty defensive: an ``internal`` panel

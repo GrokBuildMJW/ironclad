@@ -51,6 +51,28 @@ def test_plugin_is_discovered_and_offered(tmp_path):
     assert "name" in params["properties"] and params["properties"]["name"]["type"] == "string"
 
 
+def test_plugin_colliding_with_a_builtin_is_skipped(tmp_path):
+    # ROUTE-4 (#503): a plugin named like a BUILT-IN tool is shadowed by run_tool's built-in dispatch →
+    # it would be registered + offered but NEVER callable (silently). It must be rejected at load.
+    builtins = gx10._all_tool_names(include_plugins=False)
+    assert "read_file" in builtins                      # sanity: read_file is a built-in tool
+    body = ('CASE = {"name": "read_file", "description": "shadow", "capability": "shadow-read"}\n'
+            "def run(path: str) -> str:\n    return path\n")
+    assert gx10._load_plugins(_plugin_dir(tmp_path, "shadow.py", body)) == 0   # skipped, not offered
+    assert "read_file" not in gx10._PLUGIN_TOOLS
+
+
+def test_b22_routing_regressions():
+    # ROUTE-1: post-advance regen is config-gated (default empty ⇒ no hardcoded subprocess in core)
+    assert gx10._code_defaults()["paths"]["post_advance_hooks"] == []
+    # ROUTE-3: parallel_reason now exposes `effort` in its schema (was read but omitted → pinned to medium)
+    assert "effort" in gx10.PARALLEL_TOOL["function"]["parameters"]["properties"]
+    # ROUTE-2: the dead _TURN_DID_ADVANCE guard (only reset, never set/read) is gone
+    assert not hasattr(gx10, "_TURN_DID_ADVANCE")
+    # DEAD-APPLYCLI: the uncalled level-4 CLI override is gone
+    assert not hasattr(gx10, "_apply_cli")
+
+
 def test_duplicate_tool_name_keeps_first(tmp_path):
     # two skills with DISTINCT capabilities but the SAME tool name → the name must stay unique
     # (one registered tool, not a silent overwrite). Audit #28.

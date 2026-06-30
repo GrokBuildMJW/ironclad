@@ -50,7 +50,19 @@ class SecurityPolicy:
 
     def __init__(self, profile: str, token: Optional[str], heartbeat_s: int,
                  code_locality: str) -> None:
-        self.profile = profile if profile in PROFILES else "open"
+        # SEC-1 (#503): an unknown NON-EMPTY profile must NOT silently downgrade to the weakest 'open'
+        # (fail-open in a fail-closed module). Unset/empty → the documented 'open' default; a valid profile
+        # is used; anything else is kept verbatim + flagged so startup_error() refuses to boot loudly.
+        raw = (profile or "").strip().lower()
+        if raw in PROFILES:
+            self.profile = raw
+            self._invalid_profile: Optional[str] = None
+        elif not raw:
+            self.profile = "open"
+            self._invalid_profile = None
+        else:
+            self.profile = raw
+            self._invalid_profile = raw
         self.token = token or None
         self.heartbeat_s = max(5, int(heartbeat_s))
         # open allows a code mount; sealed forces pull-only/local. token leaves it as set.
@@ -92,7 +104,11 @@ class SecurityPolicy:
         return "127.0.0.1" if self.profile == "sealed" else requested
 
     def startup_error(self) -> Optional[str]:
-        """Fail-closed: a profile that demands a secret must have one, or refuse to boot."""
+        """Fail-closed: an invalid profile, or a profile that demands a secret without one, refuses to boot."""
+        if self._invalid_profile is not None:                       # SEC-1 (#503): no silent downgrade
+            return (f"security.profile={self._invalid_profile!r} is not a valid trust profile "
+                    f"(expected one of {list(PROFILES)}); refusing to start. Unset it for the default "
+                    f"'open', or correct the typo.")
         if self.auth_required and not self.token:
             env = "GX10_SERVER_TOKEN"
             return (f"security.profile={self.profile!r} requires a deployment secret but "

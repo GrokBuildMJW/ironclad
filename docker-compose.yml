@@ -118,11 +118,21 @@ services:
       NEO4J_URL: bolt://neo4j:7687
       QDRANT_HOST: qdrant
       HF_HOME: /hf-cache               # cache BGE-M3 weights
+      # #634: optional Valkey backend for the ATOMIC, multi-worker per-mem_ns reflection counter+lock.
+      # Default empty → the file + in-process per-scope mechanism (correct at the single uvicorn worker this
+      # image runs); FAIL-SOFT (a Valkey outage never breaks /add). Wire it to activate the interprocess lock
+      # (the prerequisite for >1 worker): MEM0_WARM_URL=redis://valkey:6379 (add :<pass>@ when requirepass set).
+      MEM0_WARM_URL: ${MEM0_WARM_URL:-}
+      # #634: reflection tuning — REFLECT_EVERY_N_WRITES (per-mem_ns fire threshold) + REFLECT_MERGE_PROPS
+      # ('discard' default byte-identical | 'combine' non-lossy). Passed through so a deploy can enable them.
+      REFLECT_EVERY_N_WRITES: ${REFLECT_EVERY_N_WRITES:-50}
+      REFLECT_MERGE_PROPS: ${REFLECT_MERGE_PROPS:-discard}
     volumes:
       - hf-cache:/hf-cache
     depends_on:
       - qdrant
       - neo4j
+      - valkey
     healthcheck:
       test: ["CMD", "curl", "-fs", "http://localhost:8000/health"]
       interval: 10s

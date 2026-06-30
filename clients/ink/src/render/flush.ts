@@ -6,11 +6,10 @@
  * horizontal absolute G, each elided when already in place), style-transition caching (via
  * the Palette transition cache), and wide-glyph handling (continuation cells skipped — the
  * lead advances two columns). The whole frame is wrapped in BSU/ESU for tearing-free atomic
- * display. Erase uses cursor-up + ESC[J (clear-to-end-of-screen), which is robust to width
- * changes — the property the spike validated and Stock Ink's eraseLines(count) lacks.
+ * display.
  *
- * Coordinates are relative to the live-region top-left (cursor assumed at row 0, col 0, where
- * it sits after eraseRows). mount.ts (R7) owns origin/cursor-restore against the scrollback.
+ * Coordinates are relative to the live-region top-left. mount.ts (R7) owns origin/cursor-restore
+ * against the scrollback.
  */
 import type {Patch} from './diff.js';
 import type {Palette} from './palette.js';
@@ -23,17 +22,6 @@ export const ESU = CSI + '?2026l'; // end synchronized update
 /** Wrap a frame body in BSU/ESU so the terminal displays it atomically (no tearing). */
 export function withSync(body: string): string {
   return body ? BSU + body + ESU : '';
-}
-
-/**
- * Erase a live region of `rows` rows: the cursor sits on the LAST row → move up to the first
- * row, carriage-return to column 0, then ESC[J clears from there to the end of the screen.
- * Clears all live rows AND any leftover ghosts from a wider/taller previous frame.
- */
-export function eraseRows(rows: number): string {
-  let s = '';
-  if (rows > 1) s += `${CSI}${rows - 1}A`;
-  return s + '\r' + CSI + 'J';
 }
 
 export interface RenderResult {
@@ -76,9 +64,4 @@ export function renderPatches(patches: Patch[], palette: Palette): RenderResult 
     style = 0;
   }
   return {body, row: curY, col: curX, style};
-}
-
-/** Full frame: render patches + wrap in BSU/ESU. (Erase + cursor-restore live in mount.ts.) */
-export function flush(patches: Patch[], palette: Palette): string {
-  return withSync(renderPatches(patches, palette).body);
 }

@@ -18,16 +18,16 @@ test('limit branch: suffix "(limit=N)" and the GX10v3 note appears (limit-then-c
   const out = await runTool('list_directory', {path: d, limit: 2});
   const lines = out.split('\n');
   assert.equal(lines.length, 3, '2 entries + 1 note line');
-  assert.match(out, /\.\.\. \[GX10v3: 2 von 5 Einträgen gezeigt \(limit=2\)\]$/);
+  assert.match(out, /\.\.\. \[GX10v3: showing 2 of 5 entries \(limit=2\)\]$/);
   await fs.rm(d, {recursive: true, force: true});
 });
 
-test('hard-cap branch: >200 entries → "(Hard-Cap 200 — nutze sort=\'time\'+limit)"', async () => {
+test('hard-cap branch: >200 entries → "(hard cap 200 — use sort=\'time\'+limit)"', async () => {
   const d = await tmpWith(205);
   const out = await runTool('list_directory', {path: d});
   const lines = out.split('\n');
   assert.equal(lines.length, 201, '200 entries + 1 note line');
-  assert.match(out, /\.\.\. \[GX10v3: 200 von 205 Einträgen gezeigt \(Hard-Cap 200 — nutze sort='time'\+limit\)\]$/);
+  assert.match(out, /\.\.\. \[GX10v3: showing 200 of 205 entries \(hard cap 200 — use sort='time'\+limit\)\]$/);
   await fs.rm(d, {recursive: true, force: true});
 });
 

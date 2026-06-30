@@ -223,6 +223,31 @@ def _worker(srv: Server, codedir: Path, q: "Queue[str]", app: "Application",
                             f"{it.get('type','?'):14} {it.get('title','')}")
                 except Exception as e:  # noqa: BLE001
                     log(gx10.col(f"  ✗ {e}", gx10.C.RED))
+            elif name == "coders":   # CLI-1 (#503): was missing in the TUI → /coders did nothing; mirror client.repl
+                try:
+                    parts = payload.split()
+                    if len(parts) >= 2 and parts[1].lower() == "use":   # /coders use <id>|auto
+                        res = srv.set_coder_pin(parts[2] if len(parts) >= 3 else "auto")
+                        pin = res.get("pinned")
+                        log(gx10.col(f"  → pinned coder: {pin}" if pin
+                                     else "  → coder pin cleared (auto: the staged agent per task)", gx10.C.CYAN))
+                    data = srv.coders()
+                    pinned = data.get("pinned")
+                    log(gx10.col(f"  pinned: {pinned}  (/coders use auto to clear)" if pinned
+                                 else "  routing: auto (orchestrator's staged agent per task)", gx10.C.GRAY))
+                    for a in (data.get("coding_agents") or []):
+                        enabled = a.get("enabled", True); bound = a.get("bound")
+                        dot = "◌" if not enabled else ("●" if bound else "○")
+                        sfx = ("  (onboarded · disabled)" if not enabled
+                               else "" if bound else "  (binary not found)")
+                        log(f"  {dot} {str(a.get('id', '?')):8} {a.get('model', '—')}{sfx}")
+                    prov = data.get("providers") or {}
+                    if prov.get("pool"):
+                        b = prov.get("budget") or {}
+                        log(gx10.col(f"  providers (fan-out): {'active' if prov.get('active') else 'inactive'}"
+                                     f"  ·  spent ${b.get('spent_usd', 0):.4f}", gx10.C.GRAY))
+                except Exception as e:  # noqa: BLE001
+                    log(gx10.col(f"  ✗ {e}", gx10.C.RED))
             elif name == "work":
                 futs = client.dispatch_pending(srv, codedir, pool, claimed, log=log)
                 log(gx10.col(f"  → {len(futs)} handover(s) started (parallel)", gx10.C.CYAN)
@@ -417,7 +442,7 @@ def _build_app(q: "Queue[str]", srv: Server) -> "Application":
         if data:
             _insert_paste(event.current_buffer, data)
         else:
-            gx10._ui_print(gx10.col("  (Zwischenablage leer oder nicht lesbar)", gx10.C.GRAY))
+            gx10._ui_print(gx10.col("  (clipboard empty or not readable)", gx10.C.GRAY))
 
     # eager=True so the page keys win over the focused input buffer's defaults.
     @kb.add(Keys.PageUp, eager=True)
@@ -468,7 +493,7 @@ def run_tui(srv: Server, codedir: Path, max_agents: int) -> None:
     gx10._ui_print(gx10.col(f"  Server : {srv.base}", gx10.C.GRAY))
     gx10._ui_print(gx10.col(f"  Code   : {codedir}", gx10.C.GRAY))
     gx10._ui_print(gx10.col("  Type freely for a turn · /help for commands · exit", gx10.C.GRAY))
-    gx10._ui_print(gx10.col("  Mausrad / PageUp / PageDown = Historie scrollen · Paste wird komprimiert", gx10.C.GRAY))
+    gx10._ui_print(gx10.col("  Mouse wheel / PageUp / PageDown = scroll history · paste is compressed", gx10.C.GRAY))
 
     stop = threading.Event()
     pool = ThreadPoolExecutor(max_workers=max_agents, thread_name_prefix="codeagent")

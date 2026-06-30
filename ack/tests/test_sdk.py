@@ -23,7 +23,9 @@ _EXPECTED = {
     "Prompt", "PromptError", "Variable", "parse_prompt", "discover_prompts",
     "assemble", "run_prompt", "AssemblyError",
     # gate
-    "gate", "gate_tool", "gate_playbook", "gate_prompt", "GateResult",
+    "gate", "gate_tool", "gate_playbook", "gate_prompt", "gate_generated",
+    "has_scaffold_sentinel", "run_sibling_test_hermetic", "library_items_complete",
+    "SCAFFOLD_SENTINEL", "GateResult",
     # i18n
     "Localizer",
     # catalogue

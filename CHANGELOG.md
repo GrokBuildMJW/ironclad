@@ -9,6 +9,868 @@ Released versions are listed below; upcoming work accumulates under *Unreleased*
 
 ## [Unreleased]
 
+## [0.0.21] - 2026-06-30
+
+### Added
+- **Curated-global memory tier + per-`mem_ns` reflection** (`memory-service`, #601 S15 / #634 / ADR-0011
+  AD-4·AD-9): a SEPARATE physical Qdrant `curated_global` collection (its own Mem0 instance — 0.1.118 binds the
+  collection at construction) for operator-promoted, redacted, cross-project knowledge. An operator-gated
+  `POST /promote` (fail-closed: `confirm` + a source `mem_ns` + exactly one of redacted-text / source-query)
+  writes ONLY into `curated_global`, never `agent_memory`; an OPT-IN `/search?include_curated` fans it in with
+  **project-wins** precedence. Being a separate collection it never appears in `/scopes` or the orphan-GC, by
+  construction. Reflection is now **per-`mem_ns`** (was one global counter+lock): the threshold-fire counts +
+  the graph-hygiene Cypher are scoped to the firing partition (`n.agent_id`), with an OPTIONAL Valkey backend
+  (`MEM0_WARM_URL`) for an atomic multi-worker counter (`INCR`) + interprocess lock (`SET NX`) — **fail-soft**
+  to the file + in-process per-scope mechanism (correct at the single uvicorn worker the image runs). The
+  non-lossy `combine` merge is opt-in via `REFLECT_MERGE_PROPS` (default `discard`, byte-identical). Pure logic
+  offline-tested (`curate.py`).
+- **Lesson completion-write re-homed onto the Hook-Bus** (`gx10`, epic #602 2.3 / #804): the task-completion
+  lesson write (#601 S14-4) is now driven by a `post_feedback` Hook-Bus consumer (`gx10._lessons_consumer_hook`,
+  registered on **provider presence** via `_apply_lessons_consumer` — mirroring the inline write it replaces,
+  which fired whenever a provider was wired) through the real `_advance_pipeline` wrapper, **outside the vault
+  lock**. With #803 this puts **both** completion-writes (Process-SC + Lessons) on **one consistent reflection
+  wiring path**. The consumer gates on a fresh completion (so an already-done re-advance does **not**
+  double-report), reads the archived feedback only when a provider is wired, and stays **fail-soft**. Default
+  (no provider) → no consumer registered → **byte-identical** no-op. Covered by `test_lessons_rehome_wiring.py`.
+- **Process-Level Self-Correction re-homed onto the Hook-Bus** (`gx10`, epic #602 2.2 / #803): the Process-SC
+  completion write is now driven by a `post_feedback` Hook-Bus consumer (`gx10._process_consumer_hook`,
+  registered per `process.enabled` via `_apply_process_consumer`) through the real `_advance_pipeline` wrapper —
+  re-homed from the inline call in `_advance_pipeline_impl` onto the bus, **outside the vault lock**, so the
+  reflection consumers share **one consistent wiring path**. The consumer gates on a fresh completion (so an
+  already-done re-advance does **not** double-record), keeps `_record_process_lesson`'s own `process.enabled` +
+  concrete-provider + bound-scope gates, and stays **fail-soft** (a raising provider never breaks the advance).
+  Default OFF → no consumer registered → **byte-identical** no-op. The `pre_turn` hint (`_process_hint`) stays a
+  direct prompt-assembly call (the observer-only bus cannot inject prompt content). Covered by
+  `test_process_rehome_wiring.py`.
+- **Closed-loop Loop-Intelligence — proven end-to-end + 8b wired** (`gx10`, epic #602 2.x / #809, the C2
+  done-gate): a CI-enforced closed-loop e2e (`test_closed_loop_e2e.py`) drives the whole reflection loop on
+  the dev-task pipeline in one run and asserts **every consumer fires** (no link is a no-op — the test the C1
+  half-ship would have failed): a staged handover is scored (Verifier) → the score feeds the Quality breaker
+  and trips it → a run failure is classified (FailureClass) → the Strategy Revisor escalates on a spent budget;
+  with all flags off the whole path is a **byte-identical no-op**. Also **wires 8b**: `LoopProfile.eval_verifiers`
+  (the per-type `eval` key) now **selects which mark-only verifiers the Verifier runs** (`gx10._verifier_hook`;
+  empty → the default rules+grounding; the async LLM-judge stays a separate opt-in). And folds the carried
+  review nits: the Quality consumer **feeds the verdict once** (clears it after recording, no stale re-feed) and
+  **surfaces a trip only on the not-tripped→tripped transition**; the Verifier reads `verify.grounding_threshold`
+  from an **apply-time flag** (`_VERIFY_GROUNDING_THRESHOLD`) instead of `_EFFECTIVE_CFG`. **All `docs/status.md`
+  reflection rows now read `wired + tested` — no `delivered (seam)` / `no live consumer` / `not yet consumed`
+  wording remains.** This completes the functional Loop-Intelligence layer (#602 C2). Covered by
+  `test_closed_loop_e2e.py` (3).
+- **Per-TaskType loop profile on the dev-task pipeline** (`gx10`, epic #602 2.6 / #807): the first live
+  `loop_profiles.by_type` consumer. The code-agent failover escalation budget (#806) is now resolved **per the
+  staged task's type** — `gx10._failover_budget` runs `resolve_loop_profile(by_type[<type>].retry_budget)`
+  layered over `strategy.budget` (the default) and clamped to the hard re-ask ceiling, so a per-type override
+  can only **lower** the budget (a `chat`/`bug` type escalates sooner). Empty `by_type` → the default budget →
+  **byte-identical** to the flat #806 budget; opt-in per `strategy.enabled`; fail-soft (any store/resolver
+  hiccup → the default). The chat loop's `max_iterations` keeps the default profile (it has no per-task type).
+  Also tightens the `strategy.budget` clamp to reject a `bool`. Covered by `test_loopprofile_pertype.py` (3).
+- **Strategy Revisor consumed at the code-agent failover** (`gx10` + `engine/server.py`, epic #602 2.5 / #806):
+  the engine now consults the pure failure→action policy on a code-agent run failure instead of an endless
+  silent failover. `gx10._revise_on_failure(task_id, result)` runs `providers.code_agent_strategy` per task —
+  a per-task attempt counter vs the new `strategy.budget` (default 3) — and **surfaces a `HUMAN_ESCALATION`**
+  (`gx10._last_strategy()` + a `strategy` field in the `/feedback` response + a `[strategy]` line) when the
+  budget is spent; a successful run resets the task's counter (so it acts on the fresh failure, never a stale
+  class). **OPT-IN** per `strategy.enabled` (default OFF → byte-identical); **MARK-ONLY** — it surfaces, it
+  never adds a new hard-abort. The richer re-ask actions (inject-context / switch-retrieval) ride
+  `validated_emit`'s `strategist` in the MPR plugin, not the code-agent failover. Covered by
+  `test_strategy_failover.py` (4).
+- **FailureClass produced at the code-agent failover** (`gx10` + `engine/server.py`, epic #602 2.4 / #805):
+  when a code-agent run is classified as failed/unavailable on the `/feedback` path, the engine now maps it
+  onto the shared `FailureClass` (`providers.result_failure_class`) and **records** it
+  (`gx10._record_failure_class` → `gx10._last_failure_class()`) + **surfaces** it as a `failure_class` field in
+  the response — so the Strategy Revisor consumer (#602 2.5 / #806) can act on *why* a run failed. **OPT-IN per
+  a new `strategy.enabled` config key** (default **OFF** → nothing recorded, no response field → byte-identical;
+  captured at config-application time via `_apply_strategy`, so it works through `_apply_config` not only the
+  config-tree loader). **Fail-soft** — classifying a failure never breaks the feedback path. Covered by
+  `test_failure_class_failover.py` (4).
+- **Quality breaker consumes the Verifier scores** (`ack.quality` + `gx10`, epic #602 2.7 / #808): the
+  output-quality circuit breaker is now **fed on the default path** — a `post_handover` consumer
+  (`gx10._quality_consumer_hook`, registered per `quality.enabled` via `_apply_quality_consumer`; default
+  **OFF** → no hook → byte-identical) records the mark-only Verifier score (`gx10._last_verdict()`) into the
+  breaker on every staged handover and **surfaces** a sustained-degradation trip (`gx10._quality_tripped()` +
+  a `[quality]` advisory line). **MARK-ONLY** — a trip is advisory (escalate/surface), never a hard-abort;
+  **fail-soft**. This closes the **Verifier → score → breaker** segment of the loop. Also **hardens the #802
+  Verifier**: grounding now runs in its own fail-soft block (a memory hiccup drops only grounding, never the
+  already-computed rules verdict) and caps the per-claim cold-store lookups. Covered by
+  `test_quality_consumer_wiring.py` (4) + the verifier grounding-error case in `test_verifier_wiring.py`.
+- **Verifier wired on the dev-task pipeline** (`ack.verify` + `gx10`, epic #602 2.1 / #802): the mark-only
+  behavioral Verifier now **runs on the default path** instead of being a dormant seam. A `pre_handover`
+  Hook-Bus subscriber (`gx10._verifier_hook`, registered per the new `verify.enabled` config key — default
+  **OFF** → no hook registered → byte-identical) evaluates each staged task: deterministic **behavioral rules**
+  over `task_json` (beyond-schema quality) + (when a memory tier is up) **grounding** of the handover's claims
+  against the cold store. It stores a mark-only `VerdictResult` (`gx10._last_verdict()`) for the Quality breaker
+  (#602 SUB-9) to read. **MARK-ONLY** — it never gates a handover; **fail-soft** — a Verifier hiccup never
+  breaks staging. The opt-in **LLM-judge** (`verify_with_judge`) remains a separate explicit activation (it
+  charges the budget ledger) and is not run by this hook. `ack.hooks` gains **`unregister_hook`** (identity-
+  based) so an opt-in consumer can deregister cleanly on disable without clobbering sibling hooks. Covered by
+  `test_verifier_wiring.py` (6) + the `unregister_hook` cases in `test_hooks.py` (4).
+- **Loop-Intelligence Hook-Bus** (`ack.hooks`, epic #602 SUB-2 / Teil-2 plan 2.0 — the keystone): a
+  standalone, dependency-inverted, fail-soft event bus over the agent-loop boundary points, so the reflection
+  consumers (Verifier / Quality / Process-SC / Lessons) subscribe instead of hard-wiring call-sites into
+  `gx10`. The engine **publishes** seven canonical events — `pre_turn`, `post_generate`, `post_toolresult`
+  (from `run()`) and `pre_handover`, `post_handover`, `pre_advance`, `post_feedback` (from the
+  `_stage_handover`/`_advance_pipeline` wrappers, outside the cross-process vault lock). `register_hook` is
+  additive + idempotent and fail-loud on an unknown event / non-callable; `dispatch` is **observer-only** (a
+  hook may ABORT but can never relax/permit a gate), **fail-soft** (a per-hook exception is swallowed),
+  cancel/budget-aware, and copy-on-write + snapshot-on-dispatch for the multi-threaded engine. **Default-off
+  byte-identical**: with no hook registered `dispatch` is an O(1) no-op, so the agent loop is unchanged.
+  `HOOK_EVENTS` + `register_hook`/`dispatch`/`clear_hooks`/`registered_events`/`hook_count` join the public ACK
+  surface. Covered by `test_hooks.py` (15) + `test_hook_wiring.py` (5, engine publish-point integration).
+- **`/health` surfaces the project-registry binding** (epic #710, sweep): `/health` now carries a `registry`
+  block — `status` (`ok`, or `unisolated` when the engine fell back to the un-isolated mode at boot — a
+  fallback previously only logged once), the active project `id`, and the installation-global `home`
+  (`GX10_HOME`). `gx10.registry_health()` computes it fail-soft (never raises), and the desktop
+  `ironclad-doctor.{sh,ps1}` print it — so the otherwise-invisible project-isolation binding is observable
+  after boot. Additive; no behavior change.
+- **Process-Level Self-Correction** (`ack.process`, epic #602 S602-6): correct the *workflow*, not the
+  response. A **pure** policy — `distill_process_lesson(ProcessSignal) → ProcessLesson` (a successful task →
+  a reusable working-path note; a missing clarification → a gather-up-front note; nothing actionable → None)
+  and `format_process_hint(texts)` (a compact pre-turn block) — both deterministic and never-raising. The
+  engine wires it OPT-IN: at task completion (`post_feedback`) it distills a TYPED process-lesson and stores
+  it via the **concrete** `EngineLessonStore` (`record`/`by_category` — not the string-only `ack.lessons`
+  seam, which can't round-trip typed fields), and before the next turn (`pre_turn`) it folds known
+  working-approaches into the prompt prefix alongside RAG/steer. Gated on a new `process.enabled` config key
+  (default OFF → nothing recorded, no hint → **byte-identical**) and a registered concrete provider; fail-soft
+  throughout, never mutates the fail-closed path. `ProcessSignal` / `ProcessLesson` / `ProcessLessonKind` /
+  `distill_process_lesson` / `format_process_hint` join the public ACK surface. Covered by `test_process.py`.
+- **Quality Circuit Breaker** (`ack.quality`, epic #602 S602-9): a **separate**, agent-agnostic per-task
+  output-quality breaker (`QualityBreaker`) — distinct from the per-peer availability breaker
+  (`_CODE_AGENT_BREAKER`); folding quality into that would corrupt code-agent failover. It tracks the trend of
+  the mark-only verifier scores (`ack.verify`) and trips on **sustained degradation** (`min_consecutive`
+  scores in a row below `threshold`; an at/above-threshold score resets the streak). **MARK-ONLY**: a trip is
+  advisory — the consumer escalates / surfaces to the operator (pause-autoplan is opt-in), **never a
+  hard-abort**, and the fail-closed core is untouched. **Fail-open-safe**: every method never raises and any
+  hiccup leaves it untripped. Wired OPT-IN behind a new `quality.enabled` config key (default OFF → no breaker
+  built → no-op byte-identical); `_apply_config` builds/clears the engine's `_QUALITY_BREAKER` (separate from
+  the availability breaker), `_quality_breaker()` exposes it. `QualityBreaker` / `QualitySnapshot` join the
+  public ACK surface. Covered by `test_quality.py`.
+- **Verifier / Evaluation Layer** (`ack.verify`, epic #602 S602-4): a **mark-only** behavioral-evaluation
+  seam — `VerdictResult` (passed / score / reason) from three opt-in, transport-injected, secret-free
+  verifiers: `verify_rules` (deterministic business-logic predicates), `verify_grounding` (each claim grounded
+  by an injected `retrieve`, e.g. a cold-store hit), and the async `verify_with_judge` (LLM-as-judge over the
+  injected `chat`, **budget-gated** — it charges an injected ledger duck-typed on the engine's
+  `dispatch.BudgetLedger` and SKIPS the call when unaffordable). **MARK-ONLY**: a verdict can neither relax nor
+  tighten any gate — the fail-closed core is untouched; verdicts are read only by the opt-in reflection layer
+  (the Quality breaker #602 SUB-9). Every verifier **never raises** (an error abstains/fails advisorily) and is
+  **default-off byte-identical** (nothing runs unless invoked). Plus **8b — per-profile eval activation**: a
+  `LoopProfile.eval_verifiers` resolved from an `eval` key in the loop profile (which verifiers a consumer runs
+  per `TaskType`; empty by default → byte-identical). `VerdictResult` + the verifiers join the public ACK
+  surface. Covered by `test_verify.py` (+ `test_loop_profile.py`).
+- **Loop Profiles** (`ack.loop_profile`, epic #602 S602-8a): per-`TaskType` loop budgets — a **pure**
+  `resolve_loop_profile(...)` that deep-merges code defaults ← `loop_profiles['default']` ←
+  `loop_profiles['by_type'][<type>]` into a `LoopProfile` (max_iterations / retry_budget / effort); only
+  present keys override, `retry_budget` is clamped to the hard re-ask ceiling, and it **never raises**. The
+  schema + defaults live in the engine config tree (a new `loop_profiles` block, **empty by default** → the
+  resolver falls back to the engine globals `MAX_ITERATIONS` + the re-ask budget → **byte-identical** and
+  single-sourced); the engine accessor `_loop_profile(task_type)` drives the chat loop's iteration bound (the
+  default profile, == `MAX_ITERATIONS` unless configured). An operator (or the private monorepo's override
+  layer) can raise/lower limits per task type without touching `core/`; the public clean-room default is
+  unchanged. `LoopProfile` / `resolve_loop_profile` join the public ACK surface. (8b — per-profile eval-gate
+  activation — follows the Verifier.) Covered by `test_loop_profile.py`.
+- **Strategy Revisor** (`ack.strategy`, epic #602 S602-7): a **pure** failure→action policy
+  `revise(failure_class, attempt, budget) → Strategy` (the SSOT) that turns a `FailureClass` into a *targeted*
+  next move (`StrategyAction`: inject-context / narrow-or-clarify / switch-retrieval / ground-then-answer /
+  complete-output / resolve-policy / repair-schema / fail-over / human-escalation) instead of retrying the
+  same way — escalating to a human when the budget is spent. Two opt-in application seams consume it:
+  `ack.validated_emit.emit_validated` gains an optional `strategist` parameter that appends the strategy hint
+  to the re-ask turn (**byte-identical when not passed** — default `None`; a strategist error is swallowed),
+  and the engine-side `providers.code_agent_strategy(result, …)` maps a code-agent run result through the same
+  SSOT for the failover path. `Strategy` / `StrategyAction` / `revise` join the public ACK surface. Pure +
+  deterministic (snapshot-tested), `revise` never raises. Covered by `test_strategy.py`.
+- **Project-private lesson distiller** (`engine.lesson_store.EngineLessonStore`, epic #602 S602-5): the one
+  concrete `ack.lessons` **provider** the engine registers — supplying the lesson *semantics* the #601 seam
+  delegates to: typed distiller categories (last-failure-reason / best-known-path / known-bad-strategy /
+  user-preference — provider-internal; the public seam stays string-only), query (term-overlap) + recency
+  ranking, per-scope compaction, a **scope-keyed persistent backend** (one JSON file per opaque `mem_scope`
+  under `ironclad_home()/lessons`, hashed to a filesystem-safe name — never the global WARM session, and it
+  imports nothing from `engine.memory`/`engine.warm`), and the optional `forget(scope)` purge so the engine's
+  scope-aware forget actually drops a project's lessons. **OPT-IN: a new `lessons.enabled` config key, default
+  OFF** → no provider is wired and the seam stays a **byte-identical no-op**; `_apply_config` registers the
+  store when on (and clears only our own store when off, never clobbering a foreign provider). C1 = project-
+  private lessons only (the global `user_preferences` tier is deferred — it needs the curated-global store +
+  a `promote()` redactor). Fail-soft throughout (a corrupt/missing scope file reads as empty). Covered by
+  `test_lesson_store.py`.
+- **Shared failure-classification taxonomy** (`ack.failure_class`, epic #602 S602-3): a single,
+  string-valued `FailureClass` enum (MISSING_CONTEXT / BAD_TOOL_ARGS / RETRIEVAL_FAILURE /
+  HALLUCINATED_ASSUMPTION / INCOMPLETE_OUTPUT / POLICY_CONFLICT / SCHEMA_INVALID / UNAVAILABLE) so every
+  reflection consumer names *why* a step failed in one place — generalizing the 3-class code-agent run
+  taxonomy. `classify_emission_failure(message, detail)` is a **pure, deterministic, rule-based** mapper over
+  the exact error the validated-emit re-ask loop already records (no model, never raises); the engine
+  `providers.result_failure_class` re-maps the run results onto the same enum (one SSOT). The loop now attaches
+  an **additive, advisory** `ValidatedEmitResult.failure_class` on a terminal failure — `None` on success and
+  on any result built without it, i.e. **byte-identical** to the pre-#602 shape; it never affects control flow.
+  `FailureClass` + `classify_emission_failure` join the public ACK surface (advisory labels, **not** the
+  contract-SSOT). Covered by `test_failure_class.py`.
+- **Base-untouched reconciler check** (epic #601, S17 / AD-8): a full project lifecycle (mint → switch →
+  stage a unit → delete) run under a throwaway working dir leaves the engine's own **delivered source
+  surface** (`core/skills` + `engine/prompts`) **byte-identical** — a content-hash snapshot before/after
+  (bytecode caches excluded) catches any regression where a path resolves into the engine tree instead of the
+  project root. (The live counterpart — the installed engine + the private `conf/` byte-checked after a real
+  dev cycle — is the operator-gated deploy step.) Negative-test coverage of the new private modules is
+  satisfied by construction: each shipped with fail-closed / error-path tests under its per-PR adversarial
+  review. Covered by `test_base_untouched.py`.
+- **Self-dogfood isolation acceptance (offline)** (epic #601, S17 / AD-8): a deterministic acceptance test
+  that drives the real engine surface — `/project new` → `/switch` → stage a unit of work → switch back — for
+  two projects through the actual quiesced-switch machinery (no live infra, no model/agent, no gh/PyPI
+  deliver), and asserts the whole-epic invariant: each project's vault, state machinery, and memory partition
+  are isolated under its own root; work artifacts live only under the active project; the implicit
+  base/`default` project is never touched; and switching never bleeds the conversation. The live self-dogfood
+  run (a real separate checkout, a real run→deliver) is the operator-gated deploy step. Covered by
+  `test_self_dogfood_acceptance.py`.
+- **Export carries no project state** (epic #601, S17 / AD-8): the publish export is asserted free of any
+  runtime project-isolation artifact — the per-project engine machinery (`.ironclad/`), per-track vault
+  subtrees (`.tracks/`), and the installation-global project registry (`registry.json`) are all created under
+  a project root at runtime and never belong in the source export. They are excluded from the copy and, as a
+  fail-closed backstop, `scan_project_artifacts` fails the export if any are found in the staged tree. (Part
+  of the epic's acceptance gate; the live self-dogfood cycle + base-untouched reconciler land with the
+  operator-gated deploy.) Covered by `test_export_no_project_artifacts.py`.
+- **Project lifecycle — `/project delete` + `/project archive`/`unarchive`** (epic #601, S16): registry-
+  mediated removal + a reversible archived flag. `delete <id> [--purge]` **forgets every memory scope** the
+  project owns (cold + warm + lessons, the main track and each parallel track) **before** removing the
+  registry entry; the on-disk directories are **left untouched unless `--purge`** is given — and `--purge` is
+  guarded against deleting the cwd / boot workdir / home / any ancestor of them. Deleting the **active**
+  project first switches to `default` (a clean unbind via the quiesced switch), so the engine is never left
+  bound to a deleted project; the `default` project is never deletable. `archive <id>` / `unarchive <id>`
+  toggle a reversible `archived` flag (data + memory kept): archived projects are hidden from `/project list`
+  (shown with `--all`), refused as a `/switch` target, and the active/default project cannot be archived.
+  Covered by `test_project_delete_archive.py`.
+- **Guided project setup — `/project new <name> [--type mpr|software] [--path <dir>]`** (epic #601, S16):
+  `/project` becomes the home of the guided setup command. `new` now **mints a fresh isolated project** in one
+  step — registers it (root = `--path` or `<cwd>/<slug>`, a minted `mem_ns`, made active), binds the engine to
+  it, and (with a `--type`) **seeds the first vault unit** via the existing initiative machinery, then reloads
+  the per-project library. Fail-closed on a duplicate root or an unknown `--type` (nothing partial). The old
+  bare `project new <id> <path>` register-only form is replaced by this richer mint (a project name, not an
+  id+path pair). `/initiative` is now a **deprecated alias** (kept functional for one release, with a
+  deprecation notice) — new work flows through `/project`. Covered by `test_project_mint.py`.
+- **Project track verbs — `/project track new|use|list`** (epic #601, S16 / AD-2'): manage a project's
+  parallel **tracks** from the CLI. The registry gains `add_track` (idempotent, fail-closed on an unsafe id
+  or unknown project) and `set_active_track` (fail-closed when the track isn't registered). `track new <t>`
+  **creates and switches** (like `git checkout -b`), `track use <t>` switches to an existing track, and
+  `track list` shows them with the active one marked. Switching rebinds the engine context and reloads the
+  per-track library, so a non-`main` track's vault subtree (`.tracks/<t>/`) and memory sub-scope
+  (`<mem_ns>::track::<t>`) take effect immediately; `main` stays byte-identical. (First slice of the unified
+  guided setup command — the `/project new` mint pipeline + wizard and `delete`/`archive` follow.) Covered by
+  `test_track_verbs.py`.
+- **Memory-service scope isolation + registry-keyed orphan GC** (epic #601, S15 / AD-4): the safe slice of
+  the memory-service capabilities. The memory service gains a pure `scope_guard.require_scope` (stdlib-only,
+  unit-tested offline) that **requires `agent_id` (the `mem_ns` partition)** on `/add`, `/add_bulk`, and
+  `/search` (an unscoped write/search is refused) and **rejects `run_id` as an isolation key** (the partition
+  is `agent_id` only). A new `GET /scopes` lists the distinct partitions present in the store. On the engine
+  side, `MemoryManager.list_scopes()` reads that listing (fail-soft), `gx10._orphan_scopes` flags only
+  **minted** `mem_ns` partitions with no registered project (so the base partition and curated/human-named
+  scopes are never touched, and a track sub-scope is judged by its project key), and
+  `gx10._reconcile_orphan_memory` forgets the orphans via the scope-aware forget — **dry-run by default**
+  (destructive opt-in), fail-soft per orphan. The deeper memory-service items (a separate physical curated
+  Qdrant collection + per-`mem_ns` non-lossy reflection) are deferred to the deploy/acceptance step, where
+  the live stack can verify them. Covered by `test_scope_guard.py` + `test_orphan_gc.py`.
+- **Scope-aware forget + scope tagging** (epic #601, S14-5 / AD-10 / D5): the substrate now has a delete
+  path that targets a single project/track partition. Cold writes (`store_task_completion` / `add_bulk` /
+  `chunk_and_store`) **self-describe their origin `scope`** in the stored metadata (for promotion eligibility
+  + cross-partition audit), added **only when a project scope is bound** so the base partition stays
+  byte-identical. `MemoryManager.forget(scope)` forgets a whole partition via a new Mem0 `/delete_all` route
+  (added to the memory service; deletes by `agent_id`, from both the graph+vector and vector-only stores) —
+  synchronous, **fail-soft** (a down service / missing route returns `False`), **fail-closed on an empty
+  scope**. The warm tier's `WarmTier.forget_scope(scope)` deletes the **exact**-scope `session:` + `ret:`
+  (retrieval-cache) keys and deliberately does **not** cascade into deeper track scopes (`…::track::x`),
+  fail-closed on an empty / glob-bearing scope. `ack.lessons.forget(scope)` is an **optional** provider verb
+  (delegated when the provider implements it, else a no-op — kept off the required `LessonProvider` protocol).
+  `gx10._forget_scope(scope)` is the engine endpoint that fans out across all three layers (cold + warm +
+  lessons), fail-closed on an empty scope and fail-soft per layer. The Mem0 `/delete_all` route is itself
+  fail-closed (an all-empty filter is refused with HTTP 400, never a full wipe). Covered by
+  `test_scope_forget.py`.
+- **LessonStore seam wired into the engine** (epic #601, S14-4 / AD-10): the `ack.lessons` API is now
+  consulted at two sites in the agentic loop, each lazy-imported and scoped to the active project/track
+  `mem_scope`. **Read site** — when a task+handover is staged, an advisory lesson `brief([mem_scope])` is
+  appended to the handover (a `## Lessons` section) right alongside the existing Memory brief, so a code
+  agent inherits prior scoped lessons as context. **Write site** — when a task completes, its feedback is
+  reported as a scoped lesson (`report_lesson(mem_scope, feedback, {"task_id", "source": "task_completion"})`),
+  gated on a registered provider so that with no backend wired there is **zero** extra work (no file read, no
+  call). Both are **fail-soft** (a provider error never breaks a turn) and, with **no provider registered
+  (the default), byte-identical to the pre-seam engine** (the brief returns `""` → the handover is unchanged;
+  the write is a no-op). The provider itself is epic #602's; this only opens the call sites. Covered by
+  `test_lesson_seam_wiring.py`.
+- **LessonStore / LessonProvider API — `ack.lessons`** (epic #601, S14-3 / AD-10): the curated, versioned
+  public delegation seam for scope-partitioned actionable lessons — the stable surface that **unblocks
+  epic #602** (its Distiller registers a provider and goes through this API only, never touching `mem_ns`
+  internals). A `runtime_checkable LessonProvider` protocol (`get_lessons` / `report_lesson` / `brief`) +
+  `set_provider`/`get_provider`. With **no provider wired the API is a fail-soft no-op** (reads `[]`, writes
+  do nothing, a provider error never breaks a turn — lessons are advisory). A scope-priority `brief()` merge
+  (delegated, or composed from `get_lessons` over the scopes with dedup + limit). And a **fail-closed,
+  redaction-gated `promote()`** (AD-9): a project-private lesson — which may carry paths/secrets — is
+  promoted to a broader scope (e.g. curated-global) **only** through a redactor that approves the redacted
+  text; a missing/refusing redactor raises. Ships in the wheel (importable from a separate plugin repo);
+  the scope is an opaque partition string (the engine passes its `mem_scope`). Covered by `test_lessons.py`.
+- **Cross-switch memory re-keying — verified + locked** (epic #601, S14-2): the scope-partitioned memory
+  factory the rework called for is satisfied by **per-call** partition derivation over the
+  installation-global, overlay-locked connection — a single build-once `MemoryManager`/warm handle resolves
+  the **active** project+track partition on every call (`/switch` re-keys via the context; no rebuild, so
+  no needless reconnect to the shared store). A registered project always carries a registry-minted
+  `mem_ns`, so it can never silently fall back to the base partition; only the `default` project uses the
+  legacy base. This invariant is now **locked by tests** (`test_mem_factory_scoping.py`: one handle follows
+  A→B→A switches + the track dimension + registered-project-never-base). No production change — a regression
+  lock + the recorded design decision.
+- **Per-track memory sub-scope** (epic #601, S14-1 / AD-4): a project's memory partition gains the track
+  dimension. `ProjectContext.mem_scope()` composes `<mem_ns>::track::<tid>` for a non-`main` active track
+  (and falls an unsafe track back to `main`, matching the vault subtree); the bare `mem_ns` — and the empty
+  base partition — are returned unchanged, so a single-project / `main`-track install is byte-identical.
+  This flows through **both** the cold store (`MemoryManager._ids()` `agent_id`) and the warm tier (the
+  session key + the retrieval-cache namespace), so two tracks of one project never see each other's cold
+  memories, rolling summary, or retrieval cache. Covered by `test_track_mem_ns.py`.
+- **Evidence projector + lifecycle-completeness gate** (epic #601, S13a / AD-7): a public substrate for
+  binding dev-process evidence to the vault. `project_evidence(stage, title, body, *, tree_sha,
+  content_hash=None, slug=None)` appends a `type: evidence`, stage-tagged doc bound to a `tree_sha` + a
+  `content_hash` (sha256 of the body by default) under `<slug>/evidence/`, with a **deterministic**
+  filename (`<stage>-<tree_sha[:12]>-<hash[:12]>.md`) — **idempotent** (no timestamp; re-projecting the
+  same evidence is a no-op) and **append-only** (it only ever writes new evidence files, never rewrites
+  curated bodies), under the vault lock + an index-only reconcile. `lifecycle_completeness(slug, *,
+  required_stages, tree_sha)` → `(ready, reasons)` is the fully fail-closed gate the engine DELIVER leg
+  runs (not monorepo CI): every required stage must have an evidence doc **and** all must be bound to the
+  delivery `tree_sha` (evidence tree_sha == delivery tree_sha). The PRIVATE DELIVER-leg wiring is S13b.
+  Covered by `test_evidence_projection.py`.
+- **Lifecycle DELIVER-leg gate wired (S13b)** (engine, epic #601 S13b / #632): the S13a primitives are now
+  driven by a functioning gate. A new **pure** `engine.lifecycle_projector` maps dev-process **ledger
+  transitions** to lifecycle stages — a passed composed-gate run → `tests`, a passed REVIEW leg → `reviews`,
+  a `DELIVER` `delivered*` record → `delivery` — and composes `project_evidence` (bound to the delivery
+  `tree_sha`, deterministic + idempotent), then runs `lifecycle_completeness`. A `/lifecycle gate --slug
+  --tree [--ledger] [--stages]` engine command reads `<repo>/.devloop/ledger.jsonl` as plain data
+  (re-verifying the hash chain engine-side — no `scripts/devprocess` import, boundary-clean), projects +
+  gates, and reports `READY`/`BLOCKED` **fail-closed** (missing slug/tree_sha, tampered/unreadable ledger, or
+  a missing required stage all BLOCK — never a silent pass). The projector is boundary-clean (primitives
+  injected; ledger read as data) and engine-resident (not in the wheel). The shipped default `--stages` is
+  `delivery` (the only stage the dev-loop producer currently appends to the ledger); `tests`/`reviews` are
+  opt-in via `--stages` and become enforceable once the driver's `log` seam feeds the per-unit transitions
+  to the ledger (follow-up #830). Covered by `test_lifecycle_projector.py`.
+- **i18n of the vault/initiative chrome** (epic #601, S12e-2): the German prose that was hardcoded into
+  the self-maintaining vault — the INDEX/LIFECYCLE doc bodies, the reconcile result + "no initiative"
+  message, the initiative validation errors, the initiative `meta.md` body, and the mpr task-pipeline
+  refusal — now routes through `engine/messages.py` (the engine chrome catalog). **English is the
+  source/default** (so the public export carries no hardcoded German), with a **German overlay** selected
+  by `gx10.LANGUAGE` (`generation.language` / `GX10_LANGUAGE`). The machine `ironclad:index:auto` /
+  `ironclad:related:auto` / `ironclad:lifecycle:auto` HTML markers are **frozen** and never localized.
+  Covered by `test_vault_i18n.py` (+ the reconcile/initiative tests ported to the English default).
+- **Project-scoped + cross-track reconcile** (epic #601, S12e): `reconcile_active_project()` reconciles
+  **every** initiative in the current track (not just the single active one), and `reconcile_all_tracks()`
+  is the scheduled **cross-track reconciler** — it sweeps every track of the active project (`main` +
+  each `.tracks/<track>/`), **fail-closed per track** (a track that raises is recorded, the others
+  continue) and idempotent (delegates to the vault-locked `reconcile_vault`). Wired as
+  `/initiative reconcile all`. Covered by `test_cross_track_reconcile.py`.
+- **Composable lifecycle stages** (epic #601, S12d): an ordered stage model
+  `idea → design → adr → spec → tests → proposals → reviews → delivery` (`LIFECYCLE_STAGES`). A doc
+  declares its `stage` in frontmatter, and an initiative's lifecycle is **composed** from its docs'
+  stages via `lifecycle_state(docs)` → `present` / `current` / `gaps` / `complete` / `counts` /
+  `unknown` (deterministic, no timestamp). The composed state + each node's `stage` are surfaced in
+  `GRAPH.json` and summarised in `LIFECYCLE.md`. `can_advance_stage(frm, to, *, allow_regress=False)` is
+  the **fail-closed transition guard** (forward-only by default; an empty `frm` admits any valid stage;
+  unknown stages refused) — the reusable primitive the `/lifecycle` command (S16) and the DELIVER-leg
+  completeness gate (AD-7 / S17) build on. Covered by `test_vault_lifecycle.py`.
+- **Typed-edge vault graph — `GRAPH.json` + `LIFECYCLE.md`** (epic #601, S12c): a doc can declare
+  **typed frontmatter edges** (`depends_on` / `refines` / `supersedes` / `relates_to` / `implements` /
+  `blocks`, each a flat list of doc targets). `reconcile_vault` now also generates, next to `INDEX.md`, a
+  deterministic **machine-SSOT `GRAPH.json`** (nodes keyed by full relpath; tags/edges sorted; **no
+  timestamp**, so a re-run with unchanged docs is byte-identical) and a human-readable **`LIFECYCLE.md`**
+  view. An edge target is resolved (by relpath / stem / bare filename stem) to the target's relpath; an
+  unresolvable target is kept verbatim and flagged **`dangling`** (honest, not dropped). The generated
+  files are excluded from the doc scan, and the existing `ironclad:index:auto` / `ironclad:related:auto`
+  HTML markers stay **frozen** (`LIFECYCLE.md` adds its own `ironclad:lifecycle:auto` managed block). LLM-
+  free, idempotent, generated in both reconcile modes. Covered by `test_vault_graph.py`.
+- **Per-project + per-track vault-mutation lock** (epic #601, S12b): vault mutation is now serialized
+  (Codex S3). `project_registry.Registry.vault_lock(pid, track)` is a per-project + per-track `FileLock`,
+  **distinct** from the dev-loop `project_lock` (so a quick reconcile is never mistaken for an in-flight dev
+  unit; ADR-0011 AD-2': each track has its own lock). The engine wraps the vault writers (`initiative_new`,
+  `reconcile_vault`, and the dev-pipeline macros `_stage_handover`/`_advance_pipeline`) in `_vault_lock()`
+  — **reentrant** within a call stack (a nested writer such as `initiative_new → reconcile_vault`, or a
+  macro's inner reconcile, does not re-acquire, so there is no self-deadlock), OS-serialized across
+  processes/threads, and **fail-soft** (a locking-infra hiccup never blocks a write). Two different tracks
+  do not contend. Covered by `test_vault_lock.py`.
+- **Per-track vault subtree** (epic #601, S12a): a project's vault gains a first-class **track** dimension
+  (ADR-0011 AD-2'). The active track flows from the `ProjectContext` (`_active_track`); the default `main`
+  track resolves byte-identically to the pre-track layout, while a non-`main` track is isolated under a
+  hidden `.tracks/<track>/` subtree of the project vault (`vault_root` is now track-aware). Track isolation
+  needs no exclusion logic — every vault op is slug-scoped or a one-level `*/meta.md` scan and `.tracks`
+  carries no `meta.md` — so two tracks keep fully separate initiative trees. Unsafe track ids (traversal /
+  separators) fall back to `main` (defence in depth). A single-track install is unchanged. Covered by
+  `test_per_track_vault.py`.
+- **Strict-locale completeness for generated prompts** (epic #601, S11b-1b): `ack.gate.gate_prompt` gains a
+  `strict_locales` flag. By default a *missing* `locales/<lang>.json` overlay for a declared non-source
+  language is fine (English fallback — the lenient registration gate, unchanged). With
+  `strict_locales=True` a declared non-source language whose overlay is **absent** is a **failure**: a
+  prompt that claims to speak a language must actually ship that translation ("declared == delivered"). The
+  per-project library invariant `library_items_complete` now applies this to every generated `kind: prompt`
+  item (in addition to gating every generated tool), so the self-dogfood / operator completeness check
+  covers prompts too. A present overlay is validated under both modes (a malformed translation is always a
+  defect). Covered by `test_gate.py` + `test_library_completeness.py`.
+- **Prompt-item generation — `generate --kind prompt`** (epic #601, S10c): the paved-road generator
+  (`ack.generator`) gains a `--kind {case,prompt}` selector and a `template_root_for(args)` resolver. The
+  default, `--kind case`, renders the existing `new-case` tool scaffold **byte-identically** (no `--kind`
+  and no `--template` behave exactly as before). `--kind prompt` renders a new `new-prompt` template tree
+  into a `kind: prompt` library item — a `SKILL.md` (frontmatter + template body) plus a
+  `locales/<lang>.json` overlay — that is **valid on first render** (`ack.gate.gate_prompt`: schema, every
+  required variable used in the template, assembles in every declared language) and ready to customise. A
+  prompt has no executable `run()` to fill in, so the paved road renders a working fill-me-in template
+  rather than a sentinel-marked stub. The engine `/generate --kind prompt` writes into the **active
+  project's library** (ctx-resolved `vault/library`), and the prompt path **widens the collision guard** to
+  also cover built-in `kind: prompt` capabilities, so a generated prompt can never shadow a seed prompt.
+  Covered by `test_generator.py` + `test_generate_command.py`.
+- **Generation-completeness gate — `gate_generated`** (epic #601, S11): a registration gate stricter than
+  `gate_tool` — a generated item must pass the doctor preflight (CASE + schema + a sibling test) **and** be
+  FILLED: it may no longer carry the `ACK-SCAFFOLD-SENTINEL` marker the paved-road generator emits into a
+  fresh stub — so a generated item validated with `gate_generated` is **rejected** until it is implemented.
+  It can also **execute the behavioural sibling test hermetically** (`run_sibling_test_hermetic` /
+  `gate_generated(execute=True)`): a fresh subprocess runs the test in an isolated tmp cwd with a
+  **scrubbed** env (no credential/secret/net/memory vars — so it can't reach GitHub / PyPI / the memory
+  service) under a **hard timeout**; opt-in, because it runs generated code (the default stays a pure
+  no-execution check). Exposed on the curated SDK surface (`ack.sdk.gate_generated` /
+  `has_scaffold_sentinel` / `run_sibling_test_hermetic` / `SCAFFOLD_SENTINEL`). The loader **enforces** the
+  cheap gate at load — an unfilled scaffold in the active project's library is **dropped** (never offered as
+  a tool). A reusable library-wide invariant `library_items_complete(library_root, *, execute=False)` gates
+  every generated tool in a per-project library (for the self-dogfood acceptance / an operator); it is not
+  auto-run by the dev-process reconciler, which reconciles the repo's GitHub state, not runtime per-project
+  libraries.
+- **Project-scoped skill/prompt loader** (epic #601, S11): the loader discovers the **active project's
+  library** (`vault/library`, ctx-resolved) as the **last, additive** root — after the core built-ins, the
+  global plugins dir, and packaged entry points — so a generated per-project capability is offered
+  alongside the built-ins. Last + first-kept discovery means it can never displace a built-in; a project
+  with no library is **byte-identical** to a single-project install. Closes the generate→discover loop with
+  `/generate` (S10). A `/switch` **reloads** the registries (build-then-swap: discovery runs into fresh
+  dicts, then the live registries are swapped in — a failed/slow build never empties them) so the new
+  project's library is discovered and the previous project's is dropped. An **unfilled scaffold** in the
+  library (a tool still carrying the `ACK-SCAFFOLD-SENTINEL` marker) is **dropped at load** — never offered
+  as a real tool (S11b-3a: the cheap generation gate enforced on the hot path; the full hermetic test is the
+  `library_items_complete` invariant — operator / S17 acceptance, not auto-scheduled). Covered by
+  `test_project_scoped_loader.py`.
+- **Per-project paved-road generation — `/generate`** (epic #601, S10): the paved-road generator
+  (`ack.generator`) gains a `reserved_capabilities` built-in collision guard (and a
+  `--reserved-capabilities` CLI flag) — a generated item whose capability would shadow a core built-in is
+  **refused** fail-closed before anything is written. The engine `/generate` command renders the template
+  tree into the **active project's library** (the ctx-resolved `vault/library`, never `core/skills`), with
+  the `core/skills` built-in set injected as the guard — so a `/switch`ed project generates only into its
+  own library. Default (no reserved set / no active project) is byte-identical. Covered by
+  `test_generator.py` + `test_generate_command.py`.
+- **`ack.devprocess.api` — curated public dev-process facade** (epic #601, ADR-0004): a single, versioned
+  (`__version__`) public seam exposing the five stable verbs a generated per-project tool delegates to —
+  `select_unit`, `stage_handover`, `record_feedback`, `advance`, `deliver`. The dev-process implementation
+  substrate stays engine-internal (NOT in the wheel); the facade reaches it through a registered driver
+  (`set_driver`/`get_driver`, a `runtime_checkable` `DevProcessDriver` protocol — dependency inversion), so
+  it imports from the wheel **alone** and **degrades cleanly**: with no driver registered every verb raises
+  a clear `SubstrateUnavailable` instead of an `ImportError`. Shipped in the wheel
+  (`packages += "ack.devprocess"`) and covered by the clean-room import-smoke. **In-engine the facade is
+  live**: the engine registers a driver at import that wires the two engine-owned verbs (`stage_handover`,
+  `advance` → the real impls) and routes the `stage_handover`/`advance_pipeline` tool calls through it;
+  `select_unit` / `deliver` (the private dev-loop substrate) and `record_feedback` (the server reconciler
+  inbox) report `SubstrateUnavailable` until wired by their owner.
+- **Project isolation — `/project` + `/switch`** (epic #601): every engine session now runs in a
+  *project* with its own state/vault paths and memory partition. An installation-global **registry**
+  (under `GX10_HOME`, atomic write + OS file lock, self-healing) is the SSOT of registered projects and
+  the persisted continuity pointer; the engine's active project is **single-active per process** (cached,
+  not re-read per request, so a second engine sharing the home can never re-point a running one).
+  `/project list|new <id> <path>|active` manages projects and `/switch <project_id>` quiesces and rebinds
+  the engine — it saves the leaving conversation under its own root, binds the target's `state_root`/
+  `vault_root` + its own `mem_ns` memory partition, and **swaps** the conversation (no cross-project
+  bleed). The implicit **`default`** project binds the boot workdir + the legacy/base memory partition, so
+  an existing single-project install is **byte-identical**. A switch is **refused** while a dev unit is
+  in-flight for either project; locked config keys can never be re-pointed by a project overlay. The
+  model's **file tools, `execute_command`, and a launched code-agent now run with the active project's
+  root as their working directory** — a `/switch` does **not** `chdir` the process (a global `chdir` under
+  the daemons / fan-out threads is unsafe), so the exec cwd is threaded through the active context;
+  absolute tool paths are honoured verbatim and the `default` project resolves to the boot workdir
+  (byte-identical). The partition reaches the spawned **code agents**: the launched read-only Memory MCP
+  carries the active project's `mem_ns` in its env (via `_active_mem_ns`), and the single-writer worker /
+  MPR reducer mirror write resolves to the same `mem_ns` through the `MemoryManager._ids()` chokepoint —
+  so a code agent reads/writes only its project's memory. New `docs/project-isolation.md`.
+- **`dev-process` prompt** (epic #532, DEV 1): a curated, multilingual (EN/DE) starter prompt that
+  lays out a disciplined **C0 → C1 → C2 dev loop** (readiness → per-unit → completion) with
+  docs-as-code and no-guessing — the GitHub-agnostic dev-process doctrine, dropped in as a
+  `kind: prompt` library item (no engine change).
+- **`verbatim-scope-audit` prompt** (epic #532, DEV 1): a curated EN/DE prompt that audits a set of
+  requirements for completeness — enumerate them `V1..Vn` and map each to a work item before any
+  work starts — the DEV-1 prose discipline for full prompt adoption.
+- **`dev-loop-runner` prompt** (epic #532, DEV 1): a curated EN/DE prompt that runs **one** unit of
+  work through the light DEV-1 loop — **select → work → review → done** over the CLI-agnostic
+  per-unit handover — discipline only, stateless and single-unit. The DEV-1 execution primitive as prose.
+
+### Documentation
+- **Post-relocation doc drift cleaned** (epic #601 / #828): the starter-prompt `skills/prompts/README.md` table
+  now lists all **10** built-ins — adding the public DEV-1 trio (`dev-process`, `verbatim-scope-audit`,
+  `dev-loop-runner`, kept public per ADR-0011 D2) it had omitted, matching `status.md`. ADR-0004's evidence
+  check notes that `ack.devprocess` now ships only the curated `ack.devprocess.api` facade (substrate relocated
+  to private `scripts/devprocess/`, ADR-0011 AD-3); ADR-0011 D1 clarifies that the facade exception (AD-3/D2)
+  keeps `packages = ["ack", "ack.lodestar", "ack.devprocess"]` (facade-only); and `status.md`'s ADR-0011
+  reference is now a markdown link. Docs-only; no behavior change.
+- **Public-grade roadmap** (epic #710, sweep): the generated `docs/roadmap.md` no longer leaks internal
+  detail. The dev-process phase dropped the internal "DEV 1/2/3 — three switchable tiers" framing (the
+  internal tiers are merged and private; the public face is the versioned dev-process facade + the
+  bring-your-own code-agent runner over the extension seam) and is retitled **"Self-maintaining
+  dev-process"**; the loop-intelligence and hardening phases dropped private issue numbers — matching the
+  already-clean Enterprise/Connector phases. Driven by the open-milestone descriptions (the roadmap source)
+  and regenerated; no hand-editing.
+- **Doc-text accuracy fixes** (epic #710, sweep): `docs/docs-guide.md` said the roadmap is "Generated from
+  open epics" — corrected to **open milestones** (the actual `gen_roadmap.py` rule, matching the rest of the
+  doc); the `ack/loop_profile.py` module docstring motivated a "larger retry budget" per task type, but the
+  wired ceiling only lets a per-type `retry_budget` be *lowered* (clamped to the hard re-ask ceiling) —
+  reworded to match; and the `engine/commands.py` module docstring's local-command list now includes
+  `/coders` (it was already in `LOCAL_COMMANDS`). Docstring/doc-only; no behavior change.
+- **config-runtime.md now tables the loop-intelligence + provider config blocks** (epic #710, sweep): the
+  runtime-config reference documented `search.*` in full but omitted other shipped, operator-steerable core
+  blocks. Add a **loop-intelligence** table (`lessons.*` / `quality.*` / `process.*` / `loop_profiles` — all
+  opt-in, default OFF, no env override, with their code defaults) and a **provider router** table
+  (`providers.*` + the `GX10_PROVIDERS_*` env overrides). `providers.scoring` and `providers.effort_max_tokens`
+  are flagged honestly as reserved (the router currently uses fixed built-in values for them). Docs-only.
+- **status.md consistency + a re-armed cross-doc guard** (epic #710, sweep): the wiring SSOT had three drifts —
+  the TypeScript-client test count was stale (`344`/340 vs the real `360 passing` / `364` total), the **Quality
+  Circuit Breaker** row still read `wired + tested` though its own note (and the CHANGELOG honesty entry) says it
+  is a delivered seam with no live score-feed yet (now `delivered (seam) + tested`, matching its #602 siblings),
+  and the `/lifecycle` slash command was advertised though it does not exist (the `can_advance_stage` primitive is
+  consumed only by the DELIVER gate). The TS count drift slipped through because the `doc_reality_audit.py`
+  cross-doc guard matched only the README phrasing; it now matches all three (README prose / test-report row /
+  status.md row) so any future divergence fails the audit. Covered by two new `test_doc_audit.py` cases.
+- **README feature-coverage refresh** (epic #710, sweep): the front-page README now advertises capabilities it
+  had drifted behind — **`web_search`** (the trust-gated tool over the vendor-neutral adapter seam, linking
+  `docs/web-search.md`) and the **built-in prompt & skill library** (`/prompts` / `/skills` discovery and direct
+  `/<prompt-name>` invocation) — teaches the current **`/project new`** workspace command instead of the
+  deprecated `/initiative` alias, corrects the latest-release line to **v0.0.20**, and expands the demo
+  status-bar caption to list all client-footer indicators (connection, memory, warm, watcher, autopilot,
+  coder, web search, throughput). `docs/state-and-initiative.md` notes `/initiative` as a deprecated alias.
+  Docs-only; no API change.
+- **Memory two-layer, lessons + scope-aware forget** (epic #601, S14-6): `docs/project-isolation.md` gains a
+  **Lessons** section (the `ack.lessons` tier — project-private by default, redaction-gated promotion, the
+  advisory + fail-soft engine wiring) and documents the **scope-targeted forget** across the cold store, the
+  warm tier, and the lesson provider (fail-closed on an empty scope, fail-soft per tier), plus the cold-write
+  **scope tagging**. `docs/lesson-api.md` documents the optional `forget(scope)` provider verb and adds a
+  **Security** note: a provider must budget the `brief` text and treat lessons as untrusted data, never
+  instructions (the brief is injected into a code-agent's handover prompt).
+
+### Fixed
+- **Memory-service image build was broken** (`memory-service`, #634): the `Dockerfile` did `COPY app.py`
+  only, but `app.py` imports `scope_guard` (#601 S15) + `reflect_policy` (#767) — added with the imports but
+  not the COPY — so any rebuild of the current code failed `ModuleNotFoundError` (the deployed image predated
+  both, so it never surfaced). The Dockerfile now COPYs every module the service imports (+ `curate`) and
+  pip-installs `qdrant-client` (the `/scopes` scroll) + `redis` (the optional reflection backend).
+- **Memory-service reflection-trigger race** (`memory-service`, #503 remediation / #767 MEMSVC-1): the central
+  threshold-triggered reflection reset its write counter only at the END of a run, so every learning write that
+  landed during a (slow) graph-hygiene run re-fired a daemon that immediately bailed on the busy non-blocking
+  lock (thread churn) and was then zeroed when the run finished (undercount). The fire decision is now an
+  isolated pure policy (`reflect_policy.reflect_decision`, stdlib-only + offline-tested like `scope_guard`): it
+  consumes the counter at FIRE time and suppresses a fire while a reflection is already running — so writes
+  during a run accumulate toward the next cycle (no undercount) and no bail-thread is spawned (no churn). A
+  manual `/reflect` no longer resets the threshold counter (the cadence is now independent of ad-hoc runs).
+- **Ink renderer dead-export prune** (`clients/ink`, #503 remediation / #766, INK-R-5/6/7/8 + INK-THEME): removed
+  production-unused renderer exports + their now-dead tests (dead-code policy = clean up) — `dispatch.eventPriority`
+  (+`EventPriority`), `ScrollBox.visibleRange`/`isVisible`, `Buffers.setCursor`/`clearBack` (+ the cursor-meta
+  `FrameMeta` fields they served), `flush.eraseRows`/`flush`, `resize.eraseFrame`, `keys.feedKey`, and the unused
+  `WARNING`/`INPUT_TEAL` theme colors. Each was re-verified to have no production caller before removal (the
+  hot-path `renderPatches`/`withSync`/`BSU`/`ESU` and the `Ink`-compat-shim `Newline` are kept); stale module
+  doc-comments trimmed. TypeScript client tests: 367 -> 359 (8 dead cases dropped).
+- **MPR cleanup: dead code, default-ON hint, stemmer, English strings** (#503 remediation, MPR-3 /
+  MPR-REG-2/3/4 / MPR-EVAL-2 / MPR-DEAD-1/2/3 / MPR-ENV-2 / TEST-I18N): three genuinely dead surfaces were
+  removed — the orphan `mirror_to_memory` (the §6 memory write-back lives only in `synthesis.write_back`,
+  the single injected path), the never-called `_voice_from_spec` judge stub, and the unused `_HasContent`
+  protocol. The cheap clustering stemmer now trims the **longest** matching suffix, so German forms like
+  `Wartbarkeit`/`Wartung`/`wartbar` collapse to one stem (`barkeit` was previously unreachable behind the
+  shorter `keit`) — MPR-REG-4. The `/initiative … --type mpr` hint no longer claims "MPR is not active" when
+  `mpr.enabled` is simply **unset** — it defaults ON (`MprConfig.enabled=True`), so the hint now fires only
+  when MPR is **explicitly** disabled (MPR-ENV-2); a stale "default off" comment was corrected to match. A
+  few model-/operator-facing strings in `mpr_research` are now English (the no-active-initiative error, the
+  empty-query error, the disabled-gate note, and a test lens label) — MPR-ENV-2/TEST-I18N. The tested-but-
+  unwired registry/eval contract surfaces (`SYNTHESIS_BINDING`, `effort_to_template`/`effort_to_max_tokens`,
+  the rubric `score`/`weighted_total`, and the §9 `prune_runs` retention utility) are kept and explicitly
+  documented as **reserved** contract APIs rather than removed (MPR-REG-2/3, MPR-EVAL-2, MPR-DEAD-3).
+- **Memory fallbacks: MCP agent env + search enabled-gate** (#503 remediation, MEM-1/MEM-2): the read-only
+  Memory MCP's `memory_from_env` fell back to `GX10_MEMORY_AGENT_ID`, which **nothing sets** — so it silently
+  landed on the `"ironclad"` default instead of the configured project namespace; it now falls back to
+  `GX10_MEMORY_AGENT`, the **same knob the engine reads** (MEM-1). And `MemoryManager._search` guarded only
+  on `self.base` while every write + the other reads gate on `enabled and base` — a `base` + `enabled=false`
+  config would still issue `/search`; `_search` now also checks `enabled` (latent today since read sites
+  pre-gate, but the contract is now consistent) (MEM-2). Covered by two new tests.
+- **Python client/CLI raw-key + claim-race + English UI** (#503 remediation, CLI-2/3/4/5/6): the thin
+  client's `_run_handover` was annotated `-> Optional[str]` but returns a `(text, meta)` tuple — corrected to
+  `Tuple[Optional[str], Dict]` (CLI-2). `dispatch_pending`'s check-then-add on the shared `claimed` set was
+  non-atomic, so an overlapping `/auto` poll + `/work` could double-launch a handover — the claim is now
+  serialized under a lock (CLI-3). In the full-screen CLI's POSIX raw-input loop a **bare ESC blocked**
+  waiting for two more reads, and a **>3-byte CSI** (PageUp `ESC [ 5 ~`, Home, F-keys) leaked a stray `~`
+  into the input; a new `_consume_escape_seq` drains the sequence **non-blockingly** to its final byte (a
+  bare ESC is ignored) (CLI-4/CLI-5). And the last German UI strings in the legacy TUI (clipboard / scroll
+  hints) are now English (CLI-6). CLI-2/CLI-3 are covered by the existing client-pool tests.
+- **Engine routing hygiene + dead code** (#503 remediation, ROUTE-1/ROUTE-2/ROUTE-3/ROUTE-4/DEAD-APPLYCLI):
+  the pipeline-advance macro unconditionally spawned **three hardcoded `scripts/*.py`** that don't exist in
+  the boundary-clean export (3 fail-soft WARN subprocesses per advance, vessel-specific) — they are now
+  driven by `paths.post_advance_hooks` (default empty ⇒ no subprocess; an absent script is skipped), a
+  deployment detail kept out of core (ROUTE-1). The dead `_TURN_DID_ADVANCE` guard (only reset, never set or
+  read — its comment claimed it blocked a same-turn handover) is removed; the real auto-plan control is
+  `AUTOPILOT_AUTOPLAN` (ROUTE-2). `parallel_reason` read `args.effort` for per-item routing but its tool
+  schema omitted `effort`, so the model could never set it (pinned to medium) — `effort` is now in the schema
+  (ROUTE-3). A plugin/skill tool **named like a built-in** was registered + offered but shadowed by the
+  built-in dispatch (undispatchable, silent) — the loader now **rejects it at load** with a warning (ROUTE-4).
+  And the uncalled level-4 `_apply_cli` override (the gutted CLI path) is removed, with the precedence
+  comments corrected to `code-defaults < file/conf < env` (DEAD-APPLYCLI). Covered by two new tests.
+- **Paved-road copier template renders valid output on a raw `copier copy`** (#503 remediation,
+  TPL-1/TPL-2): the `new-case` `copier.yml` declared no `date`/`tags_yaml`/`tags_csv` variables, but the
+  rendered tree references them (`date: {{date}}`, `tags: {{tags_yaml}}`) — so a raw `copier copy` failed on
+  StrictUndefined (the canonical `ack.generator` CLI filled them via `build_context`, masking it). They are
+  now declared as computed `when: false` vars mirroring `build_context` (a `tags` question drives
+  `tags_csv`/`tags_yaml`; `date` is a prompt the CLI still auto-fills with today) (TPL-1). And
+  `non_negotiable` — embedded inside a JSON object in the gap-tracking doc — was a copier `bool`, which
+  renders capitalized `True`/`False` (invalid JSON); it is now a computed lowercase `true`/`false` **string**
+  (driven by a `non_negotiable_flag` bool question), matching the CLI's lowercase output (TPL-2). Covered by
+  two new tests (every template token is declared; `non_negotiable` is a lowercase-json string).
+- **POSIX launcher reaches parity with the PowerShell one** (#503 remediation, INSTALL-2/INSTALL-3): the
+  `ironclad.sh` EXIT trap only killed an engine **this** invocation started (`STARTED_PID`), so a **reused**
+  running engine was never stopped on `/exit` — diverging from `ironclad.ps1`, which stops by listening port
+  (#428) and leaving a background `server.py` on the port. `cleanup()` now stops the local engine **by port**
+  (whether started or reused), mirroring the `.ps1` (INSTALL-2). And the `.sh` config-reader + engine-env
+  omitted `claudeBin`/`fanoutConcurrency`/`workersMaxTokens`/`workersMaxBatchTokens` that the `.ps1`
+  forwards — there was no `GX10_CLAUDE_BIN` escape hatch on POSIX; the four keys are now read from the config
+  and exported conditionally (via `if/fi`, not `&& export`, so `set -e` can't trip on an absent key)
+  (INSTALL-3).
+- **Terminal client UI strings are English** (#503 remediation, INK-I18N-1): the recommended client's
+  session restore/reset/save messages in `ui/App.tsx` and `state/persist.ts` were hardcoded German
+  (`Sitzung zurückgesetzt`, `keine gespeicherte Sitzung`, `… Zeilen wiederhergestellt`, `Sitzung
+  gespeichert …`), not behind any language toggle — they are now English (English-only export). (The
+  companion INK-I18N-2 — the `runTool.ts` `list_directory` note — was already translated in lockstep with
+  the engine in I18N-GX10.)
+- **Terminal renderer: drop the unwired blit subsystem; document intentional unwired primitives**
+  (#503 remediation, INK-R-2/INK-R-3/INK-R-4): the partial-repaint **blit** path (`render/blit.ts` + the
+  `GeomCache` contamination tracking) was built + tested but **never wired** — `renderFrame` full-repaints
+  into the back buffer and the front→back cell diff already minimizes the terminal write. It is removed
+  (correctness over the micro-optimization), with `blit.ts`/`blit.test.ts` deleted and the contamination
+  bookkeeping stripped from `GeomCache` (the absolute-rect cache for hit-testing stays) (INK-R-2). The
+  `ScrollBox.onKey` keyboard-scroll and the dispatcher's `onWheel` routing are **generic, tested renderer
+  primitives** that the chat client intentionally does not wire — typed keys (incl. `j/k/g/G`) belong to the
+  input box (it wires PageUp/PageDown directly), and the wheel scrolls the ScrollBox (consumed before
+  dispatch). Both are now documented as intentionally-unwired-here primitives rather than removed or unsafely
+  wired (INK-R-3/INK-R-4, operator dead-code policy: keep genuine primitives, decide per item).
+- **MPR config/judge correctness** (#503 remediation, MPR-2/MPR-EVAL-1/MPR-ENV-1/MPR-REG-1): a typo'd
+  `audit_level` (config/env) was used verbatim, silently dropping the synthesis/perspective artifacts (the
+  sovereignty proof) — it is now clamped to the allowlist (`full-per-perspective` on an unknown value)
+  (MPR-2). The blind judge's `parse_judgement` coerced **any** non-`'1'` pairwise vote to `'2'`, biasing the
+  panel toward slot 2 — it now keeps only a valid `'1'`/`'2'` and drops junk (MPR-EVAL-1). `GX10_MPR_*` env
+  overrides were seeded onto the live tree only when the merged config had **no** `mpr` key, so any conf-file
+  `mpr.*` made every env read dead (inverting the documented file < env precedence) — env is now seeded once
+  per process via a latch, so env beats file while a later runtime `/config set` still persists (MPR-ENV-1).
+  And `MprConfig.registry` (the `mpr.registry.*` knobs: roles bounds, effort table, distinctness, panels dir)
+  is built but **not read by the resolver** — it is now honestly marked a **reserved** seam (loaded, not yet
+  wired) rather than implying the knobs take effect (MPR-REG-1, operator decision). Covered by four new tests.
+- **Generator re-run safety + i18n overlay robustness + dead code** (#503 remediation,
+  GEN-2/I18N-1/PROMPT-DEAD/PLAYBOOK-DEAD): the paved-road generator recorded a template **baseline for a
+  SKIPPED untracked file**, so the next run three-way-merged the user's declined file against a *phantom* base
+  — spurious diff3 conflicts in a file the user chose not to adopt; it no longer records a baseline for the
+  skipped branch (GEN-2). The `ack.i18n` overlay loader only guarded the **top-level** dict, so `role_lens`
+  and `label` chained `.get().get()` and `AttributeError`'d on a malformed nested overlay (e.g.
+  `"roles": "x"`) — breaking the never-break-a-run promise; both now isinstance-guard each nested level (via
+  `localized()`), matching the already-safe path (I18N-1). Plus dead-code cleanup: unused `field`/`Optional`
+  imports in `prompt.py` and the never-read `_SCALAR_FIELDS` constant in `playbook.py` (PROMPT-DEAD/
+  PLAYBOOK-DEAD). Covered by two new tests.
+- **Registry: PEP-604 schemas, silent-skill diagnostics, locked scan flag** (#503 remediation,
+  ACK-1/ACK-2/ACK-3): `derive_tool_schema` gated `Optional`/`Union` on `get_origin(...) is typing.Union`, so a
+  modern **PEP-604** `X | None` annotation (whose origin is `types.UnionType`) fell through to a bare-string
+  **required** fallback — giving the public SDK a wrong model-facing schema. It now also matches
+  `types.UnionType` (ACK-1). The bulk `discover_skills` dropped a module that has a `CASE` dict but an
+  empty/typo'd `capability` with **zero diagnostics** (only the single-file `register_skill` raised) — it now
+  logs a warning naming the file (ACK-2). And `_ensure_skills_scanned` read/wrote the `_skills_scanned` flag
+  **outside** the registry's advertised lock — it now uses double-checked locking under the (re-entrant) lock
+  (ACK-3). Covered by two new tests.
+- **Warm tier retries after a transient Valkey blip** (#503 remediation, WARM-1): `WarmTier.is_available()`
+  dropped a dead client on a failed ping but never cleared the `_tried` connect-once latch — so `_conn()`
+  short-circuited on `_tried` and returned `None` forever, making the documented reconnect impossible after
+  a transient outage. The failure branch now also resets `_tried=False`, so the next call re-attempts the
+  URL. Covered by a new test.
+- **Provider routing is robust to an all-disabled pool and bad effort config** (#503 remediation,
+  DISP-1/ROUTER-1/SCORING-1): the dispatcher's `active()` keyed on the raw provider pool **including disabled
+  entries**, so an all-disabled pool reported active and then routed every item to `no-capable-provider`
+  instead of falling back to in-engine fanout — it now gates on the enabled-only `by_id()` (DISP-1). The
+  router indexed `EFFORT_RANK[capabilities.max_effort]` with no validation, so a `max_effort` config value
+  outside the enum raised `KeyError` out of the dispatch loop — a `field_validator` now normalizes an unknown
+  tier to the conservative floor `low` at load (never-raises-into-the-tool-loop, and a typo can never
+  over-claim capability) (ROUTER-1). And the
+  `providers.scoring` SSOT comment falsely claimed the block was config-overridable while the router applies
+  fixed built-ins — the comment now matches the (already honest) `config-runtime.md`: a reserved seam, not
+  yet read (SCORING-1). Covered by two new tests.
+- **`/coders` works in the legacy full-screen TUI** (#503 remediation, CLI-1): `/coders` is a local command
+  but the full-screen Python TUI's command worker (`tui.py`) had no `coders` branch, so it silently did
+  nothing there (the thin REPL client and the TypeScript client both implement it). The TUI now mirrors the
+  REPL: `/coders` lists the bound coding agents + the fan-out provider lane, and `/coders use <id>|auto`
+  pins/clears the runtime agent.
+- **Engine surface is English-only regardless of `LANGUAGE`** (#503 remediation, I18N-GX10): a set of
+  always-German literals leaked to the model/client irrespective of the configured language — the
+  `list_directory` truncation note, the ACK-contract + duplicate `stage_handover` errors returned to the
+  model, the handover "context injected" log lines, the idle-workflow marker, the `/config` render labels
+  (`source`/`from env`/`set`/`not set`), and the autopilot/autoplan/watcher/log-terminal/rag status +
+  warnings (`ON`/`OFF`, the autoplan cost warning). These are now English (the deliberate `language=de`
+  CLI output is untouched, and the German *intent-classification keyword* lists stay German — they detect
+  German user input, they are not output). The `list_directory` note is **parity-locked** with the
+  TypeScript client's local tool runner (`runTool.ts`), so both substrates emit the identical
+  `[GX10v3: showing N of M entries …]` the model is tuned to (INK-I18N-2). The existing list-dir tests are
+  updated to the English form.
+- **`/doctor` is a local command, not a billed model turn** (#503 remediation, DOCTOR): both clients
+  advertised `/doctor` as a server command, but the orchestrator's command dispatcher had no `doctor` branch,
+  so a forwarded `/doctor` fell through to a billed model turn — while the real gated `GET /doctor`
+  (`_doctor_report`) had no in-product caller. `/doctor` is now a **local** command in both clients (and in
+  `commands.py` `LOCAL_COMMANDS`): it calls `GET /doctor` and prints the preflight report, exactly mirroring
+  `/health`. (The governed `POST /fanout` route flagged alongside it is a **documented, gated, tested**
+  external HTTP API — kept as-is, not dead code.)
+- **A fresh desktop install boots on defaults (`setup.type=auto`)** (#503 remediation, INSTALL-1): the
+  desktop launcher hardcoded `GX10_SETUP_TYPE=local` while the shipped default `base_url` is loopback, and
+  the engine rejects `local` + a loopback model (the model is supposed to live on a remote GPU host) — so a
+  fresh, unconfigured install aborted at boot. A new **`auto`** setup type derives the topology from
+  `base_url` at startup — a **loopback** model ⇒ `server` (fully in-box, in-engine), a **remote** model ⇒
+  `local` (the LAN-offload desktop) — and the launchers (`ironclad.ps1`/`ironclad.sh`) now ship `auto`, so a
+  default install boots in-engine and pointing `GX10_BASE_URL` at a remote model switches it to `local`,
+  with no model host baked into the repo. `sealed` still forces `server`; an explicit `server`/`local` is
+  unchanged. Covered by three new tests.
+- **Terminal client honors the server per-agent spec and always reports the run signal** (#503 remediation,
+  INK-HANDOVER-1/2): the recommended TypeScript client's local handover runner read only `model`/`effort`
+  from the `/pending` item and used STATIC client config for `bin`/`cmd_template`/`permission`/`mcp` — so a
+  multi-agent registry launched the wrong agent, the gated read-only Memory MCP was dropped under the sealed
+  profile, and the `{feedback}`/`{mcp}` template tokens were left literal (INK-HANDOVER-1). It also never
+  reported the run's `exit_code`/`stderr` and only POSTed `/feedback` when feedback text existed, so the #455
+  budget-failover breaker was unreachable from this client — a budget-exhausted agent retried forever
+  (INK-HANDOVER-2). The runner now resolves the full per-agent spec the server ships (a pure, tested
+  `resolveLaunch`: an explicit client override > the server item spec > the built-in default), threads
+  `mcp`/`mcp_env`, expands `{mcp}` (multi-token) and `{feedback}` like the Python `build_agent_argv`, and
+  ALWAYS POSTs the run signal (`exit_code` + a stderr tail) so the breaker trips and fails over. Mirrors
+  `client.py` `_run_handover`/`_process_one`. Covered by seven new client tests.
+- **Terminal client now opens a Phase-d session (sealed profile usable)** (#503 remediation, INK-SESSION):
+  the recommended TypeScript client defined `sessionOpen`/`sessionHeartbeat`/`sessionClose` but never called
+  them, so `sessionId` stayed null — under the `sealed` profile every gated route requires `X-Session-Id`,
+  so the client 401'd on every turn *and* the 2s status poll, leaving the recommended client unusable
+  against a sealed server (only the Python client handled it). A new `establishSession` (a port of
+  `client.py` `_establish_session` + `_heartbeat_loop`) runs at startup: GET `/health`, and when
+  `security.session` is set it opens a session, keeps it alive on a heartbeat interval (re-opening quietly
+  on loss), and closes it on exit. Fail-soft: the `open`/`token` profile or an unreachable server is a
+  no-op, never throwing. Covered by four new client tests.
+- **Terminal client measures colored text by visible width, not ANSI bytes** (#503 remediation, INK-R-1):
+  the renderer's Yoga measure (`layout.ts` `textWidth`/`wrapText`) summed the raw bytes of inline ANSI
+  CSI/SGR escapes as display columns, while `paint.ts` consumes those escapes into styled runs and wraps the
+  *visible* glyphs — so a colored transcript line was over-measured, given the wrong geometry by Yoga, and
+  then re-wrapped/clipped against what paint actually drew (corrupting the colored chat layout the renderer
+  exists to draw). `textWidth`/`wrapText` now strip ANSI CSI/SGR escapes (a shared `stripAnsi`, scope
+  mirroring paint's `SGR_RE`/`CSI_RE`) before counting columns, so the measure matches the paint. Covered by
+  three new client tests.
+- **MPR per-run cost/token budget is now enforced and recorded** (#503 remediation, MPR-1): the MPR config
+  parsed a `BudgetCfg` (`mpr.budget.*` / `GX10_MPR_MAX_COST_USD` / `_MAX_TOKENS` / `_ON_EXCEED`) but nothing
+  ever bound it — the cap was dead, every run was unbounded, and `manifest.budget` stayed `null`. `_engine_deps`
+  now builds a `RunBudget` from `cfg.budget`, and the budget is enforced where each resource is actually
+  consumed: the **in-engine fanout lane** (the default) clamps the per-lens token budget so the whole panel's
+  completion stays within `max_tokens_per_run` (`n × per-lens ≤ cap`; that lane runs on the local host at $0 so
+  the cost cap is structurally satisfied there), and the **offload dispatch lane** passes the cost cap to the
+  router as a `Budget(usd_cap=…)` so unaffordable candidates are dropped at admission. On both lanes each
+  perspective's **real** cost/tokens are charged to the run budget and snapshotted into the run manifest
+  (`budget.spent_cost_usd` / `spent_tokens` / `per_provider_spent` + the caps). No budget configured ⇒
+  byte-identical (no manifest block, no clamp, unbounded policy). Covered by five new tests.
+- **skillgen scaffolds stay valid with quoted/multiline free text** (#503 remediation, GEN-1): the skill
+  generator interpolated `description`/`type`/`domain`/`provenance` raw into Python literals + a docstring
+  (and into the playbook YAML frontmatter), so a description as mundane as `Wrap text in "quotes"` produced a
+  `SyntaxError` module that would not import (then silently swallowed by `discover_skills`) or a broken
+  frontmatter block. `render_tool` now serializes every free-text field via `json.dumps` (valid Python/JSON
+  literal; the docstring uses the escaped form), and `render_playbook` flattens free-text frontmatter values
+  to a single line (the naive `key: scalar` parser only breaks on a newline; the full multi-line description
+  is kept in the body). Covered by two new tests (hostile free text → importable module / parseable
+  frontmatter).
+- **`--validate-tasks` now validates the real task records** (#503 remediation, DOCTOR-VAL): the
+  `--validate-tasks` doctor flag was parsed into `DoctorContext.validate_tasks` but no check ever read it —
+  the only `validate_task_json` call was on the canonical `EXAMPLE_TASK_JSON`, so per-task `TaskSpec`
+  validation never ran (a settable-with-no-effect guardrail). A new `check_task_records_validate` honors the
+  flag, validating every stored **base** task record against the live `TaskSpec` and emitting `err` findings
+  on drift (capability tasks are Lodestar's `CapabilityTaskSpec` domain and are skipped, not double-flagged;
+  no-op when off; never raises). Covered by four new tests.
+- **security.profile no longer fails open on a typo** (#503 remediation, SEC-1): an unknown non-empty
+  `security.profile` (e.g. `seald`) was silently coerced to the weakest `open` profile, booting a server the
+  operator believed was sealed/token-protected. `SecurityPolicy` now keeps an invalid profile verbatim and
+  `startup_error()` **refuses to boot** (naming the bad value); unset/empty still defaults to `open`. Covered
+  by a new test.
+- **Context char-fallback budget reserves sys+tools+thinking** (#503 remediation, BUDGET-1/2/3): on the
+  default loopback deployment the live tokenizer is unreachable, so the char-fallback trim is the *sole*
+  context guard — but it compared only non-system content against `MAX_CTX_CHARS` (which reserves
+  output+RAG+summary, never the system prompt, the tools schema, or `THINKING_RESERVE`), and `total_len`
+  ignored tool-call `arguments`, so a dense turn could still push the real request past the model window.
+  The char trim now subtracts sys+tools+thinking from the watermark (floored, mirroring the token path),
+  counts tool_call name+arguments (via `_message_text`), and an operator-supplied
+  `GX10_MAX_CTX_CHARS`/`GX10_TRIM_TARGET_CHARS` is no longer silently overwritten while `TOKEN_BUDGET` is on.
+  Covered by three new tests.
+- **QualityBreaker snapshot reason no longer self-contradicts** (epic #710, sweep): a trip is latched until
+  `reset()`, so after a recovery score zeroes the live streak `QualityBreaker.snapshot().reason` rendered the
+  now-zero streak as `quality degraded: 0 consecutive score(s) < 0.50`. It now reports the trip **rule**
+  (`tripped on N+ consecutive score(s) < …`) instead of the live streak; the module docstring states the
+  latched-until-`reset()` behavior. Mark-only / never-raises unchanged. Covered by a new test.
+- **`/config get` with no key is a usage hint, not a crash** (epic #710, sweep): a bare `/config get` (the
+  clients `.trim()` the body) fell through to a model turn, and a raw HTTP `config get ` (trailing space)
+  raised `IndexError` on `split(None, 2)[2]`. `_dispatch` now matches the bare form too and guards the split,
+  printing `usage: /config get <dotted.key>` (mirroring `/config set`). Covered by two new tests.
+- **Legacy REPL strips MPR report sentinels** (epic #710, sweep): the ink stream router drops the
+  `<<<MPR_REPORT>>>` / `<<<END>>>` machine delimiters, but the Python REPL's `cli.py` `_stream_turn.route`
+  did not (its ink port is annotated a "byte-exact port" of it) — so an MPR report rendered the raw sentinels
+  in the zero-dependency client. `cli.py` now drops them too, restoring parity and clean MPR output.
+- **Installer gates the ink client on Node ≥ 22** (epic #710, sweep): the TypeScript client declares
+  `engines.node >= 22`, but npm does not enforce `engines` by default and the installer only checked that
+  `node` was *present* — an older Node produced a cryptic `tsc`/npm build error. Both
+  `ironclad-install.{sh,ps1}` now read the Node major version and **skip the client build with a clear
+  message** on `< 22` (the zero-dependency Python client still works); `install/README.md` states the
+  Node ≥ 22 prerequisite.
+- **Doctor + deploy verifier surface the warm tier** (epic #710, sweep): `/health` reports the Cold (memory)
+  and Warm (Valkey) tiers separately so a silent warm outage can't hide behind `memory: up`, but neither the
+  doctor nor the deploy verifier read `warm`. The desktop `ironclad-doctor.{sh,ps1}` now print the memory +
+  warm tier state from `/health` (the spark path shows `warm` too), and `deploy/spark/verify-deployment.sh`
+  DRIFTs on a configured-but-down warm tier — self-gated on `/health.warm` (`off` = not configured → skip,
+  `up` = ok, anything else → drift).
+- **Export path-rewrite covers `install/` + `.github/`** (epic #710, sweep): the export lifts `core/`'s
+  contents to the published root and rewrites `core/<subdir>/…` path references accordingly, but the rewrite
+  group omitted `install` and `.github` — so a `install/ironclad.ps1` reference (e.g. in the CHANGELOG)
+  stayed verbatim in the published tree, pointing at a path that ships at `install/ironclad.ps1`. The group is
+  now built from a `_PUBLISHED_SUBDIRS` list (incl. `install` / `.github`), guarded by a new test that fails if
+  any real published top-level subdir of `core/` is left out, so it can't silently drift again.
+- **Command-surface advertising matches the real dispatch** (epic #710, sweep): the advertised command set
+  had drifted from what the server actually dispatches. The in-engine `HELP` listed a non-existent `reload`
+  command (it fell through to a model turn) and omitted `rag` / `context` / `generate`; `commands.py`
+  `SERVER_COMMANDS` + `HELP_TEXT` (the Python REPL/TUI SSOT, also the parity-guard source) omitted
+  `rag` / `context` / `tool` / `generate`; and the Ink registry (`commands.ts`) omitted `generate`. Remove the
+  `reload` ghost, add the real commands to all three surfaces, so `/help` + autocomplete match reality and the
+  `test_ink_client_offers_every_server_command` parity guard now enforces the full set. No behavior change
+  (every command already ran via the unknown-`/x`→forward rule).
+- **Desktop installer now provisions the warm tier** (epic #710, sweep): the launcher forwards `warmUrl` /
+  `GX10_WARM_URL`, but the installer pulled only the `engine` extra — the warm-cache client (`redis`, in the
+  separate `memory` extra) was never installed, so the warm tier silently no-opped (`import redis` failed)
+  even when a Valkey URL was configured. Both `install/ironclad-install.{sh,ps1}` now install
+  `-e ".[engine,memory]"` (matching the Docker image) and accept a `--warm-url` / `-WarmUrl` flag that writes
+  `warmUrl` into `.ironclad/config.json`. Warm stays OFF at runtime until a URL is set, so the default is
+  unchanged; `install/README.md` documents the flag/env. Also fixes a latent **launcher crash** on the same
+  path: `ironclad.sh` forwarded the warm URL with a `${WARM_URL:+GX10_WARM_URL=…}` inline prefix, which bash
+  does **not** parse as an env assignment — a configured URL made it try to *run* `GX10_WARM_URL=…` as a
+  command and the engine never started; it now exports the var conditionally (preserving an inherited
+  `GX10_WARM_URL` when the config has none).
+- **`providers.effort_max_tokens` is now honored** (epic #710, sweep): the per-effort output-token cap was
+  built into the `ProviderDispatcher` (`self._emt`) but never read — routing always used the hardcoded
+  `router.EFFORT_MAX_TOKENS`, so configuring `providers.effort_max_tokens` had no effect. `route_one` now takes
+  an optional `effort_max_tokens` table (defaulting to the module values; a malformed table / missing key /
+  non-positive value falls back so it stays pure and never raises), and the dispatcher threads `self._emt`
+  through both routing call sites (batch dispatch + the server-side `web_search` route). Off-by-default
+  (`server` setup) so byte-identical there. Covered by two new `test_router` cases; `config-runtime.md` moves
+  the key from "reserved" to the live providers table.
+- **TUI now offers `/project` + `/switch`** (epic #601): the Ink client's static command registry
+  (`clients/ink/src/commands.ts`) had drifted from its `engine/commands.py` SSOT — it still listed the
+  deprecated `/initiative` but was MISSING `/project` and `/switch` (added to the engine in #601 S16), so the
+  TUI never suggested them in autocomplete or `/help` even though the server handled them. Added both (ported
+  from the SSOT help) **and** a parity guard (`test_commands.py::test_ink_client_offers_every_server_command`)
+  that fails if the client registry ever omits a `SERVER_COMMANDS` entry again (ADR-0007 — reconcile the
+  derived view). Re-run the installer (or `npm run build` in `clients/ink`) to pick it up.
+- **Docs honesty — wiring status of the #602 reflection seams** (post-merge review): `docs/status.md` no longer
+  labels the **Strategy Revisor**, **Verifier/Evaluation** and **Quality Circuit Breaker** as "wired" — they are
+  **delivered, tested seams/SSOTs with no live consumer on the default engine path** (verify has no engine
+  call-site; the strategy seams are invoked only by the MPR plugin, not the core loop; the quality breaker's
+  lifecycle is built by config but nothing feeds scores or surfaces trips yet), and `loop_profiles.by_type` is
+  **resolved but reserved** (the chat loop uses only the default profile). The honest "seam status" + the
+  consumer/deploy-step that lights each one up are now stated per row.
+- **ACK reflection-layer hardening** (epic #602, post-merge adversarial review): `classify_emission_failure`
+  now has an absolute never-raises backstop (symmetric with `strategy.revise`) — a hostile message/detail
+  cannot escape its documented contract; `verify_with_judge` charges the budget **only on a completed call
+  that yields a valid verdict** (a transport/parse failure now abstains and charges nothing — no over-charge
+  for work that didn't happen); and the engine `_process_hint` limit coercion tolerates a non-finite
+  `process.max_hints` (falls back to the default instead of suppressing the hint). All advisory; no happy-path
+  change. Covered by `test_failure_class.py` / `test_verify.py` / `test_process.py`.
+- **`EngineLessonStore` fail-soft hardening** (epic #602, post-merge adversarial review): `_load` now reads
+  fail-soft on a file with **invalid UTF-8 bytes** (`UnicodeDecodeError` is a `ValueError`, not an `OSError`,
+  so it previously escaped `report_lesson`/`get_lessons`); `_coerce_category` and `_safe_cap` swallow a hostile
+  `__str__`/`__int__` (honouring their never-raises contracts); and a failed `os.replace` no longer orphans the
+  temp file. All advisory/fail-soft — no behaviour change on the happy path. Covered by `test_lesson_store.py`.
+
 ## [0.0.20] - 2026-06-26
 
 ### Added
@@ -258,7 +1120,7 @@ Released versions are listed below; upcoming work accumulates under *Unreleased*
   to cold first**, then only the most-recent (tail) rounds within budget are summarized (a warning is
   logged on truncation). Completes the P1 trio. See ADR-0003.
 - **`ironclad` `/exit` now stops the local background engine** (#428): the launcher
-  (`core/install/ironclad.ps1`) started or reused a local `server.py` and only stopped it on exit
+  (`install/ironclad.ps1`) started or reused a local `server.py` and only stopped it on exit
   *when this session had started it* (`$started`), so a **reused or orphaned engine lingered on the
   port** after `/exit` (the CLI quit but `server.py` kept serving). The teardown now stops the local
   engine by its listening port regardless — the engine is ephemeral per session (single-tenant by

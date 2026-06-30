@@ -43,6 +43,8 @@ from .constrained_emission import (
     emit_constrained,
     tool_emission_kwargs,
 )
+from .failure_class import FailureClass, classify_emission_failure
+from .strategy import Strategy
 
 logger = logging.getLogger(__name__)
 
@@ -84,6 +86,12 @@ class ValidatedEmitResult:
     ``detail`` carries the LAST exact validator error. ``reasks`` is the ordered list
     of error details fed back to the model (empty on a first-try success), useful for
     audit / observability.
+
+    ``failure_class`` is an ADDITIVE, advisory label (#602 S602-3): on a terminal
+    failure it carries the :class:`~ack.failure_class.FailureClass` derived
+    deterministically from the last error; it is ``None`` on success (and on any
+    result built without it — byte-identical to the pre-#602 shape). It never affects
+    control flow — it is read only by the opt-in reflection layer.
     """
 
     ok: bool
@@ -92,6 +100,11 @@ class ValidatedEmitResult:
     error: Optional[str] = None
     detail: Optional[str] = None
     reasks: tuple[str, ...] = field(default_factory=tuple)
+    # ``compare=False`` keeps ``__eq__``/``__hash__`` byte-identical to the pre-#602
+    # shape (an advisory label, deterministically derived from ``detail``, must not
+    # change result identity); it stays in ``repr`` on purpose — observability is the
+    # point of the field.
+    failure_class: Optional[FailureClass] = field(default=None, compare=False)
 
     def raise_for_status(self) -> BaseModel:
         """Return ``value`` on success, else raise :class:`ValidatedEmitError`."""
@@ -104,20 +117,22 @@ class ValidatedEmitResult:
         )
 
 
-def _reask_message(detail: str) -> dict[str, str]:
+def _reask_message(detail: str, hint: str = "") -> dict[str, str]:
     """Build the re-ask turn that feeds the model the EXACT validator error.
 
     Deliberately surgical: "fix exactly these problems, change nothing else" keeps the
-    next attempt from drifting on the parts that were already correct."""
-    return {
-        "role": "user",
-        "content": (
-            "Your previous output was REJECTED by the schema / semantic validator. "
-            "Re-emit the FULL object via the tool, fixing EXACTLY these problems and "
-            "changing nothing else:\n"
-            f"{detail}"
-        ),
-    }
+    next attempt from drifting on the parts that were already correct. ``hint`` is an
+    OPTIONAL strategy instruction (#602 S602-7) appended verbatim; empty ⇒ the message
+    is byte-identical to the pre-#602 re-ask."""
+    content = (
+        "Your previous output was REJECTED by the schema / semantic validator. "
+        "Re-emit the FULL object via the tool, fixing EXACTLY these problems and "
+        "changing nothing else:\n"
+        f"{detail}"
+    )
+    if hint:
+        content += f"\n\nStrategy: {hint}"
+    return {"role": "user", "content": content}
 
 
 def _run_validators(instance: BaseModel, validators: Optional[Sequence[Validator]]) -> None:
@@ -152,6 +167,7 @@ async def emit_validated(
     description: Optional[str] = None,
     force: bool = True,
     chat_template_kwargs: Optional[dict[str, Any]] = None,
+    strategist: Optional[Callable[[FailureClass, int, int], Strategy]] = None,
 ) -> ValidatedEmitResult:
     """Emit a constrained, validated *spec_cls* instance with bounded re-ask retry.
 
@@ -167,6 +183,12 @@ async def emit_validated(
     mutated. ``temperature`` defaults to ``0.0`` for deterministic structured
     emission. Whatever the ``chat`` transport raises (transport / auth errors) is NOT
     the model's fault and propagates unchanged — it is not re-asked.
+
+    ``strategist`` (#602 S602-7) is an OPTIONAL pure policy ``(failure_class, attempt,
+    budget) → Strategy`` (e.g. :func:`ack.strategy.revise`): on a rejection its
+    ``reask_hint`` is appended to the re-ask turn so the next attempt is targeted at the
+    failure CLASS, not just the raw error. ``None`` (the default) ⇒ the re-ask is
+    byte-identical to the pre-#602 loop. A strategist error is swallowed (advisory).
     """
     budget = max(1, min(int(budget), MAX_RETRY_BUDGET))
     emission_kwargs = tool_emission_kwargs(
@@ -177,6 +199,8 @@ async def emit_validated(
     conversation: list[dict[str, Any]] = list(messages)
     reasks: list[str] = []
     last_detail: Optional[str] = None
+    last_message: Optional[str] = None
+    last_failure: Optional[FailureClass] = None
 
     for attempt in range(1, budget + 1):
         # Transport / auth errors propagate: a transport that is off or upstream-
@@ -192,15 +216,27 @@ async def emit_validated(
             _run_validators(instance, validators)
         except ConstrainedEmissionError as exc:
             last_detail = exc.detail
+            last_message = str(exc)
+            last_failure = classify_emission_failure(last_message, last_detail)
             reasks.append(last_detail)
             # `detail` carries field names / rule messages, never prompt content —
             # safe to log for observability of the re-ask loop.
             logger.info(
-                "validated-emit %s attempt %d/%d rejected: %s",
-                spec_cls.__name__, attempt, budget, last_detail,
+                "validated-emit %s attempt %d/%d rejected (%s): %s",
+                spec_cls.__name__, attempt, budget, last_failure.value, last_detail,
             )
             if attempt < budget:
-                conversation = [*conversation, _reask_message(last_detail)]
+                # #602 S602-7: an optional strategist turns the failure CLASS into a targeted re-ask
+                # hint; default (None) ⇒ empty hint ⇒ byte-identical to the pre-#602 re-ask.
+                hint = ""
+                if strategist is not None:
+                    try:
+                        # str(...) INSIDE the guard so an odd reask_hint (non-str / raising __str__) is
+                        # swallowed here, never later in _reask_message — advisory, never breaks the loop.
+                        hint = str(strategist(last_failure, attempt, budget).reask_hint or "")
+                    except Exception:   # noqa: BLE001 — advisory: a strategist error never breaks the loop
+                        hint = ""
+                conversation = [*conversation, _reask_message(last_detail, hint)]
             continue
         return ValidatedEmitResult(
             ok=True, value=instance, attempts=attempt, reasks=tuple(reasks)
@@ -218,6 +254,10 @@ async def emit_validated(
         error=f"validated emission of {spec_cls.__name__} failed after {budget} attempt(s)",
         detail=last_detail,
         reasks=tuple(reasks),
+        # Advisory, deterministic (#602 S602-3) — the class of the last error; never
+        # alters control flow. last_failure is always set here (the loop only falls
+        # through after at least one ConstrainedEmissionError classified it).
+        failure_class=last_failure or classify_emission_failure(last_message or "", last_detail),
     )
 
 

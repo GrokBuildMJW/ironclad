@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {textWidth, wrapText, collectText, createConfig, applyStyle, attachYoga, calculate, freeYoga} from '../src/render/layout.js';
+import {textWidth, wrapText, stripAnsi, collectText, createConfig, applyStyle, attachYoga, calculate, freeYoga} from '../src/render/layout.js';
 import {createVNode, createTextNode, appendChild} from '../src/render/vnode.js';
 import Yoga from 'yoga-layout';
 
@@ -23,6 +23,25 @@ test('wrapText — CJK breaks per (2-col) glyph; honors newlines; Infinity = no 
   assert.deepEqual(wrapText('世界你好', 4), ['世界', '你好']);
   assert.deepEqual(wrapText('a\nb', 10), ['a', 'b']);
   assert.deepEqual(wrapText('hi there', Infinity), ['hi there']);
+});
+
+test('stripAnsi — removes SGR/CSI, keeps visible text + newlines (INK-R-1)', () => {
+  assert.equal(stripAnsi('\x1b[31mred\x1b[0m'), 'red');
+  assert.equal(stripAnsi('a\x1b[2Kb\nc'), 'ab\nc');     // non-SGR CSI dropped too; newline preserved
+  assert.equal(stripAnsi('none'), 'none');               // no-escape input returned as-is
+});
+
+test('textWidth — ANSI SGR escapes count as zero width (INK-R-1)', () => {
+  assert.equal(textWidth('\x1b[31mred\x1b[0m'), 3);          // only "red" is visible
+  assert.equal(textWidth('\x1b[1;38;5;42mhi\x1b[0m'), 2);    // extended SGR params, still 2 cols
+  assert.equal(textWidth('世\x1b[0m界'), 4);                  // escape between CJK glyphs: 2+2, escape 0
+});
+
+test('wrapText — wraps by visible width; ANSI neither consumes budget nor is split (INK-R-1)', () => {
+  // colored "hello world" (visible width 11) wraps exactly like the plain string at width 7
+  assert.deepEqual(wrapText('\x1b[31mhello\x1b[0m \x1b[32mworld\x1b[0m', 7), ['hello', 'world']);
+  // escapes around a word must not push it over a generous width (no spurious break)
+  assert.deepEqual(wrapText('\x1b[1mhello world\x1b[0m', 20), ['hello world']);
 });
 
 test('collectText — concatenates raw text + nested ink-text', () => {

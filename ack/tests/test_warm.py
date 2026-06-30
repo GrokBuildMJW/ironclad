@@ -106,3 +106,12 @@ def test_fail_soft_on_a_dead_client() -> None:
     assert wt.set_session("s", "summary", "x") is False
     assert wt.cache_get("q") is None
     assert wt.cache_set("q", ["a"]) is False
+
+
+def test_dead_client_clears_the_tried_latch_so_conn_retries() -> None:
+    # WARM-1 (#503): a transient Valkey blip drops the client; the _tried latch MUST clear too, else
+    # _conn() short-circuits on _tried and returns None forever (the documented retry is impossible).
+    wt = _wired(DeadValkey())
+    assert wt._tried is True                       # _wired pre-sets the latch (lazy connect bypassed)
+    assert wt.is_available() is False              # ping raises → unavailable
+    assert wt._client is None and wt._tried is False   # dead client dropped AND latch cleared → _conn retries

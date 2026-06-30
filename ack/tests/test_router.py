@@ -141,6 +141,18 @@ def test_est_max_tokens_from_mapping():
     assert route_one(_req(effort="low"), REG, IDLE, NOBUDGET).est_max_tokens == 512
 
 
+def test_max_effort_outside_enum_normalizes_not_raises():
+    # ROUTER-1 (#503): a conf max_effort outside the enum must normalize at load to the conservative FLOOR
+    # "low" — so the router never KeyErrors on EFFORT_RANK[max_effort] (never-raises-into-the-tool-loop)
+    # AND a typo can never OVER-claim capability.
+    bad = {"provider_id": "typo-cli", "kind": "cli", "model": "x", "bin": "x",
+           "cmd_template": "{bin} {prompt}", "capabilities": {"max_effort": "ultra"}}
+    reg = load_registry({"providers": {"pool": [SPARK, bad], "default_id": "spark-vllm"}})
+    assert reg.by_id()["typo-cli"].capabilities.max_effort == "low"      # normalized to the floor at load
+    d = route_one(_req(effort="high"), reg, IDLE, NOBUDGET)              # must not raise
+    assert d.provider_id is not None
+
+
 def test_decision_is_deterministic():
     req = _req(index=3, effort="xhigh")
     a = route_one(req, REG, BUSY, NOBUDGET)
@@ -199,3 +211,20 @@ def test_distinct_reviewer_is_snapshot_stable():
     a = route_one(req, REG_NOLOCAL, IDLE, NOBUDGET)
     b = route_one(req, REG_NOLOCAL, IDLE, NOBUDGET)
     assert a.model_dump() == b.model_dump()
+
+
+def test_route_one_honors_configured_effort_max_tokens():
+    # providers.effort_max_tokens (threaded from the dispatcher) overrides the module per-effort cap.
+    # Regression for the dead-knob bug: the configured table was built into the dispatcher but never read.
+    d = route_one(_req(effort="high"), REG, IDLE, NOBUDGET, effort_max_tokens={"high": 9999})
+    assert d.est_max_tokens == 9999
+
+
+def test_route_one_effort_max_tokens_falls_back_per_key_and_on_garbage():
+    # a missing key falls back to the module default; a malformed table is ignored — never raises
+    assert route_one(_req(effort="high"), REG, IDLE, NOBUDGET,
+                     effort_max_tokens={"low": 7}).est_max_tokens == EFFORT_MAX_TOKENS["high"]
+    assert route_one(_req(effort="high"), REG, IDLE, NOBUDGET,
+                     effort_max_tokens="not-a-dict").est_max_tokens == EFFORT_MAX_TOKENS["high"]
+    assert route_one(_req(effort="high"), REG, IDLE, NOBUDGET,
+                     effort_max_tokens={"high": True}).est_max_tokens == EFFORT_MAX_TOKENS["high"]

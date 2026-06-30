@@ -18,7 +18,7 @@ if ($type -eq 'spark') {
   Say "type=spark (thin client, no local engine)."
   if ($server) {
     try { $sh = Invoke-RestMethod -Uri "$server/health" -TimeoutSec 5
-          Say "orchestrator ($server): version=$($sh.orchestrator_version)  memory=$($sh.memory)  language=$($sh.language)"; Say "OK reachable." }
+          Say "orchestrator ($server): version=$($sh.orchestrator_version)  memory=$($sh.memory)  warm=$($sh.warm)  language=$($sh.language)"; Say "OK reachable." }
     catch { Say "WARN: orchestrator not reachable ($server)." }
   } else { Say "no serverUrl in config — re-install." }
   return
@@ -39,5 +39,10 @@ if ($running) {
 } else {
   Say "engine   ($base): $(if (Reach "$base/health") { 'reachable (version unavailable)' } else { 'NOT reachable' })"
 }
+# #385: the Cold (memory) and Warm (Valkey) tiers are reported separately by /health so a silent warm
+# outage cannot hide behind `memory: up`; surface both (up/down/off) when the engine answered.
+if ($sh) { Say "memory tier (/health.memory): $($sh.memory)   |   warm tier (/health.warm): $($sh.warm)" }
+# #601 isolation binding (status / active project / home) — surfaces an `unisolated` registry fallback.
+if ($sh -and $sh.registry) { Say "registry (/health.registry): status=$($sh.registry.status)  active_project=$($sh.registry.active_project)  home=$($sh.registry.home)" }
 if ($cfg.baseUrl)   { Say "model    ($($cfg.baseUrl)): $(if (Reach "$($cfg.baseUrl)/models") { 'reachable' } else { 'NOT reachable' })" }
 if ($cfg.memoryUrl) { Say "memory   ($($cfg.memoryUrl)): $(if (Reach "$($cfg.memoryUrl)") { 'reachable' } else { 'NOT reachable' })" }

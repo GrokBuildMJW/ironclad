@@ -64,6 +64,11 @@ export class Server {
     return this.req('GET', '/health');
   }
 
+  /** DOCTOR (#503): gated read-only preflight report — local `/doctor` command (mirrors `/health`). */
+  doctor(): Promise<Json> {
+    return this.req('GET', '/doctor');
+  }
+
   async tasks(): Promise<Json[]> {
     const r = await this.req('GET', '/tasks');
     return (r['tasks'] as Json[]) ?? [];

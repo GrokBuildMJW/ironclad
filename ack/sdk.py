@@ -61,11 +61,16 @@ from .promptgen import (  # noqa: F401
 
 # ── Registration / eval gate (the same gate Ironclad runs before trusting a skill) ─
 from .gate import (  # noqa: F401
+    SCAFFOLD_SENTINEL,
     GateResult,
     gate,
+    gate_generated,
     gate_playbook,
     gate_prompt,
     gate_tool,
+    has_scaffold_sentinel,
+    library_items_complete,
+    run_sibling_test_hermetic,
 )
 
 # ── Shared content i18n (localize templates/labels along a dotted path) ───────────
@@ -111,6 +116,11 @@ __all__ = [
     "gate_tool",
     "gate_playbook",
     "gate_prompt",
+    "gate_generated",
+    "has_scaffold_sentinel",
+    "run_sibling_test_hermetic",
+    "library_items_complete",
+    "SCAFFOLD_SENTINEL",
     "GateResult",
     # i18n
     "Localizer",

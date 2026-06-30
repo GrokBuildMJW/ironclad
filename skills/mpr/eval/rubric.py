@@ -81,7 +81,12 @@ def weighted_total(scored: Dict[str, float]) -> float:
 
 
 def score(judgements: List[Dict[str, float]], *, cost_latency: Optional[float] = None) -> Dict[str, float]:
-    """Aggregate judge votes → median per judged dim (+ optional computed ``cost_latency``) + weighted total."""
+    """Aggregate judge votes → median per judged dim (+ optional computed ``cost_latency``) + weighted total.
+
+    Reserved (#503 MPR-EVAL-2): the canonical rubric scoring API (``score`` / ``weighted_total``), fully
+    unit-tested. The A/B judge gate currently consumes per-dim medians directly rather than the composite
+    weighted total, so this composite has no production caller yet — kept as the documented scoring
+    contract for the eval harness, not as dead code."""
     scored = median_scores(judgements)
     if cost_latency is not None:
         scored["cost_latency"] = round(float(cost_latency), 3)

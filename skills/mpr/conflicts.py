@@ -26,17 +26,12 @@ from __future__ import annotations
 
 import re
 import statistics
-from typing import Any, List, Optional, Protocol, Sequence
+from typing import Any, List, Optional, Sequence
 
 from pydantic import BaseModel, ConfigDict
 
 DEFAULT_NUMERIC_SPREAD = 0.25  # mpr.conflict_numeric_spread (§9)
 _MAX_SENTS = 60                # per-perspective sentence cap for the claim cross-product (DoS guard)
-
-
-class _HasContent(Protocol):
-    role: str
-    content: Optional[str]
 
 
 # ── schema (§3.1) ─────────────────────────────────────────────────────────────────────────────────

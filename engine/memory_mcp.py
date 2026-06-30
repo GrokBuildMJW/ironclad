@@ -108,7 +108,9 @@ def memory_from_env() -> MemoryManager:
     same knowledge the orchestrator built."""
     return MemoryManager({
         "base_url": os.environ.get("GX10_MEMORY_URL", ""),
-        "agent_id": os.environ.get("GX10_MCP_MEMORY_NS") or os.environ.get("GX10_MEMORY_AGENT_ID") or "ironclad",
+        # MEM-1 (#503): fall back to GX10_MEMORY_AGENT — the SAME knob the engine reads (gx10:_apply_config) —
+        # not GX10_MEMORY_AGENT_ID, which nothing ever sets (so the fallback silently landed on "ironclad").
+        "agent_id": os.environ.get("GX10_MCP_MEMORY_NS") or os.environ.get("GX10_MEMORY_AGENT") or "ironclad",
         "read_timeout": float(os.environ.get("GX10_MCP_READ_TIMEOUT", "15") or 15),
     })
 

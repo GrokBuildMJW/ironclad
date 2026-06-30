@@ -56,6 +56,29 @@ def test_unknown_setup_type_fails_closed():
         gx10.resolve_offload_topology(_cfg("pull"))   # pull/colocated/embedded no longer exist
 
 
+# ── INSTALL-1 (#503): setup.type=auto derives the topology from base_url so a fresh default install boots ──
+def test_auto_loopback_base_url_derives_server():
+    # a fresh desktop default ships a loopback model → auto derives to in-engine server (boots, no config).
+    t = gx10.resolve_offload_topology(_cfg("auto", base_url="http://127.0.0.1:8000/v1"))
+    assert t["setup_type"] == "server" and t["providers_enabled"] is False and t["runner_mode"] == "none"
+    assert "auto" in t.get("note", "")
+
+
+def test_auto_remote_base_url_derives_local():
+    # a remote model (the operator's working install) → auto derives to the LAN-offload local runner.
+    t = gx10.resolve_offload_topology(_cfg("auto", base_url="http://remote-gpu:8000/v1"), cli_available=True)
+    assert t == {"setup_type": "local", "providers_enabled": True, "runner_mode": "local",
+                 "note": "setup.type=auto → local (remote base_url)"}
+
+
+def test_auto_sealed_forces_server():
+    # sealed overrides auto as well — no egress regardless of the derived topology.
+    t = gx10.resolve_offload_topology(_cfg("auto", base_url="http://remote-gpu:8000/v1", profile="sealed"),
+                                      cli_available=True)
+    assert t["setup_type"] == "server" and t["runner_mode"] == "none"
+    assert "sealed" in t.get("note", "")
+
+
 def test_sealed_forces_server_over_local():
     # sealed = no egress → no external agents (force server/in-engine); never raises.
     t = gx10.resolve_offload_topology(_cfg("local", profile="sealed"), cli_available=True)

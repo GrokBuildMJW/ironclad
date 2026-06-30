@@ -105,6 +105,22 @@ def test_dispatch_config_get(monkeypatch, captured):
     assert any("not set" in s for s in captured)
 
 
+def test_dispatch_config_get_no_key_shows_usage(monkeypatch, captured):
+    # bare `config get` (clients .trim() the body) must print a usage hint, NOT fall through to a model
+    # turn — the SimpleNamespace agent has no .run, so reaching the else would raise AttributeError.
+    monkeypatch.setattr(gx10, "_EFFECTIVE_CFG", {"mpr": {"enabled": True}})
+    gx10._dispatch(types.SimpleNamespace(), "config get")
+    assert any("usage: /config get" in s for s in captured)
+
+
+def test_dispatch_config_get_trailing_space_no_indexerror(monkeypatch, captured):
+    # a raw `config get ` (trailing space, no key) once matched the branch and raised IndexError on
+    # split(None, 2)[2]; it must now print the usage hint instead.
+    monkeypatch.setattr(gx10, "_EFFECTIVE_CFG", {"mpr": {"enabled": True}})
+    gx10._dispatch(types.SimpleNamespace(), "config get ")
+    assert any("usage: /config get" in s for s in captured)
+
+
 # ── ST-1: frozen (boot-only) keys ───────────────────────────────────────────────────────────────────
 def test_config_set_frozen_key_refused(monkeypatch, captured):
     monkeypatch.setattr(gx10, "_EFFECTIVE_CFG", {"setup": {"type": "solo"}})

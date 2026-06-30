@@ -93,6 +93,45 @@ If the configured adapter is unusable (e.g. `brave` on a local setup with no key
 fail-soft (a `[search]` boot note explains why) — the server still boots. Supply the key in the
 deployment environment (for a desktop/local setup, the user environment, like `GX10_WARM_URL`).
 
+## Loop-intelligence toggles (`lessons.*` / `quality.*` / `process.*` / `loop_profiles`)
+
+The reflection-layer seams are **opt-in and default OFF** — each is a byte-identical no-op until you
+enable it with `/config set …`. They have **no env override** (set them in the config file or at runtime).
+See [`status.md`](status.md) for the honest wiring status of each, and [`lesson-api.md`](lesson-api.md)
+for the lesson provider API.
+
+| Key | Default | Meaning |
+|---|---|---|
+| `lessons.enabled` | `false` | register the project-private lesson distiller (`EngineLessonStore`); off ⇒ the lesson seam is a no-op |
+| `lessons.max_per_scope` | `200` | per-scope compaction cap (oldest lessons dropped first) |
+| `quality.enabled` | `false` | build the per-task output-quality circuit breaker; off ⇒ no breaker |
+| `quality.threshold` | `0.5` | a mark-only verifier score below this counts as a low sample |
+| `quality.min_consecutive` | `3` | consecutive low samples that trip the (advisory) breaker |
+| `quality.window` | `20` | rolling number of scores retained |
+| `process.enabled` | `false` | record typed process-lessons at completion + inject a pre-turn hint (also needs `lessons.enabled`) |
+| `process.max_hints` | `3` | max working-approach hints folded into the pre-turn prefix |
+| `loop_profiles.default` | `{}` | per-run loop-budget overrides (`max_iterations` / `retry_budget` / `effort`); empty ⇒ the engine globals apply (the live chat-loop bound) |
+| `loop_profiles.by_type` | `{}` | per-`TaskType` overrides, e.g. `{"research": {"max_iterations": 40}}` — **reserved** (resolved but not yet consumed by a per-type loop) |
+
+## Provider router (`providers.*`)
+
+The provider router/dispatcher is **off by default** (`server` setup); it is enabled in the `local` setup.
+The private deployment supplies the real provider pool (models, $/token, endpoints) in its own `conf/` —
+core ships no provider literals.
+
+| Key | Env | Default | Meaning |
+|---|---|---|---|
+| `providers.enabled` | `GX10_PROVIDERS` | `false` | global on/off; off ⇒ the dispatcher delegates to in-engine fan-out (byte-identical) |
+| `providers.default_id` | `GX10_PROVIDERS_DEFAULT` | `None` | default provider id |
+| `providers.max_agents` | `GX10_PROVIDERS_MAX_AGENTS` | `3` | server CLI-pool cap (not the client `--max-agents`) |
+| `providers.cli_timeout_s` | `GX10_PROVIDERS_CLI_TIMEOUT_S` | `None` | timeout for the default CLI runner (`None` ⇒ no timeout) |
+| `providers.budget.usd_cap` | `GX10_PROVIDERS_BUDGET_USD` | `None` | per-run USD budget cap |
+| `providers.pool` | — | `[]` | provider specs; filled by the deployment `conf/`, never hard-coded in core |
+| `providers.effort_max_tokens` | — | `{low: 512, medium: 1024, high: 2048, xhigh: 4096}` | per-effort output-token cap used by routing / cost scoring |
+
+> `providers.scoring` (router scoring weights) also exists in the tree, but the router currently applies
+> **fixed built-in values** for it — treat it as reserved until it is wired to read the config.
+
 ## Scope & persistence
 
 - The override lives in the **running process only** — it is **not** written back to any file. A restart

@@ -106,8 +106,12 @@ def parse_judgement(raw: str) -> Optional[dict]:
     s1, s2 = _valid_side(obj.get("answer_1")), _valid_side(obj.get("answer_2"))
     if s1 is None or s2 is None:
         return None
-    pw_in = obj.get("pairwise") or {}
-    pairwise = {d: ("1" if str(pw_in.get(d)) == "1" else "2") for d in JUDGED_DIMS if d in pw_in}
+    pw_in = obj.get("pairwise")
+    pw_in = pw_in if isinstance(pw_in, dict) else {}   # MPR-EVAL-1 (#503): a non-dict pairwise (e.g. a str)
+                                                       # must not be indexed — drop it wholesale, never raise.
+    # MPR-EVAL-1 (#503): keep ONLY a valid '1'/'2' pairwise vote. Coercing any other value (junk, '3',
+    # missing/None) to '2' biased the blind panel toward slot 2 — a malformed dim is dropped, not voted.
+    pairwise = {d: str(pw_in[d]) for d in JUDGED_DIMS if d in pw_in and str(pw_in[d]) in ("1", "2")}
     return {"1": s1, "2": s2, "pairwise": pairwise}
 
 
@@ -215,10 +219,6 @@ def _selftest() -> None:
     assert panel["n_votes"] == 2 and "bad" in panel["dropped_providers"]      # unstable voice dropped
     assert panel["a"]["coverage"] == 4.0                                      # median of the two stable
     print("judge selftest: OK")
-
-
-def _voice_from_spec(name: str):  # pragma: no cover - live wiring (operator)
-    raise NotImplementedError("live provider binding is operator-wired from mpr.providers; gate uses stubs")
 
 
 def main() -> None:  # pragma: no cover - operator/live path, not in the pytest gate

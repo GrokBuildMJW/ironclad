@@ -131,7 +131,10 @@ class ProviderDispatcher:
         self._budget_cap: Optional[float] = None
 
     def active(self) -> bool:
-        return self._enabled and self._registry is not None and bool(self._registry.providers)
+        # DISP-1 (#503): gate on ENABLED providers (by_id), not the raw pool — an all-disabled pool must
+        # report inactive so dispatch falls back to in-engine fanout instead of routing every item to
+        # no-capable-provider.
+        return self._enabled and self._registry is not None and bool(self._registry.by_id())
 
     @staticmethod
     def _is_web_runnable(p: ProviderSpec) -> bool:
@@ -162,7 +165,7 @@ class ProviderDispatcher:
             return {"ok": False, "content": None, "error": "no-web-substrate", "provider_id": None}
         req = RouteRequest(index=0, effort=effort, needs_web=True,
                            sensitivity=Sensitivity.PUBLIC, est_input_chars=len(q))
-        d = route_one(req, self._registry, LoadSignal(), Budget())
+        d = route_one(req, self._registry, LoadSignal(), Budget(), effort_max_tokens=self._emt)
         # route_one is the PREFERRED pick, but it can decline (effort ceiling / budget) or prefer a cheaper
         # LOCAL web-flagged spec (idle/PUBLIC favours the cost-0 local). has_web_provider() already promised
         # a runnable web provider exists, so the gate ⇄ call stays consistent: take route_one's pick iff it
@@ -240,7 +243,7 @@ class ProviderDispatcher:
 
         decisions: List[RouteDecision] = []
         for req in reqs:
-            d = route_one(req, self._registry, load, budget, ledger.spent)
+            d = route_one(req, self._registry, load, budget, ledger.spent, effort_max_tokens=self._emt)
             decisions.append(d)
             if d.provider_id is not None:
                 ledger.charge(d.est_cost_usd)

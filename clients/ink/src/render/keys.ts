@@ -103,9 +103,3 @@ export function parseKey(data: string): ParsedKey {
   // printable character, or a whole paste
   return {input: data, key};
 }
-
-/** Parse a chunk and hand the event to the input bridge (mount/dispatch wires this to stdin). */
-export function feedKey(data: string, emit: (input: string, key: Key) => void): void {
-  const {input, key} = parseKey(data);
-  emit(input, key);
-}

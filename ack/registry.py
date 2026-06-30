@@ -42,7 +42,7 @@ import threading
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from types import ModuleType
+from types import ModuleType, UnionType
 from typing import Any, Callable, Optional, Union, get_args, get_origin, get_type_hints
 
 logger = logging.getLogger(__name__)
@@ -142,8 +142,10 @@ def _annotation_to_schema(annotation: Any) -> tuple[dict[str, Any], bool]:
 
     origin = get_origin(annotation)
 
-    # Optional[X] / Union[..., None] -> not required; describe the non-None arm.
-    if origin is Union:
+    # Optional[X] / Union[..., None] -> not required; describe the non-None arm. ACK-1 (#503): also match
+    # PEP-604 `X | None`, whose get_origin is types.UnionType (NOT typing.Union) — else a modern annotation
+    # fell through to the bare-string + required fallback, giving the public SDK a wrong model-facing schema.
+    if origin is Union or origin is UnionType:
         args = [a for a in get_args(annotation) if a is not type(None)]  # noqa: E721
         optional = len(args) != len(get_args(annotation))
         if len(args) == 1:
@@ -367,6 +369,10 @@ class Registry:
                     logger.warning("registry: skipping unloadable skill %s: %s", py, exc)
                     continue
                 if reg is None:
+                    # ACK-2 (#503): a module with a CASE dict but an empty/typo'd 'capability' was dropped
+                    # with ZERO diagnostics in the bulk scan (single-file register_skill raises clearly).
+                    if isinstance(getattr(mod, "CASE", None), dict):
+                        logger.warning("registry: skill %s has a CASE but no/empty 'capability' — skipped", py)
                     continue
                 with self._lock:
                     existing = self._skills.get(reg.capability)
@@ -391,11 +397,17 @@ class Registry:
         return _discover(root)
 
     def _ensure_skills_scanned(self) -> None:
+        # ACK-3 (#503): the scan flag was read/written OUTSIDE the lock the registry advertises. Use
+        # double-checked locking (the RLock is re-entrant, so discover_skills' per-registration locking
+        # nested below is fine) so a concurrent first-touch can't double-scan or race the flag.
         if self._skills_scanned:
             return
-        for root in self._skill_roots:
-            self.discover_skills(root)
-        self._skills_scanned = True
+        with self._lock:
+            if self._skills_scanned:
+                return
+            for root in self._skill_roots:
+                self.discover_skills(root)
+            self._skills_scanned = True
 
     @staticmethod
     def _load_skill_module(path: Path) -> ModuleType:

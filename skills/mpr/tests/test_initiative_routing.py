@@ -43,7 +43,7 @@ def test_runs_dir_falls_back_to_default_without_initiative(tmp_path):
 def test_mpr_research_run_failclosed_without_initiative(tmp_path):
     out = mpr_research_run("Soll X auf Postgres laufen?")
     assert out.startswith("ERROR")
-    assert "kein aktives Initiative" in out
+    assert "no active initiative" in out
     # nothing was written into the project root
     assert not (tmp_path / "runs").exists()
 

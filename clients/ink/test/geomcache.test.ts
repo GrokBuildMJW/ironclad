@@ -28,25 +28,6 @@ test('build records absolute rects for the whole tree', () => {
   freeYoga(root);
 });
 
-test('contamination is tracked separately from rects and resets per frame', () => {
-  const root = createVNode('ink-root');
-  const box = createVNode('ink-box', {width: 4, height: 1});
-  appendChild(root, box);
-  layout(root, 10);
-
-  const cache = new GeomCache();
-  cache.build(root);
-  assert.equal(cache.isContaminated(box), false);
-
-  cache.contaminate(box);
-  assert.equal(cache.isContaminated(box), true);
-
-  cache.resetContamination();
-  assert.equal(cache.isContaminated(box), false);
-  assert.ok(cache.get(box), 'rects survive a contamination reset');
-  freeYoga(root);
-});
-
 test('build clears prior cache entries', () => {
   const root = createVNode('ink-root');
   appendChild(root, createVNode('ink-box', {width: 2, height: 1}));
@@ -117,12 +98,10 @@ test('marginTop offsets a child down, leaving a blank row above it', () => {
   freeYoga(root);
 });
 
-test('delete drops both the rect and any contamination', () => {
+test('delete drops the rect', () => {
   const cache = new GeomCache();
   const n = createVNode('ink-box');
   cache.set(n, {x: 0, y: 0, w: 1, h: 1});
-  cache.contaminate(n);
   cache.delete(n);
   assert.equal(cache.has(n), false);
-  assert.equal(cache.isContaminated(n), false);
 });

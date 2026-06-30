@@ -8,6 +8,11 @@ renders nothing (that is 1c).
 ``evidence-research`` mode but uses ``risk-register``), which is why they are separate fields on the
 panel; ``SYNTHESIS_BINDING`` records each template's *typical* mode for documentation/contract, not as
 a validation constraint.
+
+Reserved (#503 MPR-REG-2): this is the declarative §5 binding contract (the SSOT for output-form ↔ mode),
+covered by the registry contract tests. The runtime synthesis stage selects format from the
+``synthesis_template`` enum directly, so it does not read this table at request time — it is kept as the
+canonical, machine-checkable contract surface, not as dead code.
 """
 from __future__ import annotations
 

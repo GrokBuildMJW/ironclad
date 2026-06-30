@@ -4,15 +4,17 @@
  * hittest gives the topmost node under the pointer; dispatch walks the ancestor chain root→target
  * firing `on<Event>Capture` handlers, then target→root firing `on<Event>` handlers, stopping early
  * if a handler calls `stopPropagation()` — the familiar DOM model, so component handlers compose.
- * A press+release on the same node synthesizes an `onClick`. Each event carries a priority
- * (discrete for press/release/click, continuous for move/wheel) that R7 maps onto the reconciler's
- * update priority so React batches a drag stream differently from a click.
+ * A press+release on the same node synthesizes an `onClick`.
  */
 import {hitTest, type MouseEvent, type MouseAction, type MouseButton} from './hittest.js';
 import type {GeomCache} from './geomcache.js';
 import type {VNode} from './vnode.js';
 
-/** Raw action → the bubbling handler prop components carry. */
+/** Raw action → the bubbling handler prop components carry. This is the GENERIC dispatcher contract
+ *  (any host can route any action to a component handler). The chat client's mount.ts intentionally
+ *  consumes the wheel itself to scroll the ScrollBox and returns BEFORE dispatching, so `onWheel` is
+ *  not delivered to components there by design (#503 INK-R-4) — the mapping stays for hosts that do
+ *  want component-level wheel handling (it is covered by dispatch.test.ts). */
 const HANDLER_FOR: Record<MouseAction, string> = {
   down: 'onMouseDown',
   up: 'onMouseUp',
@@ -20,13 +22,6 @@ const HANDLER_FOR: Record<MouseAction, string> = {
   wheelUp: 'onWheel',
   wheelDown: 'onWheel',
 };
-
-export type EventPriority = 'discrete' | 'continuous';
-
-/** Press/release/click are discrete; pointer move and wheel are a continuous stream. */
-export function eventPriority(action: MouseAction | 'click'): EventPriority {
-  return action === 'move' || action === 'wheelUp' || action === 'wheelDown' ? 'continuous' : 'discrete';
-}
 
 export interface DispatchEvent {
   type: MouseAction | 'click';

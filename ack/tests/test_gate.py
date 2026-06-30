@@ -126,3 +126,48 @@ def test_gate_dispatch_by_path(tmp_path):
     assert gate.gate(_playbook(tmp_path, "pb2").parent).kind == "playbook"  # dir form
     assert gate.gate(_prompt(tmp_path, "pr1")).kind == "prompt"             # kind: prompt SKILL.md
     assert gate.gate(_prompt(tmp_path, "pr2").parent).kind == "prompt"      # dir form
+
+# ── prompt strict locales ─────────────────────────────────────
+def test_gate_prompt_strict_passes_when_overlay_present(tmp_path):
+    res = gate.gate_prompt(_prompt(tmp_path), strict_locales=True)
+    assert res.passed, res.reasons
+
+
+def test_gate_prompt_strict_fails_when_declared_overlay_missing(tmp_path):
+    md = _prompt(tmp_path, de=False)
+    lenient = gate.gate_prompt(md)
+    strict = gate.gate_prompt(md, strict_locales=True)
+    assert lenient.passed
+    assert not strict.passed
+    assert any("de" in r and "overlay" in r.lower() for r in strict.reasons)
+
+
+def test_gate_prompt_strict_present_but_broken_overlay_fails(tmp_path):
+    md = _prompt(tmp_path)
+    (md.parent / "locales" / "de.json").write_text("{not json", encoding="utf-8")
+    assert not gate.gate_prompt(md, strict_locales=True).passed
+
+
+def test_gate_prompt_strict_en_only_needs_no_overlay(tmp_path):
+    d = tmp_path / "skills" / "en-only"
+    d.mkdir(parents=True)
+    (d / "SKILL.md").write_text(
+        "---\n"
+        "capability: en-only\nkind: prompt\ndescription: d\n"
+        "languages: [en]\nvariables: [input]\nrequired: [input]\n"
+        "---\n"
+        "Use {input}.\n",
+        encoding="utf-8")
+    res = gate.gate_prompt(d / "SKILL.md", strict_locales=True)
+    assert res.passed, res.reasons
+
+
+def test_gate_prompt_non_string_template_overlay_fails_both_modes(tmp_path):
+    # a present overlay with a non-string template (e.g. a number) is silently ignored by the
+    # Localizer at runtime → it must be rejected as a present-but-useless overlay under BOTH modes.
+    md = _prompt(tmp_path)
+    (md.parent / "locales" / "de.json").write_text('{"template": 123}', encoding="utf-8")
+    lenient = gate.gate_prompt(md)
+    strict = gate.gate_prompt(md, strict_locales=True)
+    assert not lenient.passed and not strict.passed
+    assert any("template" in r for r in lenient.reasons)

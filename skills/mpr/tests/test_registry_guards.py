@@ -51,6 +51,17 @@ def test_lens_signature_drops_stopwords():
     assert any(t.startswith("maintain") for t in sig)
 
 
+def test_stem_longest_suffix_wins():
+    # #503 MPR-REG-4: the LONGEST matching suffix wins, so "Wartbarkeit" trims "barkeit" → "wart" and
+    # clusters with "Wartung"/"wartbar". A first-match scan stripped the shorter "keit" first
+    # ("wartbarkeit" → "wartbar"), leaving "barkeit" unreachable and the forms in separate clusters.
+    from mpr.registry.guards import _stem
+    assert _stem("wartbarkeit") == "wart"
+    assert _stem("wartung") == "wart"
+    assert _stem("wartbar") == "wart"
+    assert len({_stem("wartbarkeit"), _stem("wartung"), _stem("wartbar")}) == 1
+
+
 # ── distinctness ─────────────────────────────────────────────────────────────────────────────────
 def test_distinctness_flags_rephrasings():
     panel = _panel("competitive", [

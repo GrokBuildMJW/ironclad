@@ -27,16 +27,6 @@ test('writes to back do not touch the front until swap', () => {
   assert.equal(b.front.getChar(0, 0), 'h', 'composed frame is now on the front');
 });
 
-test('clearBack blanks only the back buffer', () => {
-  const b = new Buffers(4, 1);
-  b.back.setText(0, 0, 'ab');
-  b.swap(); // 'ab' now on front
-  b.back.setText(0, 0, 'cd'); // write into the new (other) back
-  b.clearBack();
-  assert.equal(b.back.getChar(0, 0), ' ', 'back cleared');
-  assert.equal(b.front.getChar(0, 0), 'a', 'front preserved');
-});
-
 test('resize resizes both surfaces and updates meta', () => {
   const b = new Buffers(10, 4);
   b.resize(20, 6);
@@ -48,15 +38,6 @@ test('resize resizes both surfaces and updates meta', () => {
   assert.equal(b.front.height, 6);
   assert.equal(b.meta.width, 20);
   assert.equal(b.meta.height, 6);
-});
-
-test('cursor metadata is recorded for the composed frame', () => {
-  const b = new Buffers(10, 4);
-  assert.equal(b.meta.cursorVisible, false);
-  b.setCursor(3, 2, true);
-  assert.equal(b.meta.cursorX, 3);
-  assert.equal(b.meta.cursorY, 2);
-  assert.equal(b.meta.cursorVisible, true);
 });
 
 test('degenerate sizes are clamped, not negative', () => {

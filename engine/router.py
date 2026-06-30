@@ -73,7 +73,9 @@ class RouteDecision(BaseModel):
                                                   # None (no exclusion requested). Snapshot-stable.
 
 
-# ── Scoring SSOT (module constants; config-overridable via providers.scoring) ─────────────────────
+# ── Scoring SSOT (module constants). NOTE: providers.scoring is a RESERVED config seam — it exists in the
+#    config tree but the router does NOT yet read it; it applies these fixed built-ins (see config-runtime.md,
+#    "treat it as reserved until it is wired"). SCORING-1 (#503). ────────────────────────────────────────
 EFFORT_RANK = {"low": 0, "medium": 1, "high": 2, "xhigh": 3}
 EFFORT_MAX_TOKENS = {"low": 512, "medium": 1024, "high": 2048, "xhigh": 4096}
 W_COST = 1.0
@@ -129,9 +131,15 @@ def route_one(
     load: LoadSignal,
     budget: Budget,
     spent: float = 0.0,
+    effort_max_tokens: Optional[Dict[str, int]] = None,
 ) -> RouteDecision:
     effort = _effort(req.effort)
-    out_tok = EFFORT_MAX_TOKENS[effort]
+    # The per-effort output-token cap comes from ``providers.effort_max_tokens`` (threaded from the
+    # dispatcher) when configured, else the module default. A malformed table, a missing key, or a
+    # non-positive-int value falls back to the module default so route_one stays pure and never raises.
+    emt = effort_max_tokens if isinstance(effort_max_tokens, dict) else EFFORT_MAX_TOKENS
+    cap = emt.get(effort, EFFORT_MAX_TOKENS[effort])
+    out_tok = cap if isinstance(cap, int) and not isinstance(cap, bool) and cap > 0 else EFFORT_MAX_TOKENS[effort]
     in_tok = _est_input_tokens(req.est_input_chars)
     distinct: Optional[str] = None    # #457 anti-affinity provenance (set after the capability filter)
 

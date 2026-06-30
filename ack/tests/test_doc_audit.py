@@ -81,3 +81,32 @@ def test_roadmap_pointer_in_status_is_not_flagged(tmp_path):
     root = _mkdocs(tmp_path, "# Roadmap\n\n## Theme\n\n- future work.\n",
                    status="# Status\n\nversion 0.0.x. No multi-user auth yet; see the roadmap.\n")
     assert audit.check_doc_responsibilities(root) == []
+
+
+# --- cross-doc TS-count guard (the widened regex must see all three phrasings) ---------------- #
+# The TS client count is stated three ways (README prose / test-report row / status.md row). The
+# guard once matched only the README form, so a single value was seen and a status.md drift passed
+# vacuously. These pin that the widened regex captures every phrasing so a divergence is caught.
+
+def test_ts_count_cross_doc_consistent_passes(tmp_path, monkeypatch):
+    audit = _load()
+    monkeypatch.setattr(audit, "REPO_ROOT", tmp_path)               # relative_to() needs the files under root
+    (tmp_path / "README.md").write_text("plus **360 TypeScript client\ntests**, and more.\n", encoding="utf-8")
+    (tmp_path / "test-report.md").write_text(
+        "| TypeScript client tests (`node:test`) | **360 passed** (364 total, 4 skipped) |\n", encoding="utf-8")
+    (tmp_path / "status.md").write_text(
+        "**360 passing** `node:test` cases (364 total, 4 skipped) across UI.\n", encoding="utf-8")
+    files = [tmp_path / n for n in ("README.md", "test-report.md", "status.md")]
+    findings = audit.check_cross_doc_numbers(files)
+    assert not any("TypeScript test total" in f for f in findings), findings
+
+
+def test_ts_count_cross_doc_divergence_is_caught(tmp_path, monkeypatch):
+    # the exact historical drift: status.md says 344 while README says 360 — the guard must now bite
+    audit = _load()
+    monkeypatch.setattr(audit, "REPO_ROOT", tmp_path)
+    (tmp_path / "README.md").write_text("plus **360 TypeScript client\ntests**, and more.\n", encoding="utf-8")
+    (tmp_path / "status.md").write_text(
+        "**344 passing** `node:test` cases (348 total, 4 skipped) across UI.\n", encoding="utf-8")
+    findings = audit.check_cross_doc_numbers([tmp_path / "README.md", tmp_path / "status.md"])
+    assert any("TypeScript test total" in f for f in findings), findings

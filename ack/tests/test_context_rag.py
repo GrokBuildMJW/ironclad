@@ -80,11 +80,11 @@ class _FakeWarm:
         self.gets = 0
         self.sets = []
 
-    def cache_get(self, q):
+    def cache_get(self, q, namespace=""):            # S3b: WarmTier.cache_get(query, namespace) signature
         self.gets += 1
         return self._cached
 
-    def cache_set(self, q, results, ttl=None):
+    def cache_set(self, q, results, namespace="", ttl=None):
         self.sets.append((q, list(results)))
         return True
 

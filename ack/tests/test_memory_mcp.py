@@ -125,3 +125,12 @@ def test_render_mcp_launch_normalizes_windows_path():
     args, _ = memory_mcp.render_mcp_launch(_TMPL, sealed=True, memory_url="http://m", namespace="ns",
                                            py="python", path="C:\\Users\\x\\memory_mcp.py")
     assert "C:/Users/x/memory_mcp.py" in args and "\\" not in args   # backslashes would break the JSON
+
+
+def test_memory_from_env_uses_gx10_memory_agent(monkeypatch):
+    # MEM-1 (#503): the agent_id falls back to GX10_MEMORY_AGENT (the engine's real knob, gx10:_apply_config)
+    # — NOT the never-set GX10_MEMORY_AGENT_ID (which silently landed on the "ironclad" default).
+    monkeypatch.delenv("GX10_MCP_MEMORY_NS", raising=False)
+    monkeypatch.delenv("GX10_MEMORY_AGENT_ID", raising=False)
+    monkeypatch.setenv("GX10_MEMORY_AGENT", "proj-x")
+    assert memory_mcp.memory_from_env().agent_id == "proj-x"

@@ -209,9 +209,9 @@ export async function runTool(name: string, args: Args): Promise<string> {
         const shown = lines.length;
         if (shown < total) {
           const suffix = capped
-            ? ` (Hard-Cap ${LIST_DIR_HARD_CAP} — nutze sort='time'+limit)`
+            ? ` (hard cap ${LIST_DIR_HARD_CAP} — use sort='time'+limit)`
             : ` (limit=${lim === null ? 'None' : lim})`;
-          out += `\n... [GX10v3: ${shown} von ${total} Einträgen gezeigt${suffix}]`;
+          out += `\n... [GX10v3: showing ${shown} of ${total} entries${suffix}]`;
         }
         return out;
       }

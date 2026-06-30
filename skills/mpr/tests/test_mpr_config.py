@@ -54,6 +54,25 @@ def test_env_override_enables_and_nested():
     assert cfg.budget.max_cost_usd_per_run == 0.5           # nested env override
 
 
+def test_env_overrides_existing_mpr_section():
+    # MPR-ENV-1 (#503): GX10_MPR_* must beat a conf-file mpr value (documented file < env). _apply_mpr_env
+    # layers env onto an EXISTING mpr section; the entry.py once-latch ensures it is CALLED even when the
+    # conf already set mpr.* (the old `"mpr" not in tree` guard made env dead whenever conf set mpr.*).
+    tree = {"mpr": {"audit_level": "manifest-only"}}                    # a file-provided mpr.* value
+    _apply_mpr_env(tree, env={"GX10_MPR_AUDIT_LEVEL": "full-per-perspective"})
+    assert tree["mpr"]["audit_level"] == "full-per-perspective"         # env beat the file value
+
+
+def test_clamp_audit_level_rejects_typos():
+    # MPR-2 (#503): a typo'd audit_level must fall back to the safe default (full-per-perspective), not be
+    # used verbatim (which silently dropped the synthesis/perspective artifacts = the sovereignty proof).
+    from mpr.entry import _clamp_audit_level
+    assert _clamp_audit_level("full-per-perspective") == "full-per-perspective"
+    assert _clamp_audit_level("manifest-only") == "manifest-only"
+    assert _clamp_audit_level("manifest_only") == "full-per-perspective"   # typo → safe default
+    assert _clamp_audit_level("") == "full-per-perspective"
+
+
 def test_legacy_gx10_mpr_load_flag_is_inert():
     # ADR-0002 #115: the GX10_MPR load gate is removed (MPR is a core built-in, always loaded).
     # The legacy var is now inert — it does not change the runtime config (default ON; use

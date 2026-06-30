@@ -2,12 +2,10 @@
  * scrollbox — app-managed scrollback over content taller than the viewport (R6, decision a).
  *
  * Owns the scroll position so the app (not the terminal's native scrollback, which the alt screen
- * disables) drives history: wheel, PageUp/Down, half-page (Ctrl+U/D) and vi keys (j/k/g/G). Two
- * behaviours matter for a chat UI:
+ * disables) drives history: wheel, PageUp/Down, half-page (Ctrl+U/D) and vi keys (j/k/g/G). One
+ * behaviour matters for a chat UI:
  *  - **Sticky bottom**: while parked at the end, new content auto-follows; scroll up and the view
  *    freezes at that position until you return to the bottom (which re-engages stick).
- *  - **OffscreenFreeze**: `visibleRange()`/`isVisible()` tell the compose loop which content rows
- *    are on screen, so scrolled-off subtrees are not repainted (no timer-driven offscreen redraws).
  */
 import type {Key} from './hooks.js';
 
@@ -101,15 +99,6 @@ export class ScrollBox {
     this.stick = true;
   }
 
-  /** Visible content rows [top, bottom). */
-  visibleRange(): {top: number; bottom: number} {
-    return {top: this.scrollTop, bottom: Math.min(this.contentHeight, this.scrollTop + this.viewportHeight)};
-  }
-
-  isVisible(row: number): boolean {
-    return row >= this.scrollTop && row < this.scrollTop + this.viewportHeight;
-  }
-
   /** Map a wheel event to a scroll; returns true (always consumed). */
   onWheel(action: 'wheelUp' | 'wheelDown', step = 3): boolean {
     if (action === 'wheelUp') this.lineUp(step);
@@ -117,7 +106,11 @@ export class ScrollBox {
     return true;
   }
 
-  /** Map a scroll key (PageUp/Down, Ctrl+U/D half-page, vi j/k/g/G); returns true if consumed. */
+  /** Map a scroll key (PageUp/Down, Ctrl+U/D half-page, vi j/k/g/G); returns true if consumed.
+   *  A generic ScrollBox capability (tested in isolation). The chat client intentionally does NOT route
+   *  keys through this — typed keys (incl. j/k/g/G) belong to the input box, and it wires PageUp/PageDown
+   *  to scrollbox.pageUp()/pageDown() directly (mount.ts). Kept for any host that wants keyboard scrolling
+   *  over a read-only pane (#503 INK-R-3: kept as a primitive, not wired here). */
   onKey(key: Key, input = ''): boolean {
     if (key.pageUp) {
       this.pageUp();

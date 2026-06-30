@@ -84,7 +84,7 @@ Globale Präzedenz ist ironclads: **code-defaults < datei/conf < env < CLI (`/co
 | `mpr.providers.routing.spill_when_spark_busy` | bool | `true` | bei ausgelastetem Spark auslagern |
 | `mpr.providers.routing.effort_to_provider` | dict | s. `DEFAULT_ROUTING` | Effort→Provider-Mapping |
 | `mpr.router.*` | — | s. `config.py` | Router-Subconfig (z. B. `min_panel`) |
-| `mpr.roles` / `mpr.registry.*` | — | s. `registry/config.py` | Rollen-Registry-Subconfig (z. B. `roles.max`) |
+| `mpr.roles` / `mpr.registry.*` | — | see `registry/config.py` | **Reserved** — role/registry sub-config (`roles.max`, effort table, distinctness): loaded + validated but **not yet read** by the resolver (#503 MPR-REG-1) |
 
 > **Boundary:** Der Pool enthält **keine** privaten Literale (keine Spark-IP, kein Hostname).
 > Endpunkte kommen aus `connection.*`, Secrets nur als `*_api_key_env`-**Namen** (nicht der Wert).

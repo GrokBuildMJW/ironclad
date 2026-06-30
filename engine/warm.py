@@ -70,7 +70,11 @@ class WarmTier:
         try:
             return bool(c.ping())
         except Exception:  # noqa: BLE001
-            self._client = None  # drop a dead connection so a later call can retry the URL
+            # WARM-1 (#503): drop the dead connection AND clear the _tried latch so a later _conn()
+            # actually re-attempts the URL — otherwise _conn short-circuits on _tried and returns None
+            # forever after a transient Valkey blip (the documented retry was impossible).
+            self._client = None
+            self._tried = False
             return False
 
     # ── session state (survives restart + shared across workers) ──
@@ -104,28 +108,63 @@ class WarmTier:
         except Exception:  # noqa: BLE001
             return False
 
+    # ── scope-targeted forget (drop a whole partition's warm state; ADR-0011 D5 / #601 S14-5) ──
+    def forget_scope(self, scope: str) -> int:
+        """Delete ALL warm state for partition *scope* — every ``session:{scope}:{field}`` AND every
+        ``ret:{scope}:{sha1}`` retrieval-cache entry (the warm half of the scope-aware forget). **EXACT
+        scope** (matches the cold ``delete_all agent_id==scope``): a deeper track scope (``…::track::x``)
+        lands under the same key prefix but its remainder carries another ``:`` and is skipped, so forgetting
+        a project never cascades into its tracks. Fail-soft (unavailable / error → the count so far).
+        **Fail-closed on an empty / glob-bearing scope** (returns 0 without scanning) so a forget can never
+        sweep the whole keyspace or the legacy base keys (``ret:<sha1>`` / ``session:<global-id>:*``).
+        Returns the number of keys deleted."""
+        c = self._conn()
+        scope = (scope or "").strip()
+        if c is None or not scope or any(ch in scope for ch in "*?[]\\"):
+            return 0
+        deleted = 0
+        try:
+            for prefix in (f"session:{scope}:", f"ret:{scope}:"):
+                batch: List[str] = []
+                for key in c.scan_iter(match=f"{prefix}*", count=500):
+                    if ":" in key[len(prefix):]:   # a deeper track scope under the same prefix — not this scope
+                        continue
+                    batch.append(key)
+                    if len(batch) >= 500:
+                        deleted += int(c.delete(*batch) or 0)
+                        batch = []
+                if batch:
+                    deleted += int(c.delete(*batch) or 0)
+        except Exception:  # noqa: BLE001 — fail-soft: a forget must never break a turn
+            return deleted
+        return deleted
+
     # ── retrieval cache (cache-aside in front of the cold vector store) ──
     @staticmethod
-    def _key(query: str) -> str:
-        return "ret:" + hashlib.sha1(query.encode("utf-8")).hexdigest()
+    def _key(query: str, namespace: str = "") -> str:
+        # namespace scopes the cache to the active memory partition (mem_ns) so a cached hit for one
+        # project never returns for another (ADR-0011 AD-1 / S3b). An EMPTY namespace keeps the LEGACY
+        # ``ret:<sha1>`` key byte-identical (no-ctx behaviour unchanged); a set namespace -> ``ret:<ns>:<sha1>``.
+        h = hashlib.sha1(query.encode("utf-8")).hexdigest()
+        return f"ret:{namespace}:{h}" if namespace else f"ret:{h}"
 
-    def cache_get(self, query: str) -> Optional[List[str]]:
-        """Cached ``/search`` results for *query*, or None on miss / unavailable."""
+    def cache_get(self, query: str, namespace: str = "") -> Optional[List[str]]:
+        """Cached ``/search`` results for *query* in *namespace*, or None on miss / unavailable."""
         c = self._conn()
         if c is None or not query.strip():
             return None
         try:
-            raw = c.get(self._key(query))
+            raw = c.get(self._key(query, namespace))
             return list(json.loads(raw)) if raw else None
         except Exception:  # noqa: BLE001
             return None
 
-    def cache_set(self, query: str, results: List[str], ttl: Optional[int] = None) -> bool:
+    def cache_set(self, query: str, results: List[str], namespace: str = "", ttl: Optional[int] = None) -> bool:
         c = self._conn()
         if c is None or not query.strip():
             return False
         try:
-            c.set(self._key(query), json.dumps(list(results)), ex=int(ttl or self.cache_ttl))
+            c.set(self._key(query, namespace), json.dumps(list(results)), ex=int(ttl or self.cache_ttl))
             return True
         except Exception:  # noqa: BLE001
             return False

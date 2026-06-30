@@ -1,7 +1,7 @@
 """Epic #366 follow-up (#428): the `ironclad` launcher must stop the local background engine on
 client exit.
 
-The launcher (`core/install/ironclad.ps1`) starts (or reuses) a local `server.py` and runs the
+The launcher (`install/ironclad.ps1`) starts (or reuses) a local `server.py` and runs the
 client; on `/exit` the client returns and the launcher's `finally` must reliably stop the engine —
 whether THIS session started it or reused a running/orphaned one — so no background service lingers
 on the port (the reported bug: `/exit` ended the CLI but the engine stayed reachable). The `.ps1` has

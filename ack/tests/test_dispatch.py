@@ -121,6 +121,17 @@ def test_inactive_delegates_byte_identical():
     assert disp2.active() is False
 
 
+def test_all_disabled_pool_is_inactive_falls_back_to_fanout():
+    # DISP-1 (#503): a pool where EVERY provider is disabled must report inactive (by_id() is empty) so
+    # dispatch falls back to in-engine fanout, instead of routing every item to no-capable-provider.
+    pool = [{**SPARK, "enabled": False}, {**SONNET, "enabled": False}]
+    disp = ProviderDispatcher(load_registry({"providers": {"pool": pool}}), workers=FakeWorkers(), enabled=True)
+    assert disp.active() is False
+    res = disp.dispatch(["a", "b"])
+    assert [r["content"] for r in res] == ["spark:a", "spark:b"]   # fanout fallback, not no-capable
+    assert "provider_id" not in res[0]                              # byte-identical passthrough
+
+
 def test_active_idle_routes_all_local_in_order():
     disp = ProviderDispatcher(REG, workers=FakeWorkers(), agent_runner=make_runner(), enabled=True)
     res = disp.dispatch(["a", "b", "c"])  # default reqs medium/internal, idle → local

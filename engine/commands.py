@@ -4,7 +4,7 @@ One rule, used by both `client.py` and `tui.py` so they never drift:
 
   * input starting with ``/``  → a **command**
       - a small set of **local** commands (client/connection management) is handled
-        on this side: ``/tasks /pending /work /auto /health /help``
+        on this side: ``/tasks /pending /coders /work /auto /health /help``
       - everything else is **forwarded to the orchestrator** (the leading ``/`` is
         stripped) so the server's own dispatcher handles it exactly like the old CLI:
         ``/status /config /clear /read /write /cat /ls /watcher /autopilot
@@ -64,7 +64,10 @@ def setup_output() -> None:
 
 
 #: Handled on the client side (connection / local code-agents).
-LOCAL_COMMANDS = {"tasks", "pending", "coders", "work", "auto", "health", "help", "exit", "quit"}
+# DOCTOR (#503): /doctor is a LOCAL command (it GETs the gated /doctor endpoint and prints the report,
+# mirroring /health) — NOT forwarded. Forwarding it made the server's _dispatch fall through to a billed
+# model turn (no doctor branch there), while the real GET /doctor → _doctor_report had no in-product caller.
+LOCAL_COMMANDS = {"tasks", "pending", "coders", "work", "auto", "health", "doctor", "help", "exit", "quit"}
 
 #: Known orchestrator commands — forwarded to the server verbatim (minus the slash).
 #: (Used for help + so `/help` can advertise them; unknown `/x` is still forwarded,
@@ -72,7 +75,8 @@ LOCAL_COMMANDS = {"tasks", "pending", "coders", "work", "auto", "health", "help"
 SERVER_COMMANDS = {
     "status", "config", "clear", "read", "write", "cat", "ls",
     "watcher", "autopilot", "autoplan", "log-terminal", "initiative",
-    "prompts", "skills",
+    "project", "switch", "prompts", "skills",
+    "rag", "context", "tool", "generate",
 }
 
 HELP_TEXT = """\
@@ -87,6 +91,7 @@ Commands (with a / prefix) — plain text without / is sent to the orchestrator 
     /work              run all open handovers ONCE locally (in parallel)
     /auto on|off       background poller for handovers
     /health            server status
+    /doctor            read-only preflight report (GET /doctor)
     exit               quit
 
   orchestrator (server):
@@ -106,6 +111,13 @@ Commands (with a / prefix) — plain text without / is sent to the orchestrator 
     /autoplan on|off [N]
     /initiative new <name> --type mpr|software   create + activate an initiative
     /initiative list | use <slug> | active | reconcile [slug]
+    /project list | new <name> [--type mpr|software] [--path <dir>] | active | track new|use|list
+                   manage isolated projects (the guided setup command; /initiative is a deprecated alias)
+    /switch <project_id>   rebind the engine to a project (own paths + memory partition)
+    /generate <args>   scaffold a paved-road capability into the active project library
+    /tool <name> <args>   run a tool directly/deterministically (no model election, no RAG)
+    /rag on|off        toggle per-turn retrieval (RAG)
+    /context           show the context-budget report
     (more: /write, /cat, /log-terminal)"""
 
 

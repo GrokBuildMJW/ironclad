@@ -300,33 +300,8 @@ def test_index_store_none_returns_none():
     assert index_in_taskstore("mpr-r", "q", "d", "ok", store=None) is None
 
 
-# ── §6 memory mirror ─────────────────────────────────────────────────────────────────────────────
-def test_memory_gets_only_insight():
-    from mpr.audit import mirror_to_memory
-    calls = []
-
-    def reducer(items, *, topic):
-        calls.append((items, topic))
-        return len(items)
-
-    raw_perspective = "ROH-GUTACHTEN mit Prompt-Text und Provenance"
-    n = mirror_to_memory("Destilliertes Insight: X überwiegt.", "architecture-decision", "Frage?",
-                         reducer=reducer)
-    assert n == 1 and len(calls) == 1
-    items, topic = calls[0]
-    assert len(items) == 1 and items[0]["ok"] is True
-    assert raw_perspective not in items[0]["content"]   # only insight, never raw views
-    assert topic.startswith("MPR/architecture-decision:")
-
-
-def test_reducer_disabled_no_write():
-    from mpr.audit import mirror_to_memory
-    assert mirror_to_memory("insight", "d", "q", reducer=None) == 0   # legit 0, not error
-
-
-def test_mirror_empty_insight_no_write():
-    from mpr.audit import mirror_to_memory
-    assert mirror_to_memory("   ", "d", "q", reducer=lambda i, *, topic: 1) == 0
+# (§6 memory write-back is covered by synthesis.write_back's own tests; the dead duplicate
+#  `mirror_to_memory` and its tests were removed in #503 MPR-3.)
 
 
 # ── §9 retention ─────────────────────────────────────────────────────────────────────────────────

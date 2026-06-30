@@ -80,10 +80,12 @@ export function App({
   const hcfg = useMemo<HandoverCfg>(() => {
     const c = loadConfig();
     return {
-      claudeBin: c.claudeBin,
+      // INK-HANDOVER-1 (#503): pass the EXPLICIT client overrides (null if unset) so the server's
+      // per-agent spec drives bin/template by default and a deliberate BYO override still wins.
+      claudeBinOverride: c.claudeBinExplicit,
+      agentCmdOverride: c.agentCmdExplicit,
       claudeEffort: c.claudeEffort,
       claudePermissionMode: c.claudePermissionMode,
-      agentCmd: c.agentCmd,
     };
   }, []);
 
@@ -115,7 +117,7 @@ export function App({
     if (prev && prev.serverUrl === srv.base && prev.transcript.length) {
       transcriptRef.current = [...prev.transcript];
       const {turns, lines} = transcriptStats(prev.transcript);
-      commit(<Text color={DIM}>{`  ↻ ${turns} Turn(s) (${lines} Zeilen) wiederhergestellt`}</Text>);
+      commit(<Text color={DIM}>{`  ↻ restored ${turns} turn(s) (${lines} lines)`}</Text>);
       prev.transcript.forEach((line) => commit(<Text color={DIM}>{line}</Text>));
       return true;
     }
@@ -136,7 +138,7 @@ export function App({
     // start clean and stay quiet — the saved session is kept on disk (persist keeps running) and the
     // goodbye on exit (cli.tsx) tells the user it can be brought back with /resume. No startup hint.
     if (resume && !resumeSession()) {
-      commit(<Text color={DIM}> (keine gespeicherte Sitzung zum Wiederherstellen)</Text>);
+      commit(<Text color={DIM}> (no saved session to restore)</Text>);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -263,10 +265,10 @@ export function App({
         } catch {
           /* server unreachable → local reset still done */
         }
-        commit(<Text color={DIM}> ↺ Sitzung zurückgesetzt (Transkript + Kontext + Summary geleert; Langzeit-Memory bleibt)</Text>);
+        commit(<Text color={DIM}> ↺ session reset (transcript + context + summary cleared; long-term memory kept)</Text>);
       } else if (name === 'resume') {
         // MEM-14: on-demand restore of the saved session (default start is fresh).
-        if (!resumeSession()) commit(<Text color={DIM}> (keine gespeicherte Sitzung)</Text>);
+        if (!resumeSession()) commit(<Text color={DIM}> (no saved session)</Text>);
       } else if (name === 'update') {
         // MEM-17: rebuild + reinstall the global `ironclad` from source (GX10_SRC) — no manual
         // `cd clients/ink && …`. The Node process can't hot-swap itself, so it stages the build and
@@ -280,6 +282,7 @@ export function App({
           log.forEach((l) => commit(<Text color={ok ? DIM : ERROR}>{`  ${l}`}</Text>));
         }
       } else if (name === 'health') commit(<Text color={DIM}>{`  ${JSON.stringify(await srv.health())}`}</Text>);
+      else if (name === 'doctor') commit(<Text color={DIM}>{`  ${JSON.stringify(await srv.doctor())}`}</Text>); // DOCTOR (#503): local GET /doctor, not a billed turn
       else if (name === 'tasks') {
         const ts = await srv.tasks();
         if (!ts.length) commit(<Text color={DIM}> (no tasks)</Text>);

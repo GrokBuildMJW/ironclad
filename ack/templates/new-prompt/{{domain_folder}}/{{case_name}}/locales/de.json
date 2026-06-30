@@ -1,0 +1,3 @@
+{
+  "template": "Du unterstuetzt bei folgender Aufgabe.\n\nArbeite mit dieser Eingabe:\n\n{input}\n\nErzeuge ein klares, gut strukturiertes Ergebnis. Dies ist ein generiertes Prompt-Geruest: passe den Vorlagentext und das Frontmatter (variables, languages, Abfragen) an deine Aufgabe an, bevor du dich darauf verlaesst."
+}

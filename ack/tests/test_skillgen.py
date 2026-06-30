@@ -83,3 +83,25 @@ def test_cli_writes_a_playbook(tmp_path):
                         "--kind", "playbook", "--trigger", "do demo", "--dest", str(tmp_path)])
     assert rc == 0
     assert (tmp_path / "skills" / "demo-pb" / "SKILL.md").is_file()
+
+
+# ── GEN-1 (#503): free-text with quotes/backslashes/newlines stays valid by construction ──
+def test_tool_scaffold_with_hostile_freetext_is_importable():
+    desc = 'Wrap text in "quotes", a back\\slash and\na newline'
+    spec = skillgen.SkillSpec(capability="wrap-text", description=desc, kind="tool", domain='da"ta')
+    src = next(v for k, v in skillgen.render_tool(spec).items() if k.startswith("skills/"))
+    ns: dict = {}
+    exec(compile(src, "<generated>", "exec"), ns)     # pre-fix: SyntaxError (unescaped quotes/backslash)
+    assert ns["CASE"]["description"] == desc           # free text round-trips intact through the CASE literal
+    assert ns["CASE"]["domain"] == 'da"ta'
+
+
+def test_playbook_frontmatter_survives_hostile_description(tmp_path):
+    desc = 'Summarize: handle "quotes", a back\\slash\nand a second line'
+    spec = skillgen.SkillSpec(capability="summarize-x", description=desc, kind="playbook")
+    md = next(v for k, v in skillgen.render_playbook(spec).items() if k.endswith("SKILL.md"))
+    p = tmp_path / "SKILL.md"
+    p.write_text(md, encoding="utf-8")
+    parsed = pb.parse_playbook(p)                       # pre-fix: PlaybookError (the newline spilled a line)
+    assert pb.validate_meta(parsed.meta) == []          # frontmatter valid
+    assert parsed.meta["description"] == " ".join(desc.split())   # flattened to a single YAML line, intact

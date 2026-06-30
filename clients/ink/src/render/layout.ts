@@ -23,10 +23,22 @@ export function createConfig(): YogaConfig {
 }
 
 // ── text width + word-wrap (CJK/emoji aware) ────────────────────────────────
-/** Display width of a string in terminal columns (sum of per-code-point widths). */
+// INK-R-1 (#503): ANSI CSI/SGR escapes carry ZERO display width — paint.ts consumes them into styled
+// runs (its SGR_RE/CSI_RE) and wraps the *visible* glyphs, so the layout measure must not count their
+// bytes as columns. If it does, a colored transcript line is over-measured, Yoga reserves the wrong
+// geometry, and the line is re-wrapped/clipped against paint. Scope mirrors paint: SGR is a CSI ending
+// in 'm'; any other CSI in content is dropped there too.
+const ANSI_RE = /\x1b\[[0-9;?]*[ -/]*[@-~]/g;
+
+/** Strip ANSI CSI/SGR escapes so width/wrap measurement counts visible columns only (INK-R-1). */
+export function stripAnsi(s: string): string {
+  return s.includes('\x1b') ? s.replace(ANSI_RE, '') : s;
+}
+
+/** Display width of a string in terminal columns (sum of per-code-point widths; ANSI escapes ignored). */
 export function textWidth(s: string): number {
   let w = 0;
-  for (const ch of s) w += charWidth(ch.codePointAt(0) ?? 32);
+  for (const ch of stripAnsi(s)) w += charWidth(ch.codePointAt(0) ?? 32);
   return w;
 }
 
@@ -36,6 +48,7 @@ export function textWidth(s: string): number {
  * Infinity → no wrapping (split on '\n' only).
  */
 export function wrapText(text: string, width: number): string[] {
+  text = stripAnsi(text); // INK-R-1 (#503): wrap by visible width — escapes must not consume budget or be split
   if (!Number.isFinite(width) || width <= 0) return text.split('\n');
   const out: string[] = [];
   for (const para of text.split('\n')) {

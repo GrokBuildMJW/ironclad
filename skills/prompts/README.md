@@ -16,6 +16,9 @@ flow (list → guided elicitation → assemble in your language). See
 | `pr-description` | A clear, reviewer-focused pull-request description | `changes` | en, de |
 | `refactor-plan` | A safe, incremental step-by-step refactoring plan | `code` | en, de |
 | `test-plan` | A focused, prioritised test plan for a change | `change` | en, de |
+| `dev-process` | A disciplined C0→C1→C2 dev-loop plan (readiness / per-unit / completion), docs-as-code, no-guessing | `task`, `change_type` | en, de |
+| `verbatim-scope-audit` | A Verbatim→Scope audit: enumerate a prompt's requirements V1..Vn and map each to a work item before work starts | `requirements` | en, de |
+| `dev-loop-runner` | Run one unit through the light dev loop (select → work → review → done) over the CLI-agnostic handover | `unit` | en, de |
 
 ## Add your own — drop an MD file
 

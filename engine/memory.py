@@ -34,6 +34,11 @@ import urllib.error
 import urllib.request
 from typing import Any, Dict, List, Optional
 
+try:
+    import project_context as _pc            # ADR-0011 AD-1: scope memory by the active ProjectContext (S3b)
+except ImportError:
+    _pc = None                              # absent → agent_id falls back to the instance default (today)
+
 
 class MemoryManager:
     """Thin client for a Mem0-style memory service. All methods are fail-soft: a
@@ -46,7 +51,10 @@ class MemoryManager:
     def __init__(self, config: Dict[str, Any]) -> None:
         self.base = str(config.get("base_url") or "").rstrip("/")
         self.enabled = bool(config.get("enabled", bool(self.base)))
-        self.agent_id = config.get("agent_id") or "ironclad"
+        _aid = config.get("agent_id")
+        # Normalize the base partition: a blank/whitespace/non-string agent_id falls back to "ironclad"
+        # (otherwise a whitespace id would survive here yet be rejected by the service's require_scope).
+        self.agent_id = _aid.strip() if isinstance(_aid, str) and _aid.strip() else "ironclad"
         self.user_id = config.get("user_id") or None
         # /add runs LLM extraction + graph build server-side → slow (tens of seconds).
         # It's fire-and-forget on a daemon thread, so a generous timeout is safe.
@@ -67,17 +75,44 @@ class MemoryManager:
         self.recency_tiebreak = bool(config.get("recency_tiebreak", True))
 
     # ── transport ────────────────────────────────────────────
+    def _active_scope(self) -> str:
+        """The ACTIVE ProjectContext partition (``mem_scope`` — ``<mem_ns>::track::<tid>`` for a non-``main``
+        track, bare ``mem_ns`` for ``main``; S14-1), or ``""`` when no project is bound (the base partition).
+        Evaluate in the request thread (a fire-and-forget write thread does not inherit the contextvar)."""
+        if _pc is not None:
+            c = _pc.current()
+            if c is not None and c.mem_ns:
+                return c.mem_scope()
+        return ""
+
     def _ids(self) -> Dict[str, Any]:
-        ids: Dict[str, Any] = {"agent_id": self.agent_id}
+        """The Mem0 scope keys. The partition (``agent_id``) is the active ProjectContext's ``mem_scope``
+        when a project is bound (ADR-0011 AD-1 / S3b/S14-1 — so a project's, and a track's, memory is
+        isolated), else the instance default (today's behaviour; the implicit `default` project keeps the
+        legacy ``ironclad`` ns for continuity). SNAPSHOT it before a fire-and-forget write thread."""
+        ids: Dict[str, Any] = {"agent_id": self._active_scope() or self.agent_id}
         if self.user_id:
             ids["user_id"] = self.user_id
         return ids
+
+    def _tag_scope(self, md: Dict[str, Any]) -> Dict[str, Any]:
+        """Stamp the active partition ``scope`` into a write's metadata (#601 S14-5 — so a stored memory
+        self-describes its origin for promotion eligibility / cross-partition audit, not only via its
+        ``agent_id`` partition). Added ONLY when a real project scope is bound → **byte-identical** for the
+        base partition (no key added, no behaviour change). Snapshot in the request thread, like ``_ids``."""
+        ns = self._active_scope()
+        return {**md, "scope": ns} if ns else md
 
     def _post(self, path: str, body: Dict[str, Any], timeout: float) -> Dict[str, Any]:
         data = json.dumps(body).encode("utf-8")
         req = urllib.request.Request(self.base + path, data=data,
                                      headers={"Content-Type": "application/json"},
                                      method="POST")
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read().decode("utf-8") or "{}")
+
+    def _get(self, path: str, timeout: float) -> Dict[str, Any]:
+        req = urllib.request.Request(self.base + path, method="GET")
         with urllib.request.urlopen(req, timeout=timeout) as r:
             return json.loads(r.read().decode("utf-8") or "{}")
 
@@ -103,14 +138,16 @@ class MemoryManager:
         if not self.enabled or not self.base:
             return
         content = self._episode(task_id, task or {}, feedback or "")
+        ids = self._ids()                    # SNAPSHOT the scope in this thread (the write thread won't inherit ctx)
+        md_add = self._tag_scope({"task_id": task_id, "type": (task or {}).get("type"),
+                                  "title": (task or {}).get("title"), "source": "task_completion"})
 
         def _go() -> None:
             try:
                 self._post("/add", {
                     "messages": [{"role": "user", "content": content}],
-                    "metadata": {"task_id": task_id, "type": (task or {}).get("type"),
-                                 "title": (task or {}).get("title"), "source": "task_completion"},
-                    **self._ids(),
+                    "metadata": md_add,
+                    **ids,
                 }, self.add_timeout)
             except Exception:  # noqa: BLE001 — best effort, never break advance
                 pass
@@ -154,12 +191,14 @@ class MemoryManager:
         md: Dict[str, Any] = {"source": "context_eviction"}
         if metadata:
             md.update(metadata)
+        md = self._tag_scope(md)             # S14-5: self-describe the origin scope (byte-identical for base)
+        ids = self._ids()                    # SNAPSHOT the scope before the fire-and-forget thread
 
         def _go() -> None:
             try:
                 self._post("/add_bulk", {
                     "messages": [{"role": "user", "content": text}],
-                    "metadata": md, "infer": False, **self._ids(),
+                    "metadata": md, "infer": False, **ids,
                 }, self.read_timeout)  # bulk has no LLM → the short read timeout is enough
             except Exception:  # noqa: BLE001 — best effort, never break the turn
                 pass
@@ -200,7 +239,9 @@ class MemoryManager:
         base_md: Dict[str, Any] = {"source": source}
         if metadata:
             base_md.update(metadata)
+        base_md = self._tag_scope(base_md)   # S14-5: self-describe the origin scope (byte-identical for base)
         n = len(chunks)
+        ids = self._ids()                    # SNAPSHOT the scope before the fire-and-forget thread
 
         def _go() -> None:
             for i, ch in enumerate(chunks):
@@ -208,17 +249,54 @@ class MemoryManager:
                     self._post("/add_bulk", {
                         "messages": [{"role": "user", "content": ch}],
                         "metadata": {**base_md, "chunk": i, "chunks": n},
-                        "infer": False, **self._ids(),
+                        "infer": False, **ids,
                     }, self.read_timeout)
                 except Exception:  # noqa: BLE001 — best effort per chunk, never break a turn
                     pass
 
         threading.Thread(target=_go, daemon=True, name="mem-chunk").start()
 
+    # ── delete / forget a whole partition (scope-targeted; ADR-0011 D5 / #601 S14-5) ──
+    def forget(self, scope: str) -> bool:
+        """Forget every memory under partition *scope* (its ``agent_id``) — the cold half of the scope-aware
+        forget endpoint (e.g. when a project or track is dropped). **Synchronous** (the caller wants to know
+        it happened) but **fail-soft**: a transport error, an unavailable service, or a backend without a
+        ``/delete_all`` route returns ``False`` and never raises. **Fail-closed on an empty scope** (returns
+        ``False`` without calling the backend) so a forget can never wipe the shared base partition. Targets
+        ``agent_id`` only (the partition key); ``user_id`` is an orthogonal dimension, left untouched."""
+        if not self.enabled or not self.base:
+            return False
+        scope = (scope or "").strip()
+        if not scope:
+            return False
+        try:
+            self._post("/delete_all", {"agent_id": scope}, self.add_timeout)
+            return True
+        except Exception:  # noqa: BLE001 — fail-soft: a missing endpoint / down service is not fatal
+            return False
+
+    def list_scopes(self) -> "List[str]":
+        """The distinct memory partitions (``agent_id`` = ``mem_ns``) present in the cold store — the input
+        to the engine's registry-keyed orphan GC (ADR-0011 AD-4 / #601 S15). ``GET /scopes`` on the memory
+        service; **fail-soft** → ``[]`` when disabled / unavailable / the route is missing / on any error or
+        garbage payload (so the GC, which only deletes orphans, simply finds nothing)."""
+        if not self.enabled or not self.base:
+            return []
+        try:
+            d = self._get("/scopes", self.read_timeout)
+        except Exception:  # noqa: BLE001 — fail-soft: a down service / missing route is not fatal
+            return []
+        scopes = d.get("scopes") if isinstance(d, dict) else None
+        if not isinstance(scopes, list):
+            return []
+        return [s for s in scopes if isinstance(s, str) and s]
+
     # ── read (vector-only by default: graph=false; deep_query opts into graph=true) ──
     def _search(self, query: str, limit: int, graph: bool = False,
                 timeout: Optional[float] = None) -> List[str]:
-        if not query.strip() or not self.base:
+        # MEM-2 (#503): gate on `enabled` too (like every write + the other reads) — a base+enabled=false
+        # config must NOT issue /search. Was guarded only on self.base (latent; read sites pre-gate today).
+        if not self.enabled or not self.base or not query.strip():
             return []
         try:
             d = self._post("/search", {"query": query, "limit": int(limit),

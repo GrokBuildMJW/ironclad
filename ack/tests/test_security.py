@@ -71,6 +71,20 @@ def test_token_profile_requires_secret(monkeypatch):
     assert p2.check_token(None) is False
 
 
+def test_invalid_profile_refuses_boot_not_silent_open(monkeypatch):
+    # SEC-1 (#503): an unknown NON-EMPTY profile (a typo) must REFUSE to boot, not silently downgrade to the
+    # weakest 'open' (fail-open in a fail-closed module). Unset/empty still defaults to 'open'.
+    monkeypatch.delenv("GX10_SERVER_TOKEN", raising=False)
+    monkeypatch.delenv("GX10_PROFILE", raising=False)
+    bad = SecurityPolicy.from_config({"security": {"profile": "seald"}})    # typo of 'sealed'
+    assert bad.profile != "open"                        # NOT silently downgraded to the weakest profile
+    err = bad.startup_error()
+    assert err is not None and "seald" in err           # refuses to boot, names the bad value
+    empty = SecurityPolicy.from_config({"security": {"profile": ""}})
+    assert empty.profile == "open" and empty.startup_error() is None   # unset → documented default
+    assert SecurityPolicy.from_config({}).profile == "open"            # missing section → default
+
+
 def test_sealed_profile_forces_loopback_and_local(monkeypatch):
     monkeypatch.setenv("GX10_SERVER_TOKEN", "tok")
     p = SecurityPolicy.from_config({"security": {"profile": "sealed", "code_locality": "mount"}})

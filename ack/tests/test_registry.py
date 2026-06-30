@@ -9,6 +9,7 @@ and unified capability resolution.
 from __future__ import annotations
 
 import asyncio
+import logging
 import textwrap
 from enum import Enum
 from pathlib import Path
@@ -119,6 +120,20 @@ def test_auto_schema_optional_not_required():
     schema = derive_tool_schema(f)
     assert schema["required"] == ["a"]
     assert "b" in schema["properties"]
+
+
+def _pep604_handler(a: str, b: int | None = None) -> None:
+    # ACK-1 (#503): module-level so get_type_hints resolves the PEP-604 `int | None` under
+    # `from __future__ import annotations` — exactly how real tools are declared.
+    ...
+
+
+def test_auto_schema_pep604_optional_not_required():
+    # ACK-1 (#503): `X | None` (types.UnionType) must be treated like Optional[X] — not a bare-string
+    # required fallback. Pre-fix the schema gave the public SDK a wrong model-facing shape for `b`.
+    schema = derive_tool_schema(_pep604_handler)
+    assert schema["required"] == ["a"]                        # b is optional (X | None), not required
+    assert schema["properties"]["b"] == {"type": "integer"}  # the non-None arm, not {"type": "string"}
 
 
 class _Mode(str, Enum):
@@ -239,6 +254,19 @@ def test_discover_skills_walks_tree(tmp_path):
 def test_discover_missing_root_is_fail_soft():
     r = Registry()
     assert r.discover_skills("/no/such/path/at/all") == []
+
+
+def test_discover_warns_on_case_without_capability(tmp_path, caplog):
+    # ACK-2 (#503): a module with a CASE dict but an empty/missing 'capability' is dropped in the bulk
+    # scan — now WITH a diagnostic (it used to vanish silently; only single-file register_skill raised).
+    sk = tmp_path / "skills"
+    sk.mkdir()
+    (sk / "broken.py").write_text("CASE = {'name': 'x', 'description': 'd'}\n", encoding="utf-8")  # no capability
+    r = Registry()
+    with caplog.at_level(logging.WARNING, logger="ack.registry"):
+        added = r.discover_skills(tmp_path)
+    assert added == []                                    # dropped, as before
+    assert "no/empty 'capability'" in caplog.text         # but no longer silent
 
 
 def test_skill_roots_are_lazily_scanned(tmp_path):

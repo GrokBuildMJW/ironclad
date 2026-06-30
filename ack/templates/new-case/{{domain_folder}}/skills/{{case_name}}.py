@@ -25,6 +25,8 @@ def run(context: dict | None = None) -> dict:
     injected chat transport (``ack.validated_emit.emit_validated``) — never the
     network directly.
     """
+    # ACK-SCAFFOLD-SENTINEL — remove this line once run() is implemented. The generation-completeness
+    # gate (ack.gate.gate_generated) REJECTS an item that still carries this marker (an unfilled scaffold).
     raise NotImplementedError(
         "Case '{{capability_key}}' is a scaffold — implement run() per "
         "{{case_name}}-spec.md before wiring it in."

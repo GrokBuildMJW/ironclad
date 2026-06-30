@@ -13,16 +13,64 @@ import {promises as fs} from 'node:fs';
 import path from 'node:path';
 import type {Server, Json} from '../net/server.js';
 
-export const MODEL_BY_AGENT: Record<string, string> = {
-  OPUS: 'claude-opus-4-8',
-  SONNET: 'claude-sonnet-4-6',
-};
+type Item = Record<string, unknown>;
+const str = (v: unknown, d = ''): string => (v === undefined || v === null ? d : String(v));
+
+/** The Claude-default launch template — used only when neither an explicit client override nor the
+ *  server's per-agent spec supplies one (≙ client.py DEFAULT_AGENT_CMD). */
+export const DEFAULT_AGENT_CMD =
+  '{bin} --model {model} --effort {effort} --permission-mode {permission} --print {prompt}';
+const DEFAULT_BIN = 'claude';
+/** #455: how much of a code-agent's stderr to upload for the server-side exhausted classifier. */
+const STDERR_TAIL_CHARS = 4000;
 
 export interface HandoverCfg {
-  claudeBin: string;
-  claudeEffort: string;
-  claudePermissionMode: string;
-  agentCmd: string;
+  // #449/INK-HANDOVER-1 (#503): an EXPLICIT client-side override (GX10_CLAUDE_BIN / GX10_AGENT_CMD or
+  // the config file) — the documented single-agent BYO path — beats the server's per-agent spec; null
+  // (unset) ⇒ the server spec wins, then the built-in default. Mirrors client.py's *_OVERRIDE precedence.
+  claudeBinOverride: string | null;
+  agentCmdOverride: string | null;
+  claudeEffort: string; // default effort when the item omits it
+  claudePermissionMode: string; // default permission when the item omits it
+}
+
+/** First non-empty string (mirrors Python `a or b or c`; '' is falsy). */
+function firstNonEmpty(...vals: Array<string | null | undefined>): string {
+  for (const v of vals) if (v) return v;
+  return '';
+}
+
+/** The fully-resolved per-agent launch spec (INK-HANDOVER-1, #503). PURE + testable: the server ships
+ *  the full spec per `/pending` item (bin/cmd_template/model/effort/permission + mcp/mcp_env); the client
+ *  is a thin renderer. Precedence per field mirrors client.py `_run_handover`: an explicit client override
+ *  > the server's item spec > the built-in default; `mcp`/`mcp_env` come straight from the item. */
+export interface LaunchSpec {
+  bin: string;
+  model: string;
+  effort: string;
+  permission: string;
+  template: string;
+  mcp: string;
+  mcpEnv: Record<string, string>;
+}
+
+export function resolveLaunch(item: Item, cfg: HandoverCfg): LaunchSpec {
+  const me = item['mcp_env'];
+  const mcpEnv: Record<string, string> = {};
+  if (me && typeof me === 'object' && !Array.isArray(me)) {
+    for (const [k, v] of Object.entries(me as Record<string, unknown>)) mcpEnv[String(k)] = String(v);
+  }
+  return {
+    bin: firstNonEmpty(cfg.claudeBinOverride, str(item['bin']), DEFAULT_BIN),
+    // model fallback matches client.py exactly (`item['model'] or 'claude-opus-4-8'`) — the server ships
+    // the per-agent model, so no client-side agent→model table (a thin renderer keeps no such table).
+    model: firstNonEmpty(str(item['model']), 'claude-opus-4-8'),
+    effort: firstNonEmpty(str(item['effort']), cfg.claudeEffort),
+    permission: firstNonEmpty(str(item['permission']), cfg.claudePermissionMode),
+    template: firstNonEmpty(cfg.agentCmdOverride, str(item['cmd_template']), DEFAULT_AGENT_CMD),
+    mcp: str(item['mcp']),
+    mcpEnv,
+  };
 }
 
 /** POSIX shlex.split — whitespace splits tokens; single/double quotes and backslash group. */
@@ -65,20 +113,34 @@ export function shlexSplit(s: string): string[] {
   return out;
 }
 
-/** ≙ _build_agent_argv: shlex-split the template, then substitute placeholders PER TOKEN so
- *  `{prompt}` (with spaces) stays exactly one argv element. Unknown `{x}` are left as-is. */
+/** ≙ commands.build_agent_argv: shlex-split the template, then substitute placeholders PER TOKEN so
+ *  `{prompt}` (with spaces) stays exactly one argv element. `{feedback}` (#443) is the deterministic
+ *  result-capture path; `{mcp}` (#480) is a MULTI-token placeholder that expands (via shlex) to 0+ args
+ *  (the gated read-only Memory MCP config under the sealed profile, else nothing). Unknown `{x}` are
+ *  left as-is. (INK-HANDOVER-1, #503: the client previously dropped {feedback}/{mcp} — left literal.) */
 export function buildAgentArgv(
   template: string,
-  subs: {bin: string; model: string; effort: string; permission: string; prompt: string},
+  subs: {bin: string; model: string; effort: string; permission: string; prompt: string;
+         feedback?: string; mcp?: string},
 ): string[] {
-  const map: Record<string, string> = {...subs};
-  return shlexSplit(template).map((tok) => {
-    const bare = tok.slice(1, -1);
-    if (tok.startsWith('{') && tok.endsWith('}') && bare in map) return map[bare] as string;
-    let t = tok;
-    for (const [k, v] of Object.entries(map)) t = t.replaceAll('{' + k + '}', v);
-    return t;
-  });
+  const map: Record<string, string> = {
+    bin: subs.bin, model: subs.model, effort: subs.effort,
+    permission: subs.permission, prompt: subs.prompt, feedback: subs.feedback ?? '',
+  };
+  const mcp = subs.mcp ?? '';
+  const argv: string[] = [];
+  for (const tok of shlexSplit(template)) {
+    if (tok === '{mcp}') {
+      argv.push(...shlexSplit(mcp)); // #480: multi-token — empty mcp ⇒ no args
+    } else if (tok.startsWith('{') && tok.endsWith('}') && tok.slice(1, -1) in map) {
+      argv.push(map[tok.slice(1, -1)] as string);
+    } else {
+      let t = tok;
+      for (const [k, v] of Object.entries(map)) t = t.replaceAll('{' + k + '}', v);
+      argv.push(t);
+    }
+  }
+  return argv;
 }
 
 /** Bounded async pool — at most `max` concurrent jobs (≙ ThreadPoolExecutor max_workers). */
@@ -98,36 +160,54 @@ export class Pool {
   }
 }
 
-type Item = Record<string, unknown>;
-const str = (v: unknown, d = ''): string => (v === undefined || v === null ? d : String(v));
+/** The run signal reported back to the server (#455 / INK-HANDOVER-2): exit code + a stderr tail so a
+ *  budget/quota-exhausted run is classified `agent-unavailable` (trip the breaker + fail over) instead
+ *  of retrying the same agent forever. `enoent` ⇒ the binary was missing (exit_code null). */
+type SpawnResult = {enoent: true} | {rc: number | null; stderr: string};
 
-/** Spawn the code-agent; resolve {enoent:true} if the binary is missing, else {rc}. */
-function spawnAgent(argv: string[], codedir: string): Promise<{rc: number} | {enoent: true}> {
+/** Spawn the code-agent; capture stderr (and surface it) so the run signal can be reported. */
+function spawnAgent(argv: string[], codedir: string, env: NodeJS.ProcessEnv): Promise<SpawnResult> {
   return new Promise((resolve) => {
     let done = false;
-    const fin = (r: {rc: number} | {enoent: true}): void => {
+    let stderr = '';
+    const fin = (r: SpawnResult): void => {
       if (!done) {
         done = true;
         resolve(r);
       }
     };
+    // stdout inherits (the agent's progress shows live); stderr is PIPED so we can both surface it and
+    // report a tail to the server (≙ client.py subprocess.run(..., stderr=PIPE)).
     const child = spawn(argv[0] as string, argv.slice(1), {
       cwd: codedir,
-      stdio: ['ignore', 'inherit', 'inherit'],
-      env: {...process.env, PYTHONIOENCODING: 'utf-8'},
+      stdio: ['ignore', 'inherit', 'pipe'],
+      env,
     });
-    child.on('error', (e) => fin((e as NodeJS.ErrnoException).code === 'ENOENT' ? {enoent: true} : {rc: 1}));
-    child.on('close', (code) => fin({rc: code ?? 0}));
+    child.stderr?.on('data', (d: Buffer) => {
+      stderr += d.toString();
+    });
+    child.on('error', (e) =>
+      fin((e as NodeJS.ErrnoException).code === 'ENOENT' ? {enoent: true} : {rc: 1, stderr}),
+    );
+    child.on('close', (code) => fin({rc: code, stderr}));
   });
 }
 
-/** ≙ _run_handover: materialise the handover, run claude --print locally, read the feedback. */
+/** The handover run result: the feedback text (null if none) + the run signal meta (#455). */
+export interface RunResult {
+  fb: string | null;
+  meta: {exit_code: number | null; stderr: string};
+}
+
+/** ≙ _run_handover: materialise the handover, run the per-agent code-agent locally, read the feedback,
+ *  and ALWAYS return the run signal (#455). Threads the full server-shipped per-agent spec (INK-HANDOVER-1)
+ *  and falls back to the {feedback} captured final message when no feedback file is written (#443). */
 export async function runHandover(
   item: Item,
   codedir: string,
   cfg: HandoverCfg,
   log: (m: string) => void,
-): Promise<string | null> {
+): Promise<RunResult> {
   const tid = str(item['id']);
   const agent = str(item['agent'], 'OPUS').toUpperCase();
   const hoName = str(item['handover_file']) || `${tid}_${agent}.md`;
@@ -139,34 +219,62 @@ export async function runHandover(
   await fs.mkdir(hoDir, {recursive: true});
   await fs.writeFile(path.join(hoDir, hoName), hoText, 'utf-8');
 
-  const model = str(item['model']) || MODEL_BY_AGENT[agent] || 'claude-opus-4-8';
-  const effort = str(item['effort']) || cfg.claudeEffort;
+  const spec = resolveLaunch(item, cfg); // INK-HANDOVER-1 (#503): bin/template/model/effort/permission/mcp
   const fbName = `${tid}_${agent}-feedback.md`;
+  const capName = `${tid}_${agent}-output.md`; // #443: deterministic {feedback} capture path
   const prompt =
     `Autonomously read and complete the handover at .ironclad/agent/handovers/${hoName}. ` +
     `Follow any agent guide in this repo (e.g. AGENTS.md / CLAUDE.md). When done, write a ` +
     `short result summary to .ironclad/agent/feedback/${fbName}.`;
 
-  const argv = buildAgentArgv(cfg.agentCmd, {
-    bin: cfg.claudeBin,
-    model,
-    effort,
-    permission: cfg.claudePermissionMode,
+  const argv = buildAgentArgv(spec.template, {
+    bin: spec.bin,
+    model: spec.model,
+    effort: spec.effort,
+    permission: spec.permission,
     prompt,
+    feedback: `.ironclad/agent/feedback/${capName}`, // relative to codedir (the agent's cwd)
+    mcp: spec.mcp,
   });
-  log(`  → code-agent (local): ${tid} (${agent}, ${model}, effort=${effort})  cwd=${codedir}`);
-  const res = await spawnAgent(argv, codedir);
+
+  // #443 (review F-1): unlink BOTH result paths before launching so a stale file from a prior failed
+  // attempt can never be read as THIS run's result (the codedir persists across re-runs).
+  const fbDir = path.join(codedir, '.ironclad', 'agent', 'feedback');
+  await fs.mkdir(fbDir, {recursive: true});
+  const fbPath = path.join(fbDir, fbName);
+  const capPath = path.join(fbDir, capName);
+  await fs.rm(fbPath, {force: true});
+  await fs.rm(capPath, {force: true});
+
+  log(`  → code-agent (local): ${tid} (${agent}, ${spec.model}, effort=${spec.effort})  cwd=${codedir}`);
+  // #480: the spawned MCP inherits the memory connection from the agent's env — it travels here, NEVER
+  // on the MCP JSON-RPC wire (secret-free). Empty mcp_env under open/token ⇒ byte-identical launch.
+  const env: NodeJS.ProcessEnv = {...process.env, PYTHONIOENCODING: 'utf-8', ...spec.mcpEnv};
+  const res = await spawnAgent(argv, codedir, env);
   if ('enoent' in res) {
-    log(`  ✗ code-agent binary '${argv[0] ?? cfg.claudeBin}' not found (set GX10_CLAUDE_BIN / GX10_AGENT_CMD) — handover ${tid} skipped`);
-    return null;
+    log(`  ✗ code-agent binary '${argv[0] ?? spec.bin}' not found (set GX10_CLAUDE_BIN / GX10_AGENT_CMD) — handover ${tid} skipped`);
+    return {fb: null, meta: {exit_code: null, stderr: 'binary-not-found'}};
   }
-  const fbPath = path.join(codedir, '.ironclad', 'agent', 'feedback', fbName);
+  if (res.stderr.trim()) log(res.stderr.replace(/\s+$/, '')); // keep the agent's stderr visible
+  const meta = {exit_code: res.rc, stderr: res.stderr.slice(-STDERR_TAIL_CHARS)};
+
   try {
-    return await fs.readFile(fbPath, 'utf-8');
+    return {fb: await fs.readFile(fbPath, 'utf-8'), meta};
   } catch {
-    log(`  ⚠ claude exited (exit ${res.rc}) without a feedback file ${fbName}`);
-    return null;
+    /* no feedback file — fall through to the {feedback} captured final message */
   }
+  // #443 hybrid fallback: the agent didn't write the feedback file — use its captured final message.
+  try {
+    const cap = await fs.readFile(capPath, 'utf-8');
+    if (cap.trim()) {
+      log(`  ⓘ no feedback file ${fbName}; using the captured final message ${capName}`);
+      return {fb: cap, meta};
+    }
+  } catch {
+    /* no capture either */
+  }
+  log(`  ⚠ agent exited (exit ${res.rc}) without a feedback file ${fbName} or a captured message`);
+  return {fb: null, meta};
 }
 
 /** ≙ _process_one: run the handover, upload feedback; un-claim on any failure for retry. */
@@ -181,15 +289,30 @@ export async function processOne(
   const tid = str(item['id']);
   const agent = str(item['agent'], 'OPUS').toUpperCase();
   try {
-    const fb = await runHandover(item, codedir, cfg, log);
-    if (fb) {
-      const res = await srv.feedback({task_id: tid, agent, content: fb});
+    const {fb, meta} = await runHandover(item, codedir, cfg, log);
+    // INK-HANDOVER-2 (#503): ALWAYS report the run signal (even with no feedback) so the server can
+    // classify a budget-exhausted run → trip the #455 breaker + fail over on the next poll, instead of
+    // retrying the same out-of-budget agent forever. Mirrors client.py _process_one.
+    const res = await srv.feedback({
+      task_id: tid,
+      agent,
+      content: fb ?? '',
+      exit_code: meta.exit_code,
+      stderr: meta.stderr,
+    });
+    const clsRaw = (res as Json)['classification'];
+    const cls = typeof clsRaw === 'string' ? clsRaw : null;
+    if (cls === 'ok-feedback' || (cls === null && fb)) {
       log(`  ✓ feedback uploaded: ${tid} → ${str((res as Json)['feedback_file'])}`);
       return true;
     }
-    log(`  ⚠ ${tid}: no feedback produced — will retry on the next poll`);
+    if (cls === 'agent-unavailable') {
+      log(`  ⚠ ${tid}: ${agent} unavailable (budget/quota) → failing over to a peer on the next poll`);
+    } else {
+      log(`  ⚠ ${tid}: no feedback produced — will retry on the next poll`);
+    }
   } catch (e) {
-    log(`  ✗ ${tid}: code-agent failed: ${e instanceof Error ? e.message : String(e)}`);
+    log(`  ✗ ${tid}: upload/code-agent failed: ${e instanceof Error ? e.message : String(e)}`);
   }
   claimed.delete(tid);
   return false;

@@ -88,6 +88,11 @@ class MprConfig(BaseModel):
     providers: ProvidersCfg = Field(default_factory=lambda: ProvidersCfg(
         pool=dict(DEFAULT_POOL), routing=RoutingCfg(**DEFAULT_ROUTING)))
     router: RouterConfig = Field(default_factory=RouterConfig)
+    # MPR-REG-1 (#503): RESERVED config seam — the registry sub-config (mpr.registry.* : roles_min/max,
+    # effort_max_tokens, distinct_max_overlap, adaptive_min_roles, panels_dir) is LOADED + validated here but
+    # the panel resolver/guards/loader do NOT yet read it (they apply the module constants in
+    # registry/resolve.py + the Panel model). Treat these knobs as reserved until they are wired; setting
+    # them has no effect today (operator decision, #503: mark reserved honestly rather than fully wire/remove).
     registry: RegistryConfig = Field(default_factory=RegistryConfig)
 
 

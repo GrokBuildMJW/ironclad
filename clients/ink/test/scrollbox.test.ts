@@ -80,15 +80,6 @@ test('onWheel scrolls by a step and is always consumed', () => {
   assert.equal(sb.top, 90);
 });
 
-test('visibleRange and isVisible reflect the viewport', () => {
-  const sb = new ScrollBox(10, 100);
-  sb.scrollTo(40);
-  assert.deepEqual(sb.visibleRange(), {top: 40, bottom: 50});
-  assert.equal(sb.isVisible(45), true);
-  assert.equal(sb.isVisible(39), false);
-  assert.equal(sb.isVisible(50), false);
-});
-
 test('PageUp/PageDown keys are consumed; unrelated keys are not', () => {
   const sb = new ScrollBox(10, 100);
   assert.equal(sb.onKey(emptyKey({pageUp: true})), true);

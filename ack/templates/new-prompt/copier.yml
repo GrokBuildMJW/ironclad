@@ -1,0 +1,51 @@
+# Copier template — ACK "new-prompt" prompt-library scaffold.
+# ---------------------------------------------------------------------------
+# A valid Copier questionnaire so `copier copy`/`copier update` work once
+# `pip install copier` is present. Copier is intentionally NOT required; the
+# canonical driver is `python -m ack.generator --kind prompt`, which renders the
+# same `{{ token }}` tree with substitution-only semantics and does the
+# re-runnable 3-way merge itself. The CLI mirrors the computed defaults below —
+# keep them in sync. See TEMPLATE-README.md.
+
+_subdirectory: "."
+_envops:
+  keep_trailing_newline: true
+
+# Skip the template's own meta files when rendering.
+_exclude:
+  - "copier.yml"
+  - "copier.yaml"
+  - "TEMPLATE-README.md"
+  - "~*"
+  - ".ack-generator-state.json"
+
+# --- Questions ------------------------------------------------------------- #
+domain_name:
+  type: str
+  help: "Domain key in kebab-case (e.g. writing)"
+  validator: "{% if not (domain_name | regex_search('^[a-z0-9]+(-[a-z0-9]+)*$')) %}kebab-case only{% endif %}"
+
+domain_folder:
+  type: str
+  help: "Library subfolder (Title-Case)"
+  default: "{{ domain_name.split('-') | map('capitalize') | join('-') }}"
+
+case_name:
+  type: str
+  help: "Prompt key in kebab-case (e.g. blog-brief)"
+  validator: "{% if not (case_name | regex_search('^[a-z0-9]+(-[a-z0-9]+)*$')) %}kebab-case only{% endif %}"
+
+key_prefix:
+  type: str
+  help: "Short capability-key prefix (default: domain initials)"
+  default: "{{ domain_name.split('-') | map('first') | join('') }}"
+
+capability_key:
+  type: str
+  help: "Capability key for the prompt item"
+  default: "{{ key_prefix }}-{{ case_name }}"
+  when: false
+
+description:
+  type: str
+  help: "One-line description of the prompt"

@@ -380,7 +380,41 @@ def check_deps_mcp(ctx: DoctorContext) -> list[Finding]:
 
 
 #: The generic, always-on checks in dependency order.
-CORE_CHECKS: list[Check] = [check_ack_kernel, check_task_store_integrity, check_deps_mcp]
+def check_task_records_validate(ctx: DoctorContext) -> list[Finding]:
+    """DOCTOR-VAL (#503): opt-in per-task validation. With ``--validate-tasks`` (``ctx.validate_tasks``),
+    validate EVERY stored task record against the live TaskSpec — not just the canonical example — so
+    contract drift in a real task is caught. A no-op (no findings) unless the flag is set; never raises
+    (a malformed task is reported as an ``err`` finding, not an exception)."""
+    chk = "task-validate"
+    if not ctx.validate_tasks:
+        return []
+    cs = ctx.case_spec
+    if cs is None:
+        return [skip(chk, "ACK SSOT spec unavailable (kernel check skipped) — cannot validate task records")]
+    findings: list[Finding] = []
+    bad = 0
+    checked = 0
+    for r in ctx.records:
+        # A record with a `capability` field is a Lodestar CapabilityTaskSpec task — its own doctor checks
+        # validate it (the base TaskSpec forbids `capability`); the core check validates only base records,
+        # so it never double-flags a legitimate capability task.
+        if isinstance(r.data, dict) and "capability" in r.data:
+            continue
+        checked += 1
+        try:
+            cs.validate_task_json(r.data)
+        except Exception as e:  # noqa: BLE001 — a malformed task is a finding, not a crash
+            bad += 1
+            findings.append(err(chk, f"task '{r.task_id}' fails TaskSpec: {e}",
+                                field=rel(r.file, ctx.root),
+                                fix="correct the task JSON to satisfy the ACK TaskSpec (run --validate-tasks)"))
+    if not bad and checked:
+        findings.append(ok(chk, f"all {checked} base task record(s) validate against TaskSpec"))
+    return findings
+
+
+CORE_CHECKS: list[Check] = [check_ack_kernel, check_task_store_integrity, check_deps_mcp,
+                            check_task_records_validate]
 
 
 # --------------------------------------------------------------------------- #
@@ -422,6 +456,7 @@ def run_doctor(
     # Remaining core checks.
     report.extend(check_task_store_integrity(ctx))
     report.extend(check_deps_mcp(ctx))
+    report.extend(check_task_records_validate(ctx))   # DOCTOR-VAL (#503): opt-in per-task TaskSpec validation
 
     # Plugin checks (Lodestar etc.) — registered, ordered, share the context.
     for check in extra_checks or ():

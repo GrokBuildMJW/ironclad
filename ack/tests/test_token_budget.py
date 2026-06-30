@@ -102,3 +102,67 @@ def test_apply_config_derives_when_on_and_respects_off():
     finally:
         (gx10.MAX_CTX_CHARS, gx10.TRIM_TARGET_CHARS, gx10.MAX_MODEL_LEN,
          gx10.TOKEN_BUDGET, gx10.MAX_TOKENS, gx10.RAG_MAX_TOKENS, gx10.SUMMARY_MAX_TOKENS) = saved
+
+
+# ── #503 BUDGET-1/2/3: char-fallback trim hardening ───────────────────────────
+def test_char_trim_reserves_system_tools_thinking(monkeypatch):
+    # BUDGET-1: the char-fallback watermark must reserve sys+tools+thinking; the same `others` that fits
+    # the bare MAX_CTX_CHARS must trim once a large system prompt + tools + thinking are reserved.
+    monkeypatch.setattr(gx10, "MAX_CTX_CHARS", 10000)
+    monkeypatch.setattr(gx10, "TRIM_TARGET_CHARS", 6000)
+    monkeypatch.setattr(gx10, "THINKING_RESERVE", 1000)
+    monkeypatch.setattr(gx10, "CHARS_PER_TOKEN", 1.0)
+    monkeypatch.setattr(gx10, "SUMMARIZE_EVICTED", False)
+    monkeypatch.setattr(gx10, "_tools_schema_tokens", lambda: 500)   # → 500 chars at cpt 1.0
+    msgs = [{"role": "system", "content": "S" * 4000},               # reserve = 4000+500+1000 = 5500
+            {"role": "user", "content": "U" * 3000},
+            {"role": "assistant", "content": "A" * 3000},            # round 1 = 6000
+            {"role": "user", "content": "Q" * 200},
+            {"role": "assistant", "content": "B" * 200}]             # round 2 = 400  (others = 6400)
+    fake = types.SimpleNamespace(messages=list(msgs))
+    gx10.GX10._trim_context_chars(fake)                              # high = 10000-5500 = 4500 < 6400 → trims
+    others = [m for m in fake.messages if m.get("role") != "system"]
+    assert len(others) < 4 and sum(len(gx10._message_text(m)) for m in others) <= int(4500 * 0.6)
+    assert any(m.get("role") == "system" for m in fake.messages)    # system partition preserved
+    # contrast: with NO reserve (tiny system, no tools/thinking) the same others fit → no trim
+    monkeypatch.setattr(gx10, "_tools_schema_tokens", lambda: 0)
+    monkeypatch.setattr(gx10, "THINKING_RESERVE", 0)
+    keep = [{"role": "system", "content": ""}] + msgs[1:]
+    fake2 = types.SimpleNamespace(messages=list(keep))
+    gx10.GX10._trim_context_chars(fake2)
+    assert len([m for m in fake2.messages if m.get("role") != "system"]) == 4   # 6400 <= 10000 → unchanged
+
+
+def test_char_trim_counts_tool_call_arguments(monkeypatch):
+    # BUDGET-2: an assistant tool-call message has empty content but large `arguments`; the char trim must
+    # count them (via _message_text) — a content-only sum under-measured and never trimmed a tool-heavy round.
+    monkeypatch.setattr(gx10, "MAX_CTX_CHARS", 3000)
+    monkeypatch.setattr(gx10, "TRIM_TARGET_CHARS", 1500)
+    monkeypatch.setattr(gx10, "THINKING_RESERVE", 0)
+    monkeypatch.setattr(gx10, "CHARS_PER_TOKEN", 1.0)
+    monkeypatch.setattr(gx10, "SUMMARIZE_EVICTED", False)
+    monkeypatch.setattr(gx10, "_tools_schema_tokens", lambda: 0)
+    msgs = [{"role": "system", "content": ""},
+            {"role": "user", "content": "U" * 100},
+            {"role": "assistant", "content": "", "tool_calls": [{"function": {"name": "f", "arguments": "X" * 4000}}]},
+            {"role": "tool", "content": "ok"},
+            {"role": "user", "content": "Q"}]                        # content-only others ~= 103 (would NOT trim)
+    fake = types.SimpleNamespace(messages=list(msgs))
+    gx10.GX10._trim_context_chars(fake)                              # _message_text sees ~4001 → > 3000 → trims
+    others = [m for m in fake.messages if m.get("role") != "system"]
+    assert not any(m.get("tool_calls") for m in others)             # the big-arguments round was evicted
+
+
+def test_apply_config_honors_operator_supplied_char_budget(monkeypatch):
+    # BUDGET-3: an operator-set GX10_MAX_CTX_CHARS must be honored, not silently overwritten by the derive.
+    saved = (gx10.MAX_CTX_CHARS, gx10.TRIM_TARGET_CHARS, gx10.MAX_MODEL_LEN,
+             gx10.TOKEN_BUDGET, gx10.MAX_TOKENS, gx10.RAG_MAX_TOKENS, gx10.SUMMARY_MAX_TOKENS)
+    try:
+        monkeypatch.setenv("GX10_MAX_CTX_CHARS", "12345")
+        cfg = gx10._code_defaults()
+        cfg["context"].update({"token_budget": True, "max_model_len": 32768, "max_ctx_chars": 12345})
+        gx10._apply_config(cfg)
+        assert gx10.MAX_CTX_CHARS == 12345   # operator env honored despite token_budget on (no clobber)
+    finally:
+        (gx10.MAX_CTX_CHARS, gx10.TRIM_TARGET_CHARS, gx10.MAX_MODEL_LEN,
+         gx10.TOKEN_BUDGET, gx10.MAX_TOKENS, gx10.RAG_MAX_TOKENS, gx10.SUMMARY_MAX_TOKENS) = saved

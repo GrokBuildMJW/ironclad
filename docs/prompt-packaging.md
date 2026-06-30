@@ -68,6 +68,10 @@ A prompt item passes `ack.gate.gate_prompt` before it is trusted: frontmatter sc
 `{placeholder}` in the template (a required input that can't affect the output is a defect); and it
 **assembles cleanly in every declared language** — each present `locales/<lang>.json` overlay must
 be valid JSON with a non-empty `template` (a *missing* overlay is fine: it falls back to source).
+A **strict** variant `gate_prompt(strict_locales=True)` makes a *missing* overlay for a declared
+non-source language a failure ("declared == delivered") — this is the completeness check the
+per-project library invariant (`library_items_complete`) applies to **generated** prompt items;
+hand-authored built-ins stay on the lenient default.
 `ack.gate.gate(<dir|SKILL.md>)` auto-routes `kind: prompt` items here. Deterministic, model-free;
 the heavier behavioral `eval/` stays opt-in. **New prompt = drop an MD file** under `skills/`
 — no engine change (see the shipped [starter library](../skills/prompts/README.md)).

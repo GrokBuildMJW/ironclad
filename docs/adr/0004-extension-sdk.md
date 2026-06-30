@@ -12,8 +12,12 @@ never forks the core. The core stays **inbound-closed** (no upstream PRs into `c
 boundary is the only open surface (`self-extending-architecture.md` §0/§1.2).
 
 **Evidence check (2026-06-22), correcting C0.** C0 assumed the contract modules were *not*
-published. Verified false: `pyproject.toml` ships `packages = ["ack", "ack.lodestar"]`, which
-includes **every flat module under `ack/`**. A fresh `pip install ironclad-ai==0.0.11` from PyPI
+published. Verified false: `pyproject.toml` ships `packages = ["ack", "ack.lodestar", "ack.devprocess"]`, which
+includes **every flat module under `ack/`** (sub-packages such as `ack.lodestar` / `ack.devprocess`
+must be listed explicitly — a flat list of `["ack"]` alone would drop them; the clean-room import-smoke
+gates this). *(Update, ADR-0011 AD-3: `ack.devprocess` now ships ONLY the curated `ack.devprocess.api`
+facade — the dev-process implementation substrate was relocated to monorepo-private `scripts/devprocess/`;
+the packages list above is still accurate, just thinner in content.)* A fresh `pip install ironclad-ai==0.0.11` from PyPI
 imports `ack.registry`, `ack.playbook`, `ack.prompt`, `ack.promptgen`, `ack.gate`, `ack.catalogue`,
 `ack.i18n`, `ack.doctor`, `ack.skillgen`, `ack.generator` — all succeed. So the real gap is **not
 distribution** but **curation, an explicit stability boundary, and a documented separate-repo

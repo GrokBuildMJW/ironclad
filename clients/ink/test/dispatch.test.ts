@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {dispatchTo, pathToRoot, eventPriority, MouseDispatcher, type DispatchEvent} from '../src/render/dispatch.js';
+import {dispatchTo, pathToRoot, MouseDispatcher, type DispatchEvent} from '../src/render/dispatch.js';
 import {createVNode, appendChild, setHandler, type VNode} from '../src/render/vnode.js';
 import {createConfig, attachYoga, calculate, freeYoga} from '../src/render/layout.js';
 import {GeomCache} from '../src/render/geomcache.js';
@@ -84,15 +84,6 @@ test('handler receives target, currentTarget and coords', () => {
   assert.equal(seen!.currentTarget, root, 'currentTarget is the running node');
   assert.equal(seen!.x, 7);
   assert.equal(seen!.y, 2);
-});
-
-test('eventPriority: press/release/click discrete, move/wheel continuous', () => {
-  assert.equal(eventPriority('down'), 'discrete');
-  assert.equal(eventPriority('up'), 'discrete');
-  assert.equal(eventPriority('click'), 'discrete');
-  assert.equal(eventPriority('move'), 'continuous');
-  assert.equal(eventPriority('wheelUp'), 'continuous');
-  assert.equal(eventPriority('wheelDown'), 'continuous');
 });
 
 test('MouseDispatcher synthesizes onClick on press+release over the same node', () => {

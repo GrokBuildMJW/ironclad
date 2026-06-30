@@ -117,7 +117,7 @@ export function transcriptStats(transcript: string[]): {turns: number; lines: nu
  *  can be brought back with /resume) — like other code CLIs. "" when nothing worth resuming. Pure. */
 export function exitMessage(saved: SessionState | null): string {
   return saved && saved.transcript.length
-    ? '  Sitzung gespeichert — nächstes Mal mit /resume (oder --resume) wiederherstellen.'
+    ? '  Session saved — restore it next time with /resume (or --resume).'
     : '';
 }
 

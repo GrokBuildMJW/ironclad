@@ -62,3 +62,11 @@ def test_broken_overlay_is_harmless(tmp_path):
     (tmp_path / "de.json").write_text("{ not json", encoding="utf-8")
     loc = Localizer(tmp_path)
     assert loc.localized("EN", "de", "x") == "EN"
+
+
+def test_malformed_nested_overlay_falls_back_not_raises(tmp_path):
+    # I18N-1 (#503): a malformed overlay whose nested level is NOT a dict must not AttributeError on the
+    # chained .get().get() in role_lens/label — fall back to the English default (never-break-a-run).
+    loc = _loc(tmp_path, {"roles": "garbage", "labels": "garbage"}, en_labels={"q": "QUESTION"})
+    assert loc.role_lens("arch", "skeptic", "EN", "de") == "EN"   # not a crash
+    assert loc.label("q", "de") == "QUESTION"                      # English fallback, not a crash

@@ -17,6 +17,7 @@ Zero external dependencies (stdlib only). Outputs are secret-free and English-on
 from __future__ import annotations
 
 import argparse
+import json
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -65,20 +66,25 @@ def render_tool(spec: SkillSpec) -> dict[str, str]:
     """Render a typed CASE+run skill (+ its structural test) as {relpath: content}."""
     mod = _py_module_name(spec.capability)
     sig = ", ".join(f"{n}: {t}" for n, t in spec.params) or ""
+    # GEN-1 (#503): serialize every free-text field via json.dumps so a value containing quotes,
+    # backslashes or newlines yields a VALID Python/JSON string literal (raw interpolation produced a
+    # SyntaxError module that would not import — and discover_skills then swallowed the error).
     case = (
         "CASE = {\n"
-        f'    "name": "{spec.capability}",\n'
-        f'    "capability": "{spec.capability}",\n'
-        f'    "description": "{spec.description}",\n'
-        f'    "type": "{spec.type}",\n'
-        f'    "domain": "{spec.domain}",\n'
-        f'    "version": "{spec.version}",\n'
-        f'    "provenance": "{spec.provenance}",\n'
+        f'    "name": {json.dumps(spec.capability)},\n'
+        f'    "capability": {json.dumps(spec.capability)},\n'
+        f'    "description": {json.dumps(spec.description)},\n'
+        f'    "type": {json.dumps(spec.type)},\n'
+        f'    "domain": {json.dumps(spec.domain)},\n'
+        f'    "version": {json.dumps(spec.version)},\n'
+        f'    "provenance": {json.dumps(spec.provenance)},\n'
         "}\n\n"
     )
+    # The docstring carries the description; json.dumps(...)[1:-1] gives escaped content (quotes/backslashes/
+    # newlines all escaped) that is safe inside a triple-quoted string.
     run = (
         f"def run({sig}) -> str:\n"
-        f'    """{spec.description}"""\n'
+        f'    """{json.dumps(spec.description)[1:-1]}"""\n'
         f"    # TODO(author/LLM): implement. The CASE + signature above are the stable\n"
         f"    # contract (schema-valid by construction); fill in the body.\n"
         f'    raise NotImplementedError("skill {spec.capability!r}: body not implemented yet")\n'
@@ -106,17 +112,22 @@ def render_tool(spec: SkillSpec) -> dict[str, str]:
 def render_playbook(spec: SkillSpec) -> dict[str, str]:
     """Render a SKILL.md playbook package as {relpath: content}."""
     trig = "[" + ", ".join(spec.trigger) + "]" if spec.trigger else "[]"
+    # GEN-1 (#503): the frontmatter parser is a naive flat `key: scalar` reader (it splits on the first
+    # ':' and keeps the rest verbatim), so a colon/quote/backslash in a value round-trips fine — the only
+    # break is a NEWLINE, which would spill into a bogus frontmatter line. Flatten free-text values to a
+    # single line. (The full multi-line description is preserved in the body below.)
+    _flat = lambda s: " ".join(str(s).split())
     skill_md = (
         "---\n"
         f"capability: {spec.capability}\n"
         f"name: {spec.capability}\n"
-        f"description: {spec.description}\n"
+        f"description: {_flat(spec.description)}\n"
         "kind: playbook\n"
-        f"type: {spec.type}\n"
-        f"domain: {spec.domain}\n"
+        f"type: {_flat(spec.type)}\n"
+        f"domain: {_flat(spec.domain)}\n"
         f"trigger: {trig}\n"
         f'version: "{spec.version}"\n'
-        f"provenance: {spec.provenance}\n"
+        f"provenance: {_flat(spec.provenance)}\n"
         "---\n\n"
         f"# {spec.capability}\n\n"
         f"{spec.description}\n\n"

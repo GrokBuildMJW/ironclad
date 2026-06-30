@@ -100,6 +100,14 @@ def test_disabled_when_no_endpoint():
     m.store_task_completion("KGC-1", {}, "x")  # must not raise
 
 
+def test_search_respects_enabled_flag():
+    # MEM-2 (#503): _search must gate on `enabled` (like every write + the other reads) — a base set but
+    # enabled=false must NOT issue /search. Returns [] without touching the network (no stub needed).
+    m = memory.MemoryManager({"base_url": "http://mem:8800", "enabled": False})
+    assert m.base and m.enabled is False          # base present, but disabled
+    assert m._search("anything", 5) == []         # gated off, no /search
+
+
 # ── #458 (D1): richer token-budgeted handover brief ───────────────────────────────────────────────
 def _count4(s):
     return len(s or "") // 4 + 1

@@ -49,16 +49,18 @@ class Localizer:
 
     def role_lens(self, domain: str, role: str, default: str, lang: Optional[str]) -> str:
         """Localized lens prompt for (domain, role); English ``default`` fallback."""
-        if not lang or lang == "en":
-            return default
-        return (self._overlay(lang).get("roles", {}).get(domain, {}).get(role)) or default
+        # I18N-1 (#503): walk via localized() so EACH nested level is isinstance-guarded — a malformed
+        # overlay (e.g. "roles": "x") otherwise AttributeErrors on chained .get().get() and breaks the run.
+        return self.localized(default, lang, "roles", domain, role)
 
     def label(self, key: str, lang: Optional[str]) -> str:
-        """Localized UI label; English fallback (an absent overlay is harmless)."""
+        """Localized UI label; English fallback (an absent/malformed overlay is harmless)."""
         if lang and lang != "en":
-            v = self._overlay(lang).get("labels", {}).get(key)
-            if v:
-                return v
+            labels = self._overlay(lang).get("labels")     # I18N-1 (#503): guard a non-dict "labels"
+            if isinstance(labels, dict):
+                v = labels.get(key)
+                if isinstance(v, str) and v:
+                    return v
         return self._en_labels.get(key, key)
 
     def localized(self, default: str, lang: Optional[str], *path: str) -> str:

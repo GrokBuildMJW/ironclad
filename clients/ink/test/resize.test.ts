@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {EventEmitter} from 'node:events';
-import {terminalSize, watchResize, clearScreen, eraseFrame} from '../src/render/resize.js';
+import {terminalSize, watchResize, clearScreen} from '../src/render/resize.js';
 
 function fakeStdout(columns?: number, rows?: number): NodeJS.WriteStream {
   const e = new EventEmitter() as unknown as NodeJS.WriteStream & EventEmitter;
@@ -30,10 +30,4 @@ test('watchResize fires with the new size and can unsubscribe', () => {
 
 test('clearScreen wipes and homes', () => {
   assert.equal(clearScreen(), '\x1b[2J\x1b[H');
-});
-
-test('eraseFrame returns to the frame top and clears to end of screen', () => {
-  assert.equal(eraseFrame(1), '\r\x1b[J', 'single row: just clear');
-  assert.equal(eraseFrame(5), '\r\x1b[4A\x1b[J', 'move up rows-1 then clear');
-  assert.equal(eraseFrame(0), '\r\x1b[J');
 });

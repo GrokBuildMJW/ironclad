@@ -10,12 +10,15 @@ CFG="$PROJ/.ironclad/config.json"
 
 # read the (install-written) config — unit-separator (\x1f) so empty fields (e.g. clientCli) and paths
 # with spaces both survive (a Tab is IFS-whitespace → read would collapse empty fields and shift values).
-IFS=$'\x1f' read -r ROOT VENV ENGINE_DIR CLIENT_CLI BASE_URL MEMORY_URL MODEL PORT LANGUAGE ENGINE_CONFIG WARM_URL TYPE SERVER_URL < <(python3 - "$CFG" <<'PY'
+IFS=$'\x1f' read -r ROOT VENV ENGINE_DIR CLIENT_CLI BASE_URL MEMORY_URL MODEL PORT LANGUAGE ENGINE_CONFIG WARM_URL TYPE SERVER_URL CLAUDE_BIN FANOUT_CONCURRENCY WORKERS_MAX_TOKENS WORKERS_MAX_BATCH_TOKENS < <(python3 - "$CFG" <<'PY'
 import json, sys
 c = json.load(open(sys.argv[1], encoding="utf-8"))
 keys = [("root",""),("venv",""),("engineDir",""),("clientCli",""),("baseUrl",""),
         ("memoryUrl",""),("model",""),("port","8100"),("language","en"),("engineConfig",""),
-        ("warmUrl",""),("type","desktop"),("serverUrl","")]
+        ("warmUrl",""),("type","desktop"),("serverUrl",""),
+        # INSTALL-3 (#503): forward the optional code-agent / fan-out / worker tuning keys (parity with
+        # ironclad.ps1) so a POSIX deploy can set them via the config file (+ a GX10_CLAUDE_BIN escape hatch).
+        ("claudeBin",""),("fanoutConcurrency",""),("workersMaxTokens",""),("workersMaxBatchTokens","")]
 print("\x1f".join(str(c.get(k, d)) for k, d in keys))
 PY
 )
@@ -71,16 +74,37 @@ if [ "$REUSE" -eq 0 ]; then
   say "starting the engine ($BASE, version $STAMP) ..."
   SV_ARGS=( "$ENGINE_DIR/server.py" --host 127.0.0.1 --port "$PORT" )
   [ -n "$ENGINE_CONFIG" ] && [ -f "$ENGINE_CONFIG" ] && SV_ARGS+=( --config "$ENGINE_CONFIG" )
-  GX10_SETUP_TYPE=local GX10_BASE_URL="$BASE_URL" GX10_MEMORY_URL="$MEMORY_URL" GX10_MODEL="$MODEL" \
+  # Only override an inherited GX10_WARM_URL when the config carries a URL. A `${WARM_URL:+VAR=val}`
+  # inline prefix does NOT parse as an env assignment (the expansion yields a word bash tries to RUN),
+  # so a configured warm URL would crash startup — export it conditionally instead.
+  if [ -n "$WARM_URL" ]; then export GX10_WARM_URL="$WARM_URL"; fi
+  # INSTALL-3 (#503): optional, config-driven tuning (absent → engine defaults) — parity with ironclad.ps1.
+  # Use if/fi, NOT `[ -n ] && export`: under `set -e` a false test makes the && compound exit the script.
+  if [ -n "$CLAUDE_BIN" ]; then export GX10_CLAUDE_BIN="$CLAUDE_BIN"; fi
+  if [ -n "$FANOUT_CONCURRENCY" ]; then export GX10_FANOUT_CONCURRENCY="$FANOUT_CONCURRENCY"; fi
+  if [ -n "$WORKERS_MAX_TOKENS" ]; then export GX10_WORKERS_MAX_TOKENS="$WORKERS_MAX_TOKENS"; fi
+  if [ -n "$WORKERS_MAX_BATCH_TOKENS" ]; then export GX10_WORKERS_MAX_BATCH_TOKENS="$WORKERS_MAX_BATCH_TOKENS"; fi
+  # INSTALL-1 (#503): 'auto' lets the engine derive the topology from base_url at boot (loopback -> server/
+  # in-engine, remote -> local), so a fresh default install BOOTS without baking a model host into the repo.
+  GX10_SETUP_TYPE=auto GX10_BASE_URL="$BASE_URL" GX10_MEMORY_URL="$MEMORY_URL" GX10_MODEL="$MODEL" \
   GX10_WORKDIR="$PROJ" GX10_PLUGINS_DIR="$ROOT/skills" GX10_LANGUAGE="$LANGUAGE" \
-  GX10_ORCHESTRATOR_VERSION="$STAMP" ${WARM_URL:+GX10_WARM_URL="$WARM_URL"} \
+  GX10_ORCHESTRATOR_VERSION="$STAMP" \
     nohup "$PY" "${SV_ARGS[@]}" >"$PROJ/.ironclad/engine.log" 2>&1 &
   STARTED_PID=$!
   for _ in $(seq 1 30); do [ -n "$(probe "$BASE/health")" ] && break; sleep 0.7; done
   [ -n "$(probe "$BASE/health")" ] || { say "ERROR: engine did not become healthy — see $PROJ/.ironclad/engine.log"; [ -n "$STARTED_PID" ] && kill "$STARTED_PID" 2>/dev/null; exit 1; }
 fi
 
-cleanup() { [ -n "$STARTED_PID" ] && { say "stopping the engine (pid $STARTED_PID)."; kill "$STARTED_PID" 2>/dev/null || true; }; }
+cleanup() {
+  # INSTALL-2 (#503): on /exit reliably stop the LOCAL engine whether THIS session STARTED it
+  # ($STARTED_PID) or REUSED a running one (REUSE=1) — mirror ironclad.ps1 stop-by-port (#428), else a
+  # background server.py lingers on the port after /exit. (spark exec'd earlier; one engine per port.)
+  say "stopping the engine on $BASE ..."
+  if command -v fuser >/dev/null 2>&1; then fuser -k "${PORT}/tcp" 2>/dev/null || true
+  elif command -v lsof >/dev/null 2>&1; then kill $(lsof -t -i ":${PORT}" 2>/dev/null) 2>/dev/null || true   # unquoted: word-split multiple PIDs (matches the restart path)
+  elif [ -n "$STARTED_PID" ]; then kill "$STARTED_PID" 2>/dev/null || true
+  fi
+}
 trap cleanup EXIT
 
 if [ -n "$CLIENT_CLI" ] && command -v node >/dev/null 2>&1; then

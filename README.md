@@ -45,7 +45,7 @@ export GX10_BASE_URL=http://localhost:8000/v1 GX10_MODEL=your-model   # your mod
 
 python engine/server.py &              # 1) the orchestrator (the agent + state)
 python engine/client.py --codedir .    # 2) the client — drives it; type what you want
-#   /initiative new demo --type software   ← create a workspace first (artefacts live under vault/<slug>/)
+#   /project new demo --type software      ← create a workspace first (artefacts live under vault/<slug>/)
 #   Read README.md and summarise it.   /   Build add(a,b) in calc.py with a pytest test, and run it.
 ```
 
@@ -56,9 +56,10 @@ write the code, write the test, and run it** — you describe, they build; no pr
 needed.
 
 > **One step first:** any work that produces artefacts (a task, a handover, an MPR run)
-> needs an active **initiative** — `/initiative new <name> --type software|mpr`. It is
-> fail-closed: without one the macros refuse rather than scatter state into your project
-> root. Plain Q&A turns need no initiative. See
+> needs an active **project** — `/project new <name> --type software|mpr` (`/initiative` is a
+> deprecated alias). It is fail-closed: without one the macros refuse rather than scatter
+> state into your project root. Plain Q&A turns need no project. See
+> [`docs/project-isolation.md`](docs/project-isolation.md) and
 > [`docs/state-and-initiative.md`](docs/state-and-initiative.md).
 
 ## What you get
@@ -78,6 +79,13 @@ needed.
 - **Scalable-context memory** — long-term vector(+graph) store plus a multi-tier context
   system (bounded model window + short-term summary/cache tier + long-term retrieval) with
   rolling summarization and per-turn RAG.
+- **Web search, trust-gated** — a first-class `web_search` tool over a vendor-neutral
+  adapter seam (a CLI delegate or native HTTP), kept out of the `sealed` profile by default
+  (operator opt-in); results stream a `web N · Xms` chip to the client. See
+  [`docs/web-search.md`](docs/web-search.md).
+- **Built-in prompt & skill library** — reusable prompt items and typed skills ship in the
+  box (including MPR); discover them with `/prompts` / `/skills` and run a prompt directly as
+  `/<prompt-name>` (e.g. `/code-review`), or scaffold your own with the paved-road generator.
 - **Secure, session-gated channel** — selectable trust profiles (`open` / `token` /
   `sealed`) with an explicit session that seals on disconnect (single-operator).
 - **An open extension surface** — a versioned **[plugin API](docs/plugin-api.md)** (no core
@@ -94,11 +102,11 @@ Ironclad's engine comes from a **proven, in-production orchestrator**, now **reb
 the server + client architecture above and **wired and tested**. It is still
 **pre-release** (0.0.x, alpha): single-tenant by design (no multi-user auth yet) and
 APIs/layout/config may change. Tagged releases ship on **PyPI** (`ironclad-ai`) and as
-**GitHub Releases** (currently `v0.0.19`) — treat them as early previews and `main` as a
+**GitHub Releases** (currently `v0.0.21`) — treat them as early previews and `main` as a
 development snapshot. The internal DEV → Prod → Public **promote pipeline** that hardens our
 releases is in development (today a manual gated path).
 
-Verified by **1700 Python tests** (1691 offline + 9 live) plus **360 TypeScript client
+Verified by **2202 Python tests** (2193 offline + 9 live) plus **355 TypeScript client
 tests**, and a **full end-to-end run with a real code-agent**. Read these before relying on
 anything:
 
@@ -129,7 +137,8 @@ per-component wiring status live in [`docs/status.md`](docs/status.md).
 ## Demo
 
 The recommended TypeScript client streams a turn live into the terminal's own scrollback,
-with a pinned status bar (model · throughput · tasks · watcher · connection):
+with a pinned status bar (model · connection · memory · warm · watcher · autopilot ·
+tasks · coder · web search · throughput):
 
 ```text
  █▀▄▀█ Ironclad · Orchestrator Client
@@ -212,7 +221,7 @@ export GX10_API_KEY=...                           # only if your endpoint needs 
 python engine/server.py &
 ( cd clients/ink && npm install && npm install -g . )    # global `ironclad`, like claude / kimi
 ironclad --server http://localhost:8100                  # runs in the current folder (codedir = cwd)
-# then, before the first build/task:  /initiative new myproject --type software
+# then, before the first build/task:  /project new myproject --type software
 # zero-Node alternative: python engine/client.py --codedir .   (legacy TUI: engine/tui.py)
 ```
 

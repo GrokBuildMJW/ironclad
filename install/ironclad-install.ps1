@@ -4,13 +4,16 @@
 #
 #   install\ironclad-install.ps1                                  # localhost endpoint defaults
 #   install\ironclad-install.ps1 -BaseUrl http://host:8000/v1 -Model my-model
+#   install\ironclad-install.ps1 -WarmUrl redis://host:6379          # bind the Valkey/Redis warm tier
 #
-# Builds a venv, installs the engine, builds the optional TypeScript client, writes a project config
+# Builds a venv, installs the engine (incl. the warm-cache client so the warm tier works whenever
+# GX10_WARM_URL / -WarmUrl is set), builds the optional TypeScript client, writes a project config
 # (.ironclad\config.json) and wires an `ironclad` command into your PowerShell profile. Defaults point at
 # localhost; override any endpoint via a flag or a GX10_* env var. No host/IP/path is baked into the repo.
 param(
   [string]$BaseUrl    = $(if ($env:GX10_BASE_URL)   { $env:GX10_BASE_URL }   else { "http://127.0.0.1:8000/v1" }),
   [string]$MemoryUrl  = $(if ($env:GX10_MEMORY_URL) { $env:GX10_MEMORY_URL } else { "" }),
+  [string]$WarmUrl    = $(if ($env:GX10_WARM_URL)   { $env:GX10_WARM_URL }   else { "" }),
   [string]$Model      = $(if ($env:GX10_MODEL)      { $env:GX10_MODEL }      else { "qwen3.6-35b" }),
   [int]$Port          = $(if ($env:GX10_PORT)       { [int]$env:GX10_PORT }  else { 8100 }),
   [string]$Language   = $(if ($env:GX10_LANGUAGE)   { $env:GX10_LANGUAGE }   else { "en" }),
@@ -51,25 +54,33 @@ Say "root=$Root  project=$Project  model=$Model  base_url=$BaseUrl"
 $Venv = "$Root\.venv"
 if (-not (Test-Path "$Venv\Scripts\python.exe")) { Say "creating venv ($Venv) ..."; & python -m venv $Venv }
 $VenvPy = "$Venv\Scripts\python.exe"
-Say "installing the engine (pip install -e .[engine]) ..."
+Say "installing the engine (pip install -e .[engine,memory]) ..."
 & $VenvPy -m pip install --quiet --upgrade pip
-Push-Location $PkgRoot   # ".[extra]" from the pkg dir — pip rejects "C:\abs\path[extra]"
-& $VenvPy -m pip install --quiet -e ".[engine]"
+# Install the warm-cache client (the `memory` extra -> redis>=5) alongside the engine so the warm tier
+# works whenever GX10_WARM_URL is set (via env or -WarmUrl), matching the Docker image; warm stays OFF
+# at runtime until a URL is configured. ".[extra]" from the pkg dir -- pip rejects "C:\abs\path[extra]".
+Push-Location $PkgRoot
+& $VenvPy -m pip install --quiet -e ".[engine,memory]"
 Pop-Location
 & $VenvPy -c "import ack, pydantic" | Out-Null
 
 # --- optional TypeScript client ---
 $ClientCli = ""
 if ($InkDir -and (Get-Command node -ErrorAction SilentlyContinue)) {
-  Say "building the ink client ..."
-  Push-Location $InkDir; npm install --silent | Out-Null; npm run build --silent | Out-Null; Pop-Location
-  $ClientCli = "$InkDir\dist\cli.js"
+  # The ink client needs Node >= 22 (clients/ink package.json engines); npm does NOT enforce `engines` by
+  # default, so gate it here and skip with a clear message on older Node rather than emit a cryptic build error.
+  $nodeMajor = 0; try { $nodeMajor = [int]((& node -p "process.versions.node.split('.')[0]") 2>$null) } catch {}
+  if ($nodeMajor -ge 22) {
+    Say "building the ink client ..."
+    Push-Location $InkDir; npm install --silent | Out-Null; npm run build --silent | Out-Null; Pop-Location
+    $ClientCli = "$InkDir\dist\cli.js"
+  } else { Say "skipping ink client — Node >= 22 required (have $(node -v)); the legacy Python client still works." }
 } else { Say "skipping ink client (no Node or clients/ink absent) — the legacy Python client still works." }
 
 # --- project config ---
 $dot = "$Project\.ironclad"; New-Item -ItemType Directory -Force $dot | Out-Null
 $cfg = [ordered]@{ type="desktop"; root=$Root; venv=$Venv; engineDir=$EngineDir; clientCli=$ClientCli;
-                   baseUrl=$BaseUrl; memoryUrl=$MemoryUrl; model=$Model; port=$Port; language=$Language }
+                   baseUrl=$BaseUrl; memoryUrl=$MemoryUrl; warmUrl=$WarmUrl; model=$Model; port=$Port; language=$Language }
 $cfg | ConvertTo-Json | Set-Content "$dot\config.json" -Encoding utf8
 Set-Content "$dot\.gitignore" "*" -Encoding ascii
 Say "bound project: $dot\config.json"

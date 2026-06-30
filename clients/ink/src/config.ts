@@ -22,6 +22,11 @@ export interface Config {
   claudeEffort: string;
   claudePermissionMode: string;
   agentCmd: string;
+  // INK-HANDOVER-1 (#503): the EXPLICIT client-side bin/template (env or config file), null if unset.
+  // Distinct from the resolved claudeBin/agentCmd above: an explicit override beats the server's
+  // per-agent spec, whereas an unset value lets the server spec win (then the built-in default).
+  claudeBinExplicit: string | null;
+  agentCmdExplicit: string | null;
   maxAgents: number;
   srcDir: string | null; // MEM-17: repo root for /update (rebuild+reinstall); null = unknown
 }
@@ -84,6 +89,8 @@ export function loadConfig(): Config {
       f.agentCmd,
       '{bin} --model {model} --effort {effort} --permission-mode {permission} --print {prompt}',
     ),
+    claudeBinExplicit: opt('GX10_CLAUDE_BIN', f.claudeBin), // INK-HANDOVER-1: env|file, else null
+    agentCmdExplicit: opt('GX10_AGENT_CMD', f.agentCmd),
     maxAgents: parseInt(process.env['GX10_MAX_AGENTS'] ?? '', 10) || f.maxAgents || 3,
     srcDir: opt('GX10_SRC', f.srcDir),
   };

@@ -64,11 +64,12 @@ class _StubDispatcher:
         return [dict(self._row(i)) for i in range(len(items))]
 
 
-def _deps(tmp_path, llm, dispatcher, *, run_id="pw-0001", store=None, reducer=None):
+def _deps(tmp_path, llm, dispatcher, *, run_id="pw-0001", store=None, reducer=None, budget=None):
     return Deps(llm=llm, registry=registry(), dispatcher=dispatcher, fanout=_boom,
                 synth_llm=lambda p, *, system, max_tokens: _DEC, reducer=reducer, store=store,
                 writer=_writer, run_id=run_id, runs_dir=str(tmp_path), audit_level="full-per-perspective",
                 pool=dict(DEFAULT_POOL), routing=dict(DEFAULT_ROUTING), default_offload="claude-sonnet",
+                budget=budget,
                 sovereignty={"default_policy": "offloadable", "internal_is_local_only": True, "fail_closed": True})
 
 
@@ -211,3 +212,85 @@ def test_non_dict_dispatch_row_degrades_cleanly(tmp_path):
     m = _manifest(tmp_path, "pw-bad")
     assert m["perspectives"] and all(p["ok"] is False and p["error"] == "malformed execution result"
                                      for p in m["perspectives"])
+
+
+# ── MPR-1 (#503): the per-run cost/token budget is enforced + recorded ─────────────────────────────
+def test_run_budget_cap_passed_to_dispatch_policy(tmp_path):
+    # The cfg budget cap reaches the dispatcher's router as a usd_cap. This is the correct MPR-layer
+    # assertion (propagation): the router's actual admission gate — dropping unaffordable candidates to
+    # `budget-exhausted` — is the engine's contract, covered by ack/tests/test_router.py
+    # ::test_budget_gate_falls_to_cheap_local_then_exhausted. Pre-fix DispatchPolicy got no budget at all.
+    from mpr.mpr_config import RunBudget
+    stub = _StubDispatcher(_local_row)
+    run_mpr(_ARCH_Q, deps=_deps(tmp_path, FakeClassifierLLM(run_panel(**_ARCH)), stub, run_id="pw-cap",
+                                budget=RunBudget(max_cost_usd=3.5, max_tokens=50000)))
+    _, policy = _reqs(stub)
+    assert policy.budget is not None and policy.budget.usd_cap == 3.5
+
+
+def test_manifest_records_real_budget_spend(tmp_path):
+    # Each perspective's REAL cost/tokens are charged to the run budget and snapshotted into the manifest
+    # (pre-fix: cfg.budget was parsed but never bound → manifest.budget stayed null, the cap was dead).
+    from mpr.mpr_config import RunBudget
+    stub = _StubDispatcher(_offload_row)
+    run_mpr(_COMP_Q, deps=_deps(tmp_path, FakeClassifierLLM(run_panel(**_COMP)), stub, run_id="pw-bud",
+                                budget=RunBudget(max_cost_usd=10.0, max_tokens=100000)))
+    m = _manifest(tmp_path, "pw-bud")
+    n = len(m["perspectives"])
+    assert n >= 1 and m["budget"] is not None
+    assert m["budget"]["max_cost_usd_per_run"] == 10.0 and m["budget"]["max_tokens_per_run"] == 100000
+    assert m["budget"]["spent_cost_usd"] == round(0.02 * n, 6) and m["budget"]["spent_tokens"] == 200 * n
+    pp = m["budget"]["per_provider_spent"]["claude-sonnet"]
+    assert pp["cost_usd"] == round(0.02 * n, 6) and pp["tokens"] == 200 * n
+
+
+def test_no_budget_leaves_run_unbounded(tmp_path):
+    # Backwards-compat: with no budget configured the manifest carries no budget block and the dispatch
+    # policy stays unbounded (the dispatcher falls back to its own default Budget()).
+    stub = _StubDispatcher(_local_row)
+    run_mpr(_ARCH_Q, deps=_deps(tmp_path, FakeClassifierLLM(run_panel(**_ARCH)), stub, run_id="pw-nob"))
+    assert _manifest(tmp_path, "pw-nob").get("budget") is None
+    _, policy = _reqs(stub)
+    assert policy.budget is None
+
+
+def test_token_cap_clamps_in_engine_fanout(tmp_path):
+    # The DEFAULT (in-engine fanout) lane has no router usd_cap to gate it, so the run token cap binds by
+    # clamping the per-lens budget: n lenses × per-lens ≤ max_tokens_per_run. Pre-fix the panel ran at the
+    # full per-lens budget regardless of the configured cap.
+    from mpr.mpr_config import RunBudget
+    seen = {}
+
+    def _cap_fanout(prompts, *, system, max_tokens, think):
+        seen["max_tokens"], seen["n"] = max_tokens, len(prompts)
+        return [{"ok": True, "content": f"G{i}", "error": None, "completion_tokens": max_tokens,
+                 "latency": 0.1} for i in range(len(prompts))]
+
+    deps = _deps(tmp_path, FakeClassifierLLM(run_panel(**_ARCH)), None, run_id="pw-tok",   # no dispatcher → fanout
+                 budget=RunBudget(max_cost_usd=10.0, max_tokens=300))
+    deps.fanout = _cap_fanout                                  # capture the budget the fanout lane runs with
+    run_mpr(_ARCH_Q, deps=deps)
+    assert seen["max_tokens"] == max(1, 300 // seen["n"])      # per-lens clamped to the run cap
+    assert _manifest(tmp_path, "pw-tok")["budget"]["spent_tokens"] <= 300   # whole panel stays within cap
+
+
+def test_token_cap_degenerate_caps_stay_bounded(tmp_path):
+    # A sub-lens-count cap (cap < n) and a non-positive cap must NOT fall back to the full per-lens budget
+    # (the pre-fix unbounded run). A model call needs >=1 token, so each lens is floored to 1 → the panel is
+    # bounded to n tokens (= max(cap, n)), never the default per-lens budget.
+    from mpr.mpr_config import RunBudget
+    for cap, run_id in ((1, "pw-tiny"), (0, "pw-zero")):
+        seen = {}
+
+        def _cap_fanout(prompts, *, system, max_tokens, think):
+            seen["max_tokens"], seen["n"] = max_tokens, len(prompts)
+            return [{"ok": True, "content": f"G{i}", "error": None, "completion_tokens": max_tokens,
+                     "latency": 0.1} for i in range(len(prompts))]
+
+        deps = _deps(tmp_path, FakeClassifierLLM(run_panel(**_ARCH)), None, run_id=run_id,
+                     budget=RunBudget(max_cost_usd=10.0, max_tokens=cap))
+        deps.fanout = _cap_fanout
+        run_mpr(_ARCH_Q, deps=deps)
+        assert seen["max_tokens"] == 1                          # floored to 1, not the ~_PANEL_DIRECT_TOKENS default
+        spent = _manifest(tmp_path, run_id)["budget"]["spent_tokens"]
+        assert spent == seen["n"] <= max(cap, seen["n"])        # bounded to n — never unbounded

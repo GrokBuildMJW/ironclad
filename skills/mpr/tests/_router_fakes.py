@@ -49,6 +49,6 @@ def run_panel(domain="adhoc", route="wide", mode="decision", perspectives=None,
 
 
 def persp(role, lens=None, **extra) -> dict:
-    p = {"role": role, "lens_prompt": lens or f"lens für {role}"}
+    p = {"role": role, "lens_prompt": lens or f"lens for {role}"}
     p.update(extra)
     return p

@@ -7,13 +7,15 @@ at startup** and wires the provider dispatcher's runner; it is **not** runtime-s
 
 Pick **one** value at deploy time — set it in the **config file** (`setup.type`) or via the
 **`GX10_SETUP_TYPE`** env var (there is no CLI flag for it). It is a [frozen config key](config-runtime.md):
-`/config get setup.type` reads it, `/config set setup.type …` is refused. There are **exactly two**
-values; the dispatcher code is the same for both — only *which runner closure* is injected at boot differs.
+`/config get setup.type` reads it, `/config set setup.type …` is refused. There are **three** values; the
+dispatcher code is the same for all — only *which runner closure* is injected at boot differs (`auto` is not
+its own runner: it **resolves to `server` or `local`** at boot from the `base_url`).
 
 | `setup.type` | Where the engine + agents run | Model + memory | Code agents | Effect |
 |--------------|-------------------------------|----------------|-------------|--------|
-| **`server`** (default) | the model host (e.g. a GPU server, containerized) | local to that host | — (in-engine only; external agents deferred) | **byte-identical to a no-provider deployment** |
+| **`server`** (engine code default) | the model host (e.g. a GPU server, containerized) | local to that host | — (in-engine only; external agents deferred) | **byte-identical to a no-provider deployment** |
 | **`local`** | natively on the user's machine (the engine + agents run here) | **remote** over the network (the model host keeps the GPU model) | local subprocess (`claude --print`) | engine + agents co-located on the user's machine |
+| **`auto`** (desktop launcher default) | derived at boot from `base_url` | — | — | a **loopback** `base_url` ⇒ `server` (fully in-box), a **remote** `base_url` ⇒ `local`; so a fresh default install boots without baking a model host into the repo (INSTALL-1) |
 
 **Two fixed poles, regardless of the value:** the **model and the _Cold_ memory (Mem0) always live on the
 model host** (both are GPU-/LLM-coupled — Mem0's embedder/graph extraction run there), and the **terminal
@@ -27,8 +29,8 @@ the LAN **and** set `--requirepass` + firewall-pin; see `docker-compose.yml`), s
 reports `warm: off`/`down`, fail-soft. The
 engine block
 (orchestrator + agents) is strictly **on one machine, never both** — that single choice is what `setup.type`
-makes. A deployment may surface these two values under its own install-time names; the engine only knows
-`server` and `local`.
+makes. A deployment may surface these values under its own install-time names; the engine knows
+`server`, `local`, and `auto` (the last derives one of the first two at boot).
 
 ## Semantics & validation (fail-closed)
 
@@ -41,6 +43,11 @@ silently degrading when the mode can't be honored:
   **`GX10_CLAUDE_BIN`** (default `claude`) on `PATH` via `shutil.which`; if you point the agent at a
   different binary through the `GX10_AGENT_CMD` template, make sure that binary is the one on `PATH`.
   Missing remote URL or missing CLI → the server **fails closed** (no silent degrade).
+- `auto` → resolves to `server` when `base_url` is loopback (a fully in-box desktop) and to `local` when it
+  is remote, then applies that mode's rules above (so an `auto`→`local` install still needs a reachable
+  CLI). This is the desktop launcher's default: it ships a loopback `base_url`, so a fresh install boots
+  in-engine, and pointing `GX10_BASE_URL` at a remote model switches it to the LAN-offload `local` topology
+  — no host baked into the repo (INSTALL-1).
 - An unknown value → fails closed.
 
 **`setup.type` is the single boot control for dispatcher activation.** Whether the provider dispatcher

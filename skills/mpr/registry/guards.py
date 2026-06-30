@@ -41,10 +41,14 @@ _SUFFIXES = ("ungen", "ung", "keit", "heit", "barkeit", "lich", "isch", "bar", "
 
 
 def _stem(tok: str) -> str:
+    # #503 MPR-REG-4: the LONGEST matching suffix wins (order-independent), so "Wartbarkeit" trims
+    # "barkeit" → "wart" and clusters with "Wartung"/"wartbar". A first-match scan stripped the shorter
+    # "keit" first ("Wartbarkeit" → "wartbar"), leaving the longer suffixes ("barkeit") unreachable.
+    best = ""
     for suf in _SUFFIXES:
-        if len(tok) > len(suf) + 2 and tok.endswith(suf):
-            return tok[: -len(suf)]
-    return tok
+        if len(suf) > len(best) and len(tok) > len(suf) + 2 and tok.endswith(suf):
+            best = suf
+    return tok[: -len(best)] if best else tok
 
 
 def _tokenize(text: str) -> set[str]:

@@ -43,6 +43,7 @@ config tree (``conf/…``), never hard-coded here.
 """
 from __future__ import annotations
 
+import copy
 import json
 import os
 import secrets
@@ -188,6 +189,9 @@ def bootstrap(config_path: Optional[str] = None) -> Tuple[gx10.GX10, Dict[str, A
     cfg = gx10._apply_env(cfg)
     gx10._apply_config(cfg)
     gx10._EFFECTIVE_CFG = cfg
+    # S5b: a PRISTINE snapshot of the deployment base — a /switch re-overlays a project's config from this.
+    # Must NOT alias _EFFECTIVE_CFG (which `/config set`, `/coders`, … mutate in place at runtime).
+    gx10._BASE_CFG = copy.deepcopy(cfg)
     gx10._load_skills(cfg["paths"].get("plugins_dir"))    # core built-ins (always) + 3rd-party (plugins_dir)
     gx10._CFG_SOURCE = cfg_path
 
@@ -201,6 +205,11 @@ def bootstrap(config_path: Optional[str] = None) -> Tuple[gx10.GX10, Dict[str, A
     workdir = Path(cfg["paths"]["workdir"]).expanduser().resolve()
     workdir.mkdir(parents=True, exist_ok=True)
     os.chdir(workdir)
+
+    # S5b: bring up the installation-global Project Registry, ensure the implicit `default` project
+    # (root == workdir) and bind its ProjectContext on this (boot) thread. Behaviour-preserving — the
+    # default project resolves paths to workdir and binds an empty mem_ns (legacy/base memory partition).
+    gx10.init_registry(workdir)
 
     api_key = os.environ.get(cfg["connection"]["api_key_env"]) or gx10.DEFAULT_API_KEY
     agent = gx10.GX10(
@@ -250,6 +259,7 @@ def _queue_consumer(agent: gx10.GX10, stop: threading.Event,
             if len(parts) >= 4:
                 tid, agent_adv = parts[2], parts[3]
                 with _AGENT_LOCK:
+                    gx10.bind_active()          # S5b: this daemon thread → the active project's ctx
                     try:
                         res = gx10._advance_pipeline(tid, agent_adv)
                     except Exception as e:  # noqa: BLE001
@@ -268,6 +278,7 @@ def _queue_consumer(agent: gx10.GX10, stop: threading.Event,
             continue
         # Plain prompt (e.g. autoplan) → normal turn.
         with _AGENT_LOCK:
+            gx10.bind_active()                  # S5b: this daemon thread → the active project's ctx
             try:
                 gx10._dispatch(agent, item)
             except Exception as e:  # noqa: BLE001
@@ -529,14 +540,19 @@ class _Handler(BaseHTTPRequestHandler):
                     "security": self.policy.summary(),
                     "sealed": self.sessions.is_sealed(),
                     "coders": _coders_health(),            # #452: compact bound/total for the 2s poller
+                    # #601 isolation observability: the active project, the installation-global home, and
+                    # whether the registry is wired or fell back to un-isolated mode (else only logged at boot).
+                    "registry": gx10.registry_health(),
                 })
             elif self.path == "/tasks":
                 if not self._guard():
                     return
+                gx10.bind_active()          # S5b: this request thread → the active project's ctx
                 self._send(200, {"tasks": gx10._store().list()})
             elif self.path == "/pending":
                 if not self._guard():
                     return
+                gx10.bind_active()          # S5b: this request thread → the active project's ctx
                 self._send(200, {"pending": _pending_handovers()})
             elif self.path == "/coders":
                 # #452: which coding agents are bound + the fan-out provider lane. Guarded like /tasks.
@@ -546,6 +562,7 @@ class _Handler(BaseHTTPRequestHandler):
             elif self.path == "/doctor":
                 if not self._guard():
                     return
+                gx10.bind_active()          # S5b: this request thread → the active project's ctx
                 self._send(200, _doctor_report())
             elif self.path == "/catalogue":
                 # Read-only snapshot of the loaded prompt/skill registry — the source the
@@ -593,6 +610,7 @@ class _Handler(BaseHTTPRequestHandler):
                     return
                 with _Captured() as cap:
                     with _AGENT_LOCK:
+                        gx10.bind_active()      # S5b: this request thread → the active project's ctx
                         gx10._dispatch(self.agent, message)
                 self._send(200, {"ok": True, "output": cap.text})
             elif self.path == "/chat/stream":
@@ -649,6 +667,7 @@ class _Handler(BaseHTTPRequestHandler):
                 try:
                     with _Streamed(_write):
                         with _AGENT_LOCK:
+                            gx10.bind_active()  # S5b: this request thread → the active project's ctx
                             if bridge is not None:
                                 _ACTIVE_BRIDGE["b"] = bridge
                                 gx10._LOCAL_TOOL_BRIDGE = bridge
@@ -675,6 +694,7 @@ class _Handler(BaseHTTPRequestHandler):
                 gx10._CANCEL_EVENT.set()
                 self._send(200, {"ok": True, "cancelled": True})
             elif self.path == "/feedback":
+                gx10.bind_active()          # S5b: this request thread → the active project's ctx
                 data = self._read_json()
                 tid = (data.get("task_id") or "").strip()
                 content = data.get("content") or ""
@@ -698,13 +718,23 @@ class _Handler(BaseHTTPRequestHandler):
                 cls = providers.classify_agent_result(
                     exit_code=data.get("exit_code"), stderr=data.get("stderr") or "",
                     has_feedback=bool(content.strip()), patterns=patterns)
+                # #602 2.4/#805: opt-in (strategy.enabled) — classify WHY the run failed into the shared
+                # FailureClass + record it for the Strategy consumer (2.5/#806); None + no field when off.
+                fc = gx10._record_failure_class(cls)
+                # #602 2.5/#806: per-task Strategy on the run result — HUMAN_ESCALATION when the attempt
+                # budget is spent (instead of an endless silent failover); a success (OK) resets the counter.
+                strat = gx10._revise_on_failure(tid, cls)
                 if cls == providers.RESULT_UNAVAILABLE:
                     gx10._breaker_trip(agent, "budget/quota exhausted")
                     self._send(200, {"ok": True, "classification": cls,
-                                     "action": "breaker-tripped → failover on the next poll"})
+                                     "action": "breaker-tripped → failover on the next poll",
+                                     **({"failure_class": fc} if fc else {}),
+                                     **({"strategy": strat} if strat else {})})
                     return
                 if cls == providers.RESULT_FAILED:
-                    self._send(200, {"ok": True, "classification": cls, "action": "no-feedback"})
+                    self._send(200, {"ok": True, "classification": cls, "action": "no-feedback",
+                                     **({"failure_class": fc} if fc else {}),
+                                     **({"strategy": strat} if strat else {})})
                     return
                 path = _write_feedback(tid, agent, content)
                 self._send(200, {"ok": True, "classification": cls, "feedback_file": path})

@@ -34,6 +34,7 @@ import shutil
 import subprocess
 import threading
 import queue as _q
+from contextlib import contextmanager
 import argparse
 import math
 import copy
@@ -66,6 +67,31 @@ except ImportError:
     _WarmTier = None
 
 try:
+    import project_context as _pc            # ADR-0011 AD-1: the request-scoped ProjectContext seam (S3)
+except ImportError:
+    _pc = None                              # absent → path accessors fall back to the legacy globals
+
+try:
+    import lifecycle_projector as _lifecycle_projector   # S13b: pure transition→evidence projector (AD-7)
+except ImportError:
+    _lifecycle_projector = None             # absent → the /lifecycle gate reports fail-closed BLOCKED
+
+try:
+    import project_registry as _pr           # ADR-0011 AD-6: installation-global Project Registry SSOT (S2)
+except ImportError:
+    _pr = None                              # absent → no registry; engine runs un-isolated (legacy)
+
+try:
+    import project_switch as _ps             # ADR-0011 AD-1: the quiesced switch core (S5a)
+except ImportError:
+    _ps = None
+
+# ack.devprocess.api (the curated dev-process facade, ADR-0011 AD-3 / S6) is imported LATE — in
+# _register_devprocess_driver() below, AFTER core/ is placed on sys.path — so the real launch (only
+# core/engine on the path at import time) still resolves it. Until set, the tools call the impls directly.
+_devapi = None
+
+try:
     from prompt_toolkit import Application
     from prompt_toolkit.buffer import Buffer
     from prompt_toolkit.layout import Layout
@@ -94,7 +120,7 @@ if str(_CORE_DIR) not in sys.path:
 
 # ─── Configuration (code defaults) ──────────────────────────
 # These module constants are the weakest level of value precedence
-# (code defaults < config file < env < CLI). At startup
+# (code defaults < config file < env). At startup
 # `_apply_config()` overrides them from the loaded config — so all
 # existing references (run_tool, macros, _trim_context …) stay unchanged.
 DEFAULT_BASE_URL = "http://localhost:8000/v1"   # generic default; real endpoint via config (connection.base_url)
@@ -118,6 +144,28 @@ def orchestrator_version() -> str:
                 v = ""
         _ORCH_VERSION = v or "unknown"
     return _ORCH_VERSION
+
+
+def registry_health() -> dict:
+    """Read-only observability of the project-isolation binding for /health + the doctor (NEVER raises).
+    ``status`` is ``"ok"`` when the installation-global Project Registry is wired, or ``"unisolated"`` when
+    the engine fell back to the un-isolated mode at boot (a fallback only logged at boot today); the
+    ``active_project`` id is None when un-isolated; ``home`` is the installation-global ``GX10_HOME``.
+    Generic + secret-free; surfaces the otherwise-invisible #601 isolation binding."""
+    try:
+        active = _ACTIVE_PROJECT.id if _ACTIVE_PROJECT is not None else None
+    except Exception:  # noqa: BLE001 — observability must never raise
+        active = None
+    try:
+        import project_registry as _pr      # lazy: keep the module-top import surface unchanged
+        home = str(_pr.ironclad_home())
+    except Exception:  # noqa: BLE001
+        home = None
+    try:
+        status = "ok" if _REGISTRY is not None else "unisolated"
+    except Exception:  # noqa: BLE001
+        status = "unknown"
+    return {"status": status, "active_project": active, "home": home}
 DEFAULT_WORKDIR  = "."           # WORKDIR: work location (CWD behaviour as before)
 CODE_ROOT        = ""            # optional code root for the handover path guard
                                  # (vessel-specific, e.g. a service subfolder
@@ -225,10 +273,8 @@ AUTOPILOT_TERMINATE_ON_ADVANCE = False  # terminate the associated claude sessio
 AUTOPILOT_AUTOPLAN       = False   # after an empty queue, have GX10 automatically plan the next task; default OFF
 AUTOPILOT_MAX_TASKS      = 0       # max tasks autoplan plans (0 = unlimited — use LOCAL vLLM ONLY!)
 _AUTOPLAN_DONE           = 0       # session counter (touched only in the agent_thread → no lock needed)
-_TURN_DID_ADVANCE        = False   # guard: True after advance_pipeline in the running turn. Prevents
-                                   # the model from immediately pushing a stage_handover in the SAME
-                                   # turn (without operator input) ("auto-plan"), as long as AUTOPILOT_AUTOPLAN
-                                   # is off. Reset on every new operator turn (run()).
+# ROUTE-2 (#503): removed the dead `_TURN_DID_ADVANCE` guard — it was only reset, never set or read, so it
+# never blocked anything (its comment claimed otherwise). The actual auto-plan control is AUTOPILOT_AUTOPLAN.
 AUTOPILOT_LOG_TERMINAL   = False        # on every autopilot start open a new terminal with Get-Content -Wait; default OFF
 # Kimi was replaced by Sonnet on 2026-06-15. "KIMI" remains only as a
 # legacy alias and is transparently normalized to SONNET everywhere
@@ -248,12 +294,44 @@ WORKSPACE_DIRS = [
 # engine machinery and lives under state_root()/"memory" (created by _ensure_dirs).
 
 
+def _project_root() -> Optional[Path]:
+    """The active project's root (ADR-0011 AD-1 / S3), or None when no project is active — in which case
+    the path accessors fall back to the legacy WORKDIR-relative globals (byte-unchanged pre-switch)."""
+    pc = _pc.current() if _pc is not None else None
+    return Path(pc.root) if (pc is not None and pc.root) else None
+
+
+_TRACK_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+
+
+def _is_safe_track(t: object) -> bool:
+    """A track id may name a directory segment — reject traversal / separators (defence in depth;
+    the binding is trusted, but the active track reaches the filesystem via ``vault_root``). Crash-safe
+    for a non-str input (→ False), mirroring ``project_context._safe_track`` so the vault subtree and the
+    memory sub-scope agree on the effective track for EVERY input."""
+    return isinstance(t, str) and t not in (".", "..") and _TRACK_RE.match(t) is not None
+
+
+def _active_track() -> str:
+    """The active track within the project (ADR-0011 AD-2'), from the ProjectContext, or ``"main"``
+    when no project is active or the bound track is unsafe. ``"main"`` is the default track and
+    resolves byte-identically to the pre-track vault layout (no surprise relocation)."""
+    pc = _pc.current() if _pc is not None else None
+    t = (pc.track if pc is not None else "") or "main"
+    return t if _is_safe_track(t) else "main"
+
+
 def state_root() -> Path:
     """Root of the hidden engine machinery (initiative-independent): session.json, the local
     warm cache (memory/), config.json/active. Relative to WORKDIR (after chdir), overridable via
     cfg["paths"]["state_root"] (default ``.ironclad``); absolute overrides are taken
-    unchanged. Boundary clean — no private literal."""
-    return Path(STATE_ROOT)
+    unchanged. Boundary clean — no private literal. Under an active ProjectContext a RELATIVE
+    state_root is resolved against the project root (S3); an absolute override is still taken as-is."""
+    p = Path(STATE_ROOT)
+    root = _project_root()
+    if root is not None and not p.is_absolute():
+        return root / p
+    return p
 
 
 def session_path() -> Path:
@@ -265,8 +343,78 @@ def session_path() -> Path:
 
 def vault_root() -> Path:
     """Visible knowledge root (initiative-centric): ``vault/<slug>/`` per initiative. Relative to
-    WORKDIR (after chdir), overridable via cfg["paths"]["vault_root"] (default ``vault``)."""
-    return Path(VAULT_ROOT)
+    WORKDIR (after chdir), overridable via cfg["paths"]["vault_root"] (default ``vault``). Under an
+    active ProjectContext a RELATIVE vault_root is resolved against the project root (S3).
+
+    Per-track (ADR-0011 AD-2'): a non-``"main"`` active track is isolated under a hidden
+    ``.tracks/<track>/`` subtree of the project vault, so each track gets its own first-class vault
+    subtree. The default ``"main"`` track resolves byte-identically to the pre-track layout (and a
+    single-track install is unchanged). Track isolation needs no exclusion logic: every vault op is
+    slug-scoped (``vault_root()/<slug>``) or a one-level ``*/meta.md`` scan, and the ``.tracks`` dir
+    carries no ``meta.md`` of its own."""
+    p = Path(VAULT_ROOT)
+    root = _project_root()
+    if root is not None and not p.is_absolute():
+        p = root / p
+    track = _active_track()
+    if track != "main":
+        p = p / ".tracks" / track
+    return p
+
+
+_vault_lock_tl = threading.local()
+
+
+def _resolve_vault_lock():
+    """A ``FileLock`` for the active project+track's vault, or ``None`` when locking is unavailable.
+    Uses the registry's per-project+track ``vault_lock`` (under the installation home ``ironclad_home()``
+    = the ``GX10_HOME`` env var or a per-user default, AD-6) when a project is active; otherwise (legacy /
+    no-ctx single-project) a lock under the project-scoped
+    state root. Distinct from the dev-loop ``project_lock`` so a quick reconcile is never mistaken for
+    an in-flight dev unit. Fail-soft: any resolution hiccup → ``None`` (no lock, write proceeds)."""
+    track = _active_track()
+    pc = _pc.current() if _pc is not None else None
+    if _REGISTRY is not None and pc is not None and getattr(pc, "project_id", ""):
+        try:
+            return _REGISTRY.vault_lock(pc.project_id, track)
+        except Exception:   # noqa: BLE001 — locking is best-effort, never blocks a write
+            return None
+    try:
+        from project_registry import FileLock   # lazy: keep the module-top import surface unchanged
+        lp = state_root() / "locks" / f"vault__{track}.lock"
+        return FileLock(lp)
+    except Exception:   # noqa: BLE001
+        return None
+
+
+@contextmanager
+def _vault_lock():
+    """Serialize vault mutation for the active project+track (Codex S3 / #601 S12b). **Reentrant**
+    within a call stack — a nested writer (e.g. ``initiative_new`` → ``reconcile_vault``) does not
+    re-acquire, so there is no self-deadlock; cross-process / cross-thread it serializes via the OS
+    file lock. **Fail-soft**: a locking-infra hiccup never blocks a vault write (best-effort
+    serialization, not a hard gate)."""
+    if getattr(_vault_lock_tl, "depth", 0) > 0:
+        yield
+        return
+    lk = _resolve_vault_lock()
+    acquired = False
+    if lk is not None:
+        try:
+            lk.acquire()
+            acquired = True
+        except Exception:   # noqa: BLE001 — best-effort; proceed unserialized rather than fail the write
+            lk = None
+    _vault_lock_tl.depth = 1
+    try:
+        yield
+    finally:
+        _vault_lock_tl.depth = 0
+        if acquired:
+            try:
+                lk.release()
+            except Exception:   # noqa: BLE001
+                pass
 
 
 # ─── Initiative (initiative-centric vault) ────────────────────
@@ -294,8 +442,8 @@ _INITIATIVE_SKELETON: Dict[str, List[str]] = {
 # Umlaut folding for readable ASCII slugs (ä→ae …). Pure convenience; Unicode slugs would work too.
 _SLUG_UMLAUT = {"ä": "ae", "ö": "oe", "ü": "ue", "ß": "ss"}
 
-_NO_ACTIVE_MSG = ("kein aktives Initiative — `/initiative new <name> --type mpr|software` "
-                  "(oder `/initiative use <slug>`) zuerst")
+# The "no active initiative" message is localized at call time (engine/messages.py: init.no_active) —
+# a module constant would freeze the language at import; use _msg("init.no_active") at each use site.
 
 
 def _slugify(name: str) -> str:
@@ -327,6 +475,14 @@ def _parse_frontmatter(text: str) -> Dict[str, str]:
     return out
 
 
+def _msg(key: str, **fmt: object) -> str:
+    """Localized engine chrome (engine/messages.py): English is the source/default; the active
+    language is ``gx10.LANGUAGE`` (config ``generation.language`` / ``GX10_LANGUAGE``), so the public
+    export defaults to English with a DE overlay (no hardcoded German in core/). Lazy sibling import."""
+    from messages import msg   # noqa: PLC0415 — sibling engine module; lazy keeps import order clean
+    return msg(key, **fmt)
+
+
 class Initiative:
     """Metadata + paths of an initiative. Persistence lives in vault/<slug>/meta.md (SSOT)."""
 
@@ -356,8 +512,7 @@ class Initiative:
             f"status: {self.status}\n"
             "---\n\n"
             f"# {self.title}\n\n"
-            f"_Initiative (type: {self.type}). Artefakte unter `{vault_root().as_posix()}/{self.slug}/`. "
-            "INDEX.md wird automatisch gepflegt (reconcile)._\n"
+            f"_{_msg('init.meta_body', type=self.type, path=f'{vault_root().as_posix()}/{self.slug}')}_\n"
         )
 
     @classmethod
@@ -429,22 +584,23 @@ def initiative_new(name: str, type: str) -> Initiative:
     get a -N suffix. Unknown type / empty name → ValueError."""
     t = (type or "").strip().lower()
     if t not in INITIATIVE_TYPES:
-        raise ValueError(f"unbekannter Initiative-Typ {type!r} — erlaubt: {', '.join(INITIATIVE_TYPES)}")
+        raise ValueError(_msg("init.unknown_type", type=type, allowed=", ".join(INITIATIVE_TYPES)))
     title = (name or "").strip()
     if not title:
-        raise ValueError("Initiative braucht einen Namen")
-    base = _slugify(title)
-    slug, n = base, 2
-    while (vault_root() / slug).exists():
-        slug, n = f"{base}-{n}", n + 1
-    v = Initiative(slug=slug, type=t, title=title,
-                 created=time.strftime("%Y-%m-%d", time.localtime()), status="active")
-    v.path.mkdir(parents=True, exist_ok=True)
-    for d in _INITIATIVE_SKELETON[t]:
-        (v.path / d).mkdir(parents=True, exist_ok=True)
-    v.meta_path.write_text(v.to_meta(), encoding="utf-8", newline="\n")
-    set_active_slug(slug)
-    _reconcile_active_soft()   # C2: seed INDEX.md immediately → navigable from the start
+        raise ValueError(_msg("init.needs_name"))
+    with _vault_lock():        # serialize the collision scan + creation (Codex S3 / S12b)
+        base = _slugify(title)
+        slug, n = base, 2
+        while (vault_root() / slug).exists():
+            slug, n = f"{base}-{n}", n + 1
+        v = Initiative(slug=slug, type=t, title=title,
+                     created=time.strftime("%Y-%m-%d", time.localtime()), status="active")
+        v.path.mkdir(parents=True, exist_ok=True)
+        for d in _INITIATIVE_SKELETON[t]:
+            (v.path / d).mkdir(parents=True, exist_ok=True)
+        v.meta_path.write_text(v.to_meta(), encoding="utf-8", newline="\n")
+        set_active_slug(slug)
+        _reconcile_active_soft()   # reentrant: already holds the vault lock
     return v
 
 
@@ -452,8 +608,7 @@ def initiative_use(slug: str) -> Initiative:
     """Sets an existing initiative active. Unknown slug → ValueError."""
     v = initiative_get((slug or "").strip())
     if v is None:
-        raise ValueError(f"kein Initiative {slug!r} unter {vault_root().as_posix()}/ — "
-                         "`/initiative new <name> --type mpr|software` zuerst")
+        raise ValueError(_msg("init.unknown_slug", slug=slug, root=vault_root().as_posix()))
     set_active_slug(v.slug)
     return v
 
@@ -469,7 +624,7 @@ def active_initiative_path() -> Path:
     Source of artefact routing (B3): tasks/handovers/decisions/reviews/MPR runs land under it."""
     v = initiative_active()
     if v is None:
-        raise RuntimeError(_NO_ACTIVE_MSG)
+        raise RuntimeError(_msg("init.no_active"))
     return v.path
 
 
@@ -479,9 +634,7 @@ def _mpr_blocks_tasks() -> Optional[str]:
     becomes a real contract instead of only choosing the seed skeleton."""
     v = initiative_active()
     if v is not None and v.type == "mpr":
-        return (f"Task-Pipeline (tasks/handovers/feedback) nur in einem `--type software`-Initiative — "
-                f"aktives Initiative '{v.slug}' ist type mpr (reasoning-only). "
-                f"`/initiative new <name> --type software` oder `/initiative use <slug>`.")
+        return _msg("mpr.blocks_tasks", slug=v.slug)
     return None
 
 
@@ -541,9 +694,76 @@ _INDEX_AUTO_START = "<!-- ironclad:index:auto START — generiert von reconcile_
 _INDEX_AUTO_END   = "<!-- ironclad:index:auto END -->"
 _LINKS_AUTO_START = "<!-- ironclad:related:auto START -->"
 _LINKS_AUTO_END   = "<!-- ironclad:related:auto END -->"
+# S12c: a machine-readable typed-edge graph (GRAPH.json) + a human LIFECYCLE.md view, both generated
+# next to INDEX.md. The HTML markers above stay FROZEN; LIFECYCLE.md adds its own managed-block markers.
+_LIFECYCLE_AUTO_START = "<!-- ironclad:lifecycle:auto START -->"
+_LIFECYCLE_AUTO_END   = "<!-- ironclad:lifecycle:auto END -->"
+GRAPH_FILENAME     = "GRAPH.json"
+LIFECYCLE_FILENAME = "LIFECYCLE.md"
 # Doc categories (first path segment) that get a "Verwandt" (related) block — curated knowledge,
 # NOT the auto-generated MPR runs/ and not the meta.md.
 _LINK_CATEGORIES  = {"decisions", "proposals", "reviews", "(root)"}
+# Typed frontmatter edges (allowlist). Each value is a flat list (``[a, b]`` or ``a, b``) of doc
+# targets (a relpath, a stem, or a bare filename stem). Unknown keys are ignored; an unresolvable
+# target is recorded as a *dangling* edge (honest, not dropped).
+_EDGE_TYPES = ("depends_on", "refines", "supersedes", "relates_to", "implements", "blocks")
+# Composable lifecycle stages (S12d), in canonical order. A doc declares its stage via a flat
+# ``stage:`` frontmatter field; the initiative's lifecycle is COMPOSED from its docs' stages
+# (``lifecycle_state``). The order defines the transition guard (``can_advance_stage``) and the
+# completeness notion the DELIVER leg (AD-7) / the ``/lifecycle`` command (S16) consume.
+LIFECYCLE_STAGES = ("idea", "design", "adr", "spec", "tests", "proposals", "reviews", "delivery")
+_STAGE_INDEX = {s: i for i, s in enumerate(LIFECYCLE_STAGES)}
+
+
+def is_lifecycle_stage(s: object) -> bool:
+    """True iff *s* is a known lifecycle stage. Crash-safe for non-str / unhashable input (→ False)."""
+    return isinstance(s, str) and s in _STAGE_INDEX
+
+
+def can_advance_stage(frm: object, to: object, *, allow_regress: bool = False) -> bool:
+    """Transition guard (fully fail-closed): may a unit move from stage *frm* to stage *to*?
+    *to* must be a known stage; only the **empty string** *frm* (no stage yet) admits any valid *to*;
+    a non-str / unknown *frm* or *to* is refused (so ``None``/``[]`` can never slip through). Otherwise
+    the move must be forward (``to`` at or after ``frm`` in :data:`LIFECYCLE_STAGES`) unless
+    *allow_regress*. The reusable primitive the ``/lifecycle`` command (S16) and the DELIVER-leg
+    completeness gate (AD-7 / S17) build on."""
+    if not is_lifecycle_stage(to):
+        return False
+    if frm == "":
+        return True
+    if not is_lifecycle_stage(frm):
+        return False
+    return allow_regress or _STAGE_INDEX[to] >= _STAGE_INDEX[frm]
+
+
+def lifecycle_state(docs: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """The COMPOSED lifecycle of an initiative, derived deterministically from its docs' ``stage`` fields
+    (S12d). ``present`` = the known stages that have at least one artifact (in canonical order);
+    ``current`` = the furthest-along present stage; ``gaps`` = required earlier stages (before
+    ``current``) with no artifact; ``complete`` = a current stage with no gaps; ``unknown`` = declared
+    stages that are not in the allowlist. LLM-free, no timestamp (idempotent)."""
+    counts: Dict[str, int] = {}
+    unknown: List[str] = []
+    for d in docs:
+        s = (d.get("stage") or "").strip()
+        if not s:
+            continue
+        if s in _STAGE_INDEX:
+            counts[s] = counts.get(s, 0) + 1
+        elif s not in unknown:
+            unknown.append(s)
+    present = [s for s in LIFECYCLE_STAGES if counts.get(s)]
+    current = present[-1] if present else ""
+    gaps = [s for s in LIFECYCLE_STAGES[:_STAGE_INDEX[current]] if not counts.get(s)] if current else []
+    return {
+        "stages": list(LIFECYCLE_STAGES),
+        "present": present,
+        "current": current,
+        "gaps": gaps,
+        "complete": bool(current) and not gaps,
+        "counts": {s: counts[s] for s in present},
+        "unknown": sorted(unknown),
+    }
 
 
 def _parse_tags(raw: str) -> set:
@@ -572,12 +792,38 @@ def _set_managed_block(text: str, start: str, end: str, block: Optional[str]) ->
     return (text.rstrip() + "\n\n" + block + "\n") if text.strip() else (block + "\n")
 
 
+def _parse_edge_targets(raw: str) -> List[str]:
+    """Doc targets from a flat frontmatter value: ``[a, b]`` or ``a, b`` → ['a', 'b'] (comma-separated,
+    order-preserving, case-insensitively deduped). Targets may be relpaths (with ``/``), so do NOT split
+    on whitespace."""
+    s = (raw or "").strip().strip("[]")
+    out: List[str] = []
+    seen: set = set()
+    for t in s.split(","):
+        t = t.strip().strip("'\"")
+        if t and t.lower() not in seen:
+            seen.add(t.lower())
+            out.append(t)
+    return out
+
+
+def _doc_edges(fm: Dict[str, str]) -> Dict[str, List[str]]:
+    """Typed edges declared in a doc's frontmatter (only the allowlisted, non-empty ones)."""
+    out: Dict[str, List[str]] = {}
+    for et in _EDGE_TYPES:
+        targets = _parse_edge_targets(fm.get(et, ""))
+        if targets:
+            out[et] = targets
+    return out
+
+
 def _vault_docs(vdir: Path) -> List[Dict[str, Any]]:
-    """Indexable docs under the initiative (excluding INDEX.md and the hidden .work/), with metadata."""
+    """Indexable docs under the initiative (excluding the generated INDEX.md / LIFECYCLE.md and the
+    hidden .work/), with metadata + typed frontmatter edges."""
     out: List[Dict[str, Any]] = []
     for p in sorted(vdir.rglob("*.md")):
         rel = p.relative_to(vdir)
-        if p.name == "INDEX.md" or (rel.parts and rel.parts[0] == WORKFLOW_DIR):
+        if p.name in ("INDEX.md", LIFECYCLE_FILENAME) or (rel.parts and rel.parts[0] == WORKFLOW_DIR):
             continue
         try:
             text = p.read_text(encoding="utf-8", errors="replace")
@@ -591,6 +837,9 @@ def _vault_docs(vdir: Path) -> List[Dict[str, Any]]:
             "date": fm.get("created") or fm.get("date") or "",
             "tags": _parse_tags(fm.get("tags", "")),
             "category": rel.parts[0] if len(rel.parts) > 1 else "(root)",
+            "stage": (fm.get("stage", "") or "").strip(),
+            "tree_sha": (fm.get("tree_sha", "") or "").strip(),       # S13: evidence-doc provenance
+            "edges": _doc_edges(fm),
             "text": text,
         })
     return out
@@ -598,7 +847,7 @@ def _vault_docs(vdir: Path) -> List[Dict[str, Any]]:
 
 def _index_block(slug: str, docs: List[Dict[str, Any]]) -> str:
     lines = [_INDEX_AUTO_START,
-             f"_Automatisch gepflegt (reconcile_vault, LLM-frei) — {len(docs)} Dokument(e)._", ""]
+             f"_{_msg('vault.index_auto', n=len(docs))}_", ""]
     by_cat: Dict[str, List[Dict[str, Any]]] = {}
     for d in docs:
         by_cat.setdefault(d["category"], []).append(d)
@@ -629,46 +878,140 @@ def _related_docs(d: Dict[str, Any], docs: List[Dict[str, Any]]) -> List[Dict[st
     return rel
 
 
+def build_graph(slug: str, docs: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """The machine SSOT graph (S12c): nodes keyed by **full relpath**, plus the typed edges declared in
+    each doc's frontmatter. Deterministic + LLM-free: nodes are emitted in relpath order, tags sorted,
+    edges sorted, and there is **no timestamp** (so a re-run with unchanged docs is byte-identical →
+    idempotent). An edge target is resolved (against relpath / stem / bare filename stem) to the target's
+    relpath; an unresolvable target is kept verbatim and flagged ``resolved=false`` (dangling)."""
+    by_key: Dict[str, str] = {}
+    for d in sorted(docs, key=lambda x: x["rel"].as_posix()):
+        rp = d["rel"].as_posix()
+        for key in (rp, d["stem"], d["rel"].stem):       # first (relpath-sorted) doc wins a shared key
+            by_key.setdefault(key, rp)
+    nodes: Dict[str, Any] = {}
+    edges: List[Dict[str, Any]] = []
+    seen: set = set()
+    for d in sorted(docs, key=lambda x: x["rel"].as_posix()):
+        rp = d["rel"].as_posix()
+        nodes[rp] = {"title": d["title"], "type": d["type"], "status": d["status"],
+                     "date": d["date"], "category": d["category"], "stage": d.get("stage", ""),
+                     "tags": sorted(d["tags"])}
+        for et in _EDGE_TYPES:
+            for tgt in d.get("edges", {}).get(et, []):
+                resolved = by_key.get(tgt)
+                to = resolved or tgt
+                key = (rp, et, to)
+                if key in seen:        # aliases of the same target (e.g. stem + relpath) collapse to one edge
+                    continue
+                seen.add(key)
+                edges.append({"from": rp, "type": et, "to": to, "resolved": resolved is not None})
+    edges.sort(key=lambda e: (e["from"], e["type"], e["to"]))
+    return {"version": 1, "slug": slug, "generator": "reconcile_vault",
+            "lifecycle": lifecycle_state(docs), "nodes": nodes, "edges": edges}
+
+
+def _graph_json(graph: Dict[str, Any]) -> str:
+    """Deterministic JSON for GRAPH.json (sorted keys + trailing newline) → stable diffs / idempotent."""
+    import json
+    return json.dumps(graph, indent=2, ensure_ascii=False, sort_keys=True) + "\n"
+
+
+def _lifecycle_block(graph: Dict[str, Any]) -> str:
+    """A human-readable LIFECYCLE.md view of the graph (managed block, deterministic). Lists each node
+    with its outgoing typed edges; a dangling edge is marked. The HTML markers are frozen."""
+    nodes = graph["nodes"]
+    edges = graph["edges"]
+    lc = graph.get("lifecycle") or {}
+    by_from: Dict[str, List[Dict[str, Any]]] = {}
+    for e in edges:
+        by_from.setdefault(e["from"], []).append(e)
+    lines = [_LIFECYCLE_AUTO_START,
+             f"_{_msg('vault.lifecycle_auto', nodes=len(nodes), edges=len(edges))}_", ""]
+    # S12d: the composed lifecycle summary (current stage + gaps + present-stage progression)
+    if lc:
+        current = lc.get("current") or "(none)"
+        complete = "complete" if lc.get("complete") else "incomplete"
+        lines.append(f"## Lifecycle — {current} ({complete})")
+        present = lc.get("present") or []
+        if present:
+            lines.append("- present: " + ", ".join(f"{s} ({lc['counts'][s]})" for s in present))
+        if lc.get("gaps"):
+            lines.append("- gaps: " + ", ".join(lc["gaps"]))
+        if lc.get("unknown"):
+            lines.append("- unknown stages: " + ", ".join(lc["unknown"]))
+        lines.append("")
+    lines.append("## Graph")
+    for rp in sorted(nodes):
+        n = nodes[rp]
+        bits = " · ".join(b for b in (n.get("stage"), n.get("type"), n.get("status"), n.get("date")) if b)
+        lines.append(f"- `{rp}` — {n.get('title') or rp}" + (f"  ({bits})" if bits else ""))
+        for e in by_from.get(rp, []):
+            mark = "" if e["resolved"] else "  (dangling)"
+            lines.append(f"    - {e['type']} -> `{e['to']}`{mark}")
+    lines.append("")
+    lines.append(_LIFECYCLE_AUTO_END)
+    return "\n".join(lines)
+
+
 def reconcile_vault(slug: str, *, links: bool = True) -> str:
     """Maintains INDEX.md (always) + optionally the "Verwandt (auto)" (related) blocks (``links=True``) of an initiative.
     Deterministic, idempotent, LLM-free. ``links=False`` (auto-trigger) only keeps the index fresh and
     does not touch doc bodies (no conflict with an open editor)."""
     vdir = vault_root() / slug
     if not (vdir / "meta.md").is_file():
-        return f"kein Initiative {slug!r} unter {vault_root().as_posix()}/"
-    docs = _vault_docs(vdir)
+        return _msg("vault.no_initiative", slug=slug, root=vault_root().as_posix())
+    with _vault_lock():        # serialize the index/related writes (Codex S3 / S12b)
+        docs = _vault_docs(vdir)
 
-    index_path = vdir / "INDEX.md"
-    # Seed the H1 from the initiative's title (meta.md is guaranteed present above), not the slug —
-    # keeps the overview header consistent with meta.md and the wikilink label. Fallback: slug.
-    try:
-        seed_title = Initiative.from_meta(slug).title or slug
-    except Exception:
-        seed_title = slug
-    existing = index_path.read_text(encoding="utf-8") if index_path.exists() else f"# {seed_title} — INDEX\n"
-    new_index = _set_managed_block(existing, _INDEX_AUTO_START, _INDEX_AUTO_END, _index_block(slug, docs))
-    if new_index != existing:
-        index_path.write_text(new_index, encoding="utf-8", newline="\n")
+        index_path = vdir / "INDEX.md"
+        # Seed the H1 from the initiative's title (meta.md is guaranteed present above), not the slug —
+        # keeps the overview header consistent with meta.md and the wikilink label. Fallback: slug.
+        try:
+            seed_title = Initiative.from_meta(slug).title or slug
+        except Exception:
+            seed_title = slug
+        existing = index_path.read_text(encoding="utf-8") if index_path.exists() else f"# {seed_title} — INDEX\n"
+        new_index = _set_managed_block(existing, _INDEX_AUTO_START, _INDEX_AUTO_END, _index_block(slug, docs))
+        if new_index != existing:
+            index_path.write_text(new_index, encoding="utf-8", newline="\n")
 
-    linked = 0
-    if links:
-        for d in docs:
-            if d["category"] not in _LINK_CATEGORIES or d["rel"].name == "meta.md":
-                continue
-            related = _related_docs(d, docs)
-            if related:
-                items = sorted(related, key=lambda x: x["title"].lower())
-                body = "\n".join([_LINKS_AUTO_START, "", "## Verwandt (auto)",
-                                  *[f"- [[{o['stem']}|{o['title']}]]" for o in items],
-                                  "", _LINKS_AUTO_END])
-                new = _set_managed_block(d["text"], _LINKS_AUTO_START, _LINKS_AUTO_END, body)
-            else:   # no related docs → remove any existing block (tidy)
-                new = _set_managed_block(d["text"], _LINKS_AUTO_START, _LINKS_AUTO_END, None)
-            if new != d["text"]:
-                d["path"].write_text(new, encoding="utf-8", newline="\n")
-                linked += 1
-    suffix = f", {linked} Related-Block/Blöcke aktualisiert" if links else " (nur Index)"
-    return f"{slug}: {len(docs)} Dokument(e) indiziert{suffix}"
+        # S12c: the machine SSOT graph (GRAPH.json) + the human LIFECYCLE.md view — generated next to
+        # INDEX.md in BOTH modes (they are generated files, never curated bodies). Idempotent: written
+        # only when the content actually changes (GRAPH.json carries no timestamp).
+        graph = build_graph(slug, docs)
+        graph_path = vdir / GRAPH_FILENAME
+        new_graph = _graph_json(graph)
+        if (not graph_path.exists()) or graph_path.read_text(encoding="utf-8") != new_graph:
+            graph_path.write_text(new_graph, encoding="utf-8", newline="\n")
+        life_path = vdir / LIFECYCLE_FILENAME
+        life_existing = (life_path.read_text(encoding="utf-8") if life_path.exists()
+                         else f"# {seed_title} — LIFECYCLE\n")
+        new_life = _set_managed_block(life_existing, _LIFECYCLE_AUTO_START, _LIFECYCLE_AUTO_END,
+                                      _lifecycle_block(graph))
+        if new_life != life_existing:
+            life_path.write_text(new_life, encoding="utf-8", newline="\n")
+
+        linked = 0
+        if links:
+            for d in docs:
+                if d["category"] not in _LINK_CATEGORIES or d["rel"].name == "meta.md":
+                    continue
+                related = _related_docs(d, docs)
+                if related:
+                    items = sorted(related, key=lambda x: x["title"].lower())
+                    body = "\n".join([_LINKS_AUTO_START, "", "## " + _msg("vault.related_heading"),
+                                      *[f"- [[{o['stem']}|{o['title']}]]" for o in items],
+                                      "", _LINKS_AUTO_END])
+                    new = _set_managed_block(d["text"], _LINKS_AUTO_START, _LINKS_AUTO_END, body)
+                else:   # no related docs → remove any existing block (tidy)
+                    new = _set_managed_block(d["text"], _LINKS_AUTO_START, _LINKS_AUTO_END, None)
+                if new != d["text"]:
+                    d["path"].write_text(new, encoding="utf-8", newline="\n")
+                    linked += 1
+        suffix = (_msg("vault.related_suffix", n=linked) if links
+                  else _msg("vault.index_only_suffix"))
+        return _msg("vault.indexed", slug=slug, n=len(docs), suffix=suffix)
 
 
 def _reconcile_active_soft(*, links: bool = False) -> None:
@@ -680,6 +1023,168 @@ def _reconcile_active_soft(*, links: bool = False) -> None:
             reconcile_vault(s, links=links)
     except Exception:   # noqa: BLE001 — reconcile must never make a write fail
         pass
+
+
+# ─── Evidence projection + lifecycle-completeness gate (S13a / AD-7) ──────────
+# A deterministic, append-only EVIDENCE projector: dev-process transitions are projected (by the
+# PRIVATE DELIVER leg, S13b) into stage-tagged vault docs bound to a `tree_sha` + a `content_hash`,
+# via the index-only reconcile path — NEVER rewriting curated bodies. The lifecycle-completeness gate
+# (run in the engine DELIVER leg, not monorepo CI) verifies the required evidence stages are present
+# AND all bound to the delivery tree_sha. Builds on the public S12 vault (stage frontmatter,
+# lifecycle_state, _vault_lock).
+EVIDENCE_TYPE = "evidence"
+EVIDENCE_DIR = "evidence"
+
+
+def project_evidence(stage: str, title: str, body: str, *, tree_sha: str,
+                     content_hash: "Optional[str]" = None, slug: "Optional[str]" = None) -> str:
+    """Append an evidence doc for *stage* into the active (or *slug*) initiative's vault, bound to
+    *tree_sha* + a content hash (AD-7). The doc carries ``type: evidence`` + the lifecycle ``stage`` +
+    ``tree_sha`` + ``content_hash`` frontmatter; it is written under ``<slug>/evidence/`` with a
+    **deterministic** filename ``<stage>-<tree_sha[:12]>-<hash[:12]>.md``, so re-projecting the same
+    (stage, tree_sha, body) is a **no-op** (idempotent, no timestamp). Append-only: it only ever writes
+    NEW evidence files and never touches curated bodies. Fail-closed: an unknown *stage*, an empty
+    *tree_sha*, or no resolvable initiative raises ``ValueError``. Returns the doc path (posix)."""
+    import hashlib
+    if not is_lifecycle_stage(stage):
+        raise ValueError(f"unknown lifecycle stage: {stage!r}")
+    if not isinstance(tree_sha, str) or not tree_sha.strip():
+        raise ValueError("evidence requires a non-empty tree_sha")
+    tree_sha = tree_sha.strip()
+    # tree_sha + content_hash land in the on-disk FILENAME → must be hex-only (no separators / traversal).
+    if not re.fullmatch(r"[0-9a-fA-F]{7,64}", tree_sha):
+        raise ValueError("evidence requires a git-like hex tree_sha (7-64 hex chars)")
+    target = (slug or active_slug() or "").strip()
+    if not target:
+        raise ValueError("no active initiative for evidence projection")
+    # Normalize line endings so the rendered bytes match what read_text() returns on a re-run (the
+    # comparison/hash would otherwise churn on CRLF input → broken idempotency).
+    body = str(body).replace("\r\n", "\n").replace("\r", "\n")
+    if not body.endswith("\n"):
+        body += "\n"
+    chash = (content_hash or hashlib.sha256(body.encode("utf-8")).hexdigest()).strip()
+    if not re.fullmatch(r"[0-9a-fA-F]{12,64}", chash):
+        raise ValueError("evidence content_hash must be hex (12-64 chars)")
+    with _vault_lock():
+        vdir = vault_root() / target
+        if not (vdir / "meta.md").is_file():
+            raise ValueError(_msg("vault.no_initiative", slug=target, root=vault_root().as_posix()))
+        edir = vdir / EVIDENCE_DIR
+        edir.mkdir(parents=True, exist_ok=True)
+        content = (
+            "---\n"
+            f"type: {EVIDENCE_TYPE}\n"
+            f"stage: {stage}\n"
+            f"title: {title}\n"
+            f"tree_sha: {tree_sha}\n"
+            f"content_hash: {chash}\n"
+            "---\n\n"
+            f"# {title}\n\n"
+            f"{body}"
+        )
+        # Filename identity = the hash of the FULL rendered doc (incl. title) → any content change yields a
+        # distinct file (strict append-only); identical content yields the same file (idempotent no-op).
+        ident = hashlib.sha256(content.encode("utf-8")).hexdigest()
+        doc = edir / f"{stage}-{tree_sha[:12]}-{ident[:12]}.md"
+        if doc.exists():
+            if doc.read_text(encoding="utf-8") != content:   # defensive: never rewrite an evidence doc
+                raise ValueError(f"evidence collision with differing content: {doc.name}")
+        else:
+            doc.write_text(content, encoding="utf-8", newline="\n")
+        try:
+            reconcile_vault(target, links=False)   # index-only refresh (reentrant under the vault lock)
+        except Exception:   # noqa: BLE001 — projection must not fail on a reconcile hiccup
+            pass
+        return (doc.relative_to(vault_root())).as_posix()
+
+
+def lifecycle_completeness(slug: str, *, required_stages: "List[str]", tree_sha: str) -> "tuple[bool, List[str]]":
+    """The lifecycle-completeness gate (S13a / AD-7), consumed by the engine DELIVER leg. Verifies that
+    the *slug* initiative's vault carries an **evidence** doc for **every** stage in *required_stages*
+    AND that every evidence doc for those stages is bound to the delivery *tree_sha* (evidence tree_sha
+    == delivery tree_sha). Returns ``(ready, reasons)`` — ``ready`` iff there are no reasons. Fully
+    fail-closed: an empty *tree_sha*, an unknown required stage, or a missing/mismatched evidence doc is
+    a reason. Pure + deterministic."""
+    reasons: List[str] = []
+    if not isinstance(tree_sha, str) or not tree_sha.strip():
+        return False, ["no delivery tree_sha"]
+    tree_sha = tree_sha.strip()
+    vdir = vault_root() / slug
+    if not (vdir / "meta.md").is_file():
+        return False, [f"no initiative {slug!r}"]
+    evidence = [d for d in _vault_docs(vdir) if d.get("type") == EVIDENCE_TYPE]
+    by_stage: Dict[str, List[Dict[str, Any]]] = {}
+    for d in evidence:
+        by_stage.setdefault(d.get("stage", ""), []).append(d)
+    for stage in required_stages:
+        if not is_lifecycle_stage(stage):
+            reasons.append(f"unknown required stage: {stage!r}")
+            continue
+        docs = by_stage.get(stage, [])
+        if not docs:
+            reasons.append(f"missing evidence for stage {stage!r}")
+            continue
+        if not any(d.get("tree_sha") == tree_sha for d in docs):
+            reasons.append(f"stage {stage!r} evidence not bound to delivery tree_sha {tree_sha[:12]}")
+    return (not reasons), reasons
+
+
+def _project_vault_base() -> Path:
+    """The project vault root WITHOUT the active-track suffix (the ``main`` track location). Cross-track
+    enumeration + reconcile work off this base. Derived from the :func:`vault_root` accessor (not the raw
+    global): for a non-``main`` active track ``vault_root`` appended ``.tracks/<track>``, so strip those
+    two trailing segments back to the base; for ``main`` it already IS the base."""
+    base = vault_root()
+    if _active_track() != "main":
+        base = base.parent.parent
+    return base
+
+
+def _project_tracks() -> List[str]:
+    """All tracks of the active project: ``main`` plus each safe directory under
+    ``<project_vault>/.tracks/`` (sorted, deterministic)."""
+    tracks = ["main"]
+    td = _project_vault_base() / ".tracks"
+    if td.is_dir():
+        tracks += sorted(d.name for d in td.iterdir() if d.is_dir() and _is_safe_track(d.name))
+    return tracks
+
+
+def reconcile_active_project(*, links: bool = False) -> List[str]:
+    """Project-scoped reconcile (S12e): reconcile EVERY initiative in the **current track** (not just the
+    single active initiative). Fail-closed per initiative — one that errors is reported and the rest
+    proceed. Idempotent (delegates to the vault-locked :func:`reconcile_vault`)."""
+    out: List[str] = []
+    for v in initiative_list():
+        try:
+            out.append(reconcile_vault(v.slug, links=links))
+        except Exception as e:   # noqa: BLE001 — one bad initiative must not abort the sweep
+            out.append(f"{v.slug}: ERROR {e!r}")
+    return out
+
+
+def reconcile_all_tracks(*, links: bool = False) -> Dict[str, List[str]]:
+    """The scheduled **cross-track reconciler** (S12e): reconcile every initiative in every track of the
+    active project. **Fail-closed per track** — a track that raises is recorded and the others continue.
+    Returns ``{track: [per-initiative results]}``. Idempotent; the scheduled reconcile tick / the
+    ``/initiative reconcile all`` command call this. With no active project only ``main`` is swept."""
+    pcur = _pc.current() if _pc is not None else None
+    has_project = pcur is not None and bool(getattr(pcur, "project_id", ""))
+    # With no active project there is nothing to bind a non-main track to, so only ``main`` is swept
+    # (a stray legacy ``.tracks/`` subtree must NOT surface as empty entries — contract-honest).
+    tracks = _project_tracks() if has_project else ["main"]
+    out: Dict[str, List[str]] = {}
+    for track in tracks:
+        try:
+            if has_project:
+                ctx = _pc.ProjectContext(pcur.project_id, pcur.root, pcur.mem_ns, track=track)
+                with _pc.use(ctx):
+                    out[track] = reconcile_active_project(links=links)
+            else:
+                out[track] = reconcile_active_project(links=links)   # main only
+        except Exception as e:   # noqa: BLE001 — fail-closed per track
+            out[track] = [f"track {track!r}: ERROR {e!r}"]
+    return out
 
 
 # Memory layer — module-level singleton, initialized in GX10.__init__()
@@ -718,6 +1223,293 @@ WORKER_WRITE_MODE = "reducer"
 #: Warm-tier session key for the shared rolling summary + worker scratch (single-tenant default).
 #: Config GX10_SESSION_ID. ``session:{id}:summary`` survives restart and is read by the workers.
 WARM_SESSION_ID = "main"
+
+
+def _active_warm_session() -> str:
+    """The warm-tier session key, scoped to the active ProjectContext's track-composed memory partition
+    (``mem_scope()`` = ``<mem_ns>::track::<tid>`` for a non-``main`` track; S14-1) when one is set
+    (ADR-0011 AD-1 / S3b — so a project's, and a track's, rolling summary is isolated), else the global
+    ``WARM_SESSION_ID`` (today's behaviour; dormant until the switch sets a ctx). Evaluate in the request
+    thread — a fan-out worker that does not carry the ctx is bound in S3b(b2)."""
+    pc = _pc.current() if _pc is not None else None
+    if pc is not None and pc.mem_ns:
+        return pc.mem_scope()
+    return WARM_SESSION_ID
+
+
+def _active_mem_ns(default: str = "") -> str:
+    """The active cold-memory partition (ADR-0011 AD-1 / S3b; S14-1 adds the per-track sub-scope): the
+    ProjectContext's ``mem_scope()`` (``<mem_ns>::track::<tid>`` for a non-``main`` track) when a project
+    is active, else *default*. Used to scope the warm retrieval cache + the launched read-only Memory MCP
+    to the SAME partition the orchestrator's memory uses."""
+    pc = _pc.current() if _pc is not None else None
+    if pc is not None and pc.mem_ns:
+        return pc.mem_scope()
+    return default
+
+
+def _forget_scope(scope: str) -> Dict[str, Any]:
+    """Scope-aware forget endpoint (ADR-0011 D5 / #601 S14-5): drop every trace of partition *scope* across
+    all three substrate layers — the cold store (Mem0 ``agent_id``), the warm tier (session state + the
+    retrieval cache), and the lesson backend. *scope* is an opaque partition string (typically a
+    ``mem_scope`` from :func:`_active_mem_ns`). **Fail-closed on an empty scope** (returns immediately — a
+    forget must never wipe the shared base partition); each layer is **fail-soft** (a down/absent tier never
+    breaks the call). Returns a per-layer summary: ``{scope, cold: bool, warm: int, lessons: bool}``."""
+    scope = (scope or "").strip()
+    out: Dict[str, Any] = {"scope": scope, "cold": False, "warm": 0, "lessons": False}
+    if not scope:
+        return out
+    if _MEMORY is not None:
+        try:
+            out["cold"] = bool(_MEMORY.forget(scope))
+        except Exception:  # noqa: BLE001 — fail-soft: a forget never breaks the call
+            pass
+    if _WARM is not None:
+        try:
+            out["warm"] = int(_WARM.forget_scope(scope))
+        except Exception:  # noqa: BLE001
+            pass
+    try:
+        from ack import lessons as _lessons   # lazy: never import ack at gx10 top-level (S6b lesson)
+        out["lessons"] = bool(_lessons.forget(scope))
+    except Exception:  # noqa: BLE001
+        pass
+    return out
+
+
+def _orphan_scopes(present: "List[str]", registered: "List[str]") -> "List[str]":
+    """The memory partitions present in the store with **no registered project** — orphans eligible for GC
+    (ADR-0011 AD-4 / #601 S15). An orphan is a present scope whose project key is a **minted** ``mem_ns``
+    (``valid_mem_ns``) that is not in *registered*. This precisely targets partitions left behind by a
+    removed project, and by construction never flags the base partition (e.g. ``ironclad``) or a curated /
+    human-named scope (neither is a minted ``mem_ns``). A per-track sub-scope (``<mem_ns>::track::<tid>``)
+    is judged by its project ``mem_ns``, so a live project's tracks are kept and an orphan project's tracks
+    are collected with it."""
+    if _pr is None:
+        return []
+    reg = set(registered)
+    orphans: List[str] = []
+    for s in present:
+        if not isinstance(s, str) or not s:
+            continue
+        base_ns = s.split("::track::", 1)[0]
+        if _pr.valid_mem_ns(base_ns) and base_ns not in reg:
+            orphans.append(s)
+    return orphans
+
+
+def _reconcile_orphan_memory(*, dry_run: bool = True) -> Dict[str, Any]:
+    """Registry-keyed orphan GC (ADR-0011 AD-4 / #601 S15): list the partitions present in the memory store,
+    diff against the registered projects' ``mem_ns``, and **forget** any minted partition with no project
+    (cold + warm + lessons, via :func:`_forget_scope`). **Destructive → ``dry_run=True`` by default** (it
+    returns the orphans without deleting; a caller opts in to the delete). Fail-soft throughout. Returns
+    ``{present, registered, orphans, forgotten, dry_run}``."""
+    out: Dict[str, Any] = {"present": [], "registered": [], "orphans": [], "forgotten": [], "dry_run": dry_run}
+    if _MEMORY is None or _REGISTRY is None:
+        return out
+    try:
+        present = list(_MEMORY.list_scopes())
+    except Exception:  # noqa: BLE001 — store unreachable → no present scopes → nothing to GC (safe)
+        present = []
+    out["present"] = present
+    try:
+        registered = [p.mem_ns for p in _REGISTRY.list() if getattr(p, "mem_ns", "")]
+    except Exception:  # noqa: BLE001 — can't enumerate registered projects → REFUSE to GC (never mass-delete)
+        return out
+    out["registered"] = registered
+    orphans = _orphan_scopes(present, registered)
+    out["orphans"] = orphans
+    if dry_run:
+        return out
+    for s in orphans:
+        try:
+            _forget_scope(s)
+            out["forgotten"].append(s)
+        except Exception:  # noqa: BLE001 — fail-soft: one orphan's failure never aborts the sweep
+            pass
+    return out
+
+
+def _exec_cwd() -> "Optional[str]":
+    """The filesystem working directory for MODEL-DRIVEN execution — the code-tools (read/write/list/…),
+    ``execute_command``, and the launched code-agent — under the active ProjectContext (ADR-0011 AD-1 / S9c).
+    Returns the active project's ``root`` ONLY when a genuinely non-default project is bound; otherwise
+    ``None`` so the caller keeps the process workdir (``_BOOT_WORKDIR``, set by the boot ``os.chdir``) —
+    BYTE-IDENTICAL to the pre-isolation engine. A ``/switch`` does NOT chdir the process (a global chdir under
+    the daemons/fan-out threads is unsafe), so this is the seam that points a switched project's file ops at
+    its own tree.
+
+    NB: when a local-tool bridge is active the code-tools run on the CLIENT's tree (``run_tool`` returns
+    early), so this governs only SERVER-side execution — exactly where the project root must be honoured."""
+    pc = _pc.current() if _pc is not None else None
+    if pc is None or not pc.root:
+        return None
+    if _BOOT_WORKDIR is not None and Path(pc.root) == _BOOT_WORKDIR:
+        return None                              # the default project == the boot workdir → today's behaviour
+    return pc.root
+
+
+def _resolve_exec_path(path: str) -> Path:
+    """Resolve a model-supplied tool path against the active project's exec cwd (``_exec_cwd``). An absolute
+    path is taken verbatim; a relative path under a non-default project is anchored at the project root; with
+    no active (non-default) project it is returned unchanged (relative to the process workdir — byte-identical
+    to before)."""
+    p = Path(path)
+    cwd = _exec_cwd()
+    if cwd is None or p.is_absolute():
+        return p
+    return Path(cwd) / p
+
+
+# ─── Project Registry integration (ADR-0011 AD-1/AD-6 / S5b) ──────────────────
+# The installation-global Registry is the SSOT of registered, isolated projects + the PERSISTED continuity
+# pointer (`active`). The engine's CURRENT project, by contrast, is PER-PROCESS (single-active-per-engine):
+# it is read from the registry's `active` ONCE at boot (continuity) and cached in `_ACTIVE_PROJECT`; a
+# `/switch` updates that cache AND persists `active`. Threads that don't inherit the boot contextvar
+# (daemons, request handlers) call `bind_active()`, which binds the cached project — it does NOT re-read the
+# registry, so a second engine process sharing the same home can never yank a running process onto another
+# project (and there is no per-tick file I/O).
+#
+# Until a non-default project is activated this is BYTE-IDENTICAL to the pre-isolation engine: the `default`
+# project binds THIS process's boot workdir (`_BOOT_WORKDIR`) — never a root some other workdir's boot
+# persisted — so state_root()/vault_root() resolve exactly as before, and its bound mem_ns is EMPTY (memory
+# + warm fall back to the legacy/base partition). Distinct per-project partitions begin only on activation.
+_REGISTRY = None        # type: ignore[assignment]   # the live Registry (None when project_registry absent)
+_BASE_CFG: Optional[Dict[str, Any]] = None            # the deployment base config (pre project-overlay)
+_ACTIVE_PROJECT = None  # type: ignore[assignment]    # this process's active Project (cached; not re-read per tick)
+_BOOT_WORKDIR: "Optional[Path]" = None                # this process's workdir — the `default` project's root
+
+
+def _engine_ctx_for(project) -> "Any":
+    """Build the ProjectContext to bind for *project*, applying the engine's binding policy. The implicit
+    ``default`` project binds THIS process's boot workdir and an EMPTY ``mem_ns`` (it shares the
+    legacy/base memory partition — backward-compatible, and process-local so a shared registry can't
+    re-point it); every explicitly-registered project binds its own fixed root + minted ``mem_ns`` (true
+    isolation). Shared by boot, the daemons, and the ``/switch`` path so the binding is consistent."""
+    default_id = getattr(_pr, "DEFAULT_PROJECT_ID", "default") if _pr is not None else "default"
+    if project.id == default_id:
+        root = str(_BOOT_WORKDIR) if _BOOT_WORKDIR is not None else project.root
+        mem_ns = ""
+    else:
+        # S14-2 / C0 cond.5 — fail-closed: a REGISTERED (non-default) project MUST carry a valid minted
+        # mem_ns. A malformed persisted entry with an empty/low-entropy mem_ns would otherwise bind here
+        # and silently fall back to the BASE partition (a cross-project memory leak). Refuse instead; the
+        # switch path rolls back, and boot degrades to the safe `default` project (see init_registry).
+        _valid = getattr(_pr, "valid_mem_ns", None) if _pr is not None else None
+        if _valid is not None and not _valid(project.mem_ns):
+            raise ValueError(f"project {project.id!r} has an invalid mem_ns "
+                             f"({project.mem_ns!r}) — refusing to bind it to the base partition; "
+                             f"run a registry reconcile")
+        root, mem_ns = project.root, project.mem_ns
+    return _pc.ProjectContext(project.id, root, mem_ns,
+                              getattr(project, "active_track", "main") or "main")
+
+
+def _set_active_project(project) -> None:
+    """Set this process's cached active project (used by boot and the ``/switch`` wrapper). The caller is
+    responsible for persisting ``registry.active`` when the change should survive a reboot."""
+    global _ACTIVE_PROJECT
+    _ACTIVE_PROJECT = project
+
+
+def init_registry(workdir: "Path | str") -> None:
+    """Instantiate the installation-global Registry, ensure the implicit ``default`` project, cache this
+    process's active project (the registry's persisted ``active`` — continuity), and bind it on the boot
+    thread. No-op when the registry/context seams are absent (the engine then runs un-isolated, exactly as
+    before)."""
+    global _REGISTRY, _BOOT_WORKDIR, _ACTIVE_PROJECT
+    if _pr is None or _pc is None:
+        return
+    _BOOT_WORKDIR = Path(workdir).resolve()
+    _REGISTRY = _pr.Registry()
+    try:
+        _REGISTRY.ensure_default(_BOOT_WORKDIR)
+        _ACTIVE_PROJECT = _REGISTRY.active()    # continuity: the last-active project (default after a fresh ensure)
+    except Exception as e:   # noqa: BLE001 — a registry hiccup must never block boot (fall back to legacy)
+        _ui_print(col(f"[WARN] project registry unavailable, running un-isolated: {e!r}", C.YELLOW))
+        _REGISTRY = None
+        _ACTIVE_PROJECT = None
+        _pc.set_current(None)   # never leave a stale ctx behind the "un-isolated" claim
+        return
+    try:
+        bind_active()
+    except Exception as e:   # noqa: BLE001 — S14-2: a corrupt active entry must NEVER bind to the base
+        # partition. Degrade to the legitimate `default` project (which uses the base by design — safe),
+        # rather than leaking the corrupt project's memory into the base partition.
+        _ui_print(col(f"[WARN] active project unbindable ({e!r}); binding the default project (safe base)",
+                      C.YELLOW))
+        try:
+            default_id = getattr(_pr, "DEFAULT_PROJECT_ID", "default")
+            dflt = _REGISTRY.get(default_id)
+            _ACTIVE_PROJECT = dflt
+            _pc.set_current(_engine_ctx_for(dflt) if dflt is not None else None)
+        except Exception:   # noqa: BLE001
+            _ACTIVE_PROJECT = None
+            _pc.set_current(None)
+
+
+def bind_active() -> None:
+    """Bind THIS thread's ProjectContext to this process's cached active project. Called at boot and at the
+    top of each daemon/request section so a background thread — which does not inherit the boot thread's
+    contextvar — operates on the active project (and follows a ``/switch`` that updated the cache). No-op
+    (leaves the ctx untouched) when there is no active project."""
+    if _pc is None or _ACTIVE_PROJECT is None:
+        return
+    _pc.set_current(_engine_ctx_for(_ACTIVE_PROJECT))
+
+
+# ─── Dev-process facade driver (ADR-0011 AD-3 / S6b) ──────────────────────────
+# Make the curated public ``ack.devprocess.api`` facade LIVE in-engine by registering a driver that wraps
+# the engine's own verbs. Only the verbs the engine OWNS in-process are wired: ``stage_handover`` and
+# ``advance`` (their impls live here). ``select_unit`` (the deterministic selection policy) and ``deliver``
+# (the supervised delivery leg) live in the private dev-loop substrate that ``core/`` must not import
+# (boundary), and ``record_feedback`` is the server-side reconciler inbox — those three raise a clear
+# ``SubstrateUnavailable`` rather than pretend. The engine impls are referenced by name (late binding), so
+# a runtime reload / test monkeypatch of ``_stage_handover`` / ``_advance_pipeline`` is honoured.
+class _EngineDevProcessDriver:
+    """The in-engine driver registered into ``ack.devprocess.api`` at import — wires the two engine-owned
+    verbs; the other three are not in-engine and say so."""
+
+    def stage_handover(self, agent, handover_md, *, task_id=None, task_json=None,
+                       set_active=True, force=False):
+        return _stage_handover(task_id, agent, handover_md, task_json, set_active, force)
+
+    def advance(self, task_id, agent, *, next_task_id=None):
+        return _advance_pipeline(task_id, agent, next_task_id)
+
+    def record_feedback(self, task_id, agent, content):
+        raise _devapi.SubstrateUnavailable(
+            "record_feedback is the server-side reconciler inbox (POST /feedback), not the in-engine facade")
+
+    def select_unit(self, candidates, *, skip=()):
+        raise _devapi.SubstrateUnavailable(
+            "select_unit is provided by the dev-loop extension, not the in-engine facade")
+
+    def deliver(self, unit, *, go, operator, secret, tree_sha, version, release_index,
+                ledger_path, dial_config=None):
+        raise _devapi.SubstrateUnavailable(
+            "deliver is provided by the dev-loop extension, not the in-engine facade")
+
+
+def _register_devprocess_driver() -> None:
+    """Make ``ack.devprocess.api`` LIVE in-engine: import the facade (LATE — core/ is on sys.path by now,
+    so the real launch resolves it) and register the in-engine driver, but ONLY if no driver is already
+    registered — a richer driver a private/composite extension wired earlier must win (the engine driver is
+    the minimal fallback). Idempotent + fail-soft (a missing facade ⇒ the tools call the impls directly)."""
+    global _devapi
+    try:
+        from ack.devprocess import api as _devapi
+    except Exception:   # noqa: BLE001 — facade absent ⇒ legacy direct path
+        _devapi = None
+        return
+    try:
+        if _devapi.get_driver() is None:
+            _devapi.set_driver(_EngineDevProcessDriver())
+    except Exception:   # noqa: BLE001 — registration must never break the import
+        pass
+
+
+_register_devprocess_driver()
 #: Tools that operate on the *code* — they run where the code is. When a client is driving
 #: a turn and has offered local execution, the server routes these THROUGH the client (it
 #: runs them on the local filesystem and returns the result). Set by the server per turn.
@@ -972,7 +1764,7 @@ _AUTOPILOT_ACTIVE             = 0
 _AUTOPILOT_LOCK               = threading.Lock()
 _AUTOPILOT_PROCS: Dict[str, Any] = {}   # task_id -> Popen (for targeted termination on advance)
 
-_status = {"thinking": False, "label": "bereit"}
+_status = {"thinking": False, "label": "ready"}
 
 # Effectively loaded config + source (set in main()) — for the `config` command.
 _EFFECTIVE_CFG: Optional[Dict[str, Any]] = None
@@ -1066,7 +1858,7 @@ def _toolbar():
             ("fg:ansiblue bold", "MJWC-AI-LAB"),
             ("",                 "\n"),
             ("fg:ansiblue bold", " ██ "),
-            ("",                 f"  {frame}  {_status['label']}...   Strg+C = abbrechen   "),
+            ("",                 f"  {frame}  {_status['label']}...   Ctrl+C = cancel   "),
             (w_color,            w_dot),
             ("",                 " Watcher  "),
             (a_color,            a_dot),
@@ -1395,6 +2187,8 @@ PARALLEL_TOOL = {
                     "description": "shared instruction applied to every item (e.g. 'Classify the sentiment as pos/neg/neutral')",
                 },
                 "max_tokens": {"type": "integer", "description": "optional per-item token cap"},
+                "effort": {"type": "string", "enum": ["low", "medium", "high", "xhigh"],
+                           "description": "optional reasoning effort per item (routes to a token budget; default medium)"},
             },
             "required": ["items"],
         },
@@ -1498,7 +2292,7 @@ def _mcp_for_launch(spec) -> Tuple[str, Dict[str, str]]:
             getattr(spec, "mcp_template", None),
             sealed=_is_sealed_profile(),
             memory_url=str(cfg.get("base_url") or ""),
-            namespace=str(cfg.get("agent_id") or "ironclad"),
+            namespace=_active_mem_ns(default=str(cfg.get("agent_id") or "ironclad")),  # S3b: the active project's partition
         )
     except Exception:  # noqa: BLE001 — never let the MCP seam break a launch
         return "", {}
@@ -1529,6 +2323,12 @@ def _breaker_tripped(agent: str) -> bool:
 
 def _breaker_snapshot() -> Dict[str, str]:
     return dict(_CODE_AGENT_BREAKER)
+
+# epic #602 SUB-9: a SEPARATE per-task output-QUALITY breaker (an ``ack.quality.QualityBreaker`` or None) —
+# distinct from the per-peer availability breaker above (folding quality in would corrupt failover). Built /
+# cleared by ``_apply_quality_breaker`` from the ``quality`` config block; OPT-IN, default off → None → no-op
+# byte-identical. A trip is ADVISORY (escalate/surface, never a hard-abort).
+_QUALITY_BREAKER = None
 
 # #456 (FORK-D): task_class is derived DETERMINISTICALLY from task_json.type — never from model output.
 # Security/architecture get their own class (the OPUS matrix); verification = analysis; everything else
@@ -1606,7 +2406,7 @@ def _tools_with_agent_enum(tools: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         out.append(t)
     return out
 
-def _all_tool_names() -> frozenset:
+def _all_tool_names(include_plugins: bool = True) -> frozenset:
     """Every tool name the model might know — independent of whether it is offered this turn — used
     to catch a tool invoked as a shell command via execute_command (S12). Defensive over globals so a
     conditionally-absent tool constant never raises."""
@@ -1623,7 +2423,8 @@ def _all_tool_names() -> frozenset:
         n = ((t or {}).get("function") or {}).get("name") if isinstance(t, dict) else None
         if n:
             names.add(n)
-    names.update((g.get("_PLUGIN_TOOLS") or {}).keys())
+    if include_plugins:   # ROUTE-4 (#503): include_plugins=False → the BUILT-IN tool names only (collision check)
+        names.update((g.get("_PLUGIN_TOOLS") or {}).keys())
     return frozenset(names)
 
 
@@ -1644,7 +2445,7 @@ def _effective_tools() -> List[Dict[str, Any]]:
 
 # ─── Macro tool: deterministic pipeline (HV-A) ─────────────
 _TASK_ID_RE = re.compile(rf"^{re.escape(TASK_PREFIX)}-[A-Za-z0-9_]+$")
-_IDLE_ACTIVE = "# Workflow — idle\n\nKein aktiver Handover.\n"
+_IDLE_ACTIVE = "# Workflow — idle\n\nNo active handover.\n"
 
 def _atomic_write(p: Path, content: str):
     p.parent.mkdir(parents=True, exist_ok=True)
@@ -1676,7 +2477,44 @@ def _normalize_handover_id(md: str, tid: str) -> str:
     return re.sub(r"(?m)^(task_id:\s*).*$", rf"\g<1>{tid}", md, count=0)
 
 
+# ── #602 SUB-2 (#690): the Loop-Intelligence Hook-Bus publish seam ───────────────────────────────
+# The reflection consumers (#602 C2: Verifier / Quality / Process-SC / Lessons) subscribe via
+# ``ack.hooks``; the engine PUBLISHES the boundary events through this seam. Lazy-imported + cached
+# (never import ack at gx10 top-level — S6b lesson); fail-soft and an O(1) no-op when no hook is
+# registered, so with NO subscriber (the default) the loop is byte-identical. Observer-only: a hook's
+# return value is ignored, and the engine's cancel flag is threaded in so a cancelled turn stops dispatch.
+_HOOKS_MOD = None
+
+
+def _emit_hook(event: str, ctx: "Any" = None) -> None:
+    global _HOOKS_MOD
+    try:
+        if _HOOKS_MOD is None:
+            from ack import hooks as _h   # lazy: never import ack at gx10 top-level (S6b lesson)
+            _HOOKS_MOD = _h
+        _HOOKS_MOD.dispatch(event, ctx, should_cancel=_CANCEL_EVENT.is_set)
+    except Exception:   # noqa: BLE001 — the hook bus must never break a turn
+        pass
+
+
 def _advance_pipeline(task_id: str, agent: str, next_task_id: Optional[str] = None) -> str:
+    """Serialized wrapper (#601 S12b): run the deterministic advance under the per-project+track vault
+    lock so a concurrent vault mutation (a parallel ``initiative_new`` / handover) can't interleave —
+    e.g. the active slug being re-pointed mid-advance. Reentrant: the impl's inner reconcile does not
+    re-acquire."""
+    _emit_hook("pre_advance", {"task_id": task_id, "agent": (agent or "").upper(),
+                               "next_task_id": next_task_id})
+    with _vault_lock():
+        result = _advance_pipeline_impl(task_id, agent, next_task_id)
+    # post_feedback = task completion boundary, published OUTSIDE the vault lock. BOTH completion-writes are
+    # re-homed here as bus subscribers — Process-SC (#803) + Lessons (#804) — so the reflection consumers share
+    # one consistent wiring path. `result` lets a consumer gate on a FRESH completion ("OK: pipeline advanced …")
+    # vs an already-done re-advance / error.
+    _emit_hook("post_feedback", {"task_id": task_id, "agent": (agent or "").upper(), "result": result})
+    return result
+
+
+def _advance_pipeline_impl(task_id: str, agent: str, next_task_id: Optional[str] = None) -> str:
     """Advances the 'done' pipeline for ONE task deterministically.
     Status transitions go through the TaskStore (directory = truth),
     active.md is projected. Fail-closed: no completion without a feedback
@@ -1690,7 +2528,7 @@ def _advance_pipeline(task_id: str, agent: str, next_task_id: Optional[str] = No
         return f"ERROR: invalid next_task_id: {next_task_id!r}"
 
     if artifact_root_soft() is None:
-        return f"ERROR: {_NO_ACTIVE_MSG}"     # B3: fail-closed — artefacts route to the active initiative
+        return f"ERROR: {_msg('init.no_active')}"     # B3: fail-closed — artefacts route to the active initiative
     _mpr = _mpr_blocks_tasks()
     if _mpr:
         return f"ERROR: {_mpr}"               # #15: mpr initiative is reasoning-only
@@ -1702,7 +2540,7 @@ def _advance_pipeline(task_id: str, agent: str, next_task_id: Optional[str] = No
     existing = store.get(task_id)
     if existing and existing.get("status") == "done":
         return (f"OK: task {task_id} is already done — no re-advance needed. "
-                f"Feedback liegt in {(archive_feedback_dir() / f'{task_id}_{agent}-feedback.md').as_posix()}")
+                f"feedback is in {(archive_feedback_dir() / f'{task_id}_{agent}-feedback.md').as_posix()}")
 
     # 0. Fail-closed gate: feedback MUST exist
     # Primary: <initiative>/.work/feedback/ (reconciler inbox)
@@ -1712,11 +2550,11 @@ def _advance_pipeline(task_id: str, agent: str, next_task_id: Optional[str] = No
         fb_arch = archive_feedback_dir() / f"{task_id}_{agent}-feedback.md"
         if fb_arch.exists():
             fb = fb_arch
-            log.append(f"feedback aus Archiv gelesen: {fb_arch}")
+            log.append(f"feedback read from archive: {fb_arch}")
         else:
-            return (f"ERROR: Feedback fehlt: {fb.as_posix()} "
-                    f"und {fb_arch.as_posix()} "
-                    f"— Task gilt als NICHT abgeschlossen. Pipeline nicht weitergeschaltet.")
+            return (f"ERROR: feedback missing: {fb.as_posix()} "
+                    f"and {fb_arch.as_posix()} "
+                    f"— the task is NOT considered complete. Pipeline not advanced.")
     log.append(f"feedback found: {fb}")
 
     try:
@@ -1726,7 +2564,7 @@ def _advance_pipeline(task_id: str, agent: str, next_task_id: Optional[str] = No
         if active.exists():
             archive.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(str(active), str(archive))
-            log.append(f"active.md archiviert → {archive}")
+            log.append(f"active.md archived → {archive}")
         else:
             log.append("active.md not present (skip archive)")
 
@@ -1739,7 +2577,7 @@ def _advance_pipeline(task_id: str, agent: str, next_task_id: Optional[str] = No
             shutil.copy2(str(fb), str(vfb))
             try:
                 fb.unlink()
-                log.append(f"feedback archiviert → {vfb} (Original entfernt)")
+                log.append(f"feedback archived → {vfb} (original removed)")
             except OSError:
                 log.append(f"feedback → {vfb}")
         else:
@@ -1759,6 +2597,15 @@ def _advance_pipeline(task_id: str, agent: str, next_task_id: Optional[str] = No
                 _MEMORY.store_task_completion(task_id, existing or {}, fb_text)
             except Exception:
                 pass
+
+        # 3b. LessonStore (ADR-0011 AD-10 / S14-4) is RE-HOMED onto the Hook-Bus (#804): the completion
+        # feedback is reported as a scoped loop-lesson by the `post_feedback` consumer (`_lessons_consumer_hook`)
+        # emitted by the wrapper below — gated on a registered provider (byte-identical no-op when none is
+        # wired), outside the vault lock. (No inline call here.)
+
+        # 3c. Process-SC (#602 S602-6) is RE-HOMED onto the Hook-Bus (#803): the typed process-lesson is
+        # distilled + stored by the `post_feedback` consumer (`_process_consumer_hook`) emitted by the
+        # wrapper below — one consistent reflection path, outside the vault lock. (No inline call here.)
 
         # 4. delete the handover in the inbox (.work/handovers)
         deleted = False
@@ -1783,12 +2630,12 @@ def _advance_pipeline(task_id: str, agent: str, next_task_id: Optional[str] = No
 
         # 6. project active.md (newest non-done handover, or idle)
         store.project_active()
-        log.append("active.md projiziert")
+        log.append("active.md projected")
 
         # 7. Optional: terminate the associated autopilot session (task is done)
         if AUTOPILOT_TERMINATE_ON_ADVANCE:
             _terminate_autopilot(task_id)
-            log.append("autopilot-session beendet (falls active)")
+            log.append("autopilot session terminated (if active)")
 
         # 8. regenerate the vault projections DETERMINISTICALLY — mechanically, NOT
         #    dependent on GX10's step-6 discipline (prevents a stale backlog →
@@ -1796,16 +2643,21 @@ def _advance_pipeline(task_id: str, agent: str, next_task_id: Optional[str] = No
         #    fail-soft: a script error does NOT abort the already-completed advance.
         #    UTF-8 env so emoji output doesn't crash on cp1252 stdout.
         _env = {**os.environ, "PYTHONIOENCODING": "utf-8"}
-        # update_capability_tracking.py regenerates ALL capability domains
-        # (n8n-parity, frontend-ux-parity, …) generically from their *-gap-tracking.md.
-        for _script in ("update_capability_tracking.py", "update_workflow_mocs.py",
-                        "update_masterplan_status.py"):
+        # ROUTE-1 (#503): the post-advance regen hooks are a DEPLOYMENT detail (vessel-specific scripts,
+        # absent from the boundary-clean export) — config-driven via paths.post_advance_hooks (default
+        # empty ⇒ NO subprocess; each absent script is skipped). Without this, core unconditionally spawned
+        # 3 hardcoded scripts/*.py that don't exist in the export (3 fail-soft WARN procs per advance).
+        _hooks = ((_EFFECTIVE_CFG or {}).get("paths") or {}).get("post_advance_hooks") or []
+        for _script in _hooks:
+            if not os.path.isfile(_script):
+                log.append(f"regen {_script}: skipped (absent)")
+                continue
             try:
-                _r = subprocess.run([sys.executable, f"scripts/{_script}"],
+                _r = subprocess.run([sys.executable, _script],
                                     cwd=".", capture_output=True, text=True,
                                     timeout=60, env=_env)
                 log.append(f"regen {_script}: {'ok' if _r.returncode == 0 else 'WARN rc=' + str(_r.returncode)}")
-            except Exception as _e:
+            except Exception as _e:  # noqa: BLE001
                 log.append(f"regen {_script}: WARN {_e!r}")
 
     except Exception as e:
@@ -1867,6 +2719,23 @@ def _ack_validate(fields: Dict[str, Any]) -> Optional[str]:
 def _stage_handover(task_id: Optional[str], agent: str, handover_md: str,
                     task_json: Optional[str] = None, set_active: bool = True,
                     force: bool = False) -> str:
+    """Serialized wrapper (#601 S12b): publish the task+handover under the per-project+track vault lock
+    so the id scan + task/handover/active.md writes can't interleave with a concurrent vault mutation
+    (the in-process ``TaskStore`` RLock alone does not serialize across processes). Reentrant: the
+    impl's inner reconcile does not re-acquire."""
+    _emit_hook("pre_handover", {"task_id": task_id, "agent": (agent or "").upper(),
+                                "handover_md": handover_md, "task_json": task_json})
+    with _vault_lock():
+        result = _stage_handover_impl(task_id, agent, handover_md,
+                                      task_json=task_json, set_active=set_active, force=force)
+    _emit_hook("post_handover", {"task_id": task_id, "agent": (agent or "").upper(),
+                                 "handover_md": handover_md, "result": result})
+    return result
+
+
+def _stage_handover_impl(task_id: Optional[str], agent: str, handover_md: str,
+                         task_json: Optional[str] = None, set_active: bool = True,
+                         force: bool = False) -> str:
     """Publishes a NEW task+handover in ONE step via the
     TaskStore: ID assignment, created_at stamp, schema and topic dedup are
     deterministic (no AI involvement). On a topic duplicate, fail-closed —
@@ -1901,15 +2770,15 @@ def _stage_handover(task_id: Optional[str], agent: str, handover_md: str,
             # → the agent loop hands it back to the model (reask).
             ack_err = _ack_validate(fields)
             if ack_err:
-                return ("ERROR: task_json verletzt den ACK-Vertrag (nichts angelegt):\n"
-                        + ack_err + "\n→ Felder korrigieren und stage_handover erneut aufrufen.")
+                return ("ERROR: task_json violates the ACK contract (nothing created):\n"
+                        + ack_err + "\n→ fix the fields and call stage_handover again.")
             # Store: dedup + ID + created_at + schema, writes the pending JSON
             try:
                 task = store.create(fields, force=bool(force))
             except DuplicateTaskError as e:
                 return (f"ERROR: duplicate — a task on the same topic already exists as "
-                        f"{e.existing_id}. KEIN neuer Task angelegt. Bestehenden Task "
-                        f"nutzen oder (nur auf Anweisung) force=true setzen.")
+                        f"{e.existing_id}. No new task created. Use the existing task "
+                        f"or (only when instructed) set force=true.")
             except ValueError as e:
                 return f"ERROR: {e} — no task created."
             tid = task["id"]
@@ -1922,7 +2791,7 @@ def _stage_handover(task_id: Optional[str], agent: str, handover_md: str,
                     warm_summary = ""
                     if _WARM is not None:
                         try:
-                            warm_summary = (_WARM.get_session(WARM_SESSION_ID, "summary") or "").strip()
+                            warm_summary = (_WARM.get_session(_active_warm_session(), "summary") or "").strip()
                         except Exception:
                             warm_summary = ""
                     mem_ctx = _MEMORY.brief(
@@ -1935,12 +2804,24 @@ def _stage_handover(task_id: Optional[str], agent: str, handover_md: str,
                     )
                     if mem_ctx:
                         ho_md = ho_md.rstrip() + "\n\n---\n\n" + mem_ctx
-                        log.append("Memory-Kontext injiziert")
+                        log.append("Memory context injected")
                 except Exception:
                     pass
+            # Advisory loop-lessons for the active scope (ADR-0011 AD-10 / S14-4) — appended to the handover
+            # the way the Memory brief above is, but INDEPENDENT of Mem0 (a lesson backend may be wired even
+            # when Mem0 is not). With NO provider registered ``lessons.brief`` returns "" → ``ho_md`` is
+            # unchanged and no I/O happens, so this is byte-identical to the pre-seam engine.
+            try:
+                from ack import lessons as _lessons   # lazy: never import ack at gx10 top-level (S6b lesson)
+                lesson_ctx = _lessons.brief([_active_mem_ns()])
+                if lesson_ctx:
+                    ho_md = ho_md.rstrip() + "\n\n---\n\n## Lessons\n\n" + lesson_ctx
+                    log.append("Lesson context injected")
+            except Exception:   # noqa: BLE001 — advisory: a lesson read must never break a turn
+                pass
             ho = handovers_dir() / f"{tid}_{agent}.md"
             _atomic_write(ho, ho_md)
-            log.append(f"handover geschrieben: {ho} ({len(ho_md)} Zeichen)")
+            log.append(f"handover written: {ho} ({len(ho_md)} chars)")
         else:
             # Pure handover without task JSON — requires a valid task_id.
             if not task_id or not _TASK_ID_RE.match(task_id):
@@ -1948,27 +2829,27 @@ def _stage_handover(task_id: Optional[str], agent: str, handover_md: str,
             tid = task_id
             ho = handovers_dir() / f"{tid}_{agent}.md"
             _atomic_write(ho, handover_md)
-            log.append(f"handover geschrieben: {ho} ({len(handover_md)} Zeichen)")
+            log.append(f"handover written: {ho} ({len(handover_md)} chars)")
 
         if set_active:
             store.project_active()
             log.append("active.md projected (= newest non-done handover)")
 
     except Exception as e:
-        return f"ERROR: stage_handover fehlgeschlagen: {e}\nBisher:\n" + "\n".join(f"  - {l}" for l in log)
+        return f"ERROR: stage_handover failed: {e}\nSo far:\n" + "\n".join(f"  - {l}" for l in log)
 
-    result = f"OK: Handover {tid} ({agent}) bereitgestellt\n" + "\n".join(f"  - {l}" for l in log)
+    result = f"OK: handover {tid} ({agent}) staged\n" + "\n".join(f"  - {l}" for l in log)
     # Path guard only for code tasks: with type=documentation (memory seed, docs)
     # the agent builds no code → no duplication risk, the check would only be noise.
     bad = [] if task_type == "documentation" else _handover_path_warnings(handover_md)
     if bad:
         result += (
-            "\n\n⚠ PFAD-CHECK — diese code-Pfade im Handover existieren NICHT "
-            "(weder relativ zum Repo-Root noch unter CODE_ROOT):\n"
+            "\n\n⚠ PATH CHECK — these code paths in the handover do NOT exist "
+            "(neither relative to the repo root nor under CODE_ROOT):\n"
             + "\n".join(f"    - {p}" for p in bad[:10])
-            + "\n  → Referenzieren sie BESTEHENDEN Code, sind sie FALSCH — "
-              "korrigiere sie, sonst baut der Agent neu statt zu erweitern (Dublette). "
-              "Neu anzulegende Dateien sind ok."
+            + "\n  → if they reference EXISTING code, they are WRONG — "
+              "fix them, else the agent builds anew instead of extending (a duplicate). "
+              "Files to be newly created are fine."
         )
     _reconcile_active_soft()   # C2: keep the active initiative's INDEX.md fresh (fail-soft, index only)
     return result
@@ -1984,7 +2865,7 @@ def _stage_handover(task_id: Optional[str], agent: str, handover_md: str,
 class DuplicateTaskError(Exception):
     """Raised when a task on the same topic already exists."""
     def __init__(self, existing_id: str):
-        super().__init__(f"Duplikat zu {existing_id}")
+        super().__init__(f"duplicate of {existing_id}")
         self.existing_id = existing_id
 
 
@@ -2026,7 +2907,7 @@ class TaskStore:
         """Like _base, but fail-closed (RuntimeError) — for producing ops (create/transition)."""
         b = self._base()
         if b is None:
-            raise RuntimeError(_NO_ACTIVE_MSG)
+            raise RuntimeError(_msg("init.no_active"))
         if self.root is None:                  # #15: only gate when routed to the ACTIVE initiative
             _mpr = _mpr_blocks_tasks()
             if _mpr:
@@ -2529,14 +3410,32 @@ def _extract_tool_calls_from_text(content: str, tool_names: set) -> List[Dict[st
 _BUILTIN_DIR = Path(__file__).resolve().parents[1] / "skills"   # skills/
 
 
-def _discover_tools_into(root: str) -> int:
-    """Discover typed ``CASE``+``run`` skills under *root* and ADD them to _PLUGIN_TOOLS
-    (no clear — additive). Returns how many this root contributed. Fail-soft."""
+def _discover_tools_into(root: str, *, forbidden_caps: "set | None" = None,
+                         record_caps: "set | None" = None, into: "dict | None" = None,
+                         skip_scaffolds: bool = False) -> int:
+    """Discover typed ``CASE``+``run`` skills under *root* and ADD them to *into* (default ``_PLUGIN_TOOLS``).
+    No clear — additive. Returns how many this root contributed. Fail-soft.
+
+    ``record_caps`` (when given) accumulates the capabilities this root added; ``forbidden_caps`` (when
+    given) skips a tool whose capability is already in it — the cross-root CAPABILITY guard the project
+    library is loaded under (S11 / #630). ``into`` lets the build-then-swap loader (S11a-2) accumulate into a
+    FRESH dict before swapping it live. ``skip_scaffolds`` (S11b-3a, the project-library root only) drops an
+    UNFILLED scaffold — a generated stub still carrying the ``ACK-SCAFFOLD-SENTINEL`` marker is never offered
+    as a real tool (enforces the generation gate cheaply at load; the full hermetic check is the
+    ``ack.gate.library_items_complete`` invariant — operator / S17 acceptance, not auto-scheduled). All
+    default None/False ⇒ byte-identical to the pre-S11 loader."""
+    target = into if into is not None else _PLUGIN_TOOLS
     try:
         from ack.registry import Registry, derive_tool_schema
     except Exception as e:  # noqa: BLE001 — no registry → no tools, never fatal
         _ui_print(col(f"  [skills] registry unavailable: {e!r}", C.YELLOW))
         return 0
+    _scaffold_check = None
+    if skip_scaffolds:
+        try:
+            from ack.gate import has_scaffold_sentinel as _scaffold_check
+        except Exception:  # noqa: BLE001 — no gate → no scaffold filter (never blocks loading)
+            _scaffold_check = None
     try:
         added = Registry().discover_skills(root)
     except Exception as e:  # noqa: BLE001
@@ -2547,10 +3446,29 @@ def _discover_tools_into(root: str) -> int:
         if r.handler is None:
             continue
         name = str(r.name)
-        if name in _PLUGIN_TOOLS:        # tool names must be unique — otherwise silent shadowing
+        cap = str(getattr(r, "capability", "") or "")
+        src = str(getattr(r, "source", "") or "")
+        # ROUTE-4 (#503): a plugin/skill tool named like a BUILT-IN tool is shadowed by run_tool's built-in
+        # dispatch → it would be registered + offered to the model but NEVER callable (silently). Reject it.
+        if name in _all_tool_names(include_plugins=False):
+            _ui_print(col(f"  [skills] tool {name!r} collides with a built-in tool — skipped (undispatchable)", C.YELLOW))
+            continue
+        if _scaffold_check is not None and src and _scaffold_check(src):
+            _ui_print(col(f"  [skills] {name!r} is an unfilled scaffold — not offered (#630; implement it)", C.YELLOW))
+            continue
+        # S11 (#630): cross-root CAPABILITY guard for a later root (the project library) — a fresh Registry
+        # per root only dedups capability WITHIN a root, and the name check below is per-name; without this a
+        # project-library tool with a built-in's capability but a different name would load as an extra tool.
+        # forbidden_caps holds the capabilities already loaded from the earlier (global) roots.
+        if forbidden_caps and cap and cap in forbidden_caps:
+            _ui_print(col(f"  [skills] tool {name!r} shadows built-in/plugin capability {cap!r} — skipped", C.YELLOW))
+            continue
+        if name in target:               # tool names must be unique — otherwise silent shadowing
             _ui_print(col(f"  [skills] duplicate tool name {name!r} — first kept, rest skipped", C.YELLOW))
             continue
-        _PLUGIN_TOOLS[name] = {
+        if record_caps is not None and cap:
+            record_caps.add(cap)
+        target[name] = {
             "schema": {"type": "function", "function": {
                 "name": name,
                 "description": str(r.description or f"skill {name}"),
@@ -2597,9 +3515,11 @@ USE_SKILL_TOOL = {
 }
 
 
-def _discover_playbooks_into(root: str) -> int:
-    """Discover ``SKILL.md`` playbooks under *root* and ADD them to _PLAYBOOKS (no clear —
-    additive; first capability wins). Returns how many this root contributed. Fail-soft."""
+def _discover_playbooks_into(root: str, *, into: "dict | None" = None) -> int:
+    """Discover ``SKILL.md`` playbooks under *root* and ADD them to *into* (default _PLAYBOOKS; no clear —
+    additive; first capability wins). ``into`` lets the build-then-swap loader (S11a-2) accumulate into a
+    fresh dict. Returns how many this root contributed. Fail-soft."""
+    target = into if into is not None else _PLAYBOOKS
     try:
         from ack.registry import Registry
         found = Registry.discover_playbooks(root)
@@ -2608,9 +3528,9 @@ def _discover_playbooks_into(root: str) -> int:
         return 0
     n = 0
     for pb in found:
-        if pb.capability in _PLAYBOOKS:
+        if pb.capability in target:
             continue
-        _PLAYBOOKS[pb.capability] = pb
+        target[pb.capability] = pb
         n += 1
     return n
 
@@ -2628,9 +3548,11 @@ def _load_playbooks(plugins_dir: Optional[str]) -> int:
     return len(_PLAYBOOKS)
 
 
-def _discover_prompts_into(root: str) -> int:
-    """Discover ``kind: prompt`` items under *root* and ADD them to _PROMPTS (no clear —
-    additive; first capability wins). Returns how many this root contributed. Fail-soft."""
+def _discover_prompts_into(root: str, *, into: "dict | None" = None) -> int:
+    """Discover ``kind: prompt`` items under *root* and ADD them to *into* (default _PROMPTS; no clear —
+    additive; first capability wins). ``into`` lets the build-then-swap loader (S11a-2) accumulate into a
+    fresh dict. Returns how many this root contributed. Fail-soft."""
+    target = into if into is not None else _PROMPTS
     try:
         from ack.prompt import discover_prompts
         found = discover_prompts(root)
@@ -2639,9 +3561,9 @@ def _discover_prompts_into(root: str) -> int:
         return 0
     n = 0
     for p in found:
-        if p.capability in _PROMPTS:
+        if p.capability in target:
             continue
-        _PROMPTS[p.capability] = p
+        target[p.capability] = p
         n += 1
     return n
 
@@ -2703,21 +3625,45 @@ def _entrypoint_plugin_roots() -> list[str]:
 
 
 def _load_skills(plugins_dir: Optional[str] = None) -> tuple[int, int, int]:
-    """Startup loader (ADR-0002 #114): **always** load core built-ins from ``_BUILTIN_DIR``,
-    then **additively** load 3rd-party/internal skills — from *plugins_dir* (a dir, dev) **and**
-    from packaged plugins advertised via the ``ironclad.plugins`` entry-point group (ADR-0004
-    #136). Clears once. Returns (n_tools, n_playbooks, n_prompts)."""
-    _PLUGIN_TOOLS.clear()
-    _PLAYBOOKS.clear()
-    _PROMPTS.clear()
+    """Load the skill/prompt registries (ADR-0002 #114): **always** the core built-ins from ``_BUILTIN_DIR``,
+    then **additively** 3rd-party/internal skills — from *plugins_dir* (a dir, dev), packaged plugins
+    (``ironclad.plugins`` entry points, ADR-0004 #136), and (S11 #630) the ACTIVE project's library, LAST.
+
+    BUILD-THEN-SWAP (S11a-2): discovery runs into FRESH dicts, then the live registries are swapped in
+    (``clear()+update()`` keeps the dict OBJECTS so any held reference stays valid). A failed/slow build
+    never leaves the live registries empty or half-populated — so this is safe to call on a ``/switch`` to
+    reload the new project's library. Returns (n_tools, n_playbooks, n_prompts)."""
     ep_roots = _entrypoint_plugin_roots()
-    roots = [str(_BUILTIN_DIR)] + ([plugins_dir] if plugins_dir else []) + ep_roots
-    for root in roots:
-        _discover_tools_into(root)
-        _discover_playbooks_into(root)
-        _discover_prompts_into(root)
+    # S11 (#630): the ACTIVE project's library is the LAST (additive) root — generated per-project items are
+    # discovered alongside the built-ins/plugins. It comes last so a name/capability collision keeps the
+    # built-in (discovery is first-kept); a generated item can't shadow a built-in anyway (the S10a generate
+    # guard refuses that). Only added when the dir EXISTS, so a project with no library is byte-identical.
+    _lib = _project_library_root()
+    _lib_in = _lib.is_dir()
+    global_roots = [str(_BUILTIN_DIR)] + ([plugins_dir] if plugins_dir else []) + ep_roots
+    _global_caps: "set | None" = set() if _lib_in else None   # only track when guarding the lib root
+    tools: Dict[str, Dict[str, Any]] = {}
+    playbooks: Dict[str, Any] = {}
+    prompts: Dict[str, Any] = {}
+    for root in global_roots:
+        _discover_tools_into(root, record_caps=_global_caps, into=tools)
+        _discover_playbooks_into(root, into=playbooks)
+        _discover_prompts_into(root, into=prompts)
+    if _lib_in:
+        # the project library is loaded LAST + capability-guarded against the global roots, so a generated
+        # item can never displace a built-in/plugin (playbooks/prompts are already first-kept by capability).
+        # S11b-3a: an UNFILLED scaffold tool (still carrying the sentinel) is dropped — never offered.
+        _discover_tools_into(str(_lib), forbidden_caps=_global_caps, into=tools, skip_scaffolds=True)
+        _discover_playbooks_into(str(_lib), into=playbooks)
+        _discover_prompts_into(str(_lib), into=prompts)
+    # swap the fully-built registries in, keeping the dict objects (held references stay valid)
+    _PLUGIN_TOOLS.clear(); _PLUGIN_TOOLS.update(tools)
+    _PLAYBOOKS.clear(); _PLAYBOOKS.update(playbooks)
+    _PROMPTS.clear(); _PROMPTS.update(prompts)
     if _PLUGIN_TOOLS or _PLAYBOOKS or _PROMPTS:
-        srcs = "built-ins" + (f" + {plugins_dir}" if plugins_dir else "") + (f" + {len(ep_roots)} entry-point(s)" if ep_roots else "")
+        srcs = ("built-ins" + (f" + {plugins_dir}" if plugins_dir else "")
+                + (f" + {len(ep_roots)} entry-point(s)" if ep_roots else "")
+                + (" + project library" if _lib_in else ""))
         _ui_print(col(f"  [skills] {len(_PLUGIN_TOOLS)} tool(s) + {len(_PLAYBOOKS)} playbook(s) "
                       f"+ {len(_PROMPTS)} prompt(s) ({srcs})", C.GRAY))
     return len(_PLUGIN_TOOLS), len(_PLAYBOOKS), len(_PROMPTS)
@@ -2843,9 +3789,10 @@ def _retrieve_hits(query: str, top_k: int) -> List[str]:
         return []
     hits: Optional[List[str]] = None
     warm = _WARM
+    _ns = _active_mem_ns()                                  # S3b: scope the cache to the active project's partition
     if warm is not None:
         try:
-            hits = warm.cache_get(query)
+            hits = warm.cache_get(query, _ns)
         except Exception:  # noqa: BLE001
             hits = None
     if hits is None:
@@ -2855,7 +3802,7 @@ def _retrieve_hits(query: str, top_k: int) -> List[str]:
             return []
         if warm is not None and hits:
             try:
-                warm.cache_set(query, hits)
+                warm.cache_set(query, hits, _ns)
             except Exception:  # noqa: BLE001
                 pass
     return list(hits or [])
@@ -3137,7 +4084,7 @@ def _worker_shared_floor() -> str:
     if not WORKER_MEMORY or _WARM is None:
         return ""
     try:
-        s = _WARM.get_session(WARM_SESSION_ID, "summary")
+        s = _WARM.get_session(_active_warm_session(), "summary")
     except Exception:  # noqa: BLE001
         return ""
     s = (s or "").strip()
@@ -3237,7 +4184,7 @@ def run_tool(name: str, args: Dict[str, Any]) -> str:
         if _LOCAL_TOOL_BRIDGE is not None and name in LOCAL_TOOL_NAMES:
             return _LOCAL_TOOL_BRIDGE(name, args)
         if name == "read_file":
-            p = Path(args["path"])
+            p = _resolve_exec_path(args["path"])
             if not p.exists():
                 return f"ERROR: Not found: {args['path']}"
             # errors="replace": a non-UTF-8 file is read lossily, never crashes the read.
@@ -3257,7 +4204,7 @@ def run_tool(name: str, args: Dict[str, Any]) -> str:
             return text
 
         elif name == "write_file":
-            p   = Path(args["path"])
+            p   = _resolve_exec_path(args["path"])
             p.parent.mkdir(parents=True, exist_ok=True)
             tmp = p.with_name(p.name + ".tmp")
             tmp.write_text(args["content"], encoding="utf-8")
@@ -3265,9 +4212,9 @@ def run_tool(name: str, args: Dict[str, Any]) -> str:
             return f"OK: Written {len(args['content'])} chars to {args['path']}"
 
         elif name == "list_directory":
-            p = Path(args.get("path", "."))
+            p = _resolve_exec_path(args.get("path", "."))
             if not p.exists():
-                return f"ERROR: Not found: {p}"
+                return f"ERROR: Not found: {args.get('path', '.')}"
             items = list(p.iterdir())
             total = len(items)
             if args.get("sort") == "time":
@@ -3293,8 +4240,8 @@ def run_tool(name: str, args: Dict[str, Any]) -> str:
             out = "\n".join(lines) if lines else "(empty)"
             shown = len(lines)
             if shown < total:
-                out += (f"\n... [GX10v3: {shown} von {total} Einträgen gezeigt"
-                        + (f" (Hard-Cap {LIST_DIR_HARD_CAP} — nutze sort='time'+limit)" if capped else f" (limit={limit})")
+                out += (f"\n... [GX10v3: showing {shown} of {total} entries"
+                        + (f" (hard cap {LIST_DIR_HARD_CAP} — use sort='time'+limit)" if capped else f" (limit={limit})")
                         + "]")
             return out
 
@@ -3318,30 +4265,36 @@ def run_tool(name: str, args: Dict[str, Any]) -> str:
                 r = subprocess.run(
                     argv, stdin=subprocess.DEVNULL,
                     capture_output=True, text=True, encoding="utf-8", errors="replace",
-                    timeout=timeout
+                    timeout=timeout, cwd=_exec_cwd()       # S9c: run in the active project's root (None → process workdir)
                 )
             else:
                 r = subprocess.run(
                     command, shell=True, stdin=subprocess.DEVNULL,
                     capture_output=True, text=True, encoding="utf-8", errors="replace",
-                    timeout=timeout
+                    timeout=timeout, cwd=_exec_cwd()       # S9c: run in the active project's root (None → process workdir)
                 )
             out = (r.stdout + r.stderr).strip()
             return out or f"(exit {r.returncode}, no output)"
 
         elif name == "move_file":
-            dst = Path(args["destination"])
+            # Guard empty/missing source|destination BEFORE resolving: an empty path normalises to "."
+            # (str(Path("")) == ".") which under a project root would target the root itself — a
+            # destructive move. The pre-isolation code passed the raw "" to shutil.move (a plain error),
+            # so this both preserves that no-op and closes the destructive edge.
+            if not args.get("source") or not args.get("destination"):
+                return "ERROR: move_file requires a non-empty source and destination"
+            dst = _resolve_exec_path(args["destination"])
             dst.parent.mkdir(parents=True, exist_ok=True)
-            shutil.move(str(args["source"]), str(dst))
+            shutil.move(str(_resolve_exec_path(args["source"])), str(dst))
             return f"OK: Moved {args['source']} → {args['destination']}"
 
         elif name == "delete_file":
-            Path(args["path"]).unlink()
+            _resolve_exec_path(args["path"]).unlink()
             return f"OK: Deleted {args['path']}"
 
         elif name == "copy_file":
-            src = Path(args["source"])
-            dst = Path(args["destination"])
+            src = _resolve_exec_path(args["source"])
+            dst = _resolve_exec_path(args["destination"])
             if not src.exists():
                 return f"ERROR: Source not found: {args['source']}"
             dst.parent.mkdir(parents=True, exist_ok=True)
@@ -3363,7 +4316,7 @@ def run_tool(name: str, args: Dict[str, Any]) -> str:
                 def _hit(line: str) -> bool:
                     return needle in line.lower()
             hits = []
-            for fp in Path(directory).rglob(file_pattern):
+            for fp in _resolve_exec_path(directory).rglob(file_pattern):
                 if fp.is_file():
                     try:
                         for i, line in enumerate(
@@ -3376,17 +4329,28 @@ def run_tool(name: str, args: Dict[str, Any]) -> str:
             return "\n".join(hits[:50]) if hits else "No matches"
 
         elif name == "create_directory":
-            Path(args["path"]).mkdir(parents=True, exist_ok=True)
+            _resolve_exec_path(args["path"]).mkdir(parents=True, exist_ok=True)
             return f"OK: Created {args['path']}"
 
         elif name == "advance_pipeline":
-            return _advance_pipeline(
-                args.get("task_id", ""),
-                args.get("agent", ""),
-                args.get("next_task_id"),
-            )
+            # S6b: route through the curated facade (the engine driver, registered at import, delegates to
+            # _advance_pipeline). Fall back to the impl only when the facade/driver is absent.
+            tid, ag, nxt = args.get("task_id", ""), args.get("agent", ""), args.get("next_task_id")
+            if _devapi is not None and _devapi.get_driver() is not None:
+                return _devapi.advance(tid, ag, next_task_id=nxt)
+            return _advance_pipeline(tid, ag, nxt)
 
         elif name == "stage_handover":
+            # S6b: route through the curated facade (the engine driver delegates to _stage_handover).
+            if _devapi is not None and _devapi.get_driver() is not None:
+                return _devapi.stage_handover(
+                    args.get("agent", ""),
+                    args.get("handover_md", ""),
+                    task_id=args.get("task_id"),
+                    task_json=args.get("task_json"),
+                    set_active=args.get("set_active", True),
+                    force=args.get("force", False),
+                )
             return _stage_handover(
                 args.get("task_id"),
                 args.get("agent", ""),
@@ -3588,7 +4552,9 @@ class GX10:
                 _ui_print(col(f"[INFO] adopting live model window: max_model_len={_live_win} "
                               f"(configured {MAX_MODEL_LEN})", C.GRAY))
                 MAX_MODEL_LEN = _live_win
-                if TOKEN_BUDGET:   # re-derive the char-fallback watermarks for the new window
+                # re-derive the char-fallback watermarks for the new window — but BUDGET-3 (#503): keep an
+                # operator-supplied GX10_MAX_CTX_CHARS/GX10_TRIM_TARGET_CHARS (don't clobber it here either).
+                if TOKEN_BUDGET and not (os.environ.get("GX10_MAX_CTX_CHARS") or os.environ.get("GX10_TRIM_TARGET_CHARS")):
                     MAX_CTX_CHARS, TRIM_TARGET_CHARS = _derive_ctx_budget(
                         MAX_MODEL_LEN, MAX_TOKENS, RAG_MAX_TOKENS, SUMMARY_MAX_TOKENS, CHARS_PER_TOKEN)
 
@@ -3717,13 +4683,15 @@ class GX10:
         if p.exists():
             content = p.read_text(encoding="utf-8")
             self.messages.append({"role": "system", "content": content})
-            _ui_print(col(f"[OK] Prompt: {p} ({len(content)} Zeichen)", C.GREEN))
+            _ui_print(col(f"[OK] Prompt: {p} ({len(content)} chars)", C.GREEN))
         else:
             _ui_print(col(f"[WARN] not found: {p}", C.YELLOW))
 
-    def save_session(self):
+    def save_session(self, *, strict: bool = False):
         # Silent by design: called after every turn (see _dispatch) — a per-turn "[OK] session saved"
-        # would stream into the client as noise. Only a real failure is surfaced.
+        # would stream into the client as noise. Only a real failure is surfaced. ``strict`` re-raises
+        # instead of swallowing — a /switch saves the LEAVING conversation with strict=True so a failed
+        # save aborts the switch (ctx still on the leaving project) rather than silently losing it.
         try:
             p = session_path()
             p.parent.mkdir(parents=True, exist_ok=True)   # state_root existiert i.d.R. (ensure_dirs); idempotent
@@ -3732,6 +4700,8 @@ class GX10:
                 encoding="utf-8"
             )
         except Exception as e:
+            if strict:
+                raise
             _ui_print(col(f"[WARN] session not saved: {e}", C.YELLOW))
 
     @staticmethod
@@ -3865,21 +4835,36 @@ class GX10:
 
     def _trim_context_chars(self):
         def total_len(msgs):
-            return sum(len(str(m.get("content") or "")) for m in msgs)
+            # BUDGET-2 (#503): count tool_call name+arguments too — assistant tool-call messages carry
+            # empty content but often-large arguments, so a content-only sum under-measured the window.
+            return sum(len(_message_text(m)) for m in msgs)
 
-        # PERF-06: hysteresis trimming for the vLLM prefix cache.
-        # As long as it stays below the high-water mark, the message list
-        # stays UNCHANGED → the prefix after the system prompt is stable and
-        # the server's KV/prefix cache holds across many rounds.
-        others_len = total_len([m for m in self.messages if m.get("role") != "system"])
-        if others_len <= MAX_CTX_CHARS:
-            return
-
-        # Trimming happens only when exceeded — but then in one go
-        # down to the low-water mark, instead of a little each round. This causes
-        # cache invalidation only RARELY instead of on every iteration.
         system = [m for m in self.messages if m.get("role") == "system"]
         others = [m for m in self.messages if m.get("role") != "system"]
+
+        # BUDGET-1 (#503): the char-fallback watermark must reserve the partitions that go into EVERY
+        # prompt but are NOT in `others` — the system partition, the tools schema vLLM serializes, and the
+        # thinking-output reserve — mirroring the token path's `hard_room = window - out - tools - sys`.
+        # MAX_CTX_CHARS already reserves output+RAG+summary; subtract sys+tools+thinking here (floored so a
+        # large system prompt can't drive the budget <= 0), then trim to 60 % of THAT.
+        cpt = max(1.0, float(CHARS_PER_TOKEN))
+        # Reserve the thinking-output headroom only when this turn may actually think (mirrors the token
+        # path's `THINKING_RESERVE if think else 0`); a turn with thinking off needs no output reserve.
+        think_on = bool(getattr(self, "_turn_think", True)) and getattr(self, "thinking_mode", "auto") != "off"
+        reserve_chars = (total_len(system) + int(_tools_schema_tokens() * cpt)
+                         + int((THINKING_RESERVE if think_on else 0) * cpt))
+        # Floor at 25 % of the configured budget (not an absolute) so a pathological reserve can't drive the
+        # working set toward 0, while a small configured budget isn't inflated by a fixed floor.
+        high = max(max(512, int(MAX_CTX_CHARS * 0.25)), MAX_CTX_CHARS - reserve_chars)
+        low = min(TRIM_TARGET_CHARS, int(high * 0.6))
+
+        # PERF-06: hysteresis trimming for the vLLM prefix cache. Below the high-water mark the message
+        # list stays UNCHANGED → the prefix after the system prompt is stable and the server's KV/prefix
+        # cache holds across many rounds.
+        if total_len(others) <= high:
+            return
+        # Trimming happens only when exceeded — then in one go down to the low-water mark (rare cache
+        # invalidation instead of every iteration).
 
         # B1: only when the switch is on, record the removed rounds
         # to summarize + archive them. OFF = empty path, no overhead.
@@ -3888,7 +4873,7 @@ class GX10:
 
         # Trim in whole "rounds", so assistant.tool_calls and the
         # associated tool responses stay together (API invariant).
-        while total_len(others) > TRIM_TARGET_CHARS and len(others) > 1:
+        while total_len(others) > low and len(others) > 1:
             cut = 1
             while cut < len(others) and others[cut].get("role") != "user":
                 cut += 1
@@ -4009,7 +4994,7 @@ class GX10:
         # and is readable by the fan-out workers as a shared floor. Fail-soft; no-op without a warm tier.
         if _WARM is not None:
             try:
-                _WARM.set_session(WARM_SESSION_ID, "summary", new_summary.strip())
+                _WARM.set_session(_active_warm_session(), "summary", new_summary.strip())
             except Exception:  # noqa: BLE001 — the warm mirror is best effort
                 pass
 
@@ -4103,7 +5088,8 @@ class GX10:
 
         t0 = time.time()
         t_first = [None]          # OPT-3: time of the first token
-        th = threading.Thread(target=_worker, daemon=True)
+        th = threading.Thread(                                  # bind the active ProjectContext into the worker (S3b):
+            target=(_pc.bound_target(_worker) if _pc is not None else _worker), daemon=True)
         th.start()
 
         tf        = _ThinkFilter()
@@ -4186,7 +5172,8 @@ class GX10:
                 done.set()
 
         t0 = time.time()
-        th = threading.Thread(target=_worker, daemon=True)
+        th = threading.Thread(                                  # bind the active ProjectContext into the worker (S3b):
+            target=(_pc.bound_target(_worker) if _pc is not None else _worker), daemon=True)
         th.start()
         while not done.is_set():
             if _CANCEL_EVENT.is_set():
@@ -4235,7 +5222,7 @@ class GX10:
             "done":  ("✓ DONE",          C.GREEN),
             "abort": ("⚠ CANCELLED",     C.YELLOW),
             "error": ("✗ ERROR",         C.RED),
-            "max":   (f"⏱ MAX-ITER ({MAX_ITERATIONS})", C.YELLOW),
+            "max":   (f"⏱ MAX-ITER ({_loop_profile().max_iterations})", C.YELLOW),   # #602 SUB-8a: the profile bound (== MAX_ITERATIONS by default)
             "crash": ("✗ ERROR (internal)", C.RED),
         }
         label, color = marks.get(kind, marks["done"])
@@ -4250,7 +5237,6 @@ class GX10:
 
     # ── Agent loop ────────────────────────────────────────────
     def run(self, user_input: str):
-        global _TURN_DID_ADVANCE
         _CANCEL_EVENT.clear()
         # B2: per-turn retrieval BEFORE the append (query = user message, dedup against the existing
         # window). FLAG OFF → "" → the user message is appended verbatim (byte-identical).
@@ -4259,13 +5245,13 @@ class GX10:
         # model doesn't improvise a shell web fetch. A per-turn hint folded into the message (like rag) —
         # transient, non-accumulating; the model still decides.
         steer = _websearch_steer(user_input)
-        prefix = "\n\n".join(p for p in (rag, steer) if p)
+        # #602 S602-6: an opt-in pre-turn hint of known working approaches (process-lessons); "" by default
+        # → the prefix is byte-identical (transient + non-accumulating, like rag/steer).
+        prefix = "\n\n".join(p for p in (rag, steer, _process_hint()) if p)
         self.messages.append({"role": "user",
                               "content": (prefix + "\n\n" + user_input) if prefix else user_input})
-        # New operator turn → reset the auto-plan guard. An advance_pipeline
-        # in THIS turn sets it again; a following stage_handover in the
-        # same turn is then blocked (as long as autoplan is off).
-        _TURN_DID_ADVANCE = False
+        # #602 2.0/#690: publish the turn-start boundary (observer-only; byte-identical with no subscriber).
+        _emit_hook("pre_turn", {"user_input": user_input, "agent": self})
 
         # auto mode: decide once per turn whether iteration 0 thinks
         self._turn_think = self._classify_thinking(user_input)
@@ -4275,7 +5261,10 @@ class GX10:
         outcome: Dict[str, Any] = {"kind": "max"}
 
         try:
-          for iteration in range(MAX_ITERATIONS):
+          # #602 SUB-8a: the chat loop's iteration bound comes from the default loop profile — which is the
+          # global MAX_ITERATIONS unless an operator configured loop_profiles (byte-identical by default).
+          loop_max = _loop_profile().max_iterations
+          for iteration in range(loop_max):
             if _CANCEL_EVENT.is_set():
                 outcome = {"kind": "abort"}
                 return
@@ -4338,6 +5327,9 @@ class GX10:
                     for i, t in enumerate(tool_calls)
                 ]
             self.messages.append(msg_dict)
+            # #602 2.0/#690: publish the generation boundary — the Verifier (2.1) feed site.
+            _emit_hook("post_generate", {"content": cleaned, "tool_calls": tool_calls,
+                                         "iteration": iteration, "metrics": metrics, "agent": self})
 
             if not tool_calls:
                 self.last_response = cleaned
@@ -4382,6 +5374,9 @@ class GX10:
                     "tool_call_id": tcid,
                     "content":      result_t
                 })
+                # #602 2.0/#690: publish the tool-result boundary (ctx carries the tool name).
+                _emit_hook("post_toolresult", {"tool": name, "args": args, "result": result_t,
+                                               "agent": self})
           # Loop ran through normally → max iterations (outcome stays "max")
         except Exception as e:
             # Catches unexpected errors so the agent thread does NOT die
@@ -4404,7 +5399,7 @@ class GX10:
 
     def manual_write(self, path: str) -> str:
         if not self.last_response:
-            return col("[FEHLER] Keine letzte Antwort!", C.RED)
+            return col("[ERROR] no previous response!", C.RED)
         r = run_tool("write_file", {"path": path, "content": self.last_response})
         return col(r, C.GREEN if r.startswith("OK") else C.RED)
 
@@ -4427,7 +5422,7 @@ class GX10:
         # (otherwise a stale/contradictory summary resurrects). Fail-soft; Cold/Mem0 untouched.
         if _WARM is not None:
             try:
-                _WARM.del_session(WARM_SESSION_ID, "summary")
+                _WARM.del_session(_active_warm_session(), "summary")
             except Exception:  # noqa: BLE001
                 pass
         return col("[OK] context reset (the system prompt stays).", C.YELLOW)
@@ -4461,20 +5456,20 @@ class GX10:
         avg_tps   = (p["completion"] / p["wall"]) if p["wall"] > 0 else 0.0
         return "\n".join([
             col(f"  Model        : {self.model}",                C.GRAY),
-            col(f"  Streaming    : {'an' if self.stream else 'aus'}", C.GRAY),
+            col(f"  Streaming    : {'on' if self.stream else 'off'}", C.GRAY),
             col(f"  Platform     : {self.platform}",              C.GRAY),
             col(f"  Onboarding   : {'on' if self.onboarding else 'off'}", C.GRAY),
             col(f"  Autopilot    : {('on (max=' + str(AUTOPILOT_MAX_CONCURRENT) + (', stream' if AUTOPILOT_STREAM else '') + (', replan' if AUTOPILOT_AUTOPLAN else '') + ')') if AUTOPILOT_ENABLED else 'off'}", C.GRAY),
             col(f"  Thinking     : {self.thinking_mode}",         C.GRAY),
             col(f"  max_tokens   : {self.max_tokens}",            C.GRAY),
-            col(f"  Nachrichten  : {len(self.messages)}",         C.GRAY),
-            col(f"  Zeichen      : {chars}",                      C.GRAY),
+            col(f"  Messages     : {len(self.messages)}",         C.GRAY),
+            col(f"  Chars        : {chars}",                      C.GRAY),
             col(f"  Tool Results : {tool_msgs}",                  C.GRAY),
             col(f"  Tools active : {len(_effective_tools())}",    C.GRAY),
             col(f"  Perf         : {p['gens']} Gens · prompt {p['prompt']} · "
                 f"completion {p['completion']} tok · ⌀ {avg_tps:.0f} tok/s", C.GRAY),
-            col(f"  Letzte Gen   : {p['last'] or '—'}",            C.GRAY),
-            col(f"  Parser       : qwen3_coder (nativ)",            C.GREEN),
+            col(f"  Last gen     : {p['last'] or '—'}",            C.GRAY),
+            col(f"  Parser       : qwen3_coder (native)",            C.GREEN),
         ])
 
 # ─── Hilfe ────────────────────────────────────────────────────
@@ -4495,9 +5490,14 @@ HELP = """
                               (on|off|true|false|num|str; e.g. mpr.enabled on)
     tool <name> <args|text>   run a tool DIRECTLY/deterministically (no model election, no RAG);
                               text → first required arg, or {json}. e.g. tool mpr_research <frage>
+    rag on|off       toggle per-turn retrieval (RAG) for this session
+    context          show the context-budget report
+    generate <args>  scaffold a paved-road capability into the active project library
     initiative new <name> --type mpr|software   create + activate a initiative (artefact home)
     initiative list | use <slug> | active | reconcile [slug]
-    reload           reload gx10.py (the session stays)
+    project list | new <name> [--type mpr|software] [--path <dir>] | active | track new|use|list
+                  manage registered, isolated projects (the guided setup command; /initiative is a deprecated alias)
+    switch <project_id>   rebind this engine to a project (own paths + memory partition)
     watcher on|off        enable / disable the feedback watcher
     autopilot on|off      toggle autopilot (auto-launch of Claude)
     autoplan on [N]       autonomous planning (optional: max N tasks, then stop)
@@ -4518,11 +5518,11 @@ def _render_config() -> str:
     ws = c["workspace"]; wa = c["watcher"]; tk = c["tasks"]
     ob = c["onboarding"]; ap = c["autopilot"]; ui = c["ui"]
     key_env = conn.get("api_key_env", "GX10_API_KEY")
-    key_state = "gesetzt" if os.environ.get(key_env) else "nicht gesetzt"
+    key_state = "set" if os.environ.get(key_env) else "not set"
     return "\n".join([
-        col(f"  Quelle        : {_CFG_SOURCE if _CFG_SOURCE else '— (code defaults)'}", C.GREEN),
+        col(f"  source        : {_CFG_SOURCE if _CFG_SOURCE else '— (code defaults)'}", C.GREEN),
         col(f"  connection    : {conn['base_url']} · {conn['model']}", C.GRAY),
-        col(f"  api-key       : aus Env {key_env} ({key_state})", C.GRAY),
+        col(f"  api-key       : from env {key_env} ({key_state})", C.GRAY),
         col(f"  platform      : {PLATFORM} (mode={pl['mode']})", C.GRAY),
         col(f"  paths         : prompt={pa['system_prompt']} · workdir={pa['workdir']} · state={pa.get('state_root','.ironclad')} · vault={pa.get('vault_root','vault')} · session={pa['session_file']}", C.GRAY),
         col(f"  generation    : temp={gen['temperature']} · max_tokens={gen['max_tokens']} · thinking={gen['thinking_mode']} · stream={gen['stream']} · retry={gen['retry_backoff']}", C.GRAY),
@@ -4534,7 +5534,7 @@ def _render_config() -> str:
         col(f"  thinking_auto : {len(ta['planning_keywords'])} planning / {len(ta['routine_keywords'])} routine keywords", C.GRAY),
         col(f"  workspace     : {len(ws['dirs'])} dirs", C.GRAY),
         col(f"  ui            : max_lines={ui['max_lines']} · refresh={ui['refresh_interval']}s", C.GRAY),
-        col(f"  Precedence    : code-defaults < file/conf < env < CLI", C.GRAY),
+        col(f"  Precedence    : code-defaults < file/conf < env", C.GRAY),
     ])
 
 
@@ -4607,7 +5607,10 @@ def _cfg_get(cfg: Dict[str, Any], dotted: str):
 #   server (default): everything on the model host → in-engine only (external agents deferred); byte-identical.
 #   local:            engine + agents native on the desktop → offload = local subprocess (default_cli_runner);
 #                     the model + memory live remotely (over the network), so base_url must be REMOTE.
-_VALID_SETUP_TYPES = ("server", "local")
+#   auto:             INSTALL-1 (#503) — derive from base_url at boot: a loopback model is fully in-box
+#                     (→ server/in-engine), a remote model is the LAN-offload desktop (→ local). Lets the
+#                     desktop launcher ship a self-consistent default that boots without baking a host in.
+_VALID_SETUP_TYPES = ("server", "local", "auto")
 
 
 def _is_local_url(url: str) -> bool:
@@ -4634,10 +5637,21 @@ def resolve_offload_topology(cfg: Dict[str, Any], *, cli_available: bool = True)
     if profile == "sealed" and setup_type != "server":
         return {"setup_type": "server", "providers_enabled": False, "runner_mode": "none",
                 "note": f"sealed profile forces server (no egress); setup.type={setup_type} ignored"}
-    if setup_type == "server":
-        return {"setup_type": "server", "providers_enabled": False, "runner_mode": "none"}
-    # local
     base_url = (cfg.get("connection") or {}).get("base_url", "")
+    auto_note = None
+    if setup_type == "auto":
+        # INSTALL-1 (#503): a fresh desktop default ships a loopback base_url; derive the topology so it
+        # BOOTS out of the box — a loopback model is fully in-box (server/in-engine), a remote model is the
+        # LAN-offload desktop (local). No host is baked into the repo; the user just points GX10_BASE_URL.
+        setup_type = "server" if _is_local_url(base_url) else "local"
+        auto_note = (f"setup.type=auto → {setup_type} "
+                     f"({'loopback' if setup_type == 'server' else 'remote'} base_url)")
+    if setup_type == "server":
+        out = {"setup_type": "server", "providers_enabled": False, "runner_mode": "none"}
+        if auto_note:
+            out["note"] = auto_note
+        return out
+    # local
     if _is_local_url(base_url):
         raise ValueError("setup.type=local requires a REMOTE base_url (the model runs on the GPU host; "
                          "the engine co-locates with the code CLIs). Got a loopback endpoint — set "
@@ -4645,7 +5659,10 @@ def resolve_offload_topology(cfg: Dict[str, Any], *, cli_available: bool = True)
     if not cli_available:
         raise ValueError("setup.type=local requires a reachable agent CLI on this host (none found via "
                          "PATH). Install it or set GX10_CLAUDE_BIN/GX10_AGENT_CMD.")
-    return {"setup_type": "local", "providers_enabled": True, "runner_mode": "local"}
+    out = {"setup_type": "local", "providers_enabled": True, "runner_mode": "local"}
+    if auto_note:
+        out["note"] = auto_note
+    return out
 
 
 # ─── Dispatcher ───────────────────────────────────────────────
@@ -4668,21 +5685,24 @@ def _initiative_command(arg_str: str) -> str:
             visible = ", ".join(sorted(
                 {d.split("/")[0] for d in _INITIATIVE_SKELETON[v.type] if not d.startswith(WORKFLOW_DIR)}
             ))
-            out = (f"[initiative] angelegt + active: {v.slug} (type {v.type}) → {v.path.as_posix()}/\n"
-                   f"  Artefakte ({visible}) landen jetzt hier; INDEX.md wird automatisch gepflegt.")
+            out = _msg("init.cmd_created", slug=v.slug, type=v.type, path=v.path.as_posix(), visible=visible)
             _cfg = _EFFECTIVE_CFG if _EFFECTIVE_CFG is not None else _code_defaults()
-            if v.type == "mpr" and not _cfg_get(_cfg, "mpr.enabled"):
-                out += "\n  Hinweis: MPR ist noch nicht active — `/config set mpr.enabled on`."
+            # #503 MPR-ENV-2: mpr.enabled defaults to ON (MprConfig.enabled=True). The engine config tree
+            # carries no mpr default, so `_cfg_get` returns None when the key is unset — only warn "MPR not
+            # active" when it is EXPLICITLY disabled (a falsy value that is actually present), never on unset.
+            _mpr_enabled = _cfg_get(_cfg, "mpr.enabled")
+            if v.type == "mpr" and _mpr_enabled is not None and not _mpr_enabled:
+                out += _msg("init.cmd_mpr_hint")
             return out
         if sub == "use":
             if not rest:
                 return "usage: /initiative use <slug>"
             v = initiative_use(rest)
-            return f"[initiative] active: {v.slug} (type {v.type}) → {v.path.as_posix()}/"
+            return _msg("init.cmd_active", slug=v.slug, type=v.type, path=v.path.as_posix())
         if sub == "list":
             vs = initiative_list()
             if not vs:
-                return "[initiative] keine — `/initiative new <name> --type mpr|software`"
+                return _msg("init.cmd_none")
             cur = active_slug()
             lines = ["[initiative]  (* = active)"]
             for v in vs:
@@ -4691,20 +5711,615 @@ def _initiative_command(arg_str: str) -> str:
             return "\n".join(lines)
         if sub == "active":
             v = initiative_active()
-            return (f"[initiative] active: {v.slug} (type {v.type}) → {v.path.as_posix()}/"
-                    if v else "[initiative] keins active — `/initiative new …` oder `/initiative use <slug>`")
+            return (_msg("init.cmd_active", slug=v.slug, type=v.type, path=v.path.as_posix())
+                    if v else _msg("init.cmd_none_active"))
         if sub == "reconcile":
             fn = globals().get("reconcile_vault")          # Unit C provides the function
             if fn is None:
-                return "[initiative] reconcile kommt mit Unit C (INDEX.md + [[links]])"
+                return "[initiative] reconcile unavailable"
+            if rest.strip() in ("all", "--all", "--all-tracks"):   # S12e cross-track sweep
+                res = reconcile_all_tracks(links=True)
+                lines = [f"[initiative] reconcile all ({len(res)} track(s)):"]
+                for track in res:
+                    lines.append(f"  [{track}] {len(res[track])} initiative(s)")
+                    lines += [f"    - {r}" for r in res[track]]
+                return "\n".join(lines)
             slug = rest.strip() or active_slug()
             if not slug:
-                return "[initiative] reconcile: kein Initiative angegeben/active"
+                return _msg("init.cmd_reconcile_needs_slug")
             return f"[initiative] reconcile {slug}: {fn(slug)}"
         return ("usage: /initiative new <name> --type mpr|software | list | use <slug> | "
-                "active | reconcile [slug]")
+                "active | reconcile [slug|all]")
     except (ValueError, RuntimeError) as e:
         return f"[initiative] {e}"
+
+
+# ─── /lifecycle — the engine DELIVER-leg lifecycle-completeness gate (S13b / AD-7) ────────────────
+# Wires the S13a primitives (project_evidence + lifecycle_completeness) + the pure transition projector
+# (lifecycle_projector) into a FUNCTIONING, invokable gate: it reads the dev-process transition ledger
+# as plain JSONL DATA (stdlib json — NEVER importing the private scripts/devprocess|devloop modules),
+# projects each stage-bearing transition into tree_sha-bound vault evidence, then runs the completeness
+# gate. Fail-closed: a missing/bad tree_sha, no resolvable slug, or an unreadable/tampered ledger →
+# a clear BLOCKED / usage message, never a silent pass.
+# Fork C: the DEFAULT required stages. Only `delivery` is currently logged to the ledger in production
+# (the per-unit driver GATE/REVIEW transitions are not yet appended — the driver `log` seam is a no-op;
+# tracked as the producer-log follow-up #830). So the default gate verifies `delivery` (functional
+# today); `tests`/`reviews` are opt-in via `--stages tests,reviews,delivery` and become enforceable once
+# the producer logs them. The projector already maps all three (lifecycle_projector).
+_LIFECYCLE_DEFAULT_STAGES = ("delivery",)
+_LEDGER_GENESIS = "GENESIS"
+
+
+def _ledger_canonical(obj: Any) -> str:
+    """Canonical JSON of a ledger record / payload — mirrors ``scripts/devloop/ledger._canonical`` so the
+    hash chain recomputes identically engine-side (the ledger is read as DATA, the private bare-runner
+    module is never imported — core/ boundary)."""
+    return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+def _ledger_hash(seq: Any, prev_hash: str, payload: Any) -> str:
+    """``sha256(seq | prev_hash | canonical(payload))`` — mirrors ``scripts/devloop/ledger._hash``."""
+    import hashlib
+    return hashlib.sha256(f"{seq}|{prev_hash}|{_ledger_canonical(payload)}".encode("utf-8")).hexdigest()
+
+
+def _read_ledger_payloads(path: Path) -> "tuple[List[Dict[str, Any]], List[str]]":
+    """Read the hash-chain transition ledger at *path* as plain JSONL (stdlib only; one ``json.loads``
+    per non-empty line) and return ``(payloads, chain_errors)``. ``payloads`` = each record's ``payload``
+    (the driver/deliver dict, in file order). ``chain_errors`` = integrity violations recomputed by
+    re-reading (seq gap, broken ``prev_hash`` link, tampered payload, or a non-JSON line) — non-empty ⇒
+    the caller fails closed. A missing file is an empty ledger (no error)."""
+    if not path.is_file():
+        return [], []
+    try:
+        lines = [ln for ln in path.read_text(encoding="utf-8").splitlines() if ln.strip()]
+    except OSError as e:
+        return [], [f"ledger unreadable: {e!r}"]
+    payloads: List[Dict[str, Any]] = []
+    errors: List[str] = []
+    prev = _LEDGER_GENESIS
+    for i, line in enumerate(lines):
+        try:
+            rec = json.loads(line)
+        except (ValueError, TypeError) as e:
+            errors.append(f"record {i}: invalid JSON ({e})")
+            continue
+        if not isinstance(rec, dict):
+            errors.append(f"record {i}: not a JSON object")
+            continue
+        if rec.get("seq") != i:
+            errors.append(f"record {i}: seq {rec.get('seq')!r} (expected {i})")
+        if rec.get("prev_hash") != prev:
+            errors.append(f"record {i}: prev_hash break (chain reordered/truncated)")
+        if _ledger_hash(rec.get("seq"), rec.get("prev_hash"), rec.get("payload")) != rec.get("hash"):
+            errors.append(f"record {i}: hash mismatch (payload tampered)")
+        prev = rec.get("hash")
+        payload = rec.get("payload")
+        if isinstance(payload, dict):
+            payloads.append(payload)
+    return payloads, errors
+
+
+def _lifecycle_command(arg_str: str) -> str:
+    """`/lifecycle gate --slug <slug> --tree <sha> [--ledger <path>] [--stages tests,reviews,delivery]`
+    (S13b / AD-7) — the functioning engine DELIVER-leg lifecycle-completeness gate (Fork A1, engine-side).
+    Reads + chain-verifies the transition ledger as plain data, projects each stage-bearing transition
+    into tree_sha-bound vault evidence via ``lifecycle_projector.project_transitions`` (wiring the REAL
+    ``project_evidence`` + ``lifecycle_completeness``), and prints the projected evidence paths +
+    ``READY`` / ``BLOCKED: <reasons>``. Defaults: ledger = ``<repo>/.devloop/ledger.jsonl`` (the active
+    project root, else cwd); slug = ``active_slug()`` (Fork D); stages = ``delivery`` (Fork C — the only
+    stage the producer currently logs; ``tests``/``reviews`` are opt-in via ``--stages`` pending the
+    producer-log follow-up). FAIL-CLOSED — a missing slug/tree_sha, an unreadable/tampered ledger, or a projection error
+    yields a clear BLOCKED/usage message, never a silent pass."""
+    parts = arg_str.split()
+    sub = parts[0].lower() if parts else ""
+    if sub != "gate":
+        return ("usage: /lifecycle gate --slug <slug> --tree <sha> [--ledger <path>] "
+                "[--stages tests,reviews,delivery]")
+    rest = arg_str[len(parts[0]):].strip()
+
+    def _flag(name: str) -> "Optional[str]":
+        m = re.search(rf"--{name}[=\s]+(\S+)", rest)   # --x VALUE or --x=VALUE (position-independent)
+        return m.group(1) if m else None
+
+    if _lifecycle_projector is None:
+        return "[lifecycle] BLOCKED: lifecycle projector unavailable (engine module not importable)"
+    slug = (_flag("slug") or active_slug() or "").strip()
+    tree_sha = (_flag("tree") or "").strip()
+    stages_arg = _flag("stages")
+    required_stages = ([s.strip() for s in stages_arg.split(",") if s.strip()]
+                       if stages_arg else list(_LIFECYCLE_DEFAULT_STAGES))
+    if not slug:
+        return "[lifecycle] BLOCKED: no slug — pass --slug <slug> or set an active initiative"
+    if not tree_sha:
+        return "[lifecycle] BLOCKED: no delivery tree_sha — pass --tree <sha>"
+    if not required_stages:
+        return "[lifecycle] BLOCKED: no required stages — pass --stages a,b,c"
+    ledger_arg = _flag("ledger")
+    ledger_path = (Path(ledger_arg) if ledger_arg
+                   else (_project_root() or Path.cwd()) / ".devloop" / "ledger.jsonl")
+    payloads, chain_errors = _read_ledger_payloads(ledger_path)
+    if chain_errors:
+        return (f"[lifecycle] BLOCKED: ledger integrity failure ({ledger_path.as_posix()}): "
+                + "; ".join(chain_errors[:5]))
+    try:
+        result = _lifecycle_projector.project_transitions(
+            payloads, slug=slug, tree_sha=tree_sha, required_stages=required_stages,
+            project_evidence=project_evidence, lifecycle_completeness=lifecycle_completeness)
+    except (ValueError, RuntimeError, OSError) as e:   # fail-closed: never a silent pass on a projection error
+        return f"[lifecycle] BLOCKED: {e}"
+    lines = [f"[lifecycle] gate {slug} @ {tree_sha[:12]} "
+             f"(ledger {ledger_path.as_posix()}, {len(payloads)} record(s); "
+             f"stages: {', '.join(required_stages)})"]
+    lines.append("  projected evidence:" if result["projected"] else "  projected evidence: (none)")
+    lines += [f"    - {p}" for p in result["projected"]]
+    if result["ready"]:
+        lines.append("  READY — every required stage has evidence bound to the delivery tree_sha")
+    else:
+        lines.append("  BLOCKED: " + ("; ".join(result["reasons"]) or "(no reason given)"))
+    return "\n".join(lines)
+
+
+# ─── Project switch (ADR-0011 AD-1 / S5b-2) ───────────────────
+class _SwitchAgent:
+    """Adapts the live ``GX10`` agent to ``project_switch``'s contract. The BASE system prompt is
+    project-INDEPENDENT (the engine's operating instructions) so it is preserved; everything else — the
+    conversation AND the rolling-summary system block, which is memory-partition-specific — is dropped and
+    rebuilt from the target. Mirrors ``clear_context``'s base-only reset, so nothing bleeds across a switch
+    even if the target session is missing or corrupt."""
+
+    def __init__(self, gx: "GX10") -> None:
+        self._gx = gx
+
+    def _reset_to_base_system(self) -> None:
+        # Keep ONLY the first (base) system message — drops the leaving conversation AND the leaving
+        # project's rolling-summary block (a 2nd system message); clears the stale last_response so a
+        # post-switch /write can't emit the leaving project's last answer.
+        base = next((m for m in self._gx.messages if m.get("role") == "system"), None)
+        self._gx.messages = [base] if base else []
+        self._gx.last_response = ""
+
+    def save_session(self) -> None:
+        self._gx.save_session(strict=True)   # a failed save of the LEAVING conversation aborts the switch
+
+    def load_session(self) -> bool:
+        # Drop the leaving conversation + summary FIRST, so a missing/corrupt target session (GX10's loader
+        # leaves messages unchanged on a parse error) can never leave the leaving conversation live.
+        self._reset_to_base_system()
+        existed = session_path().exists()    # resolves under the TARGET ctx — the switch bound it first
+        self._gx.load_session()               # append the target's non-system window onto the base system
+        return existed
+
+    def start_fresh(self, _prompt_path: str) -> None:
+        # No target session → just the project-independent base system message (the prompt path is unused).
+        self._reset_to_base_system()
+
+
+class _CacheActiveRegistry:
+    """A registry view whose ``active()`` returns THIS process's cached active project
+    (``_ACTIVE_PROJECT``) — never the persisted continuity pointer, which may have been moved by another
+    process. ``get()``/``set_active()`` delegate to the real installation-global registry (``set_active``
+    persists the continuity pointer for the next boot)."""
+
+    def __init__(self, reg) -> None:
+        self._reg = reg
+
+    def get(self, pid: str):
+        return self._reg.get(pid)
+
+    def active(self):
+        return _ACTIVE_PROJECT
+
+    def set_active(self, pid: str) -> None:
+        self._reg.set_active(pid)
+
+
+def _switch_apply_config(merged: Dict[str, Any]) -> None:
+    """``apply_config`` seam for a ``/switch``: re-derive the engine globals from *merged* AND publish it as
+    ``_EFFECTIVE_CFG`` so ``/config get`` and the rest of the engine see the active project's config."""
+    global _EFFECTIVE_CFG
+    _apply_config(merged)
+    _EFFECTIVE_CFG = merged
+
+
+def _project_overlay_for(project) -> Dict[str, Any]:
+    """A project's config overlay. The per-project overlay source is a later spine step (S6+); today a
+    switch changes only the per-project paths + memory partition (via the bound ctx), not the base config
+    surface, so this returns ``{}`` — but ``apply_project_overlay``'s locked-key discipline is already on
+    the path the moment an overlay exists."""
+    return {}
+
+
+def _project_in_flight(pid: str) -> bool:
+    """Best-effort: is a dev unit currently holding *pid*'s project lock (a run in progress, possibly in
+    another process)? Probes the OS lock non-blocking — held ⇒ in-flight (the switch is refused). Never
+    raises (an unsafe id / missing registry ⇒ not in-flight)."""
+    if _REGISTRY is None:
+        return False
+    try:
+        lk = _REGISTRY.project_lock(pid, timeout_s=0.0)
+    except Exception:   # noqa: BLE001 — unsafe id etc. → treat as not-in-flight (the switch will KeyError on get)
+        return False
+    try:
+        lk.acquire()
+        lk.release()
+        return False
+    except Exception:   # noqa: BLE001 — could not acquire ⇒ a holder is running ⇒ in-flight
+        return True
+
+
+def _switch_command(agent: "GX10", arg_str: str) -> str:
+    """`/switch <project_id>` — quiesce this engine and rebind it to a registered project (per-process
+    active; the continuity pointer is persisted). Saves the leaving conversation under its own root, binds
+    the target, rebuilds the project config, and swaps the conversation; refuses when a dev unit is
+    in-flight for either side. No argument → report the active project."""
+    if _REGISTRY is None or _ps is None or _pc is None:
+        return "[switch] project isolation unavailable (registry/context seam absent)"
+    pid = arg_str.strip()
+    if not pid:
+        cur = _ACTIVE_PROJECT
+        return (f"[switch] active: {cur.id} → {_engine_ctx_for(cur).root}\n"
+                "  usage: /switch <project_id>  ·  /project list"
+                if cur is not None else "[switch] no active project — /project list")
+    shim = _CacheActiveRegistry(_REGISTRY)
+    _tgt = shim.get(pid)
+    if _tgt is None:                          # pre-check so a real error inside the switch is never
+        return f"[switch] unknown project {pid!r} — /project list"   # mis-reported as "unknown project"
+    if getattr(_tgt, "archived", False):      # an archived project is not a valid switch target (S16)
+        return f"[switch] {pid!r} is archived — /project unarchive {pid} first"
+    if _BASE_CFG is None:
+        return "[switch] no live base config (the switch rebuilds the project config from it)"
+    try:
+        target, dropped = _ps.switch_project(
+            pid,
+            registry=shim,
+            agent=_SwitchAgent(agent),
+            base_cfg=_BASE_CFG,
+            apply_config=_switch_apply_config,
+            overlay_for=_project_overlay_for,
+            in_flight=_project_in_flight,
+            ctx_for=_engine_ctx_for,
+        )
+    except _ps.SwitchRefused as e:
+        return f"[switch] refused — {e}"
+    except Exception as e:   # noqa: BLE001 — switch_project rolled the ctx back to the leaving project
+        return f"[switch] failed — {e!r}"
+    _set_active_project(target)               # publish to this process's other threads (only AFTER commit)
+    # S11a-2 (#630): reload skills so the NEW project's library is discovered (and the previous project's
+    # library items dropped) — build-then-swap, so a reload hiccup never empties the live registries and an
+    # already-committed switch is never failed by it. plugins_dir is a locked key (stable across projects).
+    try:
+        _load_skills(((_EFFECTIVE_CFG or {}).get("paths") or {}).get("plugins_dir"))
+    except Exception as e:  # noqa: BLE001 — the switch is committed; a reload warning must not fail it
+        _ui_print(col(f"[switch] skills reload warning: {e!r}", C.YELLOW))
+    msg = f"[switch] now on {target.id} → {_engine_ctx_for(target).root}"
+    if dropped:
+        msg += f"\n  (dropped locked config overrides: {', '.join(dropped)})"
+    return msg
+
+
+def _project_track_command(args: "List[str]") -> str:
+    """`/project track new|use|list` — manage the parallel TRACKS of the ACTIVE project (ADR-0011 AD-2' /
+    S16). Each non-``main`` track has its own vault subtree (``.tracks/<track>/``) and memory sub-scope
+    (``<mem_ns>::track::<tid>``), so parallel lines of work stay isolated. ``new`` creates AND switches to a
+    track (create-and-switch, like ``git checkout -b``); ``use`` switches to an existing one; ``list`` shows
+    them. Switching rebinds the engine context (vault + memory follow) and reloads the per-track library."""
+    if _REGISTRY is None:
+        return "[project] project registry unavailable"
+    cur = _ACTIVE_PROJECT
+    if cur is None:
+        return "[project] no active project — `/switch <id>` first"
+    sub = args[0].lower() if args else "list"
+    if sub == "list":
+        tracks = list(getattr(cur, "tracks", ["main"]) or ["main"])
+        act = getattr(cur, "active_track", "main") or "main"
+        lines = ["[project] tracks  (* = active):"]
+        lines += [f"  {'*' if t == act else ' '} {t}" for t in tracks]
+        return "\n".join(lines)
+    if sub in ("new", "use"):
+        if len(args) < 2:
+            return f"usage: /project track {sub} <track>"
+        track = args[1]
+        try:
+            if sub == "new":
+                _REGISTRY.add_track(cur.id, track)          # idempotent register
+            _REGISTRY.set_active_track(cur.id, track)        # new = create-and-switch; use = switch
+        except (ValueError, KeyError) as e:
+            return f"[project] {e}"
+        _set_active_project(_REGISTRY.get(cur.id))           # refresh the cached project (new active_track)
+        try:
+            bind_active()                                    # rebind ctx: vault + memory now scope to the track
+            _load_skills(((_EFFECTIVE_CFG or {}).get("paths") or {}).get("plugins_dir"))
+        except Exception as e:   # noqa: BLE001 — the track switch is committed; a reload hiccup must not fail it
+            _ui_print(col(f"[project] track reload warning: {e!r}", C.YELLOW))
+        verb = "created + active" if sub == "new" else "active"
+        return f"[project] track '{track}' {verb} — vault + memory now scoped to it"
+    return "usage: /project track new <track> | use <track> | list"
+
+
+_PROJECT_NEW_USAGE = "usage: /project new <name> [--type mpr|software] [--path <dir>]"
+
+
+def _parse_project_new(arg_str: str) -> "Tuple[Optional[str], Optional[str], Optional[str], Optional[str]]":
+    """Parse `new <name> [--type T] [--path P]` (P may be quoted) → (name, type|None, path|None, error|None).
+    The name is every remaining positional token (a multi-word name is slugified). ``--type`` is validated
+    against the initiative types; an unknown type is an error (fail-closed, nothing is created)."""
+    s = arg_str
+    typ: Optional[str] = None
+    path: Optional[str] = None
+    mt = re.search(r"--type(?:=|\s+)(\S+)", s)
+    if mt:
+        typ = mt.group(1)
+        s = s[:mt.start()] + s[mt.end():]
+    mp = re.search(r"--path(?:=|\s+)(\"[^\"]*\"|'[^']*'|\S+)", s)
+    if mp:
+        raw = mp.group(1)
+        path = raw[1:-1] if len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in "\"'" else raw
+        s = s[:mp.start()] + s[mp.end():]
+    name = " ".join(s.split())
+    # A bare / empty-valued flag (e.g. `--type`, `--type=`, `--path`) does not match the value-bearing regex
+    # above, so it would otherwise survive in the name and mint a bogus project — fail-closed instead.
+    if re.search(r"--(?:type|path)\b", name):
+        return (None, None, None, "a --type/--path flag needs a value")
+    if not name:
+        return (None, None, None, _PROJECT_NEW_USAGE)
+    if typ is not None and typ.strip().lower() not in INITIATIVE_TYPES:
+        return (None, None, None, f"unknown --type {typ!r} (allowed: {', '.join(INITIATIVE_TYPES)})")
+    return (name, (typ.strip().lower() if typ else None), path, None)
+
+
+def _project_new_mint(agent: "GX10", arg_str: str) -> str:
+    """`/project new <name> [--type mpr|software] [--path <dir>]` — the guided-setup mint (ADR-0011 / S16):
+    register a fresh isolated PROJECT (root = ``--path`` or ``<cwd>/<slug>``; a minted ``mem_ns``), then
+    **activate it through the full quiesced switch** (so the leaving conversation is saved, a fresh one is
+    started, the rolling summary / last-response are cleared, and in-flight work is refused — exactly like
+    ``/switch``, so a mid-session ``new`` never bleeds the old conversation into the new project), and finally
+    — when a ``--type`` is given — seed its first work unit (a typed vault initiative) under the new project.
+    **Atomic**: a bad name / duplicate root / a refused-or-failed switch leaves nothing registered; the unit
+    seed is fail-soft (a project without a seeded unit is still valid — add one later)."""
+    if _REGISTRY is None:
+        return "[project] project registry unavailable"
+    if agent is None:                                    # activation goes through the switch → needs a session
+        return "[project] /project new requires an interactive session"
+    name, typ, path, err = _parse_project_new(arg_str)
+    if err:
+        return err if err.startswith("usage") else f"[project] {err}"
+    if not re.search(r"[A-Za-z0-9]", name):              # _slugify would otherwise fall back to "initiative"
+        return f"[project] invalid name {name!r} (no usable characters for a slug)"
+    slug = _slugify(name)
+    base = Path(_BOOT_WORKDIR) if _BOOT_WORKDIR is not None else Path.cwd()
+    root = Path(path) if path else (base / slug)
+    # Register inactive FIRST (fail-closed on a duplicate id/root) so a duplicate never creates an orphan dir.
+    try:
+        proj = _REGISTRY.register(slug, str(root), make_active=False)
+    except (ValueError, KeyError) as e:
+        return f"[project] {e}"
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        try:
+            _REGISTRY.remove(proj.id)                    # atomic: no orphan registry entry on a root-create failure
+        except Exception:  # noqa: BLE001
+            pass
+        return f"[project] cannot create root {root}: {e}"
+    # Activate through the REAL quiesced switch — it saves the leaving conversation, swaps to a fresh one,
+    # clears rolling-summary/last-response, refuses in-flight work, rebinds paths+memory, and reloads the
+    # library. On a refusal/failure it has already rolled the context back to the leaving project.
+    sw = _switch_command(agent, proj.id)
+    if not sw.startswith("[switch] now on"):
+        try:
+            _REGISTRY.remove(proj.id)                    # atomic: roll the registration back if activation didn't commit
+        except Exception:  # noqa: BLE001
+            pass
+        return f"[project] mint of {slug!r} rolled back — {sw}"
+    seeded = ""
+    if typ:
+        try:
+            v = initiative_new(name, typ)                # seed the first work unit under the now-active project
+            seeded = f" · seeded {typ} unit '{v.slug}'"
+        except Exception as e:  # noqa: BLE001 — seed is best-effort (incl. FS errors); the project is still valid
+            seeded = f" · (unit seed skipped: {e})"
+    return f"[project] created {proj.id} → {proj.root}  (mem_ns {proj.mem_ns[:8]}, active){seeded}\n  {sw}"
+
+
+def _project_scopes(proj: "Any") -> "List[str]":
+    """Every memory partition a project owns: its base ``mem_ns`` (the ``main`` track) plus one composite
+    ``<mem_ns>::track::<tid>`` per non-``main`` track — the scopes a delete must forget."""
+    ns = getattr(proj, "mem_ns", "") or ""
+    if not ns:
+        return []
+    scopes = [ns]
+    for t in (getattr(proj, "tracks", None) or []):
+        if t and t != "main":
+            scopes.append(f"{ns}::track::{t}")
+    return scopes
+
+
+def _safe_to_purge(root_str: str) -> "Tuple[bool, str]":
+    """Guard for ``/project delete --purge`` (destructive ``rmtree``). Refuse anything that is not a safe,
+    self-contained project directory: a non-directory, a filesystem root, or any of the protected bases — the
+    user **home**, the engine **boot workdir**, the live **cwd** — OR an ANCESTOR of any of them (which would
+    delete the home / working tree out from under us)."""
+    try:
+        root = Path(root_str).resolve()
+    except Exception:  # noqa: BLE001
+        return (False, "unresolvable path")
+    if not root.is_dir():
+        return (False, "not a directory")
+    if root == root.parent:
+        return (False, "refusing to purge a filesystem root")
+    bases = []
+    for getter in (Path.home, Path.cwd):
+        try:
+            bases.append(getter().resolve())
+        except Exception:  # noqa: BLE001
+            pass
+    if _BOOT_WORKDIR is not None:
+        try:
+            bases.append(Path(_BOOT_WORKDIR).resolve())
+        except Exception:  # noqa: BLE001
+            pass
+    for base in bases:
+        if root == base:
+            return (False, "refusing to purge a protected directory (home/cwd/boot)")
+        try:
+            base.relative_to(root)                          # root is an ANCESTOR of home/cwd/boot
+            return (False, "refusing to purge an ancestor of home/cwd/boot")
+        except ValueError:
+            pass
+    return (True, "")
+
+
+def _project_delete(agent: "Optional[GX10]", args: "List[str]") -> str:
+    """`/project delete <id> [--purge]` (ADR-0011 / S16) — registry-mediated removal. Forgets ALL of the
+    project's memory scopes (cold + warm + lessons, every track) BEFORE removing the registry entry; the
+    on-disk directories are LEFT untouched unless ``--purge`` is given (and even then only for a safe,
+    self-contained dir). Fail-closed: the ``default`` project is never deletable. Deleting the ACTIVE project
+    first switches to ``default`` (a clean unbind + conversation save), so the engine is never left bound to
+    a deleted project."""
+    if _REGISTRY is None:
+        return "[project] project registry unavailable"
+    purge = "--purge" in args
+    ids = [a for a in args if not a.startswith("--")]
+    if not ids:
+        return "usage: /project delete <id> [--purge]"
+    pid = ids[0]
+    default_id = getattr(_pr, "DEFAULT_PROJECT_ID", "default") if _pr is not None else "default"
+    if pid == default_id:
+        return "[project] the default project cannot be deleted"
+    proj = _REGISTRY.get(pid)
+    if proj is None:
+        return f"[project] unknown project {pid!r} — /project list"
+    # If deleting the active project, switch away first (clean unbind + leaving-conversation save).
+    if _ACTIVE_PROJECT is not None and _ACTIVE_PROJECT.id == pid:
+        if agent is None:
+            return "[project] delete of the ACTIVE project requires an interactive session"
+        sw = _switch_command(agent, default_id)
+        if not sw.startswith("[switch] now on"):
+            return f"[project] cannot delete the active project — switch to {default_id} failed: {sw}"
+    root = proj.root
+    # Forget every memory scope the project owns BEFORE dropping the registry entry (so an interruption can
+    # never leave orphan memory behind a still-removed entry). Best-effort; a forget hiccup never blocks the
+    # delete, and re-running delete (or the S15 orphan-GC) cleans any residue.
+    forgotten = 0
+    for sc in _project_scopes(proj):
+        try:
+            _forget_scope(sc)
+            forgotten += 1
+        except Exception:  # noqa: BLE001
+            pass
+
+    if not purge:
+        # Atomic against root reuse: remove only if pid still owns this exact root.
+        try:
+            removed = _REGISTRY.remove(pid, expected_root=root)
+        except Exception as e:  # noqa: BLE001
+            return f"[project] delete failed: {e!r}"
+        if removed is None:
+            return f"[project] {pid} was already removed or changed underneath — nothing deleted"
+        return f"[project] deleted {pid} (forgot {forgotten} memory scope(s))"
+
+    # --purge: the directory delete must be claimed while STILL serialized against re-registration.
+    ok, why = _safe_to_purge(root)
+    if not ok:
+        # unsafe to purge → fall back to a registry-only removal (never touch the filesystem)
+        try:
+            removed = _REGISTRY.remove(pid, expected_root=root)
+        except Exception as e:  # noqa: BLE001
+            return f"[project] delete failed: {e!r}"
+        if removed is None:
+            return f"[project] {pid} was already removed or changed underneath — nothing deleted"
+        return (f"[project] deleted {pid} (forgot {forgotten} memory scope(s)) · "
+                f"purge refused ({why}) — dir left at {root}")
+    # Under the registry lock: verify ownership, rename the root to a fresh unique tombstone (claims it), and
+    # drop the entry — atomically. Then rmtree the tombstone outside the lock.
+    try:
+        res = _REGISTRY.remove_purge(pid, expected_root=root)
+    except OSError as e:
+        return f"[project] purge failed (directory not claimed): {e} — nothing deleted"
+    except Exception as e:  # noqa: BLE001
+        return f"[project] delete failed: {e!r}"
+    if res is None:
+        return f"[project] {pid} was already removed or changed underneath — nothing deleted"
+    _removed, tomb = res
+    try:
+        shutil.rmtree(tomb)
+        return f"[project] deleted {pid} (forgot {forgotten} memory scope(s)) · purged {root}"
+    except OSError as e:
+        return (f"[project] deleted {pid} (forgot {forgotten} memory scope(s)) · "
+                f"removed but the tombstone could not be deleted: {e} (at {tomb})")
+
+
+def _project_archive(args: "List[str]", *, archive: bool) -> str:
+    """`/project archive <id>` / `/project unarchive <id>` (ADR-0011 / S16) — toggle the reversible archived
+    flag. Archived projects are hidden from the default ``list`` and refused as a switch target; data +
+    memory are untouched. Fail-closed: the ``default`` and the ACTIVE project cannot be archived (switch
+    away first)."""
+    if _REGISTRY is None:
+        return "[project] project registry unavailable"
+    if not args:
+        return f"usage: /project {'archive' if archive else 'unarchive'} <id>"
+    pid = args[0]
+    default_id = getattr(_pr, "DEFAULT_PROJECT_ID", "default") if _pr is not None else "default"
+    if archive and pid == default_id:
+        return "[project] the default project cannot be archived"
+    if archive and _ACTIVE_PROJECT is not None and _ACTIVE_PROJECT.id == pid:
+        return "[project] cannot archive the ACTIVE project — switch away first"
+    try:
+        _REGISTRY.set_archived(pid, archive)
+    except KeyError:
+        return f"[project] unknown project {pid!r} — /project list"
+    except Exception as e:  # noqa: BLE001
+        return f"[project] {e!r}"
+    return f"[project] {pid} {'archived' if archive else 'un-archived'}"
+
+
+def _project_command(arg_str: str, agent: "Optional[GX10]" = None) -> str:
+    """`/project list | new <name> [--type] [--path] | active | track …` — the guided project-setup command
+    (ADR-0011 / S16): manage registered, isolated projects (the SSOT the `/switch` verb selects from) and
+    their parallel tracks. ``new`` activates through the quiesced switch and so needs the session *agent*;
+    the other verbs are pure bookkeeping. (`/initiative` is a deprecated alias.)"""
+    if _REGISTRY is None:
+        return "[project] project registry unavailable"
+    default_id = getattr(_pr, "DEFAULT_PROJECT_ID", "default") if _pr is not None else "default"
+    parts = arg_str.split()
+    sub = parts[0].lower() if parts else "list"
+    try:
+        if sub == "list":
+            show_all = "--all" in parts[1:]                # archived hidden unless --all
+            projs = sorted(_REGISTRY.list(), key=lambda p: p.id)
+            shown = [p for p in projs if show_all or not getattr(p, "archived", False)]
+            if not shown:
+                return "[project] none registered — /project new <name> [--type mpr|software]"
+            cur = _ACTIVE_PROJECT.id if _ACTIVE_PROJECT is not None else None
+            n_arch = sum(1 for p in projs if getattr(p, "archived", False))
+            head = "[project]  (* = active" + (", [archived] hidden — /project list --all" if (n_arch and not show_all) else "") + ")"
+            lines = [head]
+            for p in shown:
+                mark = "*" if p.id == cur else " "
+                root = str(_BOOT_WORKDIR) if (p.id == default_id and _BOOT_WORKDIR is not None) else p.root
+                tag = " [archived]" if getattr(p, "archived", False) else ""
+                lines.append(f"  {mark} {p.id}{tag}  ·  {root}  ·  mem_ns {(p.mem_ns or '-')[:8]}")
+            return "\n".join(lines)
+        if sub in ("new", "add"):
+            rest = arg_str.split(None, 1)[1] if len(parts) > 1 else ""
+            return _project_new_mint(agent, rest)
+        if sub == "active":
+            cur = _ACTIVE_PROJECT
+            return (f"[project] active: {cur.id} → {_engine_ctx_for(cur).root}"
+                    if cur is not None else "[project] none active")
+        if sub == "track":
+            return _project_track_command(parts[1:])
+        if sub in ("delete", "rm", "remove"):
+            return _project_delete(agent, parts[1:])
+        if sub == "archive":
+            return _project_archive(parts[1:], archive=True)
+        if sub == "unarchive":
+            return _project_archive(parts[1:], archive=False)
+        return ("usage: /project list [--all] | new <name> [--type mpr|software] [--path <dir>] | active | "
+                "track new|use|list | delete <id> [--purge] | archive <id> | unarchive <id>")
+    except Exception as e:   # noqa: BLE001 — registry I/O / lock / validation → a clean message, never a crash
+        return f"[project] {e}"
 
 
 def _catalogue_snapshot() -> Dict[str, List[Dict[str, Any]]]:
@@ -4857,6 +6472,82 @@ def _invoke_prompt(user_input: str) -> str:
     return "\n".join(lines)
 
 
+# ─── Per-project paved-road generator (ADR-0011 S10 / #629) ───────────────────
+# The generator (`ack.generator`) renders the paved-road template tree from the ACTIVE ProjectContext into
+# the PER-PROJECT library — a `library/` subtree under the ctx-resolved vault_root — so a generated dev-
+# project artifact lands under the active project and NEVER in core/skills. The core built-in capabilities
+# are injected as the generator's collision guard (S10a), so a generated item can never shadow a built-in.
+def _project_library_root() -> Path:
+    """The active project's per-project capability library: a ``library/`` subtree under the ctx-resolved
+    ``vault_root()``. Generated artifacts land here (the loader discovers it in S11). Under the implicit
+    ``default`` project this is the boot workdir's ``vault/library`` — the same place a single-project
+    install would write, so there is no surprise relocation."""
+    return vault_root() / "library"
+
+
+def _builtin_capabilities(*, include_prompts: bool = False) -> "set[str]":
+    """The CORE built-in capabilities, injected as the generator's collision guard so a generated
+    per-project item can never shadow a built-in (S10a). The base set is ``core/skills`` tools +
+    playbooks (the catalogue's two kinds). When *include_prompts* is set (the ``--kind prompt`` path),
+    the built-in ``kind: prompt`` capabilities are unioned in too, so a generated prompt cannot collide
+    with a seed prompt. Fail-soft: a discovery hiccup yields an empty/partial set (no guard) rather than
+    blocking generation."""
+    caps: "set[str]" = set()
+    try:
+        from ack.catalogue import build_catalogue   # lazy: never import ack at gx10 top-level (S6b lesson)
+        caps |= set(build_catalogue([(str(_BUILTIN_DIR), "built-in")]).entries)
+    except Exception:  # noqa: BLE001
+        pass
+    if include_prompts:
+        try:
+            from ack.prompt import discover_prompts   # lazy (S6b lesson)
+            caps |= {p.capability for p in discover_prompts(_BUILTIN_DIR)}
+        except Exception:  # noqa: BLE001
+            pass
+    return caps
+
+
+def _generate_command(arg_str: str) -> str:
+    """`/generate --domain <d> --case <c> --description <text> [--prefix x] [--dry-run] …` — render the
+    paved-road template tree into the ACTIVE project's per-project library (ctx-resolved), guarded against
+    shadowing a core built-in. The output_root + reserved capabilities are engine-enforced (a ``--output-root``
+    the user passes is ignored): generation always targets the active project's library, never core/skills."""
+    import shlex
+    from ack import generator as _gen        # lazy import (S6b lesson)
+    if not arg_str.strip():
+        return ("usage: /generate [--kind case|prompt] --domain <d> --case <c> --description <text> "
+                "[--prefix x] [--dry-run]\n"
+                "  renders the paved-road template (case=tool [default], prompt=prompt item) into the "
+                "active project's library (guarded vs built-ins)")
+    try:
+        args = _gen.build_parser().parse_args(shlex.split(arg_str))
+    except SystemExit:
+        return "generate: invalid args — required: --domain, --case, --description (see `ack.generator -h`)"
+    except ValueError as e:                     # shlex.split on an unbalanced quote, etc.
+        return f"generate: could not parse args ({e})"
+    ctx = _gen.build_context(args)
+    out_root = _project_library_root()
+    # case path keeps the exact pre-S10c call (byte-identical); only --kind prompt widens the guard.
+    reserved = (_builtin_capabilities(include_prompts=True) if args.kind == "prompt"
+                else _builtin_capabilities())
+    try:
+        res = _gen.generate(ctx, template_root=_gen.template_root_for(args), output_root=out_root,
+                            force=args.force, dry_run=args.dry_run,
+                            reserved_capabilities=reserved)
+    except FileNotFoundError as e:              # e.g. a missing --template tree
+        return f"generate: {e}"
+    except Exception as e:  # noqa: BLE001 — a slash command must never crash the dispatch/turn
+        return f"generate: failed — {e!r}"
+    if res.refused:
+        return f"[REFUSED] {res.refused}"
+    tag = " (dry-run)" if args.dry_run else ""
+    lines = [f"generated{tag} '{ctx['capability_key']}' into the project library: {out_root.as_posix()}"]
+    lines += [f"  [{f.action}] {f.rel}" for f in res.files]
+    if res.conflicts:
+        lines.append(f"  [CONFLICT] {res.conflicts} file(s) need manual resolution (diff3 markers written)")
+    return "\n".join(lines)
+
+
 def _dispatch(agent: GX10, user_input: str):
     cmd = user_input.lower()
     if cmd == "help":
@@ -4871,10 +6562,14 @@ def _dispatch(agent: GX10, user_input: str):
         _ui_print(_render_skills())
     elif cmd == "config":
         _ui_print(_render_config())
-    elif cmd.startswith("config get "):
-        key = user_input.split(None, 2)[2].strip()
-        val = _cfg_get(_EFFECTIVE_CFG if _EFFECTIVE_CFG is not None else _code_defaults(), key)
-        _ui_print(col(f"  {key} = {val!r}" if val is not None else f"  {key} = (not set)", C.CYAN))
+    elif cmd == "config get" or cmd.startswith("config get "):
+        parts = user_input.split(None, 2)            # config get <dotted.key>
+        if len(parts) < 3 or not parts[2].strip():   # bare `config get` (clients trim) or a trailing space (raw HTTP)
+            _ui_print(col("  usage: /config get <dotted.key>", C.YELLOW))
+        else:
+            key = parts[2].strip()
+            val = _cfg_get(_EFFECTIVE_CFG if _EFFECTIVE_CFG is not None else _code_defaults(), key)
+            _ui_print(col(f"  {key} = {val!r}" if val is not None else f"  {key} = (not set)", C.CYAN))
     elif cmd.startswith("config set "):
         parts = user_input.split(None, 3)            # config set <dotted.key> <value...>  (original case)
         if len(parts) < 4:
@@ -4912,7 +6607,7 @@ def _dispatch(agent: GX10, user_input: str):
             if _EFFECTIVE_CFG: _EFFECTIVE_CFG["watcher"]["enabled"] = False
             _ui_print(col("[RECONCILER] auto-advance OFF — complete manually", C.YELLOW))
         else:
-            state = col("AN", C.GREEN) if _WATCHER_ENABLED else col("AUS", C.YELLOW)
+            state = col("ON", C.GREEN) if _WATCHER_ENABLED else col("OFF", C.YELLOW)
             _ui_print(f"  auto-advance (reconciler): {state}  |  watcher on / watcher off")
     elif cmd.startswith("autopilot"):
         global AUTOPILOT_ENABLED
@@ -4920,17 +6615,17 @@ def _dispatch(agent: GX10, user_input: str):
         if arg == "on":
             AUTOPILOT_ENABLED = True
             if _EFFECTIVE_CFG: _EFFECTIVE_CFG["autopilot"]["enabled"] = True
-            msg = (f"[AUTOPILOT] AN (max_concurrent={AUTOPILOT_MAX_CONCURRENT}); "
-                   f"greift beim nächsten Tick (~{RECONCILER_INTERVAL:.0f}s).")
+            msg = (f"[AUTOPILOT] ON (max_concurrent={AUTOPILOT_MAX_CONCURRENT}); "
+                   f"takes effect on the next tick (~{RECONCILER_INTERVAL:.0f}s).")
             if not _WATCHER_ENABLED:
-                msg += "  ⚠ Reconciler ist AUS — 'watcher on' nötig, sonst passiert nichts."
+                msg += "  ⚠ reconciler is OFF — 'watcher on' is required, else nothing happens."
             _ui_print(col(msg, C.GREEN))
         elif arg == "off":
             AUTOPILOT_ENABLED = False
             if _EFFECTIVE_CFG: _EFFECTIVE_CFG["autopilot"]["enabled"] = False
             _ui_print(col("[AUTOPILOT] OFF — no new auto-starts (running sessions remain)", C.YELLOW))
         else:
-            state = col("AN", C.GREEN) if AUTOPILOT_ENABLED else col("AUS", C.YELLOW)
+            state = col("ON", C.GREEN) if AUTOPILOT_ENABLED else col("OFF", C.YELLOW)
             _ui_print(f"  autopilot: {state}  |  autopilot on / autopilot off")
     elif cmd.startswith("autoplan"):
         global AUTOPILOT_AUTOPLAN, AUTOPILOT_MAX_TASKS, _AUTOPLAN_DONE
@@ -4950,18 +6645,18 @@ def _dispatch(agent: GX10, user_input: str):
             AUTOPILOT_AUTOPLAN = True
             if _EFFECTIVE_CFG: _EFFECTIVE_CFG["autopilot"]["autoplan"] = True
             if AUTOPILOT_MAX_TASKS > 0:
-                limit_info = f", max {AUTOPILOT_MAX_TASKS} Tasks — stoppt automatisch"
+                limit_info = f", max {AUTOPILOT_MAX_TASKS} tasks — stops automatically"
                 _ui_print(col(
-                    f"[AUTOPLAN] AN{limit_info}",
+                    f"[AUTOPLAN] ON{limit_info}",
                     C.GREEN))
             else:
                 _ui_print(col(
-                    "[AUTOPLAN] AN — max_tasks=0 (DAUERSCHLEIFE, kein automatischer Stopp!)\n"
-                    "  → Empfehlung: Limit setzen mit  autoplan off  dann  autoplan on N",
+                    "[AUTOPLAN] ON — max_tasks=0 (INFINITE LOOP, no automatic stop!)\n"
+                    "  → recommendation: set a limit with  autoplan off  then  autoplan on N",
                     C.YELLOW))
             _ui_print(col(
-                "  ⚠ WARNUNG: Autoplan NIEMALS mit einem bezahlten API-Abo verwenden!\n"
-                "    Jede Planung = ein Qwen-Turn = Kosten. Nur für lokale vLLM-Instanzen!",
+                "  ⚠ WARNING: NEVER use autoplan with a paid API subscription!\n"
+                "    Every planning step = one model turn = cost. Local vLLM instances only!",
                 C.RED))
         elif arg == "off":
             AUTOPILOT_AUTOPLAN = False
@@ -4969,8 +6664,8 @@ def _dispatch(agent: GX10, user_input: str):
             if _EFFECTIVE_CFG: _EFFECTIVE_CFG["autopilot"]["autoplan"] = False
             _ui_print(col("[AUTOPLAN] OFF — pipeline stops when the queue is empty. Counter reset.", C.YELLOW))
         else:
-            state     = col("AN", C.GREEN) if AUTOPILOT_AUTOPLAN else col("AUS", C.YELLOW)
-            limit_str = f"  max={AUTOPILOT_MAX_TASKS}" if AUTOPILOT_MAX_TASKS > 0 else "  unbegrenzt"
+            state     = col("ON", C.GREEN) if AUTOPILOT_AUTOPLAN else col("OFF", C.YELLOW)
+            limit_str = f"  max={AUTOPILOT_MAX_TASKS}" if AUTOPILOT_MAX_TASKS > 0 else "  unlimited"
             _ui_print(f"  Autoplan: {state}{limit_str}  |  done={_AUTOPLAN_DONE}  "
                       f"|  autoplan on [N] / autoplan off")
     elif cmd.startswith("log-terminal"):
@@ -4983,9 +6678,9 @@ def _dispatch(agent: GX10, user_input: str):
         elif arg == "off":
             AUTOPILOT_LOG_TERMINAL = False
             if _EFFECTIVE_CFG: _EFFECTIVE_CFG["autopilot"]["log_terminal"] = False
-            _ui_print(col("[LOG-TERMINAL] AUS", C.YELLOW))
+            _ui_print(col("[LOG-TERMINAL] OFF", C.YELLOW))
         else:
-            state = col("AN", C.GREEN) if AUTOPILOT_LOG_TERMINAL else col("AUS", C.YELLOW)
+            state = col("ON", C.GREEN) if AUTOPILOT_LOG_TERMINAL else col("OFF", C.YELLOW)
             _ui_print(f"  Log-Terminal: {state}  |  log-terminal on / log-terminal off")
     elif cmd == "rag" or cmd.startswith("rag "):
         # MEM-13: session toggle for per-turn retrieval — turn it OFF when the retrieval itself
@@ -5001,12 +6696,25 @@ def _dispatch(agent: GX10, user_input: str):
             if _EFFECTIVE_CFG: _EFFECTIVE_CFG["context"]["rag_enabled"] = False
             _ui_print(col("[RAG] per-turn retrieval OFF — answers use only the live window", C.YELLOW))
         else:
-            state = col("AN", C.GREEN) if RAG_ENABLED else col("AUS", C.YELLOW)
+            state = col("ON", C.GREEN) if RAG_ENABLED else col("OFF", C.YELLOW)
             _ui_print(f"  per-turn retrieval (RAG): {state}  |  rag on / rag off")
     elif cmd == "context":
         _ui_print(agent.context_report())
     elif cmd == "initiative" or cmd.startswith("initiative "):
+        # `/initiative` is a DEPRECATED alias for `/project` (ADR-0011 / S16) — kept functional for one
+        # release for the nested vault-unit verbs. New work flows through `/project`.
+        _ui_print(col("[deprecated] /initiative is now an alias — use /project (kept one release)", C.YELLOW))
         _ui_print(col(_initiative_command(user_input[len("initiative"):].strip()), C.CYAN))
+    elif cmd == "switch" or cmd.startswith("switch "):
+        _ui_print(col(_switch_command(agent, user_input[len("switch"):].strip()), C.CYAN))
+    elif cmd == "lifecycle" or cmd.startswith("lifecycle "):
+        # S13b / AD-7: the engine DELIVER-leg lifecycle-completeness gate (reads the transition ledger as
+        # data → projects stage-tagged evidence → verifies completeness). Deterministic, model-free.
+        _ui_print(col(_lifecycle_command(user_input[len("lifecycle"):].strip()), C.CYAN))
+    elif cmd == "project" or cmd.startswith("project "):
+        _ui_print(col(_project_command(user_input[len("project"):].strip(), agent), C.CYAN))
+    elif cmd == "generate" or cmd.startswith("generate "):
+        _ui_print(col(_generate_command(user_input[len("generate"):].strip()), C.CYAN))
     elif cmd.startswith("tool "):
         # Deterministic, model-free tool call: `/tool <name> <json|text>`. Runs run_tool() DIRECTLY, so a
         # tool (e.g. the mpr_research panel) fires WITHOUT depending on the model electing it AND without the
@@ -5084,7 +6792,7 @@ def _terminate_autopilot(task_id: str):
                 proc.wait(timeout=5)
             except Exception:
                 proc.kill()
-        _ui_print(col(f"  [AUTO] Session zu {task_id} beendet (PID {proc.pid}) — Task ist done", C.GRAY))
+        _ui_print(col(f"  [AUTO] session for {task_id} terminated (PID {proc.pid}) — task is done", C.GRAY))
     except Exception as e:
         _ui_print(col(f"  [AUTO] could not terminate the session for {task_id}: {e!r}", C.YELLOW))
 
@@ -5160,8 +6868,8 @@ def _do_launch(task_id: str, agent: str):
         model, effort = None, None
     model  = model or spec.model                          # registry model (frontmatter `to:` overrides)
     effort = effort or spec.effort or AUTOPILOT_DEFAULT_EFFORT
-    prompt = (f"Lies und bearbeite autonom den Handover {ho.as_posix()}. "
-              f"Folge den Anweisungen in .claude/CLAUDE.md.")
+    prompt = (f"Autonomously read and work the handover {ho.as_posix()}. "
+              f"Follow the instructions in .claude/CLAUDE.md.")
     _bin = spec.bin or AUTOPILOT_CLAUDE_BIN
     _tmpl = spec.cmd_template or ""
     # #449 (review B-1): the Claude `--print` autopilot shape KEEPS its stream plumbing (--verbose +
@@ -5200,11 +6908,13 @@ def _do_launch(task_id: str, agent: str):
         # PYTHONIOENCODING=utf-8: prevents a cp1252 crash on non-ASCII characters
         # (e.g. → in handover texts) on Windows. Kimi and Claude both inherit it.
         _launch_env = {**os.environ, "PYTHONIOENCODING": "utf-8"}
-        proc = subprocess.Popen(argv, cwd=".", stdout=lf, stderr=subprocess.STDOUT,
+        # S9c: the code-agent runs in the active project's root (so its file edits land in that tree); the
+        # default project resolves to None → the process workdir, byte-identical to the pre-isolation launch.
+        proc = subprocess.Popen(argv, cwd=(_exec_cwd() or "."), stdout=lf, stderr=subprocess.STDOUT,
                                 stdin=subprocess.DEVNULL, text=True, env=_launch_env)
     except Exception as e:
         _autopilot_release()
-        _ui_print(col(f"  ✗ [AUTO] Launch {task_id} fehlgeschlagen: {e!r}", C.RED))
+        _ui_print(col(f"  ✗ [AUTO] launch {task_id} failed: {e!r}", C.RED))
         return
     with _AUTOPILOT_LOCK:
         _AUTOPILOT_PROCS[task_id] = proc
@@ -5258,7 +6968,7 @@ def _do_launch(task_id: str, agent: str):
                 _AUTOPILOT_PROCS.pop(task_id, None)
             _autopilot_release()
         ok = (rc == 0)
-        _ui_print(col(f"  {'✓' if ok else '⚠'} [AUTO] claude beendet: {task_id} "
+        _ui_print(col(f"  {'✓' if ok else '⚠'} [AUTO] claude finished: {task_id} "
                       f"(exit {rc})", C.GREEN if ok else C.YELLOW))
         # Feedback check: warn if Claude finished without writing feedback.
         # No alert if the task is already done (advance ran before _wait → feedback already deleted).
@@ -5271,8 +6981,8 @@ def _do_launch(task_id: str, agent: str):
                 already_done = t is not None and t.get("status") == "done"
                 if not already_done:
                     _ui_print(col(
-                        f"  ⚠ [AUTO] {task_id}: claude beendet (exit {rc}) "
-                        f"aber KEIN Feedback in .work/feedback/ — Task bleibt in_progress!",
+                        f"  ⚠ [AUTO] {task_id}: claude finished (exit {rc}) "
+                        f"but NO feedback in .work/feedback/ — the task stays in_progress!",
                         C.RED))
         except Exception:
             pass
@@ -5341,9 +7051,9 @@ def _reconcile_once(store: "TaskStore", enqueue, seen_mtime: Dict[str, float],
             if warn_key not in enqueued:
                 enqueued.add(warn_key)
                 _ui_print(col(
-                    f"  ⚠ [WATCHER] Fremde Datei in feedback-Inbox: {orphan.name} "
-                    f"— kein Advance möglich (kein task_id_agent-Format). "
-                    f"Analyse-Dokumente gehören nicht in die .work/feedback-Inbox",
+                    f"  ⚠ [WATCHER] foreign file in the feedback inbox: {orphan.name} "
+                    f"— cannot advance (not in task_id_agent format). "
+                    f"Analysis documents do not belong in the .work/feedback inbox",
                     C.YELLOW))
     for task in (store.list("pending") + store.list("in_progress")):
         tid = task.get("id") or ""
@@ -5399,6 +7109,7 @@ def _reconciler_loop(stop_event: threading.Event, interval: float):
     while not stop_event.wait(interval):
         if not _WATCHER_ENABLED:
             continue
+        bind_active()           # S5b: this daemon thread → the active project (re-read each tick; follows a switch)
         try:
             _reconcile_once(_store(), enqueue, seen_mtime, enqueued,
                             launch_enqueue, launched)
@@ -5444,7 +7155,7 @@ def _autoplan_tick(tid: str, enqueue) -> None:
     _AUTOPLAN_DONE += 1
     _ui_print(col(f"  [AUTOPLAN] {_AUTOPLAN_DONE}"
                   + (f"/{AUTOPILOT_MAX_TASKS}" if AUTOPILOT_MAX_TASKS > 0 else "")
-                  + " Tasks abgeschlossen", C.CYAN))
+                  + " tasks completed", C.CYAN))
     if AUTOPILOT_MAX_TASKS > 0 and _AUTOPLAN_DONE >= AUTOPILOT_MAX_TASKS:
         AUTOPILOT_AUTOPLAN = False
         if _EFFECTIVE_CFG:
@@ -5497,6 +7208,63 @@ def _code_defaults() -> Dict[str, Any]:
         },
         "lodestar": {
             "enabled": LODESTAR_ENABLED,
+        },
+        "loop_profiles": {
+            # epic #602 SUB-8a: per-TaskType loop budgets (max_iterations / retry_budget / effort). EMPTY by
+            # default → resolve_loop_profile falls back to the engine globals (MAX_ITERATIONS + the re-ask
+            # budget) → BYTE-IDENTICAL to today + single-sourced. An operator (or the private monorepo's
+            # conf/loops override layer — NOT core/conf; the boundary forbids it) may add a `default` override
+            # or per-type entries under `by_type` (e.g. {"by_type": {"research": {"max_iterations": 40}}}).
+            "default": {},
+            "by_type": {},
+        },
+        "lessons": {
+            # epic #602 SUB-5: the project-private lesson distiller (a LessonProvider registered via
+            # ack.lessons.set_provider). OPT-IN / default OFF → byte-identical: no provider is wired, so
+            # the #601 lesson seam (handover brief read + completion write + scope-aware forget) stays a
+            # no-op. When ON, EngineLessonStore persists scope-keyed lessons under ironclad_home()/lessons;
+            # the typed distiller schema is provider-internal. C1 = project-private only (global
+            # user_preferences tier deferred — needs the curated-global store + a promote() redactor).
+            "enabled":       False,
+            "max_per_scope": 200,    # compaction cap per scope (oldest dropped first)
+        },
+        "quality": {
+            # epic #602 SUB-9: a SEPARATE per-task output-quality circuit breaker (distinct from the
+            # availability breaker _CODE_AGENT_BREAKER). OPT-IN / default OFF → no breaker is built → no-op
+            # byte-identical. When ON, a QualityBreaker trips on `min_consecutive` mark-only verifier scores
+            # (ack.verify) below `threshold`; a trip is ADVISORY (escalate/surface, NEVER a hard-abort).
+            "enabled":         False,
+            "threshold":       0.5,
+            "min_consecutive": 3,
+            "window":          20,
+        },
+        "process": {
+            # epic #602 SUB-6: Process-Level Self-Correction. OPT-IN / default OFF → no process-lesson is
+            # recorded at completion and no hint is injected pre-turn (byte-identical). It records TYPED
+            # process-lessons via the concrete EngineLessonStore (so it also needs lessons.enabled), NOT the
+            # string-only ack.lessons seam.
+            "enabled":   False,
+            "max_hints": 3,
+        },
+        "verify": {
+            # epic #602 SUB-4 / 2.1: the MARK-ONLY Verifier on the dev-task pipeline. OPT-IN / default OFF →
+            # no hook is registered, so the `pre_handover` Hook-Bus dispatch is an O(1) no-op (byte-identical).
+            # When ON, a runner evaluates each staged task: deterministic BEHAVIORAL rules over task_json +
+            # (when a memory tier is up) GROUNDING of the handover's claims against the cold store. It produces
+            # a VerdictResult the Quality breaker (#602 SUB-9) reads — it NEVER gates a handover. The LLM-judge
+            # is a separate explicit opt-in (it charges the budget ledger) and is not run by this hook.
+            "enabled":             False,
+            "grounding_threshold": 0.5,
+        },
+        "strategy": {
+            # epic #602 SUB-3/SUB-7 (2.4-2.5): the failure→action policy on the code-agent failover. OPT-IN /
+            # default OFF → no FailureClass is recorded on a run failure and no strategy is applied
+            # (byte-identical). When ON, a code-agent run failure is classified into the shared FailureClass
+            # (#805) and the Strategy Revisor maps it to a targeted action on the failover/retry path (#806):
+            # a per-task attempt counter vs `budget` escalates to HUMAN_ESCALATION when spent (no endless
+            # silent failover). MARK-ONLY/advisory — it surfaces, never hard-aborts.
+            "enabled": False,
+            "budget":  3,
         },
         "security": {
             # Phase-d trust profile (single-tenant): open | token | sealed.
@@ -5620,6 +7388,10 @@ def _code_defaults() -> Dict[str, Any]:
             # Open plugin surface: a dir scanned for `skills/*.py` plugins at startup
             # (GX10_PLUGINS_DIR). Empty = no plugins. See docs/plugin-api.md.
             "plugins_dir":   "",
+            # ROUTE-1 (#503): optional list of scripts run (fail-soft) after a pipeline advance to
+            # regenerate deployment-specific vault projections. Empty (default) ⇒ no subprocess. A
+            # deploy sets e.g. ["scripts/update_capability_tracking.py", …]; absent scripts are skipped.
+            "post_advance_hooks": [],
         },
         "generation": {
             "temperature":   TEMPERATURE,
@@ -5825,21 +7597,6 @@ def _apply_env(cfg: Dict[str, Any]) -> Dict[str, Any]:
     return cfg
 
 
-def _apply_cli(cfg: Dict[str, Any], args) -> Dict[str, Any]:
-    """CLI override (level 4, strongest). Only flags actually set."""
-    if args.base_url   is not None: cfg["connection"]["base_url"]    = args.base_url
-    if args.model      is not None: cfg["connection"]["model"]       = args.model
-    if args.prompt     is not None: cfg["paths"]["system_prompt"]    = args.prompt
-    if args.workdir    is not None: cfg["paths"]["workdir"]          = args.workdir
-    if args.max_tokens is not None: cfg["generation"]["max_tokens"]  = args.max_tokens
-    if args.thinking   is not None: cfg["generation"]["thinking_mode"] = args.thinking
-    if args.platform   is not None: cfg["platform"]["mode"]          = args.platform
-    if args.onboarding is not None: cfg["onboarding"]["enabled"]     = args.onboarding
-    if args.autopilot  is not None: cfg["autopilot"]["enabled"]      = args.autopilot
-    if args.no_stream:              cfg["generation"]["stream"]      = False
-    return cfg
-
-
 def _apply_config(cfg: Dict[str, Any]):
     """Writes the merged config back into the module globals, so the
     existing references (run_tool, macros, _trim_context, _classify_thinking,
@@ -5916,14 +7673,17 @@ def _apply_config(cfg: Dict[str, Any]):
     CHARS_PER_TOKEN    = float(ctx.get("chars_per_token", CHARS_PER_TOKEN))   # #366 calibrated fallback
     THINKING_RESERVE   = int(ctx.get("thinking_reserve", THINKING_RESERVE))   # #366 D5
     MEMORY_BRIEF_TOKENS = int(ctx.get("memory_brief_tokens", MEMORY_BRIEF_TOKENS))   # #458 D1 handover brief budget
-    if TOKEN_BUDGET:
+    if TOKEN_BUDGET and not (os.environ.get("GX10_MAX_CTX_CHARS") or os.environ.get("GX10_TRIM_TARGET_CHARS")):
+        # MEM-9: derive the char watermark from the window (output/RAG/summary reserve). BUDGET-3 (#503):
+        # SKIP the derive when the operator explicitly set GX10_MAX_CTX_CHARS / GX10_TRIM_TARGET_CHARS, so
+        # those env vars are honored instead of being silently overwritten (the token budget stays primary).
         MAX_CTX_CHARS, TRIM_TARGET_CHARS = _derive_ctx_budget(
             MAX_MODEL_LEN, MAX_TOKENS, RAG_MAX_TOKENS, SUMMARY_MAX_TOKENS, CHARS_PER_TOKEN)
     _wcfg = cfg.get("workers", {})
     WORKER_MEMORY      = bool(_wcfg.get("memory_read", True))    # §3c MAP: default ON (06-18)
     WORKER_WRITE       = bool(_wcfg.get("memory_write", True))   # §3c REDUCE: default ON (06-18)
     WORKER_WRITE_MODE  = (str(_wcfg.get("write_mode", "reducer")).strip().lower() or "reducer")
-    WARM_SESSION_ID    = (os.environ.get("GX10_SESSION_ID", "").strip() or WARM_SESSION_ID)
+    WARM_SESSION_ID    = (os.environ.get("GX10_SESSION_ID", "").strip() or "main")   # pure-from-base, no self-ref accumulation (S3b)
 
     _PLANNING_KW = tuple(ta["planning_keywords"])
     _ROUTINE_KW  = tuple(ta["routine_keywords"])
@@ -5933,6 +7693,7 @@ def _apply_config(cfg: Dict[str, Any]):
 
     # Memory config: file (conf/memory/memory.json) OR env (GX10_MEMORY_URL).
     # Optional — without base_url _MEMORY_CONFIG stays empty → memory off (hooks inert).
+    _MEMORY_CONFIG = {}                       # pure-from-base: re-derive fresh from file + env each reload (no stale keys, S3b)
     _mem_cfg_path = Path("conf/memory/memory.json")
     if _mem_cfg_path.exists():
         try:
@@ -5956,6 +7717,7 @@ def _apply_config(cfg: Dict[str, Any]):
 
     # Warm tier config (B0): file (conf/warm/warm.json) OR env (GX10_WARM_URL).
     # Optional — without a url _WARM_CONFIG stays empty → warm tier off (no-op, fail-soft).
+    _WARM_CONFIG = {}                         # pure-from-base: re-derive fresh from file + env each reload (S3b)
     _warm_cfg_path = Path("conf/warm/warm.json")
     if _warm_cfg_path.exists():
         try:
@@ -5977,6 +7739,518 @@ def _apply_config(cfg: Dict[str, Any]):
     if new_max != _UI_MAX_LINES:
         _UI_MAX_LINES = new_max
         _UI_LINES = deque(_UI_LINES, maxlen=new_max)
+
+    _apply_lessons_provider(cfg)   # epic #602 SUB-5: register/clear the opt-in lesson provider
+    _apply_lessons_consumer(cfg)   # epic #602 SUB-5/2.3 (#804): register/clear the post_feedback Lessons consumer (AFTER the provider)
+    _apply_quality_breaker(cfg)    # epic #602 SUB-9: build/clear the opt-in quality breaker
+    _apply_verifier(cfg)           # epic #602 SUB-4/2.1: register/clear the opt-in pre_handover Verifier
+    _apply_quality_consumer(cfg)   # epic #602 SUB-9/2.7: register/clear the post_handover quality consumer
+    _apply_strategy(cfg)           # epic #602 SUB-3/2.4: capture strategy.enabled for the failure recorder
+    _apply_process_consumer(cfg)   # epic #602 SUB-6/2.2 (#803): register/clear the post_feedback Process-SC consumer
+
+
+def _apply_lessons_provider(cfg: Dict[str, Any]) -> None:
+    """Register (or clear) the project-private lesson distiller per ``lessons.enabled`` (epic #602 SUB-5).
+
+    Runs on every config application (boot + ``/config set`` + ``/switch``). OPT-IN: when on and no provider
+    is wired, registers an :class:`~engine.lesson_store.EngineLessonStore` (persisting under
+    ``ironclad_home()/lessons``); when off, clears it — but ONLY our own store, so a richer extension that
+    registered its own provider is never clobbered (mirrors the dev-process driver's let-the-richer-one-win
+    rule). Lazy-imports ``ack`` (never at the gx10 top level) + the store. Fail-soft — a registration hiccup
+    must never fail config application; default-off keeps the seam a byte-identical no-op."""
+    try:
+        from ack import lessons as _lessons              # lazy: never import ack at gx10 top-level (S6b lesson)
+        from lesson_store import EngineLessonStore        # bare engine-sibling import (like project_registry)
+    except Exception:   # noqa: BLE001 — seam/store unavailable ⇒ leave the no-op default
+        return
+    try:
+        enabled = bool(_cfg_get(cfg, "lessons.enabled"))
+        current = _lessons.get_provider()
+        if enabled:
+            # Pass the RAW cap straight through — the store's _safe_cap coerces it (bad/overflow/None ⇒
+            # default), so there is no int() here that could raise and derail registration. The DISABLE
+            # branch reads no cap at all, so a malformed cap can never leave a store wired while off.
+            raw_cap = _cfg_get(cfg, "lessons.max_per_scope")
+            if current is None:                          # don't clobber a foreign provider (richer wins)
+                from project_registry import ironclad_home
+                _lessons.set_provider(EngineLessonStore(ironclad_home() / "lessons", max_per_scope=raw_cap))
+            elif isinstance(current, EngineLessonStore):  # already ours ⇒ apply a live cap change
+                current.configure(max_per_scope=raw_cap)
+        elif isinstance(current, EngineLessonStore):     # off ⇒ clear only OUR store (raise-free path)
+            _lessons.set_provider(None)
+    except Exception:   # noqa: BLE001 — advisory wiring: never break config application
+        return
+
+
+def _lessons_consumer_hook(ctx) -> None:
+    """`post_feedback` consumer (#602 2.3 / #804): on a FRESH task completion, report the completion feedback
+    as a scoped, actionable loop-lesson via the registered `ack.lessons` provider — the #601 S14-4 write
+    re-homed from the inline advance site onto the Hook-Bus (one consistent reflection path, outside the vault
+    lock). Gates on the completion result so it never fires on an already-done re-advance or an error, and on a
+    registered provider + a non-empty archived feedback file (BYTE-IDENTICAL no-op when none is wired — no file
+    read). **Fail-soft** (never raises — a lesson write must never break a turn)."""
+    try:
+        ctx = ctx or {}
+        if not str(ctx.get("result") or "").startswith("OK: pipeline advanced"):
+            return                                   # only a fresh completed advance (not already-done / error)
+        from ack import lessons as _lessons          # lazy: never import ack at gx10 top-level (S6b lesson)
+        if _lessons.get_provider() is None:          # no backend wired ⇒ zero extra work (byte-identical)
+            return
+        task_id = str(ctx.get("task_id") or ""); agent = str(ctx.get("agent") or "")
+        vfb = archive_feedback_dir() / f"{task_id}_{agent}-feedback.md"   # feedback is archived by step 2 of the advance
+        _fb = vfb.read_text(encoding="utf-8").strip() if vfb.exists() else ""
+        if _fb:
+            _lessons.report_lesson(_active_mem_ns(), _fb, {"task_id": task_id, "source": "task_completion"})
+    except Exception:   # noqa: BLE001 — advisory: a lesson write must never break a turn
+        return
+
+
+def _apply_lessons_consumer(cfg: Dict[str, Any]) -> None:
+    """Register (or unregister) the `post_feedback` Lessons consumer per **provider presence** (#602 2.3 /
+    #804) — NOT a config flag: this mirrors the inline write it replaces, which fired whenever a provider was
+    registered (a foreign provider stays honoured even with `lessons.enabled` off). Runs AFTER
+    `_apply_lessons_provider` in `_apply_config`, so when `lessons.enabled` flips the provider is wired/cleared
+    first and the consumer follows. OPT-IN: no provider ⇒ the hook is removed (dispatch O(1) no-op →
+    byte-identical default). Idempotent (dedup by identity). Lazy-imports ``ack`` (S6b). Fail-soft."""
+    try:
+        from ack import hooks as _hooks       # lazy: never import ack at gx10 top-level (S6b lesson)
+        from ack import lessons as _lessons
+    except Exception:   # noqa: BLE001 — bus/seam unavailable ⇒ leave the no-op default
+        return
+    try:
+        if _lessons.get_provider() is not None:
+            _hooks.register_hook("post_feedback", _lessons_consumer_hook)
+        else:
+            _hooks.unregister_hook("post_feedback", _lessons_consumer_hook)
+    except Exception:   # noqa: BLE001 — advisory wiring: never break config application
+        return
+
+
+def _loop_profile(task_type=None):
+    """Resolve the loop budget for *task_type* (#602 SUB-8a) — the ``loop_profiles`` config deep-merged over
+    the engine globals (``MAX_ITERATIONS`` + the re-ask budget). With nothing configured (the default) the
+    profile is BYTE-IDENTICAL to today's limits; ``task_type=None`` (the chat loop) selects the default
+    profile. Fail-soft: any resolver/import hiccup falls back to the globals. Never raises."""
+    try:
+        from ack.loop_profile import resolve_loop_profile      # lazy: never import ack at gx10 top-level
+        from ack.validated_emit import DEFAULT_RETRY_BUDGET, MAX_RETRY_BUDGET
+        cfg = _EFFECTIVE_CFG if _EFFECTIVE_CFG is not None else _code_defaults()
+        return resolve_loop_profile(
+            (cfg or {}).get("loop_profiles"), task_type,
+            default_max_iterations=MAX_ITERATIONS,
+            default_retry_budget=DEFAULT_RETRY_BUDGET,
+            max_retry_budget=MAX_RETRY_BUDGET,
+        )
+    except Exception:   # noqa: BLE001 — never let profile resolution break the loop; fall back to the globals
+        from types import SimpleNamespace   # stdlib (no ack import in the fallback) → duck-typed .max_iterations
+        return SimpleNamespace(max_iterations=MAX_ITERATIONS, retry_budget=3, effort="medium", eval_verifiers=())
+
+
+def _apply_quality_breaker(cfg: Dict[str, Any]) -> None:
+    """Build (or clear) the SEPARATE quality breaker per ``quality.enabled`` (epic #602 SUB-9). Runs on every
+    config application (boot + ``/config set`` + ``/switch``). OPT-IN: when on and none exists, build a
+    ``QualityBreaker`` from the config (keeping an already-built one so its accumulated streak survives a
+    re-apply); when off, clear it. Lazy-imports ``ack`` (never at the gx10 top level). **Fail-soft** — a
+    hiccup never breaks config application; default-off keeps it a byte-identical no-op."""
+    global _QUALITY_BREAKER
+    try:
+        enabled = bool(_cfg_get(cfg, "quality.enabled"))
+        if not enabled:
+            _QUALITY_BREAKER = None
+            return
+        if _QUALITY_BREAKER is None:
+            from ack.quality import QualityBreaker   # lazy: never import ack at gx10 top-level (S6b lesson)
+            q = (_cfg_get(cfg, "quality") or {}) if isinstance(_cfg_get(cfg, "quality"), dict) else {}
+            # `.get(key, default)` (not _cfg_get) so a PARTIAL quality block falls back to the code defaults
+            # rather than passing None (which would coerce threshold to a never-trip 0.0).
+            _QUALITY_BREAKER = QualityBreaker(
+                threshold=q.get("threshold", 0.5),
+                min_consecutive=q.get("min_consecutive", 3),
+                window=q.get("window", 20),
+            )
+    except Exception:   # noqa: BLE001 — advisory wiring: never break config application
+        return
+
+
+def _quality_breaker():
+    """The process-global quality breaker (#602 SUB-9), or ``None`` when ``quality.enabled`` is off (the
+    default → no-op byte-identical). Consumers feed it verifier scores via ``.record(score)`` and surface
+    ``.tripped`` / ``.snapshot()`` — advisory only."""
+    return _QUALITY_BREAKER
+
+
+# ─── epic #602 SUB-4 / 2.1: mark-only Verifier on the dev-task pipeline (pre_handover) ─────────────
+_LAST_VERDICT = None
+_VERIFY_GROUNDING_THRESHOLD = 0.5   # captured at config-apply time (#809); the verifier reads this, not _EFFECTIVE_CFG
+
+
+def _set_last_verdict(v) -> None:
+    global _LAST_VERDICT
+    _LAST_VERDICT = v
+
+
+def _last_verdict():
+    """The most recent mark-only Verifier :class:`~ack.verify.VerdictResult` (#602 2.1), or ``None`` when the
+    Verifier is off / has not run yet. Consumed by the Quality breaker (#602 SUB-9 / 2.7) — advisory only."""
+    return _LAST_VERDICT
+
+
+def _verifier_hook(ctx) -> None:
+    """Mark-only Verifier for a staged handover (#602 2.1) — a ``pre_handover`` Hook-Bus subscriber. Evaluates
+    the task with deterministic BEHAVIORAL rules over ``task_json`` and (when a memory tier is up) GROUNDING of
+    the handover's claims against the cold store, then stores a combined :class:`~ack.verify.VerdictResult` for
+    the Quality breaker. **MARK-ONLY** (never gates a handover) and **fail-soft** (never raises; the bus also
+    swallows). The opt-in LLM-judge is a SEPARATE explicit activation (it charges the budget ledger) and is not
+    run here. Registered only while ``verify.enabled`` (see :func:`_apply_verifier`)."""
+    try:
+        from ack.verify import verify_rules, verify_grounding, VerdictResult   # lazy: never import ack at top
+        td = ctx if isinstance(ctx, dict) else {}
+        raw = td.get("task_json")
+        if isinstance(raw, dict):
+            fields = raw
+        elif isinstance(raw, str) and raw.strip():
+            try:
+                fields = json.loads(raw)
+            except Exception:   # noqa: BLE001 — a non-JSON task_json → no field rules; grounding still runs
+                fields = {}
+        else:
+            fields = {}
+        if not isinstance(fields, dict):
+            fields = {}
+        handover_md = str(td.get("handover_md") or "")
+
+        # 8b — which mark-only verifiers run for THIS task's type (`LoopProfile.eval_verifiers`); empty → the
+        # DEFAULT rules + grounding set (the operator decision). The async LLM-judge is a SEPARATE opt-in
+        # consumer (validated_emit's `strategist` / a future async eval-gate), not run by this sync hook.
+        try:
+            evs = tuple(_loop_profile(fields.get("type")).eval_verifiers or ())
+        except Exception:   # noqa: BLE001 — profile hiccup → the default set
+            evs = ()
+        run_rules = ("rules" in evs) if evs else True
+        run_grounding = ("grounding" in evs) if evs else True
+
+        verdicts = []
+        if run_rules:
+            # BEHAVIORAL (beyond-schema) quality rules — advisory; the ACK gate already enforces schema validity.
+            rules = [
+                ("description_substantive", lambda f: len(str((f or {}).get("description", "")).strip()) >= 40),
+                ("title_specific",          lambda f: len(str((f or {}).get("title", "")).split()) >= 3),
+            ]
+            verdicts.append(verify_rules(fields, rules))
+
+        # GROUNDING — only when selected AND a memory tier is up; its OWN try so a memory hiccup drops ONLY
+        # grounding and never discards the rules verdict. Capped (12 claims) to bound the sync cold-store lookups.
+        if run_grounding:
+            try:
+                if _MEMORY is not None and _MEMORY.is_available():
+                    claims = [ln.strip() for ln in handover_md.splitlines()
+                              if len(ln.strip()) >= 30 and not ln.lstrip().startswith("#")][:12]
+                    if claims:
+                        verdicts.append(verify_grounding(
+                            claims,
+                            lambda c: bool(_MEMORY.search(c, limit=3)),
+                            threshold=_VERIFY_GROUNDING_THRESHOLD,
+                        ))
+            except Exception:   # noqa: BLE001 — a memory hiccup drops only grounding; the rules verdict survives
+                pass
+
+        if verdicts:
+            score = sum(v.score for v in verdicts) / len(verdicts)
+            passed = all(v.passed for v in verdicts)
+            reason = "; ".join(f"{v.verifier} {v.score:.2f}" for v in verdicts)
+            _set_last_verdict(VerdictResult(passed, score, reason, "handover"))
+    except Exception:   # noqa: BLE001 — mark-only + fail-soft: a Verifier hiccup never breaks a handover
+        pass
+
+
+def _apply_verifier(cfg: Dict[str, Any]) -> None:
+    """Register (or unregister) the mark-only Verifier on the ``pre_handover`` Hook-Bus event per
+    ``verify.enabled`` (#602 2.1). Runs on every config application (boot + ``/config set`` + ``/switch``).
+    OPT-IN: when off the hook is removed (dispatch O(1) no-op → byte-identical); when on it is registered
+    (additive + idempotent — dedup by identity, so a re-apply never double-registers, and it never clobbers a
+    sibling hook). Lazy-imports ``ack.hooks`` (never at the gx10 top level). Fail-soft — a hiccup never breaks
+    config application."""
+    try:
+        from ack import hooks as _hooks   # lazy: never import ack at gx10 top-level (S6b lesson)
+    except Exception:   # noqa: BLE001 — bus unavailable ⇒ leave the no-op default
+        return
+    global _VERIFY_GROUNDING_THRESHOLD
+    try:   # capture the grounding threshold at apply-time (the verifier reads the flag, not _EFFECTIVE_CFG)
+        th = _cfg_get(cfg, "verify.grounding_threshold")
+        _VERIFY_GROUNDING_THRESHOLD = float(th) if isinstance(th, (int, float)) and not isinstance(th, bool) else 0.5
+    except Exception:   # noqa: BLE001 — bad value → the safe default
+        _VERIFY_GROUNDING_THRESHOLD = 0.5
+    try:
+        if bool(_cfg_get(cfg, "verify.enabled")):
+            _hooks.register_hook("pre_handover", _verifier_hook)
+        else:
+            _hooks.unregister_hook("pre_handover", _verifier_hook)
+    except Exception:   # noqa: BLE001 — advisory wiring: never break config application
+        return
+
+
+# ─── epic #602 SUB-9 / 2.7: Quality breaker CONSUMER — feed Verifier scores, surface a trip ────────
+_QUALITY_TRIPPED = None
+
+
+def _quality_tripped():
+    """The latest :class:`~ack.quality.QualitySnapshot` from a tripped quality breaker (#602 2.7), or ``None``
+    when untripped / off. Advisory + observability only — a trip NEVER hard-aborts a turn."""
+    return _QUALITY_TRIPPED
+
+
+def _quality_consumer_hook(ctx) -> None:
+    """`post_handover` consumer (#602 2.7): feed the latest mark-only Verifier score (`_last_verdict()`) into
+    the quality breaker and SURFACE a sustained-degradation trip — advisory (escalate/surface), NEVER a gate.
+    No-op when the breaker is off (`quality.enabled`) or no verdict is present; **fail-soft** (never raises)."""
+    global _QUALITY_TRIPPED
+    try:
+        qb = _quality_breaker()
+        v = _last_verdict()
+        if qb is None or v is None:
+            return
+        was_tripped = _QUALITY_TRIPPED is not None
+        tripped = qb.record(v.score)
+        _set_last_verdict(None)   # feed-once: consume the verdict so a later handover can't re-feed it stale
+        if tripped:
+            _QUALITY_TRIPPED = qb.snapshot()
+            if not was_tripped:   # surface only on the not-tripped → tripped transition (no re-print while latched)
+                _ui_print(col(f"  [quality] output-quality breaker tripped — {_QUALITY_TRIPPED.reason}", C.YELLOW))
+        else:
+            _QUALITY_TRIPPED = None
+    except Exception:   # noqa: BLE001 — mark-only + fail-soft: a quality hiccup never breaks a handover
+        return
+
+
+def _apply_quality_consumer(cfg: Dict[str, Any]) -> None:
+    """Register (or unregister) the `post_handover` quality consumer per ``quality.enabled`` (#602 2.7). When
+    on, the breaker is fed the Verifier scores and a trip is surfaced; when off the hook is removed (dispatch
+    O(1) no-op → byte-identical). Idempotent (dedup by identity). Lazy-imports ``ack.hooks`` (S6b). Fail-soft."""
+    try:
+        from ack import hooks as _hooks   # lazy: never import ack at gx10 top-level (S6b lesson)
+    except Exception:   # noqa: BLE001 — bus unavailable ⇒ leave the no-op default
+        return
+    try:
+        if bool(_cfg_get(cfg, "quality.enabled")):
+            _hooks.register_hook("post_handover", _quality_consumer_hook)
+        else:
+            _hooks.unregister_hook("post_handover", _quality_consumer_hook)
+    except Exception:   # noqa: BLE001 — advisory wiring: never break config application
+        return
+
+
+# ─── epic #602 SUB-3 / 2.4: FailureClass at the code-agent failover (the Strategy consumer's input) ───
+_LAST_FAILURE_CLASS = None
+_STRATEGY_ENABLED = False
+_STRATEGY_BUDGET = 3
+_FAILURE_ATTEMPTS: "Dict[str, int]" = {}   # per-task code-agent failure counter (#602 2.5); reset on success
+_LAST_STRATEGY = None
+
+
+def _apply_strategy(cfg: Dict[str, Any]) -> None:
+    """Capture ``strategy.enabled`` + ``strategy.budget`` at config-application time (#602 2.4/2.5), mirroring
+    the other `_apply_*` seams. Runtime (the server feedback path) reads the `_STRATEGY_ENABLED` /
+    `_STRATEGY_BUDGET` flags — NOT `_EFFECTIVE_CFG`, which only the config-tree loader sets, not
+    `_apply_config`. Default OFF → byte-identical. Fail-soft — never breaks config application."""
+    global _STRATEGY_ENABLED, _STRATEGY_BUDGET
+    try:
+        _STRATEGY_ENABLED = bool(_cfg_get(cfg, "strategy.enabled"))
+        b = _cfg_get(cfg, "strategy.budget")
+        _STRATEGY_BUDGET = b if isinstance(b, int) and not isinstance(b, bool) and b >= 1 else 3
+    except Exception:   # noqa: BLE001 — advisory wiring: default to off
+        _STRATEGY_ENABLED = False
+        _STRATEGY_BUDGET = 3
+
+
+def _last_strategy():
+    """The most recent :class:`~ack.strategy.Strategy` from the failover consumer (#602 2.5), or ``None``.
+    Advisory / observability — never gates."""
+    return _LAST_STRATEGY
+
+
+def _failover_budget(task_id) -> int:
+    """The **per-TaskType** code-agent failover attempt budget (#602 2.6 / #807): the active task's
+    `loop_profiles.by_type[<type>].retry_budget` layered over `strategy.budget` (the default) and clamped to
+    the hard re-ask ceiling (`MAX_RETRY_BUDGET`) — so a per-type override can only LOWER the budget (e.g. a
+    `chat`/`bug` type escalates sooner). The task's type is read from the store; any hiccup / unknown type /
+    empty `by_type` → the default `_STRATEGY_BUDGET` (byte-identical to the flat #806 budget). Reads
+    `loop_profiles` from `_EFFECTIVE_CFG` (the `_loop_profile` accessor pattern). Never raises."""
+    try:
+        task_type = (_store().get(task_id) or {}).get("type")
+    except Exception:   # noqa: BLE001 — store hiccup → no type → the default budget
+        task_type = None
+    try:
+        from ack.loop_profile import resolve_loop_profile        # lazy: never import ack at gx10 top-level
+        from ack.validated_emit import MAX_RETRY_BUDGET
+        cfg = _EFFECTIVE_CFG if _EFFECTIVE_CFG is not None else _code_defaults()
+        prof = resolve_loop_profile(
+            (cfg or {}).get("loop_profiles"), task_type,
+            default_max_iterations=MAX_ITERATIONS,
+            default_retry_budget=_STRATEGY_BUDGET,
+            max_retry_budget=MAX_RETRY_BUDGET,
+        )
+        return int(prof.retry_budget)
+    except Exception:   # noqa: BLE001 — resolver hiccup → the flat default
+        return _STRATEGY_BUDGET
+
+
+def _revise_on_failure(task_id, result_cls):
+    """#602 2.5 / #806: consult the Strategy Revisor on a code-agent run result and **surface** a
+    ``HUMAN_ESCALATION`` when the per-task attempt budget is spent — instead of an endless silent failover.
+    Uses the FRESH ``result_cls`` (never a stale ``_last_failure_class``); a successful run RESETS the task's
+    attempt counter. **OPT-IN** per ``strategy.enabled`` (default OFF → ``None``, byte-identical). Returns the
+    chosen ``StrategyAction`` value (or ``None``). **Fail-soft** — never breaks the feedback path."""
+    global _LAST_STRATEGY
+    try:
+        if not _STRATEGY_ENABLED or not task_id:
+            return None
+        from providers import code_agent_strategy, RESULT_OK   # bare engine-sibling import
+        if result_cls == RESULT_OK:
+            _FAILURE_ATTEMPTS.pop(task_id, None)               # success → reset (also avoids a stale class)
+            return None
+        if len(_FAILURE_ATTEMPTS) > 4096:                      # runaway guard for the per-task counter map
+            _FAILURE_ATTEMPTS.clear()
+        n = _FAILURE_ATTEMPTS.get(task_id, 0) + 1
+        _FAILURE_ATTEMPTS[task_id] = n
+        strat = code_agent_strategy(result_cls, attempt=n, budget=_failover_budget(task_id))
+        if strat is None:
+            return None
+        _LAST_STRATEGY = strat
+        if getattr(strat, "escalate", False):
+            _ui_print(col(f"  [strategy] human escalation after {n} attempt(s) on {task_id} "
+                          f"({result_cls}) → {strat.action.value}", C.YELLOW))
+        return strat.action.value
+    except Exception:   # noqa: BLE001 — advisory: a strategy hiccup must never break the feedback path
+        return None
+
+
+def _last_failure_class():
+    """The shared :class:`~ack.failure_class.FailureClass` of the most recent code-agent run failure (#602
+    2.4), or ``None``. Read by the Strategy Revisor consumer (#602 2.5 / #806) — advisory only."""
+    return _LAST_FAILURE_CLASS
+
+
+def _record_failure_class(result_cls):
+    """On a code-agent run result, record + return the shared FailureClass (#602 2.4 / #805) so the Strategy
+    consumer (2.5) can act on WHY a run failed. **OPT-IN per ``strategy.enabled``** (default OFF → ``None``,
+    byte-identical: nothing recorded, no response field). Returns the FailureClass string value, or ``None``
+    for ``RESULT_OK`` / an unknown result / when off. **Fail-soft** — classifying a failure must never break
+    the feedback path."""
+    global _LAST_FAILURE_CLASS
+    try:
+        if not _STRATEGY_ENABLED:
+            return None
+        from providers import result_failure_class   # bare engine-sibling import (like project_registry)
+        fc = result_failure_class(result_cls)
+        if fc is None:
+            return None
+        _LAST_FAILURE_CLASS = fc
+        return fc.value
+    except Exception:   # noqa: BLE001 — advisory: a classification hiccup must never break the feedback path
+        return None
+
+
+# ─── epic #602 SUB-6: Process-Level Self-Correction (post_feedback → pre_turn) ─────────────────────
+def _concrete_lesson_provider():
+    """The registered lesson provider IFF it is the concrete :class:`~engine.lesson_store.EngineLessonStore`
+    (typed ``record``/``by_category``); ``None`` otherwise. Process-SC reads/writes TYPED process-lessons
+    only through the concrete class — the string-only ``ack.lessons`` seam can't round-trip them. Never raises."""
+    try:
+        from ack import lessons as _lessons     # lazy: never import ack at gx10 top-level (S6b lesson)
+        from lesson_store import EngineLessonStore   # bare engine-sibling import (like project_registry)
+        p = _lessons.get_provider()
+        return p if isinstance(p, EngineLessonStore) else None
+    except Exception:   # noqa: BLE001 — advisory: a lookup hiccup → no concrete provider
+        return None
+
+
+def _record_process_lesson(existing, agent: str = "") -> None:
+    """At task completion, distill a TYPED process-lesson from the workflow signal and store it via the
+    concrete provider (#602 SUB-6). OPT-IN: a no-op when ``process.enabled`` is off OR no concrete
+    EngineLessonStore is registered (byte-identical). Fail-soft — never raises, never breaks a turn."""
+    try:
+        cfg = _EFFECTIVE_CFG if _EFFECTIVE_CFG is not None else _code_defaults()
+        if not bool(_cfg_get(cfg, "process.enabled")):
+            return
+        provider = _concrete_lesson_provider()
+        if provider is None:
+            return
+        scope = _active_mem_ns()
+        if not scope:    # no project bound (base partition) → no-op, byte-identical
+            return
+        from ack.process import ProcessSignal, ProcessLessonKind, distill_process_lesson
+        from lesson_store import LessonCategory
+        task_type = str((existing or {}).get("type") or "") if isinstance(existing, dict) else ""
+        lesson = distill_process_lesson(ProcessSignal(task_type=task_type, succeeded=True, agent=str(agent or "")))
+        if lesson is None:
+            return
+        cat = (LessonCategory.BEST_KNOWN_PATH if lesson.kind == ProcessLessonKind.WORKING_PATH
+               else LessonCategory.LAST_FAILURE_REASON)
+        provider.record(scope, lesson.text, cat, {"source": "process_sc", "kind": lesson.kind.value})
+    except Exception:   # noqa: BLE001 — advisory: process-SC must never break a turn
+        return
+
+
+def _process_consumer_hook(ctx) -> None:
+    """`post_feedback` consumer (#602 2.2 / #803): on a FRESH task completion, distill + store a TYPED
+    process-lesson via the concrete provider — the Process-SC write re-homed from the inline advance site onto
+    the Hook-Bus (one consistent reflection path, outside the vault lock). Gates on the completion result so it
+    never fires on an already-done re-advance or an error; `_record_process_lesson` keeps its own
+    `process.enabled` + concrete-provider + bound-scope gates (byte-identical no-op by default). **Fail-soft**
+    (never raises — a process-SC hiccup must not break a turn)."""
+    try:
+        ctx = ctx or {}
+        if not str(ctx.get("result") or "").startswith("OK: pipeline advanced"):
+            return                                   # only a fresh completed advance (not already-done / error)
+        task_id = str(ctx.get("task_id") or "")
+        existing = _store().get(task_id) if task_id else None
+        _record_process_lesson(existing, str(ctx.get("agent") or ""))
+    except Exception:   # noqa: BLE001 — advisory: process-SC must never break a turn
+        return
+
+
+def _apply_process_consumer(cfg: Dict[str, Any]) -> None:
+    """Register (or unregister) the `post_feedback` Process-SC consumer per ``process.enabled`` (#602 2.2 /
+    #803), mirroring the other `_apply_*` consumer seams. OPT-IN: when off the hook is removed (dispatch O(1)
+    no-op → byte-identical); when on it is registered (additive + idempotent — dedup by identity, never
+    clobbers a sibling). Lazy-imports ``ack.hooks`` (never at the gx10 top level, S6b). Fail-soft — a wiring
+    hiccup never breaks config application."""
+    try:
+        from ack import hooks as _hooks   # lazy: never import ack at gx10 top-level (S6b lesson)
+    except Exception:   # noqa: BLE001 — bus unavailable ⇒ leave the no-op default
+        return
+    try:
+        if bool(_cfg_get(cfg, "process.enabled")):
+            _hooks.register_hook("post_feedback", _process_consumer_hook)
+        else:
+            _hooks.unregister_hook("post_feedback", _process_consumer_hook)
+    except Exception:   # noqa: BLE001 — advisory wiring: never break config application
+        return
+
+
+def _process_hint() -> str:
+    """A pre-turn hint of known working approaches (process-lessons) for the active scope (#602 SUB-6), or
+    ``""`` (byte-identical) when ``process.enabled`` is off / no concrete provider / none recorded. Fail-soft."""
+    try:
+        cfg = _EFFECTIVE_CFG if _EFFECTIVE_CFG is not None else _code_defaults()
+        if not bool(_cfg_get(cfg, "process.enabled")):
+            return ""
+        provider = _concrete_lesson_provider()
+        if provider is None:
+            return ""
+        scope = _active_mem_ns()
+        if not scope:    # no project bound (base partition) → no hint, byte-identical
+            return ""
+        from ack.process import format_process_hint
+        from lesson_store import LessonCategory
+        try:
+            limit = int(_cfg_get(cfg, "process.max_hints"))
+        except Exception:   # noqa: BLE001 — incl. OverflowError(int(inf)) → fall back to the default, not ""
+            limit = 3
+        texts = provider.by_category(scope, LessonCategory.BEST_KNOWN_PATH, limit=limit)
+        return format_process_hint(texts, limit=limit)
+    except Exception:   # noqa: BLE001 — advisory hint: never break a turn
+        return ""
 
 
 # ─── Main ─────────────────────────────────────────────────────

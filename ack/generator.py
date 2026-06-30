@@ -37,11 +37,19 @@ USAGE
 -----
     python -m ack.generator --domain my-domain \\
         --case my-feature --description "What this case does" \\
+        [--kind case|prompt] \\
         [--prefix x] [--phase MVP] [--tier high] [--type implementation] \\
         [--assignee claude-opus-4-8] [--effort high] [--tags "tag1,tag2"] \\
-        [--output-root cases] [--template <dir>] [--force] [--dry-run]
+        [--output-root cases] [--template <dir>] [--force] [--dry-run] \\
+        [--reserved-capabilities cap1,cap2]
 
-Exit codes: 0 = clean, 2 = merge conflict(s) written (resolve by hand), 1 = error.
+``--kind case`` (default) renders the ``new-case`` paved road (a CASE+run tool +
+spec/backlog/gap-tracking/tests). ``--kind prompt`` renders the ``new-prompt`` tree
+(a ``kind: prompt`` library item: ``SKILL.md`` + ``locales/<lang>.json``), which is
+gate-valid (``ack.gate.gate_prompt``) on first render and ready to customise.
+
+Exit codes: 0 = clean; 2 = merge conflict(s) written (resolve by hand) OR the run was REFUSED by the
+built-in collision guard (`--reserved-capabilities`); 1 = error.
 
 NOTE: the template tree (``templates/new-case/``) is ported separately — see the
 demo vessel. The generator code here is generic and template-tree agnostic.
@@ -62,6 +70,9 @@ from pathlib import Path
 # under a generic, cwd-relative "cases/" dir by default (override via --output-root).
 ROOT = Path(__file__).resolve().parent
 DEFAULT_TEMPLATE = ROOT / "templates" / "new-case"
+PROMPT_TEMPLATE = ROOT / "templates" / "new-prompt"
+#: Built-in template tree per ``--kind`` (the engine picks the right one; ``--template`` overrides).
+TEMPLATE_BY_KIND = {"case": DEFAULT_TEMPLATE, "prompt": PROMPT_TEMPLATE}
 DEFAULT_OUTPUT_ROOT = Path("cases")
 STATE_FILENAME = ".ack-generator-state.json"
 
@@ -127,6 +138,16 @@ def build_context(args: argparse.Namespace) -> dict[str, str]:
 # --------------------------------------------------------------------------- #
 # Substitution-only renderer                                #
 # --------------------------------------------------------------------------- #
+def template_root_for(args: argparse.Namespace) -> Path:
+    """Resolve the template tree: an explicit ``--template`` wins; otherwise pick the built-in tree for
+    ``--kind`` (``case`` → ``new-case`` paved road [default, byte-identical], ``prompt`` → ``new-prompt``
+    prompt-library scaffold). Keeping the default in one place lets both the CLI and the engine agree."""
+    explicit = getattr(args, "template", None)
+    if explicit:
+        return Path(explicit)
+    return TEMPLATE_BY_KIND.get(getattr(args, "kind", "case"), DEFAULT_TEMPLATE)
+
+
 def render_str(text: str, ctx: dict[str, str], unknown: set[str] | None = None) -> str:
     def repl(m: re.Match) -> str:
         key = m.group(1)
@@ -235,10 +256,11 @@ class GenerateResult:
     unknown_tokens: set[str] = field(default_factory=set)
     conflicts: int = 0
     domain_dir: Path | None = None
+    refused: str = ""               # #601 S10: non-empty => the run was refused (built-in collision); nothing written
 
     @property
     def ok(self) -> bool:
-        return self.conflicts == 0
+        return self.conflicts == 0 and not self.refused
 
 
 def iter_template_files(template_root: Path):
@@ -267,6 +289,7 @@ def generate(
     output_root: Path = DEFAULT_OUTPUT_ROOT,
     force: bool = False,
     dry_run: bool = False,
+    reserved_capabilities: "set[str] | None" = None,
 ) -> GenerateResult:
     if not template_root.is_dir():
         raise FileNotFoundError(f"Template root not found: {template_root}")
@@ -274,6 +297,17 @@ def generate(
     result = GenerateResult()
     domain_dir = output_root / ctx["domain_folder"]
     result.domain_dir = domain_dir
+
+    # #601 S10 (ADR-0011): built-in collision guard. The generator writes into a PER-PROJECT library; a
+    # generated capability that shadows a core built-in (e.g. `mpr`) would be ambiguous at load time, so it
+    # is REFUSED fail-closed before anything is written — never silently overwrite/shadow a built-in. The
+    # reserved set is injected by the engine (the core/skills built-in capabilities); empty/None => no guard
+    # (byte-identical to the pre-guard generator).
+    cap = ctx.get("capability_key", "")
+    if reserved_capabilities and cap in reserved_capabilities:
+        result.refused = (f"capability {cap!r} collides with a built-in — refused (a per-project item may "
+                          f"not shadow a core built-in); choose a different --prefix/--case")
+        return result
     state_path = domain_dir / STATE_FILENAME
     state = _load_state(state_path)
     base_files: dict[str, str] = state.get("files", {})
@@ -297,8 +331,11 @@ def generate(
                     action = "conflict" if conflicted else ("upgraded" if merged != current else "unchanged")
                     content, detail = merged, "untracked (--force)"
                 else:
+                    # GEN-2 (#503): do NOT record a baseline for a SKIPPED untracked file — recording
+                    # `rendered` as the base made the NEXT run three-way-merge the user's declined file
+                    # against a phantom base, producing spurious diff3 conflicts. No baseline ⇒ the file
+                    # stays untracked and is skipped again (idempotent for a declined file).
                     result.files.append(FileResult(rel_key, "skipped", "exists, untracked (use --force)"))
-                    new_base[rel_key] = rendered
                     continue
             else:
                 merged, conflicted = three_way_merge(base, current, rendered)
@@ -338,6 +375,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--domain", required=True, help="Domain key (kebab), e.g. agent-contract-kernel")
     p.add_argument("--case", required=True, help="Case key (kebab), e.g. my-feature")
     p.add_argument("--description", required=True, help="One-line description of the case")
+    p.add_argument("--kind", default="case", choices=["case", "prompt"],
+                   help="What to scaffold: 'case' (a CASE+run tool, default) or 'prompt' "
+                        "(a kind: prompt library item). Selects the built-in template tree.")
     p.add_argument("--prefix", default=None, help="Capability key prefix (default: domain initials, e.g. 'ack')")
     p.add_argument("--phase", default="MVP", choices=["MVP", "V1", "V2", "V3", "out-of-scope"])
     p.add_argument("--tier", default="high", choices=["high", "medium", "low"])
@@ -349,26 +389,37 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--tags", default=None, help="Comma-separated frontmatter tags (default derived)")
     p.add_argument("--output-root", default=str(DEFAULT_OUTPUT_ROOT),
                    help="Where the domain folder is written (default: cases)")
-    p.add_argument("--template", default=str(DEFAULT_TEMPLATE), help="Template root directory")
+    p.add_argument("--template", default=None,
+                   help="Template root directory (default: the built-in tree for --kind)")
     p.add_argument("--force", action="store_true", help="Merge into pre-existing untracked files")
     p.add_argument("--dry-run", action="store_true", help="Report actions without writing")
+    p.add_argument("--reserved-capabilities", default=None,
+                   help="Comma-separated built-in capabilities a generated item may NOT shadow "
+                        "(the engine injects the core/skills built-ins; collision => refused)")
     return p
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     ctx = build_context(args)
+    reserved = ({c.strip() for c in args.reserved_capabilities.split(",") if c.strip()}
+                if args.reserved_capabilities else None)
     try:
         res = generate(
             ctx,
-            template_root=Path(args.template),
+            template_root=template_root_for(args),
             output_root=Path(args.output_root),
             force=args.force,
             dry_run=args.dry_run,
+            reserved_capabilities=reserved,
         )
     except FileNotFoundError as e:
         print(f"[ERR] {e}", file=sys.stderr)
         return 1
+
+    if res.refused:
+        print(f"[REFUSED] {res.refused}", file=sys.stderr)
+        return 2
 
     tag = " (dry-run)" if args.dry_run else ""
     print(f"generate-case{tag}: domain='{ctx['domain_folder']}' case='{ctx['case_name']}' "

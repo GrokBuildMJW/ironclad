@@ -39,6 +39,36 @@ from .constrained_emission import (  # noqa: F401
     recommended_vllm_server_flags,
     tool_emission_kwargs,
 )
+from .failure_class import (  # noqa: F401
+    FailureClass,
+    classify_emission_failure,
+)
+from .strategy import (  # noqa: F401
+    Strategy,
+    StrategyAction,
+    revise,
+)
+from .loop_profile import (  # noqa: F401
+    LoopProfile,
+    resolve_loop_profile,
+)
+from .verify import (  # noqa: F401
+    VerdictResult,
+    verify_grounding,
+    verify_rules,
+    verify_with_judge,
+)
+from .quality import (  # noqa: F401
+    QualityBreaker,
+    QualitySnapshot,
+)
+from .process import (  # noqa: F401
+    ProcessLesson,
+    ProcessLessonKind,
+    ProcessSignal,
+    distill_process_lesson,
+    format_process_hint,
+)
 from .validated_emit import (  # noqa: F401
     DEFAULT_RETRY_BUDGET,
     EMIT_TASK_TOOL,
@@ -75,7 +105,30 @@ __all__ = [
     "extract_tool_call",
     "emit_constrained",
     "recommended_vllm_server_flags",
-    # validated_emit (soft path — transport injected)
+    # failure_class (shared advisory taxonomy — #602)
+    "FailureClass",
+    "classify_emission_failure",
+    # strategy (failure→action policy — #602)
+    "Strategy",
+    "StrategyAction",
+    "revise",
+    # loop_profile (per-TaskType loop budgets — #602)
+    "LoopProfile",
+    "resolve_loop_profile",
+    # verify (mark-only evaluation layer — #602)
+    "VerdictResult",
+    "verify_rules",
+    "verify_grounding",
+    "verify_with_judge",
+    # quality (output-quality circuit breaker — #602)
+    "QualityBreaker",
+    "QualitySnapshot",
+    # process (process-level self-correction policy — #602)
+    "ProcessSignal",
+    "ProcessLesson",
+    "ProcessLessonKind",
+    "distill_process_lesson",
+    "format_process_hint",
     "emit_validated",
     "emit_task_spec",
     "ValidatedEmitResult",

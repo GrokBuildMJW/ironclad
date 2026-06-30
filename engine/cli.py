@@ -342,6 +342,11 @@ def _stream_turn(srv: Server, payload: str) -> None:
         # 2) "======== ✓ DONE … ========" banner → drop.
         if "===" in st and ("DONE" in st or "✓" in st):
             return
+        # 2b) MPR report sentinels (skills/mpr/entry.py REPORT_OPEN/CLOSE) — machine delimiters of the
+        #     verbatim report block; drop them so they never render in the chat (parity with the ink
+        #     stream/route filter, #50; trim also catches an indented/glued `<<<END>>>`).
+        if st in ("<<<MPR_REPORT>>>", "<<<END>>>"):
+            return
         # 3) role labels ([GX10] / [Qwen (planning)] / [… planning …]) → drop.
         if (st == "[GX10]"
                 or (st.startswith("[Qwen") and st.endswith("]"))
@@ -576,6 +581,23 @@ def _getch():
     return sys.stdin.read(1)
 
 
+def _consume_escape_seq() -> None:
+    """POSIX: after an ESC, drain the REST of an arrow/CSI/SS3 sequence WITHOUT blocking. A bare ESC (no
+    follow-on byte ready) is ignored — it no longer blocks on two more reads (CLI-4); a CSI (``ESC [ …``
+    final ``@-~``) or SS3 (``ESC O`` final) is read to its final byte so a multi-byte key (PageUp
+    ``ESC [ 5 ~``, Home, F-keys) never leaks a stray ``~`` into the input (CLI-5, #503)."""
+    import select
+    if not select.select([sys.stdin], [], [], 0.0)[0]:
+        return                                            # bare ESC → nothing follows
+    nxt = _getch()
+    if nxt == "[":                                        # CSI: params [0-9;?], then a final byte [@-~]
+        while select.select([sys.stdin], [], [], 0.05)[0]:
+            if "@" <= _getch() <= "~":
+                break
+    elif nxt == "O" and select.select([sys.stdin], [], [], 0.05)[0]:
+        _getch()                                          # SS3 ESC O <final> (some terminals' arrow/F-keys)
+
+
 def _raw_loop() -> str:
     """Edit ``_INPUT['buf']`` keystroke-by-keystroke until Enter; render via the Live."""
     old = None
@@ -598,9 +620,9 @@ def _raw_loop() -> str:
                 _INPUT["buf"] = ""
             elif ch in ("\x00", "\xe0"):                  # Windows special-key prefix → skip next
                 _getch()
-            elif ch == "\x1b":                            # POSIX arrow/ESC seq → drop the rest
+            elif ch == "\x1b":                            # POSIX: bare ESC (ignore) or an escape seq (drain non-blockingly)
                 if _RAWKIND == "posix":
-                    _getch(); _getch()
+                    _consume_escape_seq()
             elif ch >= " ":                               # printable (incl. pasted text)
                 _INPUT["buf"] += ch
             _refresh()

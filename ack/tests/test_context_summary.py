@@ -31,6 +31,16 @@ import memory  # noqa: E402
 import pytest  # noqa: E402
 
 
+@pytest.fixture(autouse=True)
+def _neutralize_budget_reserve(monkeypatch):
+    # #503 BUDGET-1 made the char-fallback trim reserve tools+thinking in the watermark. These tests pin the
+    # rolling-SUMMARY behavior against the plain char budget (high=MAX_CTX_CHARS, low=TRIM_TARGET_CHARS), so
+    # neutralize the non-system reserve (tools + thinking); the tiny system prompt is harmless (the to-low
+    # trim target is unchanged). The reserve math itself is covered in test_token_budget.py.
+    monkeypatch.setattr(gx10, "THINKING_RESERVE", 0, raising=False)
+    monkeypatch.setattr(gx10, "_tools_schema_tokens", lambda: 0, raising=False)
+
+
 # ── memory.add_bulk ──────────────────────────────────────────────────────────
 class _Resp:
     def __init__(self, payload, status=200):

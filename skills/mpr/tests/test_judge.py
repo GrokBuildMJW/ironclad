@@ -43,6 +43,35 @@ def _fixed(text):
 def test_judge_output_parses_to_schema():
     assert J.parse_judgement(_vote_json(4, 2)) is not None
     assert J.parse_judgement("kein json") is None
+
+
+def test_pairwise_drops_junk_votes_no_slot2_bias():
+    # MPR-EVAL-1 (#503): a non-'1'/'2' pairwise value (junk, '3', None) must be DROPPED, not coerced to
+    # '2' (which biased the blind panel toward slot 2).
+    dims = list(_DIMS)
+    assert len(dims) >= 2
+    pw = {dims[0]: "1", dims[1]: "3"}                    # one valid, one junk
+    if len(dims) >= 3:
+        pw[dims[2]] = "2"                                # another valid
+    raw = json.dumps({"answer_1": {d: {"score": 4} for d in _DIMS},
+                      "answer_2": {d: {"score": 2} for d in _DIMS},
+                      "pairwise": pw})
+    out = J.parse_judgement(raw)
+    assert out is not None
+    assert out["pairwise"].get(dims[0]) == "1"          # valid kept
+    assert dims[1] not in out["pairwise"]               # junk '3' DROPPED, not coerced to '2'
+    if len(dims) >= 3:
+        assert out["pairwise"].get(dims[2]) == "2"      # valid '2' kept
+
+
+def test_non_dict_pairwise_is_dropped_not_raised():
+    # MPR-EVAL-1 (#503): a non-dict 'pairwise' (e.g. a string that happens to contain a dim name as a
+    # substring) must be dropped wholesale — never indexed (TypeError) — keeping the parser fail-soft.
+    raw = json.dumps({"answer_1": {d: {"score": 4} for d in _DIMS},
+                      "answer_2": {d: {"score": 2} for d in _DIMS},
+                      "pairwise": _DIMS[0]})            # a bare string, not a dict
+    out = J.parse_judgement(raw)
+    assert out is not None and out["pairwise"] == {}    # dropped, no exception
     assert J.parse_judgement(json.dumps({"answer_1": {"coverage": {"score": 9}}})) is None   # out of range
     # one murks reply → exactly one repair re-ask → success
     seq = iter(["nicht json", _vote_json(4, 2)])

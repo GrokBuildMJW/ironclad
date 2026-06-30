@@ -45,7 +45,9 @@ if (Probe "$base/health") {
   }
 }
 if (-not $reuse) {
-  $env:GX10_SETUP_TYPE = "local"
+  # INSTALL-1 (#503): 'auto' lets the engine derive the topology from base_url at boot (loopback → server/
+  # in-engine, remote → local), so a fresh default install BOOTS without baking a model host into the repo.
+  $env:GX10_SETUP_TYPE = "auto"
   $env:GX10_BASE_URL   = $cfg.baseUrl
   $env:GX10_MEMORY_URL = $cfg.memoryUrl
   $env:GX10_MODEL      = $cfg.model

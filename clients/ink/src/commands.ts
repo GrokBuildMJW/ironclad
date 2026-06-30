@@ -2,7 +2,7 @@
  * Command routing — a VERBATIM port of engine/commands.py:classify (+ HELP_TEXT).
  * input starting with "/" → command (local set handled here; everything else forwarded
  * to the orchestrator with the slash stripped, via /chat/stream). Bare exit/quit → leave.
- * Anything else → a turn. NOTE: no local "/doctor" (parity: commands.py LOCAL_COMMANDS).
+ * Anything else → a turn. /doctor is LOCAL (GET /doctor, mirrors /health) — parity: commands.py LOCAL_COMMANDS.
  */
 export type Kind = 'empty' | 'turn' | 'local' | 'server';
 
@@ -30,6 +30,7 @@ export const COMMANDS: readonly Command[] = [
   {name: 'work', scope: 'local', desc: 'run all open handovers ONCE locally (in parallel)'},
   {name: 'auto', scope: 'local', usage: 'on|off', desc: 'background poller for handovers'},
   {name: 'health', scope: 'local', desc: 'server status'},
+  {name: 'doctor', scope: 'local', desc: 'read-only preflight report (GET /doctor)'},
   {name: 'tool', scope: 'server', usage: '<name> <args|text>', desc: 'run a tool directly/deterministic, e.g. tool mpr_research <frage>'},
   {name: 'reset', scope: 'local', desc: 'start clean — transcript + server context + summary (keeps long-term memory)'},
   {name: 'resume', scope: 'local', desc: 'restore the previous session (default start is fresh; or --resume)'},
@@ -52,8 +53,10 @@ export const COMMANDS: readonly Command[] = [
   {name: 'autopilot', scope: 'server', usage: 'on|off', desc: 'autopilot'},
   {name: 'autoplan', scope: 'server', usage: 'on|off [N]', desc: 'auto-plan the next tasks'},
   {name: 'log-terminal', scope: 'server', usage: 'on|off', desc: 'live autopilot log window'},
-  {name: 'initiative', scope: 'server', usage: 'new <name> --type mpr|software | list | use <slug> | active | reconcile', desc: 'manage the initiative-centric vault (artefact home)'},
-  {name: 'doctor', scope: 'server', desc: 'read-only preflight report'},
+  {name: 'initiative', scope: 'server', usage: 'new <name> --type mpr|software | list | use <slug> | active | reconcile', desc: 'manage the initiative-centric vault (a deprecated alias for /project)'},
+  {name: 'project', scope: 'server', usage: 'list [--all] | new <name> [--type mpr|software] [--path <dir>] | active | track new|use|list | delete <id> [--purge] | archive|unarchive <id>', desc: 'manage isolated projects (the guided setup command; /initiative is a deprecated alias)'},
+  {name: 'switch', scope: 'server', usage: '<project_id>', desc: 'rebind the engine to a project (own paths + memory partition)'},
+  {name: 'generate', scope: 'server', usage: '[--kind case|prompt] --domain <d> --case <c> --description <text> [--prefix x] [--dry-run]', desc: 'scaffold a paved-road capability into the active project library'},
 ];
 
 /** Handled on THIS (client) side — derived from the registry (no duplication). */

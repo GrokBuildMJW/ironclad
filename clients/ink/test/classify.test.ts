@@ -28,18 +28,18 @@ test('classify — local slash commands', () => {
     assert.equal(r.payload, c);
   }
   assert.deepEqual(classify('/auto on'), {kind: 'local', name: 'auto', payload: 'auto on'});
+  // DOCTOR (#503): /doctor is LOCAL now (GET /doctor, mirrors /health) — it is NOT forwarded to a turn.
+  assert.deepEqual(classify('/doctor'), {kind: 'local', name: 'doctor', payload: 'doctor'});
 });
 
 test('classify — server slash commands (forwarded, slash already stripped in payload)', () => {
   assert.deepEqual(classify('/status'), {kind: 'server', name: 'status', payload: 'status'});
   assert.deepEqual(classify('/ls src'), {kind: 'server', name: 'ls', payload: 'ls src'});
-  // no local /doctor — must forward as a server command
-  assert.deepEqual(classify('/doctor'), {kind: 'server', name: 'doctor', payload: 'doctor'});
 });
 
 test('MEM-16: registry derives LOCAL_COMMANDS + powers completions', () => {
   // the registry still covers exactly the historical local set
-  for (const c of ['tasks', 'pending', 'work', 'auto', 'health', 'help', 'reset', 'resume', 'exit', 'quit']) {
+  for (const c of ['tasks', 'pending', 'work', 'auto', 'health', 'doctor', 'help', 'reset', 'resume', 'exit', 'quit']) {
     assert.ok(LOCAL_COMMANDS.has(c), `${c} should be local`);
   }
   // completions filter by prefix (no leading slash)

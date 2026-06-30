@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {parseKey, feedKey} from '../src/render/keys.js';
+import {parseKey} from '../src/render/keys.js';
 import type {Key} from '../src/render/hooks.js';
 
 const ESC = '\x1b';
@@ -75,11 +75,4 @@ test('unrecognized CSI is swallowed (no input, no flags)', () => {
   const home = parseKey(ESC + '[H'); // home — no Ink Key field
   assert.equal(home.input, '');
   assert.deepEqual(flags(home.key), []);
-});
-
-test('feedKey emits the parsed event through the bridge callback', () => {
-  const seen: Array<[string, string[]]> = [];
-  feedKey('\x03', (input, key) => seen.push([input, flags(key)]));
-  feedKey('x', (input, key) => seen.push([input, flags(key)]));
-  assert.deepEqual(seen, [['c', ['ctrl']], ['x', []]]);
 });

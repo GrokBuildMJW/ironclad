@@ -44,6 +44,10 @@ Both roots are workdir-relative and overridable:
 An initiative is created **explicitly** — there is no artifact-producing operation without an active
 initiative (fail-closed). Pure conversational turns (no artifacts) need none.
 
+> **`/initiative` is a deprecated alias for `/project`** — new work flows through the guided
+> `/project new <name> --type mpr|software` (see [`project-isolation.md`](project-isolation.md)). The
+> `/initiative …` verbs below stay functional and are documented here for the state/vault layout they drive.
+
 ```text
 /initiative new <name> --type mpr|software   create + activate (writes meta.md + the type skeleton)
 /initiative list                            all initiatives (* = active)
