@@ -80,6 +80,18 @@ def _review_fail(unit=632):
             "reasons": ["no convergence"]}
 
 
+def _review_inert(unit=632):
+    # the run.py dry-run / non-live review shape (#830): a PASS, but marked `(inert)` — not real evidence.
+    return {"unit": unit, "src": "GATE", "dst": "REVIEW", "guard": "review-evidence", "passed": True,
+            "reasons": ["dry-run: review-evidence not enforced (inert)"]}
+
+
+def _review_enforced(unit=632):
+    # a live, enforced review-evidence leg carrying a real verdict reason (no `(inert)` marker).
+    return {"unit": unit, "src": "GATE", "dst": "REVIEW", "guard": "review-evidence", "passed": True,
+            "reasons": ["A<->B converged: 2 reviewers approved"]}
+
+
 def _deliver(status):
     return {"surface": "DELIVER", "state": "DELIVER", "status": status, "reasons": []}
 
@@ -104,6 +116,16 @@ def test_stage_for_payload_review_pass_is_reviews():
 
 def test_stage_for_payload_review_fail_is_none():
     assert lp.stage_for_payload(_review_fail()) is None
+
+
+def test_stage_for_payload_inert_review_is_none():
+    # #830: a dry-run / non-live review passes but carries the `(inert)` marker — NOT reviews evidence.
+    assert lp.stage_for_payload(_review_inert()) is None
+
+
+def test_stage_for_payload_enforced_review_with_reasons_is_reviews():
+    # #830: a live review with a real (non-inert) verdict reason still maps to `reviews`.
+    assert lp.stage_for_payload(_review_enforced()) == "reviews"
 
 
 @pytest.mark.parametrize("status", ["delivered", "delivered-pending", "delivered-unrecorded"])

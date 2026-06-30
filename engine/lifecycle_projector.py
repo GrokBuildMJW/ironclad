@@ -17,7 +17,9 @@ exactly, never guessed):
   ``guards.compose("gate", ...)`` in ``scripts/devprocess/e2e.py`` / ``shell_guard("gate", ...)``) and
   ``passed`` true — maps to the ``tests`` stage. A **green review-evidence** leg — ``dst == "REVIEW"``
   with ``guard == "review-evidence"`` and ``passed`` true (the GATE->REVIEW A<->B-convergence
-  transition, ``run.py``) — maps to the ``reviews`` stage. (The other GATE->GATE legs carry
+  transition, ``run.py``) — maps to the ``reviews`` stage, **unless** it is a dry-run / non-live review
+  (``run.py`` marks such a leg with the ``(inert)`` sentinel in its ``reasons``), which is excluded so the
+  ``reviews`` stage requires an ENFORCED review (#830). (The other GATE->GATE legs carry
   ``guard == "coupling"`` / ``"apply"``, so they never map to ``tests``.)
 - ``scripts/devloop/deliver.py`` emits ``{"surface": "DELIVER", "state", "status", "reasons"}``. A
   record whose ``status`` shows the irreversible push fired — ``delivered`` / ``delivered-pending`` /
@@ -41,6 +43,11 @@ _GATE_GUARD = "gate"
 #: The GATE->REVIEW (A<->B convergence) guard name — ``run.py`` records the review leg as
 #: ``GuardResult("review-evidence", ...)``; a green leg with this guard maps to the ``reviews`` stage.
 _REVIEW_GUARD = "review-evidence"
+#: #830: a DRY-RUN / non-live review leg is recorded PASS-but-INERT — ``run.py`` puts this sentinel token
+#: in the leg's ``reasons`` (it emits ``"dry-run: review-evidence not enforced (inert)"``). A pass alone is
+#: not real reviews evidence, so the projector keys on this marker to EXCLUDE an inert review from the
+#: ``reviews`` stage — reviews evidence requires an ENFORCED (live) review.
+_INERT_REVIEW_MARKER = "(inert)"
 #: The DELIVER statuses (``scripts/devloop/deliver.py`` / ``run.py``) that mean the irreversible push
 #: fired — so a ``delivery``-stage evidence is warranted. Halted/parked statuses are NOT delivered.
 _DELIVERED_STATUSES = frozenset({"delivered", "delivered-pending", "delivered-unrecorded"})
@@ -63,7 +70,12 @@ def stage_for_payload(payload: Any) -> Optional[str]:
     if dst == "GATE" and guard == _GATE_GUARD:
         return "tests"      # the composed GATE went green
     if dst == "REVIEW" and guard == _REVIEW_GUARD:
-        return "reviews"    # the review-evidence (A<->B convergence) leg passed
+        # #830: a dry-run / non-live review passes but is INERT (run.py marks it with `(inert)`); it is
+        # NOT real reviews evidence, so it maps to nothing — the `reviews` stage requires an enforced review.
+        reasons = payload.get("reasons") or []
+        if any(_INERT_REVIEW_MARKER in str(r) for r in reasons):
+            return None
+        return "reviews"    # an ENFORCED review-evidence (A<->B convergence) leg passed
     return None
 
 

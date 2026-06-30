@@ -9,9 +9,9 @@
 
 | | |
 |---|---|
-| Automated tests (offline, no model) | **2193 passed** |
+| Automated tests (offline, no model) | **2200 passed** |
 | Live smoke tests (skipped without a model) | **9** |
-| **Total Python** | **2202** |
+| **Total Python** | **2209** |
 | TypeScript client tests (`node:test`) | **355 passed** (359 total, 4 skipped) |
 | Full agentic loop, end to end, with a **real** code-agent | **verified** |
 | Issues found during the campaign | **1 functional gap + 5 review findings — all found and fixed** (see below) |
@@ -24,7 +24,7 @@ default** and only runs when pointed at a real server.
 
 ```bash
 # 1) offline suite — deterministic, no model needed
-pytest -q                                   # from core/  → 2193 passed, 9 skipped
+pytest -q                                   # from core/  → 2200 passed, 9 skipped
 
 # 2) live smoke — against your own running orchestrator
 GX10_LIVE_URL=http://<your-host>:8100 pytest -k live -q     # 9 passed
@@ -34,7 +34,7 @@ GX10_LIVE_URL=http://<your-host>:8100 pytest -k live -q     # 9 passed
 ## Coverage by area
 
 The breakdown below groups the suite by capability area and sums to
-the **2202** total (2193 offline + 9 live). It is a high-level view of internal QA
+the **2209** total (2200 offline + 9 live). It is a high-level view of internal QA
 coverage; the granular test names and the maintainers' internal tracker are
 intentionally not enumerated here.
 
@@ -63,8 +63,9 @@ intentionally not enumerated here.
 | **Project mint (`/project new`)** — the guided-setup mint (#601 S16): the `new <name> [--type] [--path]` parser (name/type-lowercased/quoted-path/usage/unknown-type) and the mint pipeline that registers a fresh isolated project (root `<cwd>/<slug>` or `--path`, minted `mem_ns`, made active), binds the engine to it, and — with a `--type` — seeds the first vault unit via the initiative machinery; fail-closed on a duplicate root (registers before it creates the root dir, so no orphan) or an unknown type, and a name with no slug-able characters, and a bare/empty --type/--path flag; the mint activates through the real quiesced switch (conversation reset, no bleed) and requires a session | 17 |
 | **Project delete / archive** — the registry-mediated lifecycle verbs (#601 S16): `set_archived` (registry); `/project delete <id> [--purge]` (forgets every track memory scope, removes the registry entry, leaves the dirs unless `--purge`, which is itself guarded against the cwd/boot/home/ancestors; deleting the ACTIVE project switches to default first; default never deletable); `/project archive|unarchive` (reversible flag, refuses the active/default project, hidden from `list` unless `--all`); and `_switch` refusing an archived target; plus the atomic `Registry.remove(expected_root=)` (no purge on a re-registered root) | 22 |
 | **Export no-project-artifacts guard** — the AD-8 export invariant (#601 S17): the publish export carries NO runtime project state — `export_core.scan_project_artifacts` asserts no `.ironclad/` machinery, `.tracks/` vault subtrees, or `registry.json` reach the staged tree (a fail-closed export gate + a backstop to the copy-ignore patterns) | 5 |
+| **Export test-drift guard** — the #845 lint (follow-up to #843): a fail-closed export gate (1d, `check_export_test_drift`) + suite test flagging any exported `test_*.py` that references the private `scripts/` tree without an absence guard (`.is_file()`/`.exists()`/`pytest.skip`) — such a test `FileNotFoundError`s in the public clean-room where `scripts/` is absent; covers the clean real tree, a synthetic unguarded reference, the is_file / skipif clears, and a no-reference no-op | 5 |
 | **Self-dogfood isolation acceptance** — the AD-8 offline acceptance (#601 S17): drives the real `/project new -> /switch -> stage a unit -> switch back` cycle for two projects through the quiesced switch (no live infra / model / deliver) and asserts the whole-epic invariant — distinct non-base memory partitions, vault + state machinery under each project’s own root, work artifacts only under the active project, the base/default project untouched, and no cross-project conversation bleed | 5 |
-| **Lifecycle DELIVER-leg gate** — the S13b wiring (#601 S13b / #632) of the S13a evidence primitives into a functioning gate: the pure `lifecycle_projector` maps dev-process **ledger** transitions to lifecycle stages (a green composed-gate leg → `tests`, a review-evidence leg → `reviews`, a `delivered*` DELIVER record → `delivery`) and composes `project_evidence` bound to the delivery `tree_sha` (deterministic + idempotent — no new files on re-projection); the `/lifecycle gate` engine command reads `<repo>/.devloop/ledger.jsonl` as plain data (hash chain **re-verified engine-side**, boundary-clean — no `scripts/devprocess` import), projects + runs `lifecycle_completeness`, and reports `READY`/`BLOCKED` **fail-closed** (default `--stages delivery` — the only stage the producer logs today; `tests`/`reviews` opt-in pending the producer-log follow-up #830). Covers the transition→stage mapper (every real shape + None cases), projection with fakes AND the real primitives, idempotency, fail-closed (empty tree_sha / missing stage / no slug / tampered / missing ledger), the command end-to-end, and the engine↔`scripts/devprocess/ledger` hash cross-check | 41 |
+| **Lifecycle DELIVER-leg gate** — the S13b wiring (#601 S13b / #632) of the S13a evidence primitives into a functioning gate: the pure `lifecycle_projector` maps dev-process **ledger** transitions to lifecycle stages (a green composed-gate leg → `tests`, a review-evidence leg → `reviews`, a `delivered*` DELIVER record → `delivery`) and composes `project_evidence` bound to the delivery `tree_sha` (deterministic + idempotent — no new files on re-projection); the `/lifecycle gate` engine command reads `<repo>/.devloop/ledger.jsonl` as plain data (hash chain **re-verified engine-side**, boundary-clean — no `scripts/devprocess` import), projects + runs `lifecycle_completeness`, and reports `READY`/`BLOCKED` **fail-closed** (default `--stages delivery` — the conservative default; `tests`/`reviews` are now logged by the driver (#830 wired the `log` seam to `ledger.append` in run.py / `build_real_ops`) and enforced via `--stages tests,reviews,delivery`). Covers the transition→stage mapper (every real shape + None cases, incl. a dry-run/**inert** review excluded from `reviews` #830), projection with fakes AND the real primitives, idempotency, fail-closed (empty tree_sha / missing stage / no slug / tampered / missing ledger), the command end-to-end, the engine↔`scripts/devprocess/ledger` hash cross-check, and the producer contract (driver `log` → a chain-intact ledger carrying the GATE/REVIEW transitions) | 43 |
 | **Base-untouched reconciler** — the AD-8 delivered-state check (#601 S17): a full project lifecycle (mint/switch/stage/delete) under a throwaway workdir leaves the engine’s own source surface (`core/skills` + `engine/prompts`) **byte-identical** (a content-hash snapshot before/after, bytecode caches excluded), catching any path that resolves into the engine tree instead of the project root | 2 |
 | **Read-only Memory MCP** — a dependency-free stdio JSON-RPC server exposing project memory as read-only search + deep-query tools, with a sealed-gated launch | 11 |
 | **Open plugin surface** — discover and expose `skills/*` plugins with no core patch | 9 |

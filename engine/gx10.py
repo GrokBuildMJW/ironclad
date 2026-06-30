@@ -5741,11 +5741,12 @@ def _initiative_command(arg_str: str) -> str:
 # projects each stage-bearing transition into tree_sha-bound vault evidence, then runs the completeness
 # gate. Fail-closed: a missing/bad tree_sha, no resolvable slug, or an unreadable/tampered ledger →
 # a clear BLOCKED / usage message, never a silent pass.
-# Fork C: the DEFAULT required stages. Only `delivery` is currently logged to the ledger in production
-# (the per-unit driver GATE/REVIEW transitions are not yet appended — the driver `log` seam is a no-op;
-# tracked as the producer-log follow-up #830). So the default gate verifies `delivery` (functional
-# today); `tests`/`reviews` are opt-in via `--stages tests,reviews,delivery` and become enforceable once
-# the producer logs them. The projector already maps all three (lifecycle_projector).
+# Fork C: the DEFAULT required stages. The per-unit driver GATE/REVIEW transitions ARE now appended to the
+# ledger (#830 wired the driver `log` seam to `ledger.append` in run.py), so `tests` (a green composed GATE)
+# and `reviews` (an ENFORCED, non-inert review-evidence leg) are real, enforceable evidence. The default
+# stays the conservative `delivery` — a delivery-completeness check shouldn't presume the full driver loop
+# ran for that unit — while `tests`/`reviews` are enforced via `--stages tests,reviews,delivery`. The
+# projector maps all three (lifecycle_projector); a dry-run/inert review is excluded from `reviews` (#830).
 _LIFECYCLE_DEFAULT_STAGES = ("delivery",)
 _LEDGER_GENESIS = "GENESIS"
 
@@ -5807,9 +5808,9 @@ def _lifecycle_command(arg_str: str) -> str:
     into tree_sha-bound vault evidence via ``lifecycle_projector.project_transitions`` (wiring the REAL
     ``project_evidence`` + ``lifecycle_completeness``), and prints the projected evidence paths +
     ``READY`` / ``BLOCKED: <reasons>``. Defaults: ledger = ``<repo>/.devloop/ledger.jsonl`` (the active
-    project root, else cwd); slug = ``active_slug()`` (Fork D); stages = ``delivery`` (Fork C — the only
-    stage the producer currently logs; ``tests``/``reviews`` are opt-in via ``--stages`` pending the
-    producer-log follow-up). FAIL-CLOSED — a missing slug/tree_sha, an unreadable/tampered ledger, or a projection error
+    project root, else cwd); slug = ``active_slug()`` (Fork D); stages = ``delivery`` (Fork C — the
+    conservative default; ``tests``/``reviews`` are now logged by the driver (#830) and enforced via
+    ``--stages tests,reviews,delivery``). FAIL-CLOSED — a missing slug/tree_sha, an unreadable/tampered ledger, or a projection error
     yields a clear BLOCKED/usage message, never a silent pass."""
     parts = arg_str.split()
     sub = parts[0].lower() if parts else ""

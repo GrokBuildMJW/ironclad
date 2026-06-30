@@ -9,6 +9,18 @@ Released versions are listed below; upcoming work accumulates under *Unreleased*
 
 ## [Unreleased]
 
+### Changed
+- **Lifecycle gate `tests`/`reviews` evidence is now produced, and an inert review is excluded** (`engine`,
+  #601 S13b / #632 follow-up #830): the dev-process driver's transition `log` seam is wired to the
+  per-project ledger (`build_real_ops(ledger_path=…)`, threaded from `run.py`), so **every** transition —
+  not just the DELIVER record — is appended. A green composed GATE projects to the `tests` stage and an
+  **enforced** review-evidence leg to `reviews`, so `/lifecycle gate --stages tests,reviews,delivery` is
+  now enforceable (the default stays the conservative `delivery`). A dry-run / non-live review is recorded
+  with an `(inert)` marker and is **excluded** from the `reviews` stage, so reviews evidence requires a real
+  review. All ledger consumers (merge-walk / published-issues / Test-PyPI-first guard) filter on
+  `surface == "DELIVER"`, so the added transition records are inert to them and the merge-walk high-water
+  mark stays intact.
+
 ## [0.0.21] - 2026-06-30
 
 ### Added
