@@ -352,8 +352,14 @@ def test_gate_review_guard_constants_match_real_wired_names():
 def test_engine_ledger_hash_matches_devprocess_ledger():
     # gx10 re-implements the ledger hash chain engine-side (boundary: core/ must not import scripts/dev*).
     # Pin it byte-identical to the real producer so chain verification can never silently diverge.
+    # The producer lives in scripts/devprocess/ (private, monorepo-only — NOT part of the public export),
+    # so this cross-check **skips** on an installed/clean-room tree where scripts/ is absent, matching the
+    # sibling idiom (test_doc_audit / test_export_leak_guard). The engine-side impl keeps its own tests.
     import importlib.util
     led_path = Path(__file__).resolve().parents[3] / "scripts" / "devprocess" / "ledger.py"
+    if not led_path.is_file():
+        import pytest
+        pytest.skip("scripts/devprocess/ledger.py absent — public export / clean-room tree, cross-check N/A")
     spec = importlib.util.spec_from_file_location("_devprocess_ledger_xcheck", led_path)
     led = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = led
