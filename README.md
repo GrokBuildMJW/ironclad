@@ -20,7 +20,7 @@ truth, validate→reask→retry, a generator and a preflight doctor — with a l
 **orchestration engine** that turns multi-step agent workflows into deterministic,
 fail-closed pipelines. The guiding principle: a small, fast, *self-hosted* model under hard
 schema enforcement beats a large proprietary one you merely *trust* to format its output —
-and it stays **yours**.
+and it **learns from its own runs** and stays **yours**.
 
 ## Why Ironclad
 
@@ -72,6 +72,13 @@ needed.
 - **Reliable tool-calling** — the ACK validates every tool call (validate→reask) and
   recovers for models without native tool-calls, so structured output doesn't depend on a
   specific model or parser.
+- **Loop Intelligence — a self-improving reflection loop.** A default-off layer that learns
+  across runs: a mark-only **Verifier** scores each handover, a **Quality circuit-breaker**
+  trips on sustained degradation, a **Strategy revisor** turns a *classified* failure into a
+  targeted next action (not "retry the same way"), and **Lessons / process self-correction**
+  persist what worked. All consumers ride a dependency-inverted **Hook-Bus** over the
+  agent-loop events, are opt-in per flag, and are **byte-identical when off** — they observe
+  and advise, never relaxing the fail-closed core.
 - **Governed parallelism + provider routing** — server-side reasoning fan-out
   (`/fanout` + the in-engine `parallel_reason` tool), GPU-safe via a concurrency cap and a
   token-budget envelope; a **provider router/dispatcher** on top routes work across
@@ -84,13 +91,14 @@ needed.
   (operator opt-in); results stream a `web N · Xms` chip to the client. See
   [`docs/web-search.md`](docs/web-search.md).
 - **Built-in prompt & skill library** — reusable prompt items and typed skills ship in the
-  box (including MPR); discover them with `/prompts` / `/skills` and run a prompt directly as
-  `/<prompt-name>` (e.g. `/code-review`), or scaffold your own with the paved-road generator.
+  box (including the bundled **MPR** multi-perspective reasoner as one example skill);
+  discover them with `/prompts` / `/skills` and run a prompt directly as `/<prompt-name>`
+  (e.g. `/code-review`), or scaffold your own with the paved-road generator.
 - **Secure, session-gated channel** — selectable trust profiles (`open` / `token` /
   `sealed`) with an explicit session that seals on disconnect (single-operator).
 - **An open extension surface** — a versioned **[plugin API](docs/plugin-api.md)** (no core
-  fork), a **[bring-your-own code-agent CLI](docs/code-agents.md)**, and the **MPR
-  multi-perspective reasoner** (expert role panel → synthesis, `--type mpr`) built on it.
+  fork) and a **[bring-your-own code-agent CLI](docs/code-agents.md)**: extend the platform
+  without forking the core.
 
 It's a natural reliability layer for **regional open models** too — point it at Falcon,
 Jais or K2 Think via vLLM ([running on other models](docs/models/)) and get fail-closed
