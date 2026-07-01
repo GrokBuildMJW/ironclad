@@ -9,7 +9,251 @@ Released versions are listed below; upcoming work accumulates under *Unreleased*
 
 ## [Unreleased]
 
+## [0.0.22] - 2026-07-01
+
+### Added
+- **`/ace eval` — efficiency diagnostic proving the ACE value-prop on the live system** (`engine.gx10._ace_command`
+  + `engine.playbook_store.PlaybookStore.benchmark`, epic #855 wiring-audit follow-up / #918): `ack.ace.evaluation`
+  was a complete benchmark harness only exercised by synthetic unit tests — the live system's efficiency was
+  never measured. A new opt-in `/ace eval --ledger <path>` reads the ledger as plain data, projects it to
+  trajectories, and runs `compare_adaptation` (ACE-delta vs full-rewrite vs evolutionary — each builds its OWN
+  playbook, the live one is **not** mutated) to report the paper's verdict: J-001 (ACE does zero full-rewrites /
+  LLM-merges) and J-002 (ACE cuts rollouts >50% vs the evolutionary baseline). Off the hot path, opt-in (runs
+  three strategies), fail-soft, no-op without a model/ledger. **With #914/#915/#918 every ACE paper module is
+  now on a live path** (`robust` in the adapt loop, `offline` via `/ace warmup`, `evaluation` via `/ace eval`).
+- **`/ace warmup` — offline warm-start the playbook from a dev-loop ledger** (`engine.gx10._ace_command` +
+  `engine.playbook_store.PlaybookStore.warmup`, epic #855 wiring-audit follow-up / #915): the offline
+  batch-build (`ack.ace.offline`) was a complete module with no live caller. A new opt-in command
+  `/ace warmup --ledger <path>` reads the ledger as plain data (boundary-clean, no private import), projects it
+  via `ack.ace.devtraj.ledger_to_trajectories`, and batch-replays the historical terminal trajectories through
+  `offline.warmup` to seed the active scope's playbook (which the online loop then continues on, G-004). Off
+  the hot path, single-epoch by default, fail-soft, no-op without a model / scope / ledger; a chain-tampered
+  ledger is blocked. Not auto-run at boot (a warm build is several LLM calls). (`ack.ace.evaluation` is wired
+  separately by #918's `/ace eval`.)
+- **ACE robustness half now runs in the live adapt loop** (`ack.ace.online.adapt_once`, epic #855 wiring-audit
+  follow-up / #914): a post-C2 wiring audit found `ack.ace.robust` was a complete module but orphaned from
+  every live path — the online `adapt_once` composed only reflect→curate→apply_delta→refine. It now runs the
+  paper's K-002/K-003 self-correction **after refine**: `resolve_contradictions` (keep the higher-utility of a
+  contradicted same-section pair) + `quarantine_noisy` (drop net-negative bullets), gated by `AdaptConfig.robust`
+  (default on) with `quarantine_min_net` (default 0), reported as `resolved`/`quarantined` in the adapt summary.
+  Off the hot path (adapt runs on the ReflectionWorker); fail-soft. `unlearn`/`version_id`/`PlaybookHistory`
+  remain on-demand APIs; `ack.ace.evaluation` stays a measurement harness by design.
+- **ACE playbook injection into the machine-gated dev-loop's worktree coder** (`scripts/devloop/ace_inject`,
+  epic #855 M4 Mode-2 follow-up / #894): the dev-loop runs its coder as `claude --print` in a fresh worktree
+  with no engine handover seam, so #863's handover injection could not reach it. Now, before the agent runs,
+  the unit's relevant playbook is written into the worktree's `CLAUDE.local.md` (a Claude Code local-context
+  file the coder auto-reads), added to the worktree's git exclude so it never enters the unit diff / trips the
+  confinement gate, and the injected bullet ids are recorded per unit so the M4-2 ledger scan populates
+  `Trajectory.used_bullet_ids` for the worktree path too. Resolves the SCOPE via the shared `project_registry`
+  and reads the playbook via the engine's `PlaybookStore` (private `scripts/devloop` may import core). Fail-soft:
+  no scope / no playbook ⇒ no-op (byte-identical). **Both dev-process coder modes (handover+feedback and the
+  worktree agent) now receive the always-on playbook.** (Private runner change — not in the public wheel.)
+- **ACE MPR-for-architecture — end-to-end proof (M5 capstone)** (epic #855 cluster ACE-FORKPROOF / #886,
+  MPR-A-6): a boundary-clean e2e test of the whole gated fork propose-loop through the one core seam — a
+  `ForkSignal` → the gated off-path pre-informed MPR panel (M5-2) → the matrix recorded + rendered as a
+  recommendation (M5-3) → the operator resolves → a fork-decision bullet recorded (M5-4) → a second comparable
+  fork's MPR query pre-informed by it. Proven for BOTH dev-processes (public generic `ack.devprocess` + the
+  internal DEV-3) through the same ledger schema/seam, plus the gate-off no-op (byte-identical) and the full
+  fail-soft matrix (tampered ledger / MPR no-op / MPR raises / malformed signal → the ask always surfaces, no
+  crash, the loop never blocks). With M5-1..M5-5 merged, **MPR-for-architecture ships as one self-consistent,
+  boundary-clean, gated (`ace.fork_mpr.enabled`, default OFF), fail-soft capability** on top of always-on ACE.
+- **ACE fork-decision learning — closes the propose→decide→record→pre-inform loop** (`engine.gx10`, epic #855
+  cluster ACE-FORKLEARN / #885, MPR-A-4): a newly-resolved fork (M5-1's `ForkResolution` on the ledger) becomes
+  a fork-decision `ack.ace.Trajectory` — query = the fork's question (the stable comparability key), steps =
+  the chosen option + area, outcome = chose <option> → <outcome>, `used_bullet_ids` = the prior fork bullets
+  that seeded the M5-2 query (captured `fork:<unit>` so the Reflector rates which prior decisions helped) —
+  submitted to the EXISTING background `ReflectionWorker`; reflect→curate writes a bullet into
+  `strategies_and_hard_rules`, so M5-2's `context_for` pre-informs the next comparable fork. This is what makes
+  M5 a *loop*, not a one-shot panel. Gate OFF (`ace.fork_mpr.enabled`) ⇒ no learning (byte-identical);
+  exactly-once (a persisted decision-key set, distinct from M4-2's unit-arc + #863's per-handover completion →
+  no double-learning); off-hot-path; fail-soft.
+- **ACE fork proposal surface — the MPR matrix as a recommendation at the ask** (`engine.gx10` +
+  `engine.playbook_store`, epic #855 cluster ACE-FORKPROPOSE / #884, MPR-A-3): the decision-matrix produced
+  off-path by M5-2 is recorded as a fork-proposal pointer bound to the unit (`record_fork_proposal`/
+  `read_fork_proposal`, latest-wins, bounded, boundary-clean — the full run stays under the initiative's
+  `vault/<slug>/runs/`), and `_ace_fork_proposal_for(unit)` renders it as a **recommendation only** — MPR's
+  top-ranked option (extracted from the synthesis) + the ranked matrix + dissent + an explicit "this is a
+  recommendation, NOT a decision; you decide, ACE learns from the choice". A generic, boundary-clean seam BOTH
+  dev-processes attach to their operator ask (satisfies DEV_LOOP's "ask at architecture forks, don't guess",
+  now MPR-grounded, without removing the human decision). Fail-soft: a no-op MPR result (disabled/declined/
+  ERROR) is not persisted ⇒ the ask surfaces unchanged, never an empty artifact.
+- **ACE MPR-at-fork panel — gated, off-hot-path architecture-decision proposal** (`engine.gx10`, epic #855
+  cluster ACE-FORKMPR / #883, MPR-A-2 + MPR-A-5): a new gate **`ace.fork_mpr.enabled` (default OFF)** controls
+  whether a recognized `ForkSignal` (M5-1) fires MPR's existing `architecture-decision` panel — via
+  `run_tool('mpr_research', {domain_hint:'architecture-decision', mode_hint:'decision'})` on a dedicated
+  off-hot-path worker (a `ReflectionWorker` reused as a generic queue worker, so the multi-LLM-call panel never
+  blocks the dev-loop / turn path). The MPR query is **pre-informed** by the playbook's prior relevant fork
+  bullets via `PlaybookStore.context_for` (MPR-A-5). Dispatched exactly-once (a persisted fork-key set) at the
+  `/lifecycle gate` ledger touchpoint. **Gate OFF ⇒ byte-identical to today's STOP-and-ask**; fail-soft on
+  every mode (MPR disabled / no orchestrator model / no active initiative / RunBudget exhausted / MPR raises →
+  no-op, the operator ask still surfaces). MPR only *produces* the decision-matrix here — attaching it to the
+  ask is M5-3, recording the chosen outcome is M5-4. Also respects MPR's own `mpr.enabled` + `$2/run` RunBudget.
+- **ACE fork signal — the architecture-decision data contract** (`ack.ace.fork`, epic #855 cluster
+  ACE-FORKSIG / #882, MPR-A-1): the pure, boundary-clean foundation for the M5 *propose* layer (MPR-for-
+  architecture). Defines `ForkSignal` `{unit, area, question, options[], touched_paths[]}` + `ForkResolution`
+  `{unit, area, chosen_option, outcome}` with lossless `to_dict`/`from_dict`, plus a pure adapter
+  (`parse_fork_signal`/`fork_signals_from` on the `FORK`/`FORK_RESOLVED` ledger surfaces) that reads a declared
+  fork off the SAME boundary-clean dev-loop ledger seam `ack.ace.devtraj` (M4-1) consumes. Fork-detection is
+  Variant A (declared fork at the existing STOP-and-ask point), reversible to a later Variant-B auto-detector
+  reusing this exact schema. Pure/stdlib-only (imports nothing from the engine / `scripts/devloop`);
+  drift-tolerant and never raises. No engine wiring / no MPR call yet (those are M5-2..M5-5).
+- **ACE dev-process self-learning — end-to-end proof (M4 capstone)** (epic #855 cluster ACE-DEVPROOF / #881,
+  DP-3): a boundary-clean e2e test driving the full M4 stack — ledger → `ack.ace.devtraj` → the M4-2 scan →
+  the real `ReflectionWorker` → `PlaybookStore.adapt` → a real playbook mutation — for the SAME ledger schema
+  both the public generic `ack.devprocess` driver AND the internal DEV-3 (`scripts/devloop`) emit, proving ONE
+  adapter serves both. Also proves DP-4 (a tampered/absent/garbage ledger ⇒ no crash, no learning),
+  exactly-once (a re-scan adds nothing; the per-unit merge-arc signal is distinct from #863/M4-0's per-handover
+  hook → no double-learning), and the M4-3 used-bullet correlation flowing through (a used bullet is rated
+  helpful, E-004). With M4-0..M4-4 merged, the dev-process self-learning loop (Variant A, ledger-derived) is
+  wired + tested for the handover+feedback coder-addressing mode; the machine-gated dev-loop worktree-agent
+  injection is the tracked follow-up #894.
+- **ACE dev-process used-bullet correlation** (`engine.gx10` + `engine.playbook_store`, epic #855 cluster
+  ACE-DEVBULLET / #880, DP-2): closes the used-bullet feedback loop for the dev-process. The handover
+  injection site (#863, where the coder's handover gets the playbook via `context_for`) now DURABLY records
+  which bullets it injected — keyed by the engine task id AND the issue#s the handover references (the standard
+  `Closes #N` linkage; `_ace_unit_keys`/`_ace_persist_injected` → `playbook_store.record_unit_bullets`) — and
+  the M4-2 dev-process ledger scan reads it back by the unit (issue#) to populate `Trajectory.used_bullet_ids`,
+  so the Reflector rates which dev-loop bullets were helpful/harmful (E-004). DP-2 (the playbook reaches the
+  coder) is satisfied for the **handover+feedback coder-addressing mode** — the autopilot / GitHub-only /
+  file-based-with-handovers / public `ack.devprocess.stage_handover`→engine-driver flows, where the coder reads
+  the handover md `context_for` injected. The machine-gated dev-loop's worktree-agent injection (no handover
+  seam) is the tracked follow-up #894. `[]` when no correlation (weaker, not wrong); fail-soft throughout.
+- **ACE dev-process learn-trigger** (`engine.gx10._ace_scan_dev_ledger`, epic #855 cluster ACE-DEVWIRE /
+  #879, DP-1/DP-4): the engine wiring that makes the dev-loop actually LEARN. Off the hot path it scans the
+  dev-loop ledger (read as plain data via the existing `_read_ledger_payloads`), projects it (`ack.ace.devtraj`)
+  into per-unit Trajectories, and submits each **newly-terminal** unit (reached-human-merge-gate / aborted) to
+  the existing background `ReflectionWorker` **exactly-once** (a persisted submitted-units set under
+  `ironclad_home()` survives restarts). Variant A (ledger-derived): NO driver change, NO new public seam; a
+  chain-tampered/unreadable ledger is **skipped fail-closed** (never a learning source); no worker/scope ⇒
+  no-op. Wired into the `/lifecycle gate` command — the dev-loop's DELIVER-leg ledger touchpoint — reusing the
+  payloads it already read (advisory; does not affect the gate result). A distinct per-UNIT signal from the
+  in-process per-handover `post_feedback` hook (#863/M4-0): the dev-loop runner (`run.py`) is a SEPARATE
+  process whose ledger writes never fire that hook, so there is no double-learning.
+- **ACE dev-process trajectory adapter** (`ack.ace.devtraj`, epic #855 cluster ACE-DEVTRAJ / #878, DP-1):
+  `ledger_to_trajectories` — a PURE, stdlib-only mapper that re-projects already-parsed dev-loop ledger
+  payloads (the same boundary-clean `.devloop/ledger.jsonl` the engine's `lifecycle_projector` consumes) into
+  one ACE `Trajectory` per unit of work: driver transitions grouped by `unit` (abort by `abort`), ordered
+  timestamp-free leg summaries, and a **label-free** outcome ∈ {`reached-human-merge-gate` (the driver stops
+  at the human merge gate — NOT a confirmed merge), `aborted`, `blocked`, `in-progress`}; `used_bullet_ids`
+  is `[]` (M4-3 correlates the per-unit injected bullets). Variant A (ledger-derived) — imports nothing from
+  the engine; schema-drift tolerant, never raises; a DELIVER record (carries no `unit`) is skipped. The
+  read-half of the dev-process self-learning loop; M4-2 wires the engine learn-trigger.
+- **ACE evolving-context playbook — data model** (`ack.ace`, epic #855 / ACE arXiv 2510.04618v3, cluster
+  ACE-DATA): the foundation of the Loop-Intelligence → ACE extension — an itemized `Bullet` (stable id +
+  helpful/harmful usage counters + categorical tags) inside a sectioned `Playbook` (the four canonical ACE
+  sections + custom), with a human-readable **and** machine-parsable `render()` (explicit boundaries + bullet
+  ids so a Generator can cite which bullets it used) and a **versioned, lossless JSON round-trip** (ids,
+  counters, tags, and the id-minting counter all survive a reload; a newer schema version is refused
+  fail-closed). Pure / stdlib-only (imports nothing from the engine). The Reflector/Curator (#858/#859),
+  grow-and-refine (#860) and the **always-on** ACE-WIRE engine integration (#863) build on it — ACE is wired
+  as the unconditional loop-intelligence core (no enable flag; it supersedes the #602 string-lesson +
+  Process-SC consumers).
+- **ACE Reflector** (`ack.ace.reflector`, epic #855 cluster ACE-REFLECT): the role that distils concrete,
+  reusable insights from a reasoning trajectory + natural execution feedback (label-free) and rates which
+  used bullets were helpful/harmful/neutral — structured `Trajectory` input and `ReflectorOutput`
+  (candidate bullets + ratings), with optional iterative refinement over N rounds (product default 1). The
+  LLM transport is **injected** (`chat`, like `verify_with_judge`) so it stays stdlib-only/clean-room-safe;
+  **fail-soft** (a transport or parse error yields an empty result — never raises, never breaks the loop).
+  The Curator (#859) turns its insights into deterministic playbook deltas; the async worker + budget gate
+  + real transport wire in #862/#863.
+- **ACE Curator** (`ack.ace.curator`, epic #855 cluster ACE-CURATE): integrates Reflector insights into the
+  playbook as a compact **delta** (`Delta` = `{reasoning, operations}`, F-003) and **merges it
+  deterministically** (no monolithic LLM rewrite → the ACE cost/latency win + no context collapse): `curate`
+  builds add/rate ops from the Reflector output (section-validated F-002; localized per bullet C-002;
+  delta-not-rewrite C-001), `apply_delta` merges them in place (add bullet / bump helpful-harmful counter +
+  tag / tag / remove). Deterministic + pure/stdlib-only; robust (an op on a missing bullet, an unknown op, or
+  empty content is skipped + counted, never raised); `Delta.from_json` also parses an externally-emitted
+  delta so an LLM-driven Curator variant can ride the same merge.
+- **ACE grow-and-refine** (`ack.ace.grow`, epic #855 cluster ACE-GROW): keeps the evolving playbook compact +
+  relevant. `dedupe` merges near-duplicate bullets **within a section** — **semantic** (cosine over an
+  INJECTED batched embedder at a configurable threshold, default 0.9; L-003) with a **lexical token-Jaccard
+  fallback** when no embedder is reachable (sealed / no-memory) and on any embedder error (fail-soft);
+  D-001. `prune` bounds the playbook by bullet-count or rendered-size budget, removing the **least useful**
+  bullets first (lowest helpful−harmful, then most-harmful, then oldest; D-003/L-004). `refine` runs both,
+  **proactively** or **lazily** (only over budget; D-002). Merging folds counters + unions tags into the
+  surviving bullet. Pure / stdlib-only; the real model-window coordination wires in #862/#863.
+- **ACE Generator integration** (`ack.ace.generator`, epic #855 cluster ACE-GEN): playbook-guided inference
+  (H-001) + bullet-id usage tracking (H-002) + the Generator→Reflector closure (N-004). The key window fix:
+  the playbook store may be large, but `select_relevant` retrieves only the **relevant bullet subset** per
+  query (semantic via the injected embedder, lexical token-overlap fallback, fail-soft), `prepare_context`
+  renders that subset (ids + counters + tags) into a `GeneratorContext` and tracks the injected ids, and
+  `to_trajectory` turns the run's output + used ids into the Reflector's `Trajectory` (closing the online
+  loop). Pure / stdlib-only.
+- **ACE online adaptation** (`ack.ace.online`, epic #855 cluster ACE-ADAPT-ONLINE): the closed loop
+  composed — `adapt_once` runs Trajectory → reflect → curate → apply_delta → refine over the playbook
+  in place (label-free O-001, cumulative O-002, `rounds` L-001), **budget-gated** via an injected ledger
+  (`can_afford`/`charge`, like `verify_with_judge`; skips without an LLM call when unaffordable, fail-soft
+  on a flaky ledger) and a no-op-when-nothing-learned. `ReflectionWorker` is the **async seam**: `submit`
+  is an O(1) non-blocking enqueue (hot-path-safe — drops on a full queue rather than block) and a background
+  daemon drains it off the turn path, so the engine's `post_feedback` hook never runs the model inline.
+  Fail-soft (a bad item counts an error, never kills the worker). Pure / stdlib-only; the hook wiring + real
+  transports are #863.
+- **ACE engine wiring — the always-on loop-intelligence core** (`engine.playbook_store` + `engine.gx10` +
+  `memory-service`, epic #855 cluster ACE-WIRE / #863): a new engine-side `PlaybookStore` wraps one
+  `ack.ace.Playbook` per `mem_scope` (one schema-versioned JSON file under `ironclad_home()/ace_playbooks`),
+  implementing BOTH the string `ack.lessons` provider surface (`get_lessons`/`report_lesson`/`brief`) AND the
+  typed `record`/`by_category`/`forget` surface the in-process Process-SC consumers couple to — plus the
+  ACE-native query-aware `context_for` (the 32k-safe Generator handover read that injects only the relevant
+  bullet subset) and the budget-gated online `adapt`. `gx10._apply_ace` registers it as the provider, wires a
+  `post_feedback` consumer that **submits** a Trajectory to a background `ReflectionWorker` (reflect→curate→
+  refine runs OFF the hot path — never inline), and starts the worker; the orchestrator-model `chat`, the
+  memory-service **`/embed`** adapter (BGE-M3) and the token budget are injected. The legacy #602 lesson tree
+  is migrated into the playbook on first wiring. New memory-service `POST /embed` batch endpoint exposes the
+  local BGE-M3 embedder (1024-d) for semantic dedup/retrieval. Fail-soft throughout: with no orchestrator
+  model reachable ACE no-ops and the playbook simply stays empty.
+- **ACE offline adaptation** (`ack.ace.offline`, epic #855 cluster ACE-ADAPT-OFFLINE / #864): the offline
+  counterpart to the online loop — an operator-invoked batch build over a dataset, off any turn path.
+  `build_offline` runs **multi-epoch** (G-003, default 5) over **batches** (A-003, base size 1): each batch's
+  per-sample reflect→curate deltas are computed **independently** (an injected `map_fn` may parallelize them)
+  and **merged deterministically** (`merge_deltas`, C-003 — input order, last-wins ADD collision, RATE/TAG/
+  REMOVE accumulated), then applied + refined; budget-gated, **label-free** (training labels are used only by
+  `evaluate`), fail-soft per sample. `evaluate` is the test-split **pass@1** (G-001) — it needs only the
+  optimized playbook, never the training data. `warmup` is the label-free batch-replay of the operator's
+  execution ledger (G-004) that seeds the playbook the online loop then continues on (the same playbook is
+  handed to `OnlineAdapter`). Pure / stdlib-only.
+- **ACE evaluation — shipped metrics surface + comparative-baseline harness** (`ack.ace.evaluation`, epic
+  #855 cluster ACE-EVAL / #865): the SHIPPED eval surface — `accuracy` (I-003, exact predicted==ground-truth
+  %) and `goal_completion` (I-001 Task GC / I-002 Scenario GC — fraction successful, with a per-difficulty
+  split) — plus a comparative-baseline cost/latency harness. Three BUILT adaptation strategies instrumented
+  by a `RolloutMeter` so their cost is **measured**, not asserted: real ACE (`reflect→curate→merge`), a
+  monolithic **full-rewrite** baseline, and an **evolutionary** validation-loop baseline. `compare_adaptation`
+  proves ACE does ZERO full-rewrites + ZERO LLM merges (J-001 — local deltas + deterministic merge) and cuts
+  rollouts **>50%** vs the evolutionary baseline (J-002). `kv_cache_metrics` measures the stable-prefix
+  cacheable ratio of successive playbook renders (J-003 — append-only ⇒ high reuse, a rewrite ⇒ low);
+  `validate_epochs` guards the adaptation-epochs hyperparameter (L-002 — ≥1, default 5); `EvalReport`
+  aggregates the surface. Pure / stdlib-only.
+- **ACE robustness + safety** (`ack.ace.robust`, epic #855 cluster ACE-ROBUST / #866): the mechanisms that
+  make an imperfect deployment degrade gracefully + stay reversible. `quarantine_noisy` drops harmful-dominant
+  (net-negative) bullets so a moderate amount of noisy/adversarial updates is rejected without collapse
+  (K-002), and `adaptation_gain` shows a **weak reflector still nets positive after quarantine** while a
+  stronger one gains more (K-001 — graceful degradation, monotone in reflector strength). `detect_contradictions`
+  finds opposite-polarity, same-section bullets (token-overlap + negation heuristic) and `resolve_contradictions`
+  keeps the higher-utility belief (K-003). `unlearn` is **selective item-level forget by bullet id** — no
+  retraining, no scope-wide wipe (Q-001). `version_id` + `diff_versions` + `PlaybookHistory` (snapshot /
+  rollback) are the playbook **versioning + reversible rollback** safety net (M-002). Pure / stdlib-only,
+  never raises.
+
 ### Changed
+- **ACE live feedback — the always-on hook now threads real used-bullet ids + a real outcome and learns from
+  failures** (`engine`, epic #855 cluster ACE-LIVEFEEDBACK / #877 — **behavior change**): the handover
+  injection site records which playbook bullets it injected (keyed by task_id), and the `post_feedback`
+  consumer threads those **real `used_bullet_ids`** + a **label-free outcome** into the Trajectory — a fresh
+  `OK: pipeline advanced` ⇒ `success`, an `ERROR: pipeline step failed` ⇒ `failed`. So the Reflector now
+  learns from FAILURES too (E-001/O-002) and rates the bullets the task actually used (E-004/H-002), feeding
+  grow-and-refine's utility prune (D-001/D-003) — the machinery #863 stood up but never exercised on the live
+  general-task path (it previously hardcoded `outcome="success"` + empty ids and fired only on success).
+  Already-done re-advances + trivial precondition errors are skipped; off the hot path + fail-soft preserved.
+- **ACE is now the always-on loop-intelligence core, superseding the #602 string-lesson + Process-SC
+  consumers** (`engine`, epic #855 / #863 — **behavior change**): ACE has **no enable flag** — `_apply_ace`
+  always registers the `PlaybookStore` as the `ack.lessons` provider and the ACE `post_feedback` consumer,
+  **replacing** the #602 `_apply_lessons_provider`/`_apply_lessons_consumer` (#804) and `_process_consumer`
+  (#803) wiring. Process-SC's distillation is subsumed by `reflect→curate`, but its TYPED read surface never
+  silently breaks: `_concrete_lesson_provider` is now **duck-typed** (a `record`/`by_category` capability
+  probe, not an `isinstance` check), so it resolves to the `PlaybookStore`. The handover read-site injects the
+  query-aware playbook context (`context_for`) instead of the flat `brief`. A foreign extension provider is
+  never clobbered (richer-wins: ACE steps back while one is registered). The earlier default-off /
+  byte-identical contract for the loop-intelligence layer is intentionally retired — ACE is the engine's
+  loop-intelligence mechanic.
 - **Lifecycle gate `tests`/`reviews` evidence is now produced, and an inert review is excluded** (`engine`,
   #601 S13b / #632 follow-up #830): the dev-process driver's transition `log` seam is wired to the
   per-project ledger (`build_real_ops(ledger_path=…)`, threaded from `run.py`), so **every** transition —
@@ -26,6 +270,66 @@ Released versions are listed below; upcoming work accumulates under *Unreleased*
   the flat default. An explicit handover `effort:` still wins; an unmapped class or an unreadable task falls
   through to the previous spec/default chain unchanged (**fail-open**). Token-balancing: the hardest tasks
   automatically get more reasoning budget without relying on the operator/method setting `effort:` by hand.
+
+### Fixed
+- **`/chat` response no longer carries interactive pane chrome** (`engine.server._strip_chat_chrome`,
+  desktop functional-acceptance finding / #921): a captured `POST /chat` turn returned the `[GX10]` and
+  `[Qwen (planning)]` / `[Qwen (running)]` status markers mixed in with the answer. These are terminal-pane
+  affordances, not part of the answer — the server now strips them (and collapses the blank lines they leave)
+  from the buffered response, keeping the answer plus the perf/DONE status. The interactive terminal and the
+  `/chat/stream` path are unchanged. Fail-soft (returns the text as-is on any error).
+- **Ink FPS micro-benchmark no longer false-fails under machine load** (`clients/ink/test/fps.test.tsx`,
+  desktop functional-acceptance finding / #920): the benchmark asserted a wall-clock 30fps budget
+  (<33ms/frame), which is timing-sensitive — on a busy machine it measured ~177ms/frame and failed, a false
+  red unrelated to the renderer (production coalesces token updates to maxFps). The wall-clock assertion is
+  now gated behind `INK_PERF=1` (an idle machine / a dedicated perf run); by default the test still exercises
+  the full render path (100 rapid rerenders) and logs the timing, plus an always-on functional smoke that the
+  live region still renders content after the rerenders.
+- **ACE Reflector now runs thinking-OFF so the always-on loop learns on a reasoning model** (`engine.gx10.
+  _ace_chat_adapter`, desktop functional-acceptance finding / #922): the Reflector's orchestrator-model call
+  emits STRUCTURED JSON (insights/ratings), not free reasoning, but it was sent WITHOUT disabling qwen3
+  thinking and with only a 1024-token cap. On the deployed reasoning model (qwen3.6-35b) the call burned the
+  whole budget on a `<think>` block (`finish_reason=length`) and returned EMPTY `content` → 0 insights → the
+  always-on playbook NEVER mutated (the headline capability was inert on the production model — a live-only gap
+  the stub-transport unit tests miss). Now the adapter passes `extra_body={'chat_template_kwargs':
+  {'enable_thinking': False}}` + a 2048-token budget (mirroring MPR's classify/`complete_json`). Live-verified:
+  ACE now distills a real bullet from a trajectory on qwen3.6-35b. Regression test asserts the thinking-off +
+  budget request params.
+- **ACE S4 polish — KV-cache stable prefix, docstring, no multi-issue cross-attribution** (`ack.ace.playbook`
+  + `engine.playbook_store` + `engine.gx10`, epic #855 C2 findings / #906): `Playbook.render()` now trails the
+  mutable `(↑helpful ↓harmful)` counters AFTER the stable `[id] content #tags` (KV-cache stable prefix, N-002);
+  `get_lessons`' empty-query docstring corrected ("recency" → net_utility with a recency tiebreak, matching the
+  code); and `_ace_unit_keys` keys only the FIRST `#N` in a task title (the primary unit) so a title that also
+  mentions another issue no longer cross-attributes injected bullets (a `Closes #N` body linkage stays
+  deliberate). The J-001 hardcoded-zero rewrite metric (ACE genuinely does zero full-rewrites — already
+  documented) and the rare abort-then-recover mislabel (arc preserved in `steps`) were reviewed and accepted
+  as-is.
+- **ACE learning robustness — top_k wiring, exactly-once crash window, contradiction modals, foreign clobber**
+  (`engine.gx10` + `engine.playbook_store` + `ack.ace.robust`, epic #855 C2 findings / #905): four S3 nits.
+  (1) `ace.top_k` was inert — `_apply_ace` never threaded it to `context_for`; it is now applied via
+  `PlaybookStore.configure(top_k=…)` so `/config set ace.top_k N` actually changes the injected-bullet cap.
+  (2) The M4-2 dev-process exactly-once key is persisted per-item BEFORE `worker.submit` (at-most-once), so a
+  crash between submit and the previously-batched save can no longer re-learn a unit. (3) `detect_contradictions`
+  no longer treats the bare modals "should"/"must" as negations (obligation, not polarity), removing
+  false-positive contradiction deletes. (4) The always-on supersede check is identity-based
+  (`current is _ACE_STORE`), so a foreign PlaybookStore-typed provider is never clobbered.
+- **ACE fork MPR dispatch is crash/drop-safe + tears down on gate off** (`engine.gx10`, epic #855 C2 finding /
+  #904): the exactly-once fork key was persisted at dispatch, so a full-queue drop or a worker crash
+  permanently lost the proposal with no retry. It is now committed only **after** the MPR run completes (an
+  in-memory in-flight guard prevents concurrent duplicate dispatch; a dropped/crashed run stays un-committed
+  and is retried on the next scan). The dedicated fork worker is now also torn down (stopped + cleared) on a
+  gate ON→OFF flip, so `ace.fork_mpr.enabled off` leaves no stranded idle daemon.
+- **ACE MPR fork proposal is now surfaced to the operator via `/fork`** (`engine.gx10` + `engine.playbook_store`,
+  epic #855 C2 finding / #903): M5-3 recorded + rendered the decision-matrix but `_ace_fork_proposal_for` had
+  no production caller, so MPR-A-3's output leg was inert. A new read-only **`/fork [unit]`** command
+  (`_fork_command` + `playbook_store.list_fork_proposals`) lists the pending architecture proposals (or renders
+  a single one) as a **recommendation only** — the boundary-clean, both-dev-process seam where the operator
+  sees the MPR matrix at a fork and decides (ACE then learns the choice, M5-4). Fail-soft; no proposal ⇒ a
+  clear "none pending" note.
+- **ACE playbook prune evicted the newest bullet instead of the oldest on a tie** (`ack.ace.grow.prune`, epic
+  #855 C2 finding / #902): the overflow-prune tiebreak used `-_seq(b)`, so on a `net_utility` + `harmful_count`
+  tie `min()` picked the largest seq (newest) — contradicting the documented "oldest (D-003)" contract and
+  discarding the freshest lesson. Corrected to `_seq(b)` (oldest first); regression test added.
 
 ## [0.0.21] - 2026-06-30
 

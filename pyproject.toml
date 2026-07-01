@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ironclad-ai"
-version = "0.0.21"
+version = "0.0.22"
 description = "Reliability for LLM agents through enforcement, not model size — Agent-Contract-Kernel (ACK) + a fail-closed orchestration engine."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -47,7 +47,7 @@ Issues = "https://github.com/GrokBuildMJW/ironclad/issues"
 [tool.setuptools]
 # ack.devprocess ships ONLY the curated public facade (ack.devprocess.api, ADR-0011 AD-3) — the
 # dev-process implementation substrate is engine-internal and is NOT in the wheel.
-packages = ["ack", "ack.lodestar", "ack.devprocess"]
+packages = ["ack", "ack.lodestar", "ack.devprocess", "ack.ace"]
 
 [tool.setuptools.package-data]
 # Ship the paved-road generator templates (Copier tree) as data, not as packages —

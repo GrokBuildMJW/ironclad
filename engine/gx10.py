@@ -2830,7 +2830,25 @@ def _stage_handover_impl(task_id: Optional[str], agent: str, handover_md: str,
             # unchanged and no I/O happens, so this is byte-identical to the pre-seam engine.
             try:
                 from ack import lessons as _lessons   # lazy: never import ack at gx10 top-level (S6b lesson)
-                lesson_ctx = _lessons.brief([_active_mem_ns()])
+                ns = _active_mem_ns()
+                # ACE (#863): the always-on PlaybookStore exposes a query-aware relevant-bullet read
+                # (`context_for`, keyed by the task title + handover body) — the 32k-safe Generator read that
+                # injects only the most relevant subset of a large playbook (#366). Any other provider (or a
+                # foreign extension) keeps the string-only `brief`. Duck-typed so the seam stays generic.
+                prov = _lessons.get_provider()
+                if hasattr(prov, "context_for"):
+                    q = (fields.get("title", "") + "\n" + ho_md).strip()
+                    lesson_ctx = prov.context_for([ns], query=q)
+                    # M4-0 (#877): remember WHICH bullets were injected into this task's handover so the
+                    # post_feedback consumer can rate them helpful/harmful (E-004/H-002). Advisory + fail-soft.
+                    _ids = _ace_bullet_ids(lesson_ctx)
+                    _ace_record_injected(tid, _ids)
+                    # M4-3 (#880): also DURABLY record the injected ids keyed by the task id + any issue# the
+                    # handover references (the standard `Closes #N` linkage), so the per-UNIT dev-process
+                    # ledger scan (M4-2) can populate Trajectory.used_bullet_ids (E-004 for the dev-loop unit).
+                    _ace_persist_injected(_ace_unit_keys(tid, fields, ho_md), _ids)
+                else:
+                    lesson_ctx = _lessons.brief([ns])
                 if lesson_ctx:
                     ho_md = ho_md.rstrip() + "\n\n---\n\n## Lessons\n\n" + lesson_ctx
                     log.append("Lesson context injected")
@@ -5509,6 +5527,9 @@ HELP = """
                               text → first required arg, or {json}. e.g. tool mpr_research <frage>
     rag on|off       toggle per-turn retrieval (RAG) for this session
     context          show the context-budget report
+    fork [unit]      show the MPR architecture-decision proposal at a fork (recommendation only — you decide)
+    ace warmup --ledger <path>   offline warm-start the active playbook from a dev-loop ledger's history
+    ace eval --ledger <path>     efficiency diagnostic: ACE vs full-rewrite/evolutionary (J-001/J-002)
     generate <args>  scaffold a paved-road capability into the active project library
     initiative new <name> --type mpr|software   create + activate a initiative (artefact home)
     initiative list | use <slug> | active | reconcile [slug]
@@ -5860,6 +5881,16 @@ def _lifecycle_command(arg_str: str) -> str:
     if chain_errors:
         return (f"[lifecycle] BLOCKED: ledger integrity failure ({ledger_path.as_posix()}): "
                 + "; ".join(chain_errors[:5]))
+    # M4-2 (#879): ACE dev-process self-learning — reuse the (valid) ledger we just read to submit each
+    # newly-terminal unit's Trajectory off the hot path (advisory, fail-soft, exactly-once; does not affect
+    # the gate result). The dev-loop's DELIVER-leg runs this gate, so it is the natural ledger touchpoint.
+    _ace_scan_dev_ledger(payloads, chain_errors)
+    # M5-2 (#883): ACE MPR-at-fork — dispatch each newly-declared ForkSignal in the same (valid) ledger to the
+    # gated MPR architecture-decision panel off the hot path (gate OFF ⇒ no-op; exactly-once; fail-soft).
+    _ace_scan_fork_signals(payloads, chain_errors)
+    # M5-4 (#885): ACE fork-learn — turn each newly-RESOLVED fork into a fork-decision Trajectory (→ bullet via
+    # the reflection worker) so the next comparable fork is pre-informed (gate OFF ⇒ no-op; exactly-once).
+    _ace_scan_fork_resolutions(payloads, chain_errors)
     try:
         result = _lifecycle_projector.project_transitions(
             payloads, slug=slug, tree_sha=tree_sha, required_stages=required_stages,
@@ -6729,6 +6760,14 @@ def _dispatch(agent: GX10, user_input: str):
         # S13b / AD-7: the engine DELIVER-leg lifecycle-completeness gate (reads the transition ledger as
         # data → projects stage-tagged evidence → verifies completeness). Deterministic, model-free.
         _ui_print(col(_lifecycle_command(user_input[len("lifecycle"):].strip()), C.CYAN))
+    elif cmd == "fork" or cmd.startswith("fork "):
+        # #903 (M5-3 output leg): surface the MPR architecture-decision proposal(s) at a fork as a
+        # recommendation — the operator sees it here and decides (ACE learns the choice, M5-4). Read-only.
+        _ui_print(col(_fork_command(user_input[len("fork"):].strip()), C.CYAN))
+    elif cmd == "ace" or cmd.startswith("ace "):
+        # #915: ACE ops — `/ace warmup --ledger <path>` offline warm-starts the active playbook from a
+        # dev-loop ledger's historical trajectories (opt-in, off-hot-path, fail-soft).
+        _ui_print(col(_ace_command(user_input[len("ace"):].strip()), C.CYAN))
     elif cmd == "project" or cmd.startswith("project "):
         _ui_print(col(_project_command(user_input[len("project"):].strip(), agent), C.CYAN))
     elif cmd == "generate" or cmd.startswith("generate "):
@@ -7271,6 +7310,21 @@ def _code_defaults() -> Dict[str, Any]:
             "enabled":   False,
             "max_hints": 3,
         },
+        "ace": {
+            # epic #855 ACE-WIRE (#863): the always-on Agentic Context Engineering loop-intelligence core.
+            # ACE SUPERSEDES the #602 string lesson + Process-SC consumers (operator decision 2026-06-30) —
+            # it is the engine's loop-intelligence mechanic, ALWAYS ON, there is NO enable flag. A
+            # PlaybookStore is registered as the ack.lessons provider; a post_feedback consumer submits a
+            # Trajectory to a background ReflectionWorker (reflect→curate→refine runs OFF the hot path, never
+            # inline). The keys below are TUNING only; with no orchestrator model reachable, ACE simply
+            # no-ops (fail-soft) and the playbook stays empty. C1 = project-private scope, like #602.
+            "max_bullets": 200,    # per-scope playbook cap — the 32k-window guard (#366); 0/None = uncapped
+            "rounds":      1,      # reflection rounds per online adaptation (L-001)
+            "top_k":       8,      # bullets injected into the Generator handover context (H-001)
+            "cost":        1,      # budget units charged per online adaptation (when a budget is wired)
+            "embed_url":   "",     # the memory-service /embed endpoint (semantic dedup/retrieval); "" ⇒ derive
+                                   # from GX10_MEMORY_URL, else lexical fallback (the dependency-free default)
+        },
         "verify": {
             # epic #602 SUB-4 / 2.1: the MARK-ONLY Verifier on the dev-task pipeline. OPT-IN / default OFF →
             # no hook is registered, so the `pre_handover` Hook-Bus dispatch is an O(1) no-op (byte-identical).
@@ -7765,13 +7819,15 @@ def _apply_config(cfg: Dict[str, Any]):
         _UI_MAX_LINES = new_max
         _UI_LINES = deque(_UI_LINES, maxlen=new_max)
 
-    _apply_lessons_provider(cfg)   # epic #602 SUB-5: register/clear the opt-in lesson provider
-    _apply_lessons_consumer(cfg)   # epic #602 SUB-5/2.3 (#804): register/clear the post_feedback Lessons consumer (AFTER the provider)
+    _apply_ace(cfg)                # epic #855 ACE-WIRE (#863): the ALWAYS-ON ACE loop-intelligence core —
+                                   # registers the PlaybookStore provider + the post_feedback ACE consumer +
+                                   # the background ReflectionWorker, and SUPERSEDES the #602 string lessons
+                                   # (_apply_lessons_provider/_apply_lessons_consumer) + Process-SC consumer
+                                   # (_apply_process_consumer): those #602 reflection seams are no longer wired.
     _apply_quality_breaker(cfg)    # epic #602 SUB-9: build/clear the opt-in quality breaker
     _apply_verifier(cfg)           # epic #602 SUB-4/2.1: register/clear the opt-in pre_handover Verifier
     _apply_quality_consumer(cfg)   # epic #602 SUB-9/2.7: register/clear the post_handover quality consumer
     _apply_strategy(cfg)           # epic #602 SUB-3/2.4: capture strategy.enabled for the failure recorder
-    _apply_process_consumer(cfg)   # epic #602 SUB-6/2.2 (#803): register/clear the post_feedback Process-SC consumer
 
 
 def _apply_lessons_provider(cfg: Dict[str, Any]) -> None:
@@ -7847,6 +7903,787 @@ def _apply_lessons_consumer(cfg: Dict[str, Any]) -> None:
             _hooks.register_hook("post_feedback", _lessons_consumer_hook)
         else:
             _hooks.unregister_hook("post_feedback", _lessons_consumer_hook)
+    except Exception:   # noqa: BLE001 — advisory wiring: never break config application
+        return
+
+
+# ═══ ACE (epic #855 ACE-WIRE / #863): the always-on Agentic Context Engineering loop-intelligence core ═══
+# ACE SUPERSEDES the #602 string lesson + Process-SC consumers (operator decision 2026-06-30): it is the
+# engine's loop-intelligence mechanic, always on (NO enable flag). `_apply_ace` registers a PlaybookStore as
+# the ack.lessons provider and a `post_feedback` consumer that SUBMITS a Trajectory to a background
+# ReflectionWorker — the reflect→curate→refine runs OFF the hot path (NEVER inline on the turn, the C0
+# correctness requirement). The orchestrator-model chat, the memory-service /embed adapter and the token
+# budget are injected into the store. Everything is fail-soft: with no model/endpoint reachable ACE no-ops.
+_ACE_STORE = None              # the registered PlaybookStore (None until the first _apply_ace)
+_ACE_WORKER = None             # the background ReflectionWorker draining adaptation tasks off the hot path
+_ACE_MIGRATED = False          # one-time #602 EngineLessonStore → playbook migration guard (per process)
+#: M5-2 (#883): the gated MPR-at-fork OPTION. `_ACE_FORK_MPR` mirrors `cfg['ace']['fork_mpr']['enabled']`
+#: (default OFF — gate OFF ⇒ byte-identical to today's STOP-and-ask). When ON, a recognized `ForkSignal`
+#: fires MPR's `architecture-decision` panel OFF the hot path on `_ACE_FORK_WORKER` (a ReflectionWorker
+#: reused as a generic queue worker) so the dev-loop / turn path is never blocked. NOT a ProjectContext-scoped
+#: global (not linted by check_no_raw_globals).
+_ACE_FORK_MPR = False
+_ACE_FORK_WORKER = None
+#: M5-2/#904: forks dispatched to the fork worker but not yet completed (process-local) — the scan skips these
+#: so a fork is never dispatched twice concurrently, while the DURABLE exactly-once key is committed only AFTER
+#: the MPR run completes (so a queue-drop / worker crash leaves the fork un-committed and it is retried).
+_ACE_FORK_INFLIGHT: "set" = set()
+#: M4-0 (#877): which playbook bullet ids were injected into a task's handover (keyed by task_id), so the
+#: post_feedback consumer can populate Trajectory.used_bullet_ids and the Reflector can rate them
+#: helpful/harmful (E-004/H-002). Bounded in-memory map (popped on consume); NOT a ProjectContext-scoped
+#: global (not linted by check_no_raw_globals). M4-3 (#880) persists the per-unit variant for the dev-loop.
+_ACE_INJECTED: "Dict[str, List[str]]" = {}
+_ACE_INJECTED_CAP = 512        # safety bound: a task whose handover is staged but never advanced can't leak unboundedly
+
+_ACE_BULLET_ID_RE = re.compile(r"^\s*-\s*\[([^\]]+)\]")   # the per-line `- [id] …` token _render_bullets emits
+
+
+def _ace_bullet_ids(rendered: str) -> "List[str]":
+    """Parse the injected bullet ids from a rendered playbook context (the leading ``- [id]`` token on each
+    line — the format ``PlaybookStore._render_bullets`` emits). Never raises."""
+    try:
+        out: "List[str]" = []
+        for line in (rendered or "").splitlines():
+            m = _ACE_BULLET_ID_RE.match(line)
+            if m:
+                out.append(m.group(1))
+        return out
+    except Exception:   # noqa: BLE001 — advisory: an id parse must never break the handover
+        return []
+
+
+def _ace_record_injected(task_id: str, bullet_ids: "List[str]") -> None:
+    """Record the bullet ids injected into *task_id*'s handover (M4-0). Bounded + fail-soft; a no-op on an
+    empty task_id / empty id list."""
+    try:
+        if not (task_id and bullet_ids):
+            return
+        if len(_ACE_INJECTED) >= _ACE_INJECTED_CAP:    # drop the oldest to stay bounded (insertion-ordered dict)
+            for stale in list(_ACE_INJECTED)[: max(1, len(_ACE_INJECTED) - _ACE_INJECTED_CAP + 1)]:
+                _ACE_INJECTED.pop(stale, None)
+        _ACE_INJECTED[task_id] = list(bullet_ids)
+    except Exception:   # noqa: BLE001 — advisory
+        return
+
+
+def _ace_take_injected(task_id: str) -> "List[str]":
+    """Pop + return the bullet ids injected into *task_id*'s handover (or ``[]``). Never raises."""
+    try:
+        return _ACE_INJECTED.pop(task_id, []) if task_id else []
+    except Exception:   # noqa: BLE001 — advisory
+        return []
+
+
+#: M4-3 (#880): issue#s a handover references — the standard `Closes/Fixes/Resolves #N` linkage + a `(#N)` /
+#: `#N` token in the task title. Used to key the durable injected-bullet map by the dev-loop UNIT (issue#),
+#: so the per-unit ledger scan (M4-2) can correlate which bullets the unit's handover carried.
+_ACE_CLOSES_RE = re.compile(r"\b(?:closes|fixes|resolves)\s+#(\d+)\b", re.IGNORECASE)
+_ACE_HASHNUM_RE = re.compile(r"#(\d+)\b")
+
+
+def _ace_unit_keys(task_id: str, fields: "Any", ho_md: str) -> "List[str]":
+    """The keys to durably record a handover's injected bullets under: the engine task id PLUS the issue# the
+    handover is FOR — the FIRST `#N` in the task title (the primary unit; C2 #906 — only the first, so a title
+    that also mentions another issue does not cross-attribute) plus any `Closes/Fixes/Resolves #N` link in the
+    body (deliberate linkage). The per-UNIT ledger trajectory (keyed by the ledger `unit` = issue#) reads back
+    by issue#. Never raises."""
+    keys: "List[str]" = []
+    try:
+        if task_id:
+            keys.append(str(task_id))
+        title = str((fields or {}).get("title") or "") if isinstance(fields, dict) else ""
+        title_hits = _ACE_HASHNUM_RE.findall(title)       # the PRIMARY unit is the first `#N` (e.g. "fix(#503): …")
+        if title_hits:
+            keys.append(str(title_hits[0]))
+        for n in _ACE_CLOSES_RE.findall(ho_md or ""):     # a `Closes #N` linkage in the handover body (deliberate)
+            keys.append(str(n))
+        # de-dup, order-preserving
+        seen: set = set()
+        return [k for k in keys if not (k in seen or seen.add(k))]
+    except Exception:   # noqa: BLE001 — advisory: a key-derivation hiccup must never break the handover
+        return [str(task_id)] if task_id else []
+
+
+def _ace_persist_injected(keys: "List[str]", bullet_ids: "List[str]") -> None:
+    """Durably record *bullet_ids* under each of *keys* (task id + issue#s) in the shared per-unit map, so the
+    cross-process M4-2 ledger scan can populate ``used_bullet_ids``. Advisory + fail-soft."""
+    try:
+        if not (keys and bullet_ids):
+            return
+        from playbook_store import record_unit_bullets   # bare engine-sibling import
+        from project_registry import ironclad_home
+        home = ironclad_home()
+        for k in keys:
+            record_unit_bullets(home, k, bullet_ids)
+    except Exception:   # noqa: BLE001 — advisory: a correlation write must never break the handover
+        return
+
+
+def _ace_chat_adapter():
+    """A single-shot orchestrator-model completion ``chat(prompt)->str`` for the Reflector, built from the
+    effective connection config. Runs OFF the hot path in the ReflectionWorker. Any transport error
+    propagates to ``ack.ace.reflect``, which treats it as an empty reflection (no-op) — so a missing/
+    unreachable model just means ACE doesn't learn this round.
+
+    #922: the Reflector emits STRUCTURED JSON (insights/ratings), NOT free reasoning — so qwen3 thinking is
+    disabled (``enable_thinking: False``, mirroring MPR's classify/``complete_json`` + ``workers._one``).
+    With thinking ON a reasoning model (qwen3.6-35b) burns the whole token cap on a ``<think>`` block
+    (``finish_reason=length``) and returns EMPTY ``content`` → 0 insights → the always-on loop never learns.
+    This is a live-only gap the stub-transport unit tests miss; a busy reasoning model made ACE inert."""
+    def chat(prompt: str) -> str:
+        cfg = _EFFECTIVE_CFG if _EFFECTIVE_CFG is not None else _code_defaults()
+        conn = (cfg.get("connection") or {})
+        client = OpenAI(base_url=(conn.get("base_url") or DEFAULT_BASE_URL),
+                        api_key=(os.environ.get(conn.get("api_key_env", "GX10_API_KEY")) or "not-needed"))
+        resp = client.chat.completions.create(
+            model=(conn.get("model") or DEFAULT_MODEL),
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=2048, temperature=0.2, stream=False,
+            extra_body={"chat_template_kwargs": {"enable_thinking": False}},   # #922: structured emission, not reasoning
+        )
+        return (resp.choices[0].message.content or "")
+    return chat
+
+
+def _ace_embed_adapter():
+    """A batched embedder ``embed(texts)->List[List[float]]`` over the memory-service ``/embed`` endpoint
+    (BGE-M3) for ACE's semantic dedup + relevant-bullet retrieval. URL = ``ace.embed_url`` else derived from
+    ``GX10_MEMORY_URL``; with neither set returns ``None`` so ``ack.ace`` falls back to its dependency-free
+    lexical similarity. The callable may raise (network) — ``ack.ace.grow``/``generator`` wrap it fail-soft."""
+    cfg = _EFFECTIVE_CFG if _EFFECTIVE_CFG is not None else _code_defaults()
+    url = str((cfg.get("ace") or {}).get("embed_url") or "").strip()
+    if not url:
+        mem = os.environ.get("GX10_MEMORY_URL", "").strip().rstrip("/")
+        url = (mem + "/embed") if mem else ""
+    if not url:
+        return None
+    def embed(texts):
+        import urllib.request
+        body = json.dumps({"texts": list(texts)}).encode("utf-8")
+        req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=10) as r:   # noqa: S310 — operator-configured memory URL
+            data = json.loads(r.read().decode("utf-8"))
+        return data.get("vectors") or []
+    return embed
+
+
+def _ace_run_task(task) -> None:
+    """The ReflectionWorker's per-item processor: run one online adaptation for the submitted scope's
+    playbook. Fail-soft — the worker already guards, this just routes by scope."""
+    store = _ACE_STORE
+    if store is None or not isinstance(task, dict):
+        return
+    store.adapt(task.get("trajectory"), scope=str(task.get("scope") or ""))
+
+
+def _ace_consumer_hook(ctx) -> None:
+    """`post_feedback` consumer (ACE-WIRE + M4-0 #877): on a fresh COMPLETION **or** a genuine FAILURE, build a
+    Trajectory from the task record + the bullets that were injected into this task's handover + the archived
+    feedback, and SUBMIT it to the background ReflectionWorker — an O(1), non-blocking enqueue that NEVER runs
+    the model inline (the C0 hot-path requirement). The LABEL-FREE outcome is derived from the advance result:
+    a fresh ``OK: pipeline advanced`` ⇒ ``success``; an ``ERROR: pipeline step failed`` ⇒ ``failed`` (so the
+    Reflector learns from failures too — E-001/O-002 — and rates the used bullets harmful, E-004/H-002). It
+    SKIPS an already-done re-advance and trivial precondition errors (bad task_id / unknown agent / missing
+    feedback / no active initiative) — those are not a real attempt. Gated on a bound scope + a wired worker.
+    **Fail-soft** (never raises)."""
+    try:
+        ctx = ctx or {}
+        result = str(ctx.get("result") or "")
+        fresh_success = result.startswith("OK: pipeline advanced")
+        genuine_failure = result.startswith("ERROR: pipeline step failed")
+        if not (fresh_success or genuine_failure):
+            return                                   # already-done re-advance / trivial precondition error → no learning
+        worker = _ACE_WORKER
+        if worker is None or _ACE_STORE is None:
+            return
+        scope = _active_mem_ns()
+        if not scope:                                # no project bound (base partition) → nothing to learn
+            return
+        task_id = str(ctx.get("task_id") or ""); agent = str(ctx.get("agent") or "")
+        existing = _store().get(task_id) if task_id else None
+        title = str((existing or {}).get("title") or "") if isinstance(existing, dict) else ""
+        ttype = str((existing or {}).get("type") or "") if isinstance(existing, dict) else ""
+        vfb = archive_feedback_dir() / f"{task_id}_{agent}-feedback.md"   # archived by step 2 of the advance
+        fb = vfb.read_text(encoding="utf-8").strip() if vfb.exists() else ""
+        used = _ace_take_injected(task_id)           # M4-0: the bullets this task's handover actually carried
+        outcome = "success" if fresh_success else "failed"
+        steps = [fb] if fb else ([f"pipeline step failed: {result.split(':',2)[-1].strip()[:200]}"] if genuine_failure else [])
+        from ack.ace import Trajectory      # lazy: never import ack at gx10 top-level (S6b lesson)
+        traj = Trajectory(query=(title or ttype or task_id or "task"),
+                          steps=steps, outcome=outcome, used_bullet_ids=used)
+        worker.submit({"scope": scope, "trajectory": traj})   # non-blocking; the worker reflects off the hot path
+    except Exception:   # noqa: BLE001 — advisory: a reflection submit must never break a turn
+        return
+
+
+# ── M4-2 (#879): the dev-process learn-trigger — scan the dev-loop ledger off the hot path, submit each
+# newly-TERMINAL unit's Trajectory to the ReflectionWorker exactly-once. Variant A (ledger-derived): the
+# ledger is read as PLAIN DATA via `_read_ledger_payloads` (no import of the private scripts/devloop); a
+# chain-tampered/unreadable ledger is skipped fail-closed (never a learning source). Distinct from the
+# in-process post_feedback hook (#863/M4-0, per-handover) — this is the per-UNIT merge/abort arc, and the
+# dev-loop runner is a SEPARATE process whose ledger writes never fire the in-process hook (no double-learning).
+_ACE_TERMINAL_OUTCOMES = frozenset({"reached-human-merge-gate", "aborted"})
+
+
+def _ace_devscan_path() -> "Optional[Path]":
+    """The persisted exactly-once record (the set of dev-loop units already submitted), under the install
+    home. ``None`` if the home can't resolve."""
+    try:
+        from project_registry import ironclad_home   # bare engine-sibling import (like project_registry)
+        return ironclad_home() / "ace_devscan.json"
+    except Exception:   # noqa: BLE001
+        return None
+
+
+def _ace_load_submitted() -> set:
+    try:
+        p = _ace_devscan_path()
+        data = json.loads(p.read_text(encoding="utf-8")) if p and p.is_file() else {}
+        return set(data.get("submitted") or []) if isinstance(data, dict) else set()
+    except Exception:   # noqa: BLE001 — a missing/corrupt record reads as empty (re-learn is bounded by the set we then save)
+        return set()
+
+
+def _ace_save_submitted(submitted: set) -> None:
+    tmp = None
+    try:
+        p = _ace_devscan_path()
+        if p is None:
+            return
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tmp = p.parent / f"{p.name}.{os.getpid()}.tmp"
+        tmp.write_text(json.dumps({"submitted": sorted(submitted)}, ensure_ascii=False), encoding="utf-8")
+        os.replace(tmp, p)
+    except Exception:   # noqa: BLE001 — advisory persistence; never break the caller
+        if tmp is not None:
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+
+
+def _ace_scan_dev_ledger(payloads: "Any" = None, chain_errors: "Any" = None, *,
+                         ledger_path: "Optional[Path]" = None) -> int:
+    """OFF the hot path (DP-4): project the dev-loop ledger into per-unit Trajectories (via
+    `ack.ace.devtraj`) and submit each NEWLY-TERMINAL unit (reached-human-merge-gate / aborted) to the
+    background ReflectionWorker **exactly once** (a persisted submitted-units set survives restarts). The
+    ledger is read as plain data; a chain-tampered/unreadable ledger (``chain_errors``) is skipped
+    fail-closed — never learned from. ``payloads``/``chain_errors`` may be passed in (the `/lifecycle gate`
+    site reuses what it already read) or read here. ``scope`` = the active project mem-ns (project-private,
+    like #863). Returns the number submitted. **Fail-soft** — never raises, never blocks a turn or the dev-loop."""
+    try:
+        worker = _ACE_WORKER
+        if worker is None or _ACE_STORE is None:
+            return 0
+        scope = _active_mem_ns()
+        if not scope:                                # no bound project → nothing to attribute learning to
+            return 0
+        if payloads is None:
+            path = ledger_path or ((_project_root() or Path.cwd()) / ".devloop" / "ledger.jsonl")
+            payloads, chain_errors = _read_ledger_payloads(path)
+        if chain_errors:                             # tamper / unreadable → fail-closed, never learn from a corrupt ledger
+            return 0
+        from ack.ace import ledger_to_trajectories   # lazy: never import ack at gx10 top-level (S6b lesson)
+        from playbook_store import read_unit_bullets   # M4-3: the per-unit injected-bullet correlation
+        from project_registry import ironclad_home
+        home = ironclad_home()
+        submitted = _ace_load_submitted()
+        n = 0
+        for traj in ledger_to_trajectories(payloads):
+            if traj.outcome in _ACE_TERMINAL_OUTCOMES and traj.query not in submitted:
+                # M4-3 (#880): populate used_bullet_ids from the durable map keyed by the unit (issue#) — the
+                # bullets injected into this unit's handover(s) — so the Reflector rates them (E-004). [] if none.
+                try:
+                    traj.used_bullet_ids = read_unit_bullets(home, str(traj.query))
+                except Exception:   # noqa: BLE001 — advisory: correlation is best-effort, [] is "weaker not wrong"
+                    pass
+                # #905: persist the exactly-once key BEFORE submit (per-item) — a crash between submit and a
+                # batched save would otherwise re-learn the unit. At-most-once (a rare crash loses one unit)
+                # is safer than double-counting for a learning signal.
+                submitted.add(traj.query)
+                _ace_save_submitted(submitted)
+                worker.submit({"scope": scope, "trajectory": traj})   # O(1) non-blocking; reflection runs off the turn path
+                n += 1
+        return n
+    except Exception:   # noqa: BLE001 — advisory: a ledger scan must never break a turn or the dev-loop
+        return 0
+
+
+# ─── M5-2 (#883): the gated MPR-at-fork panel (MPR-A-2 gated invocation + MPR-A-5 pre-informed query) ──
+def _ace_forkscan_path() -> "Optional[Path]":
+    """The persisted exactly-once record (fork keys already dispatched to MPR), under the install home.
+    Separate file from the dev-scan units set so neither save clobbers the other. ``None`` if unresolved."""
+    try:
+        from project_registry import ironclad_home   # bare engine-sibling import
+        return ironclad_home() / "ace_forkscan.json"
+    except Exception:   # noqa: BLE001
+        return None
+
+
+def _ace_load_fork_submitted() -> set:
+    try:
+        p = _ace_forkscan_path()
+        data = json.loads(p.read_text(encoding="utf-8")) if p and p.is_file() else {}
+        return set(data.get("forks") or []) if isinstance(data, dict) else set()
+    except Exception:   # noqa: BLE001 — a missing/corrupt record reads as empty
+        return set()
+
+
+def _ace_save_fork_submitted(submitted: set) -> None:
+    tmp = None
+    try:
+        p = _ace_forkscan_path()
+        if p is None:
+            return
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tmp = p.parent / f"{p.name}.{os.getpid()}.tmp"
+        tmp.write_text(json.dumps({"forks": sorted(submitted)[-4096:]}, ensure_ascii=False), encoding="utf-8")
+        os.replace(tmp, p)
+    except Exception:   # noqa: BLE001 — advisory: an exactly-once write must never break the dev-loop
+        if tmp is not None:
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+
+
+def _ace_fork_key(sig: "Any") -> str:
+    """A stable exactly-once key for a fork (unit + question) — a re-scan never re-dispatches the same fork."""
+    try:
+        return f"{getattr(sig, 'unit', '')}|{(getattr(sig, 'question', '') or '')[:120]}"
+    except Exception:   # noqa: BLE001
+        return ""
+
+
+def _ace_fork_query(sig: "Any", scope: str) -> str:
+    """The MPR query for a fork — the question + candidate options + touched paths, PRE-INFORMED (MPR-A-5) by
+    ACE's prior relevant fork-decision bullets via the registered PlaybookStore's query-aware ``context_for``.
+    Fail-soft: the pre-informing read is advisory (a fork query never depends on it)."""
+    parts: "List[str]" = []
+    q = (getattr(sig, "question", "") or "").strip()
+    if q:
+        parts.append(f"Architecture decision: {q}")
+    opts = [o for o in (getattr(sig, "options", None) or []) if o]
+    if opts:
+        parts.append("Candidate options:\n" + "\n".join(f"- {o}" for o in opts))
+    paths = [p for p in (getattr(sig, "touched_paths", None) or []) if p]
+    if paths:
+        parts.append("Touched paths: " + ", ".join(paths))
+    try:
+        store = _ACE_STORE
+        if store is not None and scope and hasattr(store, "context_for"):
+            prior = store.context_for([scope], query=q)
+            if prior:
+                parts.append("Prior comparable decisions (from the playbook):\n" + prior)
+                # M5-4 (#885): remember which prior fork bullets seeded this query (keyed `fork:<unit>`), so
+                # the fork-decision Trajectory can set used_bullet_ids → the Reflector rates which prior
+                # decisions actually helped (O-001). Reuses the M4-3 durable map; advisory + fail-soft.
+                _ace_persist_injected([f"fork:{getattr(sig, 'unit', '')}"], _ace_bullet_ids(prior))
+    except Exception:   # noqa: BLE001 — advisory pre-informing read
+        pass
+    return "\n\n".join(parts)
+
+
+def _ace_fork_mpr_run(sig: "Any", scope: str) -> str:
+    """Run MPR's ``architecture-decision`` panel for a declared fork (OFF the hot path, on the fork worker).
+    Fires MPR model-free via ``run_tool('mpr_research', …)`` with ``domain_hint='architecture-decision'`` +
+    ``mode_hint='decision'`` so the router selects the existing decision-matrix panel. **Fail-soft** — every
+    failure mode (MPR disabled / no orchestrator model / no active initiative per MPR's B3 / RunBudget
+    exhausted / MPR raises) degrades to a no-op string; the operator ask still surfaces (M5-3 attaches the
+    matrix, M5-4 records the outcome). Producing the matrix is all this leg does."""
+    try:
+        query = _ace_fork_query(sig, scope)
+        if not query.strip():
+            return ""
+        matrix = run_tool("mpr_research", {"query": query, "domain_hint": "architecture-decision",
+                                           "mode_hint": "decision"}) or ""
+        # M5-3 (#884): record the produced decision-matrix as a fork proposal bound to the unit, so the
+        # dev-process ask surface can render it as a RECOMMENDATION (recommendation-only; the operator decides).
+        _ace_record_fork_proposal(getattr(sig, "unit", ""), matrix)
+        return matrix
+    except Exception:   # noqa: BLE001 — a fork MPR run must never break; the ask still surfaces
+        return ""
+
+
+# ─── M5-3 (#884): the propose surface — attach the MPR matrix to the operator ask as a RECOMMENDATION ──
+def _ace_record_fork_proposal(unit: "Any", matrix: str) -> None:
+    """Persist the MPR decision-matrix produced for a fork *unit* as a proposal pointer (advisory, fail-soft).
+    A no-op MPR result (disabled / declined / ERROR / BLOCKED) is NOT a proposal — the ask surfaces
+    unchanged, never an empty artifact (MPR-A-3 fail-soft)."""
+    try:
+        m = (matrix or "").strip()
+        u = str(unit or "").strip()
+        if not (u and m) or m.startswith(("ERROR", "MPR declined", "MPR is disabled", "BLOCKED")):
+            return
+        from playbook_store import record_fork_proposal   # bare engine-sibling import
+        from project_registry import ironclad_home
+        record_fork_proposal(ironclad_home(), u, m)
+    except Exception:   # noqa: BLE001 — advisory: a proposal write must never break the fork worker
+        return
+
+
+_ACE_REC_RE = re.compile(r"^\s*[#*>\-•\s]*(recommendation|recommended|verdict|top[- ]ranked|chosen"
+                         r"|winner)\**\s*[:\-–—]\s*(.+)$", re.IGNORECASE)
+
+
+def _ace_extract_recommendation(matrix: str) -> str:
+    """Best-effort top-ranked option from the MPR decision-matrix synthesis (a `Recommendation:`/`Verdict:` …
+    line). ``""`` if none — the matrix itself carries the ranking. Never raises."""
+    try:
+        for line in (matrix or "").splitlines():
+            m = _ACE_REC_RE.match(line)
+            if m:
+                rec = m.group(2).strip().strip("*").strip()   # drop a trailing `**` bold close etc.
+                if rec:
+                    return rec[:300]
+        return ""
+    except Exception:   # noqa: BLE001
+        return ""
+
+
+def _ace_fork_proposal_for(unit: "Any") -> str:
+    """The RECOMMENDATION-only rendering of the MPR proposal for a fork *unit* (or ``""`` if none) — the
+    GENERIC, boundary-clean seam BOTH dev-processes attach to their operator ask (the dev-loop's GitHub
+    comment / the raised question). Explicitly framed as a recommendation: the operator decides; ACE learns
+    from the choice (M5-4). Fail-soft: no matrix ⇒ ``""`` ⇒ the ask is unchanged."""
+    try:
+        from playbook_store import read_fork_proposal   # bare engine-sibling import
+        from project_registry import ironclad_home
+        matrix = read_fork_proposal(ironclad_home(), str(unit or "").strip())
+    except Exception:   # noqa: BLE001
+        return ""
+    if not matrix:
+        return ""
+    parts = ["### MPR architecture proposal — recommendation only (you decide)"]
+    rec = _ace_extract_recommendation(matrix)
+    if rec:
+        parts.append(f"**MPR's top-ranked option:** {rec}")
+    parts.append(matrix)
+    parts.append("_This is an MPR-generated multi-perspective decision-matrix — a well-founded recommendation, "
+                 "NOT a decision. Review the ranked options + dissent above and choose what fits; ACE learns "
+                 "from the choice._")
+    return "\n\n".join(parts)
+
+
+def _fork_command(arg: str) -> str:
+    """`/fork [unit]` — the operator-facing surface for the M5 MPR-at-fork proposals (#903). With no arg it
+    lists the units that currently have a recorded architecture-decision matrix (or renders the single pending
+    one); `/fork <unit>` renders that unit's full recommendation-only matrix. This is the production caller of
+    the M5-3 propose OUTPUT leg: at an architecture fork, the operator sees the MPR proposal here and decides
+    (ACE then learns the choice, M5-4). Read-only; fail-soft."""
+    arg = (arg or "").strip().lstrip("#").strip()
+    try:
+        from playbook_store import list_fork_proposals   # bare engine-sibling import
+        from project_registry import ironclad_home
+        home = ironclad_home()
+    except Exception:   # noqa: BLE001
+        return "fork: proposal store unavailable"
+    if arg:
+        return _ace_fork_proposal_for(arg) or f"No MPR fork proposal recorded for #{arg}."
+    units = list_fork_proposals(home)
+    if not units:
+        return ("No pending MPR fork proposals. When an architecture fork is declared and the gate "
+                "`ace.fork_mpr.enabled` is on, its decision-matrix appears here as a recommendation.")
+    if len(units) == 1:
+        return _ace_fork_proposal_for(units[0]) or f"No MPR fork proposal recorded for #{units[0]}."
+    return ("\n".join([f"{len(units)} pending MPR fork proposal(s) — `/fork <unit>` for the full matrix:"]
+                      + [f"  - #{u}" for u in units]))
+
+
+_ACE_USAGE = "usage: /ace warmup --ledger <path>  |  /ace eval --ledger <path>"
+
+
+def _ace_command(arg: str) -> str:
+    """ACE ops over a dev-loop ledger (read as plain data — boundary-clean, no private import; off the hot
+    path, opt-in, fail-soft). `/ace warmup --ledger <path>` (#915) offline warm-STARTs the active scope's
+    playbook from the ledger's historical trajectories. `/ace eval --ledger <path>` (#918) runs the efficiency
+    DIAGNOSTIC — compares ACE vs full-rewrite/evolutionary over those trajectories and reports the paper's
+    J-001/J-002 verdict (measurement only; no playbook is mutated)."""
+    parts = (arg or "").split()
+    sub = parts[0] if parts else ""
+    if sub not in ("warmup", "eval"):
+        return _ACE_USAGE
+    ledger = ""
+    if "--ledger" in parts:
+        i = parts.index("--ledger")
+        ledger = parts[i + 1] if i + 1 < len(parts) else ""
+    if not ledger:
+        return f"usage: /ace {sub} --ledger <path>"
+    store = _ACE_STORE
+    if store is None or not hasattr(store, sub if sub == "warmup" else "benchmark"):
+        return f"ace {sub}: no ACE playbook store is registered"
+    try:
+        from ack.ace import ledger_to_trajectories   # lazy: never import ack at gx10 top-level (S6b lesson)
+        payloads, chain_errors = _read_ledger_payloads(Path(ledger))
+        if chain_errors:
+            return f"ace {sub}: BLOCKED — ledger integrity failure ({'; '.join(chain_errors[:3])})"
+        trajectories = ledger_to_trajectories(payloads)
+        if not trajectories:
+            return f"ace {sub}: no trajectories in {ledger} (nothing to do)"
+        if sub == "warmup":
+            scope = _active_mem_ns()
+            if not scope:
+                return "ace warmup: no active project scope (open a project first)"
+            report = store.warmup(scope, trajectories)
+            if report.get("skipped"):
+                return "ace warmup: skipped — no orchestrator model reachable (nothing seeded)"
+            return (f"ace warmup: replayed {report.get('samples_seen', 0)} trajectory record(s) into the playbook "
+                    f"— +{report.get('added', 0)} bullet(s), {report.get('pruned', 0)} pruned")
+        # sub == "eval" — the efficiency diagnostic (J-001/J-002); no playbook mutated
+        rep = store.benchmark(trajectories)
+        if rep.get("skipped"):
+            return "ace eval: skipped — no orchestrator model reachable"
+        ace, fr, evo = rep["ace"], rep["full_rewrite"], rep["evolutionary"]
+        j1 = "PASS" if rep.get("no_full_rewrite") else "FAIL"
+        j2 = "PASS" if rep.get("rollout_target_met") else "FAIL"
+        red = rep.get("rollout_reduction_vs_evolutionary", 0.0)
+        return (f"ace eval (over {len(trajectories)} trajectories): "
+                f"ACE={ace.rollouts} rollouts / {ace.full_rewrites} full-rewrites / {ace.llm_merges} LLM-merges; "
+                f"full-rewrite={fr.rollouts}; evolutionary={evo.rollouts}. "
+                f"rollout-reduction vs evolutionary={red:.0%} (J-002 >50%: {j2}); no-full-rewrite (J-001): {j1}")
+    except Exception as ex:   # noqa: BLE001 — the command must never crash the REPL
+        return f"ace {sub}: failed ({ex!r})"
+
+
+def _ace_mark_fork_done(key: str) -> None:
+    """Durably commit a fork's exactly-once key (#904) — called only AFTER its MPR run completes, so a
+    dropped/crashed run is retried on the next scan. Advisory + fail-soft."""
+    try:
+        if not key:
+            return
+        done = _ace_load_fork_submitted()
+        done.add(key)
+        _ace_save_fork_submitted(done)
+    except Exception:   # noqa: BLE001
+        pass
+
+
+def _ace_fork_run_task(item: "Any") -> None:
+    """The `_ACE_FORK_WORKER` task fn: run the MPR panel for one submitted fork, then durably commit its
+    exactly-once key (#904 — commit-on-completion, not at dispatch). A worker-level crash leaves the key
+    UN-committed (retried next scan). The in-flight guard is always cleared. Never raises."""
+    key = item.get("key") if isinstance(item, dict) else None
+    try:
+        if isinstance(item, dict) and item.get("signal") is not None:
+            _ace_fork_mpr_run(item.get("signal"), item.get("scope", ""))
+            _ace_mark_fork_done(key)          # ran to completion ⇒ commit exactly-once (retry only on crash/drop)
+    except Exception:   # noqa: BLE001 — a crash leaves the key un-committed so the next scan retries
+        pass
+    finally:
+        try:
+            _ACE_FORK_INFLIGHT.discard(key)
+        except Exception:   # noqa: BLE001
+            pass
+
+
+def _ace_scan_fork_signals(payloads: "Any" = None, chain_errors: "Any" = None) -> int:
+    """Off the hot path (at the dev-loop ledger touchpoint), dispatch each NEWLY-declared ``ForkSignal`` to the
+    gated MPR panel on `_ACE_FORK_WORKER`, **exactly-once** (a persisted fork-key set survives restarts). GATE
+    OFF (`_ACE_FORK_MPR`) ⇒ 0 (byte-identical to today's STOP-and-ask); a chain-tampered ledger ⇒ skipped
+    fail-closed. Advisory; never raises. Returns the number of forks dispatched."""
+    try:
+        if not _ACE_FORK_MPR or _ACE_FORK_WORKER is None:
+            return 0                                  # gate off / not wired ⇒ untouched STOP-and-ask
+        if chain_errors:
+            return 0                                  # never dispatch from a corrupt ledger
+        from ack.ace import fork_signals_from         # lazy: never import ack at gx10 top-level (S6b lesson)
+        scope = _active_mem_ns()
+        done = _ace_load_fork_submitted()             # durably-committed forks (persisted only after MPR runs)
+        n = 0
+        for sig in fork_signals_from(payloads):
+            key = _ace_fork_key(sig)
+            if not key or key in done or key in _ACE_FORK_INFLIGHT:
+                continue                              # already committed, or in flight this process
+            if _ACE_FORK_WORKER.submit({"scope": scope, "signal": sig, "key": key}):   # O(1); MPR runs off-path
+                _ACE_FORK_INFLIGHT.add(key)           # #904: committed to the durable set only AFTER it runs
+                n += 1
+            # submit() False (queue full) ⇒ not marked ⇒ retried next scan (no lost proposal)
+        return n
+    except Exception:   # noqa: BLE001 — advisory: a fork scan must never break the dev-loop / a turn
+        return 0
+
+
+# ─── M5-4 (#885): learn the fork decision + outcome so the NEXT comparable fork is pre-informed (MPR-A-4) ──
+def _ace_forklearn_path() -> "Optional[Path]":
+    """The persisted exactly-once record (fork-decision keys already learned) — a SEPARATE file from the
+    MPR-dispatch set so neither save clobbers the other. ``None`` if the home can't resolve."""
+    try:
+        from project_registry import ironclad_home   # bare engine-sibling import
+        return ironclad_home() / "ace_forklearn.json"
+    except Exception:   # noqa: BLE001
+        return None
+
+
+def _ace_load_fork_learned() -> set:
+    try:
+        p = _ace_forklearn_path()
+        data = json.loads(p.read_text(encoding="utf-8")) if p and p.is_file() else {}
+        return set(data.get("learned") or []) if isinstance(data, dict) else set()
+    except Exception:   # noqa: BLE001
+        return set()
+
+
+def _ace_save_fork_learned(learned: set) -> None:
+    tmp = None
+    try:
+        p = _ace_forklearn_path()
+        if p is None:
+            return
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tmp = p.parent / f"{p.name}.{os.getpid()}.tmp"
+        tmp.write_text(json.dumps({"learned": sorted(learned)[-4096:]}, ensure_ascii=False), encoding="utf-8")
+        os.replace(tmp, p)
+    except Exception:   # noqa: BLE001
+        if tmp is not None:
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+
+
+def _ace_fork_res_key(res: "Any") -> str:
+    """A stable exactly-once key for a learned fork DECISION (unit + chosen option) — distinct from M4-2's
+    unit-arc trajectory + #863's per-handover completion, so a fork is never double-counted."""
+    try:
+        return f"{getattr(res, 'unit', '')}|{(getattr(res, 'chosen_option', '') or '')[:120]}"
+    except Exception:   # noqa: BLE001
+        return ""
+
+
+def _ace_fork_trajectory(res: "Any", question: str, used_ids: "List[str]") -> "Any":
+    """Build the fork-decision ``ack.ace.Trajectory``: query = the fork's question/area (the stable
+    comparability key M5-2's ``context_for`` retrieves by); steps = the chosen option (+ the panel verdict if
+    known); outcome = chose <option> [→ <outcome>]; used_bullet_ids = the prior fork bullets that seeded the
+    MPR query (so the Reflector rates which prior decisions helped). ``None`` on an empty resolution."""
+    try:
+        from ack.ace import Trajectory   # lazy: never import ack at gx10 top-level (S6b lesson)
+        chosen = (getattr(res, "chosen_option", "") or "").strip()
+        q = (question or getattr(res, "area", "") or "").strip()
+        if not (chosen and q):
+            return None
+        outcome_note = (getattr(res, "outcome", "") or "").strip()
+        outcome = f"chose '{chosen}'" + (f" -> {outcome_note}" if outcome_note else "")
+        steps = [f"decision: {chosen}"]
+        area = (getattr(res, "area", "") or "").strip()
+        if area:
+            steps.append(f"area: {area}")
+        return Trajectory(query=f"architecture fork: {q}", steps=steps, outcome=outcome,
+                          used_bullet_ids=list(used_ids or []))
+    except Exception:   # noqa: BLE001 — a malformed resolution never breaks the scan
+        return None
+
+
+def _ace_scan_fork_resolutions(payloads: "Any" = None, chain_errors: "Any" = None) -> int:
+    """Off the hot path, turn each NEWLY-resolved fork (a ``ForkResolution`` on the ledger) into a
+    fork-decision Trajectory submitted to the EXISTING `_ACE_WORKER` (reflect→curate→refine writes a bullet in
+    ``strategies_and_hard_rules``), so M5-2's ``context_for`` retrieves it at the next comparable fork —
+    closing the propose→decide→record→pre-inform loop. GATE OFF (`_ACE_FORK_MPR`) ⇒ 0 (byte-identical); a
+    chain-tampered ledger ⇒ skipped fail-closed; **exactly-once** (a persisted decision-key set). Never raises."""
+    try:
+        if not _ACE_FORK_MPR or _ACE_WORKER is None:
+            return 0                                  # gate off / ACE not wired ⇒ no fork learning
+        if chain_errors:
+            return 0
+        from ack.ace import fork_resolutions_from, fork_signals_from   # lazy (S6b lesson)
+        from playbook_store import read_unit_bullets                    # the seeding bullets (M5-4 capture)
+        from project_registry import ironclad_home
+        home = ironclad_home()
+        scope = _active_mem_ns()
+        q_by_unit = {s.unit: s.question for s in fork_signals_from(payloads) if getattr(s, "unit", "")}
+        submitted = _ace_load_fork_learned()
+        n = 0
+        for res in fork_resolutions_from(payloads):
+            key = _ace_fork_res_key(res)
+            if not key or key in submitted:
+                continue
+            used = read_unit_bullets(home, f"fork:{getattr(res, 'unit', '')}")   # prior bullets that seeded the query
+            traj = _ace_fork_trajectory(res, q_by_unit.get(getattr(res, "unit", ""), ""), used)
+            if traj is not None:
+                _ACE_WORKER.submit({"scope": scope, "trajectory": traj})   # O(1); reflect runs off the turn path
+                submitted.add(key)
+                n += 1
+        if n:
+            _ace_save_fork_learned(submitted)
+        return n
+    except Exception:   # noqa: BLE001 — advisory: fork learning must never break the dev-loop / a turn
+        return 0
+
+
+def _apply_ace(cfg: Dict[str, Any]) -> None:
+    """Register the always-on ACE PlaybookStore provider + the `post_feedback` ACE consumer + the background
+    ReflectionWorker, SUPERSEDING the #602 string-lesson + Process-SC consumers. Runs on every config
+    application (boot + ``/config set`` + ``/switch``). NO enable flag — ACE is the core mechanic. Keeps the
+    extension-friendly *richer-wins* rule: a FOREIGN provider (a plugin's own backend) is never clobbered, and
+    while one is active ACE steps back (the extension owns the loop). One-time best-effort migration of the
+    legacy #602 lesson tree on first registration. Lazy-imports ``ack``/the engine siblings (S6b). Fail-soft —
+    a wiring hiccup never breaks config application."""
+    global _ACE_STORE, _ACE_WORKER, _ACE_MIGRATED, _ACE_FORK_MPR, _ACE_FORK_WORKER
+    try:
+        from ack import lessons as _lessons          # lazy: never import ack at gx10 top-level (S6b lesson)
+        from ack import hooks as _hooks
+        from ack.ace import AdaptConfig, ReflectionWorker
+        from playbook_store import PlaybookStore, migrate_lessons   # bare engine-sibling import
+        from lesson_store import EngineLessonStore
+        from project_registry import ironclad_home
+    except Exception:   # noqa: BLE001 — seam/store unavailable ⇒ leave the (no-ACE) state untouched
+        return
+    try:
+        ace = (cfg.get("ace") or {})
+        def _int(key, default):
+            try:
+                return max(1, int(ace.get(key, default)))
+            except Exception:   # noqa: BLE001 — a malformed tuning value falls back to the default
+                return default
+        max_bullets, rounds, cost = _int("max_bullets", 200), _int("rounds", 1), _int("cost", 1)
+        top_k = _int("top_k", 8)                      # #905: the context_for injection cap — now actually threaded
+        # M5-2 (#883): the gated MPR-at-fork OPTION — `ace.fork_mpr.enabled` (default OFF). Gate OFF ⇒ the
+        # fork scan is a no-op ⇒ byte-identical to today's STOP-and-ask.
+        _ACE_FORK_MPR = bool((ace.get("fork_mpr") or {}).get("enabled", False))
+        current = _lessons.get_provider()
+        # Supersede the built-in (None / the #602 EngineLessonStore / OUR OWN store on re-apply). #905: never
+        # clobber a FOREIGN PlaybookStore — the faithful check is identity (`current is _ACE_STORE`), not type.
+        if current is None or isinstance(current, EngineLessonStore) or current is _ACE_STORE:
+            store = _ACE_STORE if isinstance(_ACE_STORE, PlaybookStore) else PlaybookStore(
+                ironclad_home() / "ace_playbooks", max_bullets=max_bullets,
+                config=AdaptConfig(rounds=rounds, max_bullets=max_bullets, cost=cost))
+            store.set_transports(chat=_ace_chat_adapter(), embed=_ace_embed_adapter())
+            store.configure(max_bullets=max_bullets, top_k=top_k)
+            if current is not store:
+                _lessons.set_provider(store)
+            _ACE_STORE = store
+            if not _ACE_MIGRATED:                    # one-time: replay the legacy #602 lesson tree into the playbook
+                _ACE_MIGRATED = True
+                base = ironclad_home() / "ace_playbooks"
+                marker = base / ".migrated"
+                try:
+                    if not marker.exists() and migrate_lessons(ironclad_home() / "lessons", store) > 0:
+                        base.mkdir(parents=True, exist_ok=True)   # only persist the guard once something migrated
+                        marker.write_text("1", encoding="utf-8")
+                except Exception:   # noqa: BLE001 — migration is best-effort; a hiccup must not block wiring
+                    pass
+        # Wire the consumer iff OUR store owns the provider; retire the #602 lesson/process consumers either way.
+        if _lessons.get_provider() is _ACE_STORE and _ACE_STORE is not None:
+            _hooks.register_hook("post_feedback", _ace_consumer_hook)
+            if _ACE_WORKER is None:
+                _ACE_WORKER = ReflectionWorker(_ace_run_task)
+                _ACE_WORKER.start()
+            # M5-2: the fork MPR worker exists ONLY while the gate is ON (byte-identical when OFF). Reuses
+            # ReflectionWorker as a generic off-hot-path queue worker so a (multi-LLM-call) MPR panel never
+            # blocks the dev-loop / turn path. #904: tear it down on a gate ON->OFF flip (no stranded daemon).
+            if _ACE_FORK_MPR and _ACE_FORK_WORKER is None:
+                _ACE_FORK_WORKER = ReflectionWorker(_ace_fork_run_task)
+                _ACE_FORK_WORKER.start()
+            elif not _ACE_FORK_MPR and _ACE_FORK_WORKER is not None:
+                try:
+                    _ACE_FORK_WORKER.stop()
+                except Exception:   # noqa: BLE001
+                    pass
+                _ACE_FORK_WORKER = None
+                _ACE_FORK_INFLIGHT.clear()
+        else:                                        # a foreign provider won ⇒ ACE steps back
+            _hooks.unregister_hook("post_feedback", _ace_consumer_hook)
+        _hooks.unregister_hook("post_feedback", _lessons_consumer_hook)    # superseded (#804)
+        _hooks.unregister_hook("post_feedback", _process_consumer_hook)    # superseded (#803)
     except Exception:   # noqa: BLE001 — advisory wiring: never break config application
         return
 
@@ -8177,14 +9014,17 @@ def _record_failure_class(result_cls):
 
 # ─── epic #602 SUB-6: Process-Level Self-Correction (post_feedback → pre_turn) ─────────────────────
 def _concrete_lesson_provider():
-    """The registered lesson provider IFF it is the concrete :class:`~engine.lesson_store.EngineLessonStore`
-    (typed ``record``/``by_category``); ``None`` otherwise. Process-SC reads/writes TYPED process-lessons
-    only through the concrete class — the string-only ``ack.lessons`` seam can't round-trip them. Never raises."""
+    """The registered lesson provider IFF it exposes the TYPED ``record``/``by_category`` surface; ``None``
+    otherwise. Process-SC reads/writes TYPED process-lessons through this surface — the string-only
+    ``ack.lessons`` seam can't round-trip them. DUCK-TYPED (#863): since ACE supersedes the #602
+    ``EngineLessonStore`` with the :class:`~engine.playbook_store.PlaybookStore` (which implements the SAME
+    typed surface over the bullet playbook), the check is a capability probe, not an ``isinstance`` — so
+    Process-SC keeps working against whichever concrete backend is wired and NEVER silently breaks. Never raises."""
     try:
         from ack import lessons as _lessons     # lazy: never import ack at gx10 top-level (S6b lesson)
-        from lesson_store import EngineLessonStore   # bare engine-sibling import (like project_registry)
         p = _lessons.get_provider()
-        return p if isinstance(p, EngineLessonStore) else None
+        return p if (callable(getattr(p, "record", None))
+                     and callable(getattr(p, "by_category", None))) else None
     except Exception:   # noqa: BLE001 — advisory: a lookup hiccup → no concrete provider
         return None
 

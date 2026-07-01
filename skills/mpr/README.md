@@ -19,9 +19,16 @@ switch controls whether it runs; the tool is always registered, but it can be pa
 | Gate | Source | Default | Effect when OFF | Toggle |
 |------|--------|---------|-----------------|--------|
 | **RUNTIME** | `mpr.enabled` in the config tree | **on** | `run_mpr` returns a short "MPR is disabled" note (0 LLM calls, no run dir) | **in the CLI: `/config set mpr.enabled off`** (no redeploy) |
+| **MPR-AT-FORK** | `ace.fork_mpr.enabled` in the config tree | **off** | a declared architecture `ForkSignal` never triggers MPR — the STOP-and-ask is byte-identical to today (0 LLM calls) | **`/config set ace.fork_mpr.enabled on`** (no redeploy) |
 
 - `mpr.enabled` **on** (default) → the panel runs. **off** → loaded but paused (each call returns the note).
 - Deploy override: set `GX10_MPR_ENABLED=0` to make the runtime default off at boot.
+- `ace.fork_mpr.enabled` **off** (default) → ACE's MPR-at-fork option is dormant. **on** → when the dev-loop
+  declares an architecture fork (a `ForkSignal` on the ledger, epic #855 / M5), the engine runs MPR's
+  `architecture-decision` panel **off the hot path** (a background worker), pre-informed by the playbook's
+  prior fork decisions, and produces a decision-matrix as a well-founded proposal for the human ask. Requires
+  `mpr.enabled` **on** + an active initiative; any failure degrades to a no-op (the ask still surfaces). MPR
+  only *proposes* — the operator still decides.
 
 > **Deprecation:** the legacy `GX10_MPR` *load* gate was removed (MPR is a core built-in now). Use
 > the runtime `mpr.enabled` (`/config set mpr.enabled on|off`) or `GX10_MPR_ENABLED` at deploy.

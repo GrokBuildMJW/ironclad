@@ -49,6 +49,19 @@ def test_capture_collects_this_threads_output():
     assert "alpha" in cap.text and "beta" in cap.text
 
 
+def test_strip_chat_chrome_removes_status_markers_keeps_answer():
+    # #921 (fachtest): the captured /chat output must not carry the [GX10]/[Qwen (planning)] pane chrome
+    raw = "  [Qwen (planning)]\n\n[GX10]\n\n\n391\n\n  [perf] TTFT 1.6s\n\n  ==== DONE ====\n"
+    out = server._strip_chat_chrome(raw)
+    assert "391" in out and "[perf]" in out and "DONE" in out            # answer + status kept
+    assert "[GX10]" not in out and "Qwen (planning)" not in out          # chrome markers dropped
+    assert "\n\n\n" not in out                                           # blank runs collapsed
+    # ANSI-wrapped + running variant are stripped too; plain text is untouched
+    assert server._strip_chat_chrome("\x1b[36m[GX10]\x1b[0m\nhi") == "hi"
+    assert "[Qwen (running)]" not in server._strip_chat_chrome("[Qwen (running)]\nanswer")
+    assert server._strip_chat_chrome("just the answer") == "just the answer"
+
+
 def test_capture_does_not_leak_across_threads():
     other_emitted = threading.Event()
 

@@ -3,8 +3,9 @@
 Proves the C2 reflection loop is LIVE end-to-end on the dev-task pipeline — every consumer fires, no link is a
 no-op (the test the C1 half-ship would have failed): a staged handover is scored (Verifier) → the score feeds
 the Quality breaker and trips it → a run failure is classified (FailureClass) → the Strategy Revisor escalates
-when the per-task budget is spent. With all flags OFF the whole path is a no-op (byte-identical). Also proves
-8b: `loop_profiles.by_type[<type>].eval` selects WHICH verifiers run.
+when the per-task budget is spent. With the C2 reflection flags OFF those consumers are a no-op (the ACE
+loop-intelligence core is always-on and owns `post_feedback` — #863). Also proves 8b:
+`loop_profiles.by_type[<type>].eval` selects WHICH verifiers run.
 
 (Lessons + Process — the C1 learning half — fire at task completion and are covered by `test_lesson_seam_wiring`
 + `test_process`; this gate focuses on the C2 reflection consumers that #802/#808/#805/#806 wired.)
@@ -94,8 +95,8 @@ def test_c2_closed_reflection_loop_all_consumers_fire(tmp_path, monkeypatch):
     assert act == StrategyAction.HUMAN_ESCALATION.value and gx10._last_strategy().escalate  # strategy fired
 
 
-def test_all_flags_off_is_byte_identical_no_consumer_fires(tmp_path, monkeypatch):
-    cfg = gx10._code_defaults()                # everything OFF
+def test_c2_seams_off_but_ace_loop_is_always_on(tmp_path, monkeypatch):
+    cfg = gx10._code_defaults()                # the C2 reflection seams (verify/quality/strategy) all OFF
     gx10.STORE = None
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(gx10, "_MEMORY", _FakeMem([]))
@@ -103,7 +104,12 @@ def test_all_flags_off_is_byte_identical_no_consumer_fires(tmp_path, monkeypatch
     gx10._dispatch(_agent(), "initiative new Order Service --type software")
     out = gx10._stage_handover(None, "OPUS", "## Handover\nbuild it", task_json=_THIN, force=True)
     assert out.startswith("OK")
-    assert hooks.registered_events() == ()             # no reflection hook registered
+    # ACE is the always-on loop-intelligence core (#863): its post_feedback consumer is wired with NO flag,
+    # superseding the #602 string-lesson + Process-SC consumers. The C2 reflection seams below stay OFF.
+    from ack import lessons as L
+    from playbook_store import PlaybookStore
+    assert isinstance(L.get_provider(), PlaybookStore)
+    assert set(hooks.registered_events()) == {"post_feedback"}   # ONLY the ACE consumer (no verify/quality hook)
     assert gx10._quality_tripped() is None
     tid = gx10._store().list("pending")[0]["id"]
     assert gx10._record_failure_class(providers.RESULT_FAILED) is None

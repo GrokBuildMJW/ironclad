@@ -72,13 +72,20 @@ needed.
 - **Reliable tool-calling** — the ACK validates every tool call (validate→reask) and
   recovers for models without native tool-calls, so structured output doesn't depend on a
   specific model or parser.
-- **Loop Intelligence — a self-improving reflection loop.** A default-off layer that learns
-  across runs: a mark-only **Verifier** scores each handover, a **Quality circuit-breaker**
-  trips on sustained degradation, a **Strategy revisor** turns a *classified* failure into a
-  targeted next action (not "retry the same way"), and **Lessons / process self-correction**
-  persist what worked. All consumers ride a dependency-inverted **Hook-Bus** over the
-  agent-loop events, are opt-in per flag, and are **byte-identical when off** — they observe
-  and advise, never relaxing the fail-closed core.
+- **Loop Intelligence — an always-on, self-improving context loop (ACE).** The engine learns
+  across runs into an evolving, itemized **playbook** of bullets, refined by
+  Generator→Reflector→Curator with incremental delta updates + grow-and-refine
+  ([Agentic Context Engineering](https://arxiv.org/abs/2510.04618)). It is the **always-on
+  core mechanic** — no enable flag — registered as the lesson provider and superseding the
+  earlier string-lesson layer. A mark-only **Verifier** scores each handover and a **Quality
+  circuit-breaker** trips on sustained degradation (both ride a dependency-inverted
+  **Hook-Bus** over agent-loop events, never relaxing the fail-closed core). The loop also
+  **learns from the dev-process itself** — the transition ledger both dev-processes emit is
+  distilled into per-unit lessons and correlated to the bullets each handover used. And at an
+  **architecture fork** it can (gated `ace.fork_mpr.enabled`, default off) run the bundled
+  **MPR** multi-perspective panel off the hot path to attach a decision-matrix as a
+  *recommendation* to the human ask, then learn the chosen outcome so the next comparable fork
+  is pre-informed — always proposing, never deciding.
 - **Governed parallelism + provider routing** — server-side reasoning fan-out
   (`/fanout` + the in-engine `parallel_reason` tool), GPU-safe via a concurrency cap and a
   token-budget envelope; a **provider router/dispatcher** on top routes work across
@@ -110,11 +117,11 @@ Ironclad's engine comes from a **proven, in-production orchestrator**, now **reb
 the server + client architecture above and **wired and tested**. It is still
 **pre-release** (0.0.x, alpha): single-tenant by design (no multi-user auth yet) and
 APIs/layout/config may change. Tagged releases ship on **PyPI** (`ironclad-ai`) and as
-**GitHub Releases** (currently `v0.0.21`) — treat them as early previews and `main` as a
+**GitHub Releases** (currently `v0.0.22`) — treat them as early previews and `main` as a
 development snapshot. The internal DEV → Prod → Public **promote pipeline** that hardens our
 releases is in development (today a manual gated path).
 
-Verified by **2216 Python tests** (2207 offline + 9 live) plus **355 TypeScript client
+Verified by **2419 Python tests** (2410 offline + 9 live) plus **355 TypeScript client
 tests**, and a **full end-to-end run with a real code-agent**. Read these before relying on
 anything:
 

@@ -366,6 +366,30 @@ def health():
     return {"status": "ok"}
 
 
+class EmbedReq(BaseModel):
+    texts: list[str]
+
+
+@app.post("/embed")
+def embed(r: EmbedReq):
+    """Batch-embed raw texts with the local BGE-M3 embedder (1024-d) — the seam ACE uses for semantic bullet
+    dedup + relevant-bullet retrieval (epic #855 ACE-WIRE / #863). No vector store / graph / LLM is touched
+    (the embedding model alone → cheap + fast). Returns one vector per input text, in input order; ``dims`` is
+    the embedding width. The engine's ``_ace_embed_adapter`` POSTs here; with the endpoint absent ACE falls
+    back to dependency-free lexical similarity, so this stays an optional accelerator."""
+    em = getattr(mem, "embedding_model", None)
+    if em is None:
+        raise HTTPException(status_code=503, detail="embedder unavailable")
+    vectors = []
+    for t in r.texts:
+        try:
+            v = em.embed(t)
+        except TypeError:
+            v = em.embed(t, "search")   # some Mem0 builds require a memory_action argument
+        vectors.append(list(v))
+    return {"vectors": vectors, "dims": (len(vectors[0]) if vectors else 1024)}
+
+
 @app.post("/add")
 def add(r: AddReq):
     if (err := scope_guard.require_scope(r.agent_id, r.run_id)):

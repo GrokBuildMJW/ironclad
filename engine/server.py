@@ -97,6 +97,24 @@ def _capture_sink(text: str) -> None:
             pass
 
 
+#: #921: the interactive status markers ``[GX10]`` / ``[Qwen (planning)]`` / ``[Qwen (running)]`` are
+#: terminal-pane chrome, not part of the answer — a captured /chat response should not carry them (they are
+#: kept on the interactive terminal). Matches the marker on its own line, ANSI-color-wrapped or plain.
+_CHAT_CHROME_RE = __import__("re").compile(
+    r"^\s*(?:\x1b\[[0-9;]*m)*\[(?:GX10|Qwen \((?:planning|running)\))\](?:\x1b\[[0-9;]*m)*\s*$")
+
+
+def _strip_chat_chrome(text: str) -> str:
+    """Drop the ``[GX10]`` / ``[Qwen (planning|running)]`` status lines from a captured /chat output and
+    collapse the blank lines they leave; the answer + perf/DONE status remain. Fail-soft (returns *text* as-is
+    on any error)."""
+    try:
+        kept = [ln for ln in text.splitlines() if not _CHAT_CHROME_RE.match(ln)]
+        return __import__("re").sub(r"\n{3,}", "\n\n", "\n".join(kept)).strip("\n")
+    except Exception:  # noqa: BLE001 — cosmetic cleanup must never break the response
+        return text
+
+
 class _Captured:
     """Context manager: collect this thread's ``_ui_print`` output into a string."""
 
@@ -612,7 +630,7 @@ class _Handler(BaseHTTPRequestHandler):
                     with _AGENT_LOCK:
                         gx10.bind_active()      # S5b: this request thread → the active project's ctx
                         gx10._dispatch(self.agent, message)
-                self._send(200, {"ok": True, "output": cap.text})
+                self._send(200, {"ok": True, "output": _strip_chat_chrome(cap.text)})
             elif self.path == "/chat/stream":
                 data = self._read_json()
                 message = (data.get("message") or "").strip()
