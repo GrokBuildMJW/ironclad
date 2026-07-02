@@ -51,7 +51,7 @@
       "question": "FRAGE",
       "mode": "MODUS",
       "target_format": "ZIEL-FORMAT",
-      "gutachten": "GUTACHTEN",
+      "opinions": "GUTACHTEN",
       "roles": "Rollen",
       "role": "Rolle",
       "detected_conflicts": "ERKANNTE KONFLIKTE (vom deterministischen Detektor — als Signal behandeln):",

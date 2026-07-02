@@ -58,20 +58,21 @@ def test_new_software_creates_skeleton_meta_and_active(tmp_path):
     assert gx10.active_slug() == "order-service"
 
 
-def test_new_mpr_creates_runs_and_decisions(tmp_path):
-    v = gx10.initiative_new("Risk Review", "mpr")
-    assert v.type == "mpr"
+def test_software_seeds_runs_for_embedded_mpr(tmp_path):
+    # #984: MPR is embedded (not a project type); every software initiative gets a runs/ home where the
+    # off-hot-path architecture-decision panel writes its run artefacts, alongside the task pipeline.
+    v = gx10.initiative_new("Risk Review", "software")
+    assert v.type == "software"
     base = tmp_path / "vault" / "risk-review"
     assert (base / "runs").is_dir()
     assert (base / "decisions").is_dir()
-    # mpr has NO software task-pipeline
-    assert not (base / "tasks").exists()
+    assert (base / "tasks" / "pending").is_dir()
 
 
 def test_vault_files_written_with_lf(tmp_path):
     """Vault files + the active marker must use deterministic LF endings (newline='\\n') so a
     Windows desktop and a Linux Spark produce byte-identical files (no CRLF/LF drift). Guards #8."""
-    gx10.initiative_new("LF Check", "mpr")
+    gx10.initiative_new("LF Check", "software")
     base = tmp_path / "vault" / "lf-check"
     for rel in ("meta.md", "INDEX.md"):
         assert b"\r\n" not in (base / rel).read_bytes(), f"{rel} contains CRLF"
@@ -81,7 +82,7 @@ def test_vault_files_written_with_lf(tmp_path):
 def test_created_date_uses_local_calendar_day(tmp_path):
     # #10: the visible created date follows the local calendar day (localtime), not UTC
     import time as _t
-    v = gx10.initiative_new("Local Date", "mpr")
+    v = gx10.initiative_new("Local Date", "software")
     assert v.created == _t.strftime("%Y-%m-%d", _t.localtime())
 
 
@@ -98,7 +99,7 @@ def test_meta_frontmatter_roundtrips(tmp_path):
 # ── collision handling ────────────────────────────────────────
 def test_new_collision_gets_suffix(tmp_path):
     a = gx10.initiative_new("Same Name", "software")
-    b = gx10.initiative_new("Same Name", "mpr")
+    b = gx10.initiative_new("Same Name", "software")
     assert a.slug == "same-name"
     assert b.slug == "same-name-2"
     assert (tmp_path / "vault" / "same-name").is_dir()
@@ -110,7 +111,7 @@ def test_new_collision_gets_suffix(tmp_path):
 # ── list ──────────────────────────────────────────────────────
 def test_list_returns_all_sorted():
     gx10.initiative_new("Beta", "software")
-    gx10.initiative_new("Alpha", "mpr")
+    gx10.initiative_new("Alpha", "software")
     slugs = [v.slug for v in gx10.initiative_list()]
     assert slugs == ["alpha", "beta"]   # sorted by slug
 
@@ -122,7 +123,7 @@ def test_list_empty_when_no_vault():
 # ── use / active ──────────────────────────────────────────────
 def test_use_switches_active():
     gx10.initiative_new("First", "software")
-    gx10.initiative_new("Second", "mpr")    # now active
+    gx10.initiative_new("Second", "software")    # now active
     assert gx10.active_slug() == "second"
     v = gx10.initiative_use("first")
     assert v.slug == "first"
@@ -178,48 +179,31 @@ def test_cmd_new_creates_and_reports(tmp_path):
     assert gx10.active_slug() == "order-service"
 
 
-def test_cmd_new_message_is_type_aware(tmp_path, monkeypatch):
-    # #13: message names the artefacts actually seeded for the type (no Tasks/Handovers for mpr).
-    # #503 MPR-ENV-2: mpr.enabled defaults ON, so a fresh mpr initiative does NOT nag "MPR not active"
-    # when the key is unset — the activation hint appears ONLY when it is EXPLICITLY disabled.
-    monkeypatch.setattr(gx10, "_EFFECTIVE_CFG", {}, raising=False)   # mpr.enabled unset → default ON
-    mpr = gx10._initiative_command("new Risk Panel --type mpr")
-    assert "runs" in mpr and "decisions" in mpr
-    assert "Tasks" not in mpr and "Handovers" not in mpr
-    assert "mpr.enabled" not in mpr                                  # default ON → no spurious hint
-    soft = gx10._initiative_command("new Order Svc --type software")
-    assert "tasks" in soft and "reviews" in soft
-    assert "mpr.enabled" not in soft
+def test_cmd_new_message_names_seeded_artifacts(tmp_path):
+    # #13/#984: the message names the artefacts actually seeded (derived from the software skeleton).
+    soft = gx10._initiative_command("new Order Svc")
+    assert "tasks" in soft and "reviews" in soft and "runs" in soft
 
 
-def test_cmd_new_mpr_hint_only_when_explicitly_disabled(tmp_path, monkeypatch):
-    # #503 MPR-ENV-2: the activation hint appears only when mpr.enabled is EXPLICITLY off, never on unset.
-    monkeypatch.setattr(gx10, "_EFFECTIVE_CFG", {"mpr": {"enabled": False}}, raising=False)
-    mpr = gx10._initiative_command("new Risk Panel --type mpr")
-    assert "mpr.enabled" in mpr                                      # explicitly disabled → hint shown
-
-
-def test_cmd_new_typ_position_independent_and_eq():
-    out = gx10._initiative_command("new --type=mpr Risk Panel")
-    assert "risk-panel" in out and "mpr" in out
-    assert gx10.initiative_get("risk-panel").type == "mpr"
-
-
-def test_cmd_new_without_typ_shows_usage():
+def test_cmd_new_no_type_creates_software(tmp_path):
+    # #984: --type is dropped; `/project new <name>` (here via /initiative) always creates a software unit.
     out = gx10._initiative_command("new Just A Name")
-    assert "usage" in out.lower() and "--type" in out
-    assert gx10.initiative_list() == []   # nothing created
+    assert "just-a-name" in out and "software" in out
+    assert gx10.initiative_get("just-a-name").type == "software"
 
 
-def test_cmd_new_invalid_typ_failclosed():
-    out = gx10._initiative_command("new X --type database")
-    assert "[initiative]" in out and "database" in out   # clear error, not a crash
-    assert gx10.initiative_list() == []
+def test_cmd_new_ignores_legacy_type(tmp_path):
+    # #984: a legacy/bogus --type is tolerated + ignored — the unit is created as software, never rejected.
+    out = gx10._initiative_command("new --type=mpr Risk Panel")
+    assert "risk-panel" in out
+    assert gx10.initiative_get("risk-panel").type == "software"
+    out2 = gx10._initiative_command("new X --type database")
+    assert "x" in out2 and gx10.initiative_get("x").type == "software"
 
 
 def test_cmd_list_marks_active():
     gx10._initiative_command("new One --type software")
-    gx10._initiative_command("new Two --type mpr")     # active
+    gx10._initiative_command("new Two")     # active
     out = gx10._initiative_command("list")
     assert "* two" in out
     assert "  one" in out and "* one" not in out
@@ -232,7 +216,7 @@ def test_cmd_list_empty():
 
 def test_cmd_use_and_unknown():
     gx10._initiative_command("new Alpha --type software")
-    gx10._initiative_command("new Beta --type mpr")
+    gx10._initiative_command("new Beta")
     assert "alpha" in gx10._initiative_command("use alpha")
     assert gx10.active_slug() == "alpha"
     out = gx10._initiative_command("use nope")
@@ -277,24 +261,26 @@ def test_dispatch_initiative_new_routes_to_command(tmp_path):
     assert (tmp_path / "vault" / "routed" / "meta.md").is_file()
 
 
-# ── #15: type is a real contract — mpr refuses the task pipeline ──
-def test_mpr_initiative_refuses_task_pipeline(tmp_path):
-    gx10.initiative_new("Risk Panel", "mpr")
-    s = gx10._stage_handover(None, "OPUS", "## Handover\nbody",
-                             task_json='{"type":"feature","priority":"high","title":"x","description":"y"}')
-    assert s.startswith("ERROR") and "mpr" in s.lower()
-    a = gx10._advance_pipeline(f"{gx10.TASK_PREFIX}-1", "OPUS")
-    assert a.startswith("ERROR") and "mpr" in a.lower()
-    with pytest.raises(RuntimeError):
-        gx10._store().create({"type": "feature", "priority": "high", "title": "x", "description": "y"}, force=True)
-    # mpr seeds no task pipeline dirs
-    assert not (tmp_path / "vault" / "risk-panel" / "tasks").exists()
-    assert not (tmp_path / "vault" / "risk-panel" / ".work").exists()
-
-
+# ── #984: MPR is embedded (not a project type) — the software task pipeline just works ──
 def test_software_initiative_allows_task_pipeline(tmp_path):
     gx10.initiative_new("Order Svc", "software")
     tid = gx10._store().create(
         {"type": "feature", "priority": "high", "title": "x", "description": "y"}, force=True)["id"]
     out = gx10._stage_handover(tid, "OPUS", "## Handover\nbody")
     assert not out.startswith("ERROR")
+
+
+# ── #979: mutual exclusion — the normal in-engine pipeline is OFF on an INTERNAL dev-process target ──
+def test_internal_target_blocks_the_normal_pipeline(tmp_path):
+    gx10.initiative_new("Order Svc", "software")
+    (tmp_path / ".devloop").mkdir(parents=True, exist_ok=True)
+    (tmp_path / ".devloop" / "dev-target.json").write_text(   # bind the project as an INTERNAL target
+        '{"project_id":"default","exec_mode":"github","tier":3,"plugin_required":true,"plugin_id":"x"}',
+        encoding="utf-8")
+    s = gx10._stage_handover(None, "OPUS", "## Handover\nbody",
+                             task_json='{"type":"feature","priority":"high","title":"x","description":"y"}')
+    assert s.startswith("ERROR") and "INTERNAL" in s
+    a = gx10._advance_pipeline(f"{gx10.TASK_PREFIX}-1", "OPUS")
+    assert a.startswith("ERROR") and "INTERNAL" in a
+    with pytest.raises(RuntimeError):
+        gx10._store().create({"type": "feature", "priority": "high", "title": "x", "description": "y"}, force=True)

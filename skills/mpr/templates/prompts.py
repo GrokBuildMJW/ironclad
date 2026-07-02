@@ -92,7 +92,7 @@ def build_synthesis_prompt(inp: Any, ok: List[Any], conflicts: List[Any], lang: 
         f"{L('question', 'QUESTION')}: {inp.query}",
         f"{L('mode', 'MODE')}: {inp.mode}   {L('target_format', 'TARGET FORMAT')}: {inp.synthesis_template}",
         "",
-        f"{L('gutachten', 'OPINIONS')} ({len(ok)} {L('roles', 'roles')}):",
+        f"{L('opinions', 'OPINIONS')} ({len(ok)} {L('roles', 'roles')}):",
     ]
     for i, p in enumerate(ok, 1):
         lines.append(f"[{i}] {L('role', 'Role')} «{p.role}» (provider={p.provider}, effort={p.effort}):")

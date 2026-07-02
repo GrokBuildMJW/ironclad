@@ -29,3 +29,35 @@ ADR-0010 publicized the dev-process **substrate** (`ack.devprocess`) so the fram
 - The single-tenant control plane is rebuilt (registry + `ProjectContext`); this touches every path/memory resolution site and the background daemons/workers — the highest-risk change, gated by a feasibility spike before the refactor.
 - ADR-0009 and ADR-0010 files are **kept** (history); the inbound statements that asserted the now-reversed public substrate are marked historical where they would mislead.
 - The decomposition executes against this ADR: the relocation as the foundation, then the registry → context → switch → forge → memory → guided-setup → acceptance series.
+
+## Amendment — internal dev-process injection (epic #974)
+
+The `exec_mode` axis this ADR introduced is realised as a **per-project injection descriptor** (epic #974),
+so an operator can run the tool on a project **with** the internal (GitHub-integrated, extension-driven) dev
+process, while the **normal** (public DEV-1) process is refused on that project — mutually exclusive, stable.
+
+- **Storage & lifecycle.** The descriptor is a runtime side-file `<devloop_home>/dev-target.json` (per-project,
+  co-located with the ledger), **separate** from the delivery target table (`spec.TARGETS` is untouched) and
+  **not in the wheel**. Schema `{project_id, exec_mode∈{github,local}, tier∈{2,3}, plugin_required, plugin_id?,
+  health_gate?}` (`devprocess.spec.validate_injection`). It is bound atomically under the project's registry
+  lock (`devtarget.bind` / `devtarget.py register`), removed with `unbind`, and reconciled fail-closed
+  (`devtarget.reconcile` + the engine's `_dev_target_drift` at the `/lifecycle` gate). The engine reads it as
+  **plain data** (`gx10._dev_target_descriptor`) — it never imports the private dev-loop machinery.
+- **Validation / health / fail-closed gates.** (1) The internal driver refuses to start when the descriptor
+  requires the extension but the plugin is not present + healthy (`devtarget.plugin_active` + a rewired
+  `entry_plan` that returns a `blocked`/`refused` outcome instead of silently degrading tier-3 → native).
+  (2) The normal in-engine pipeline (`stage_handover` / `advance` / `TaskStore`) is refused on an internal
+  target (`gx10._internal_target_blocks_normal`). (3) `/switch` serializes under a repo-global lock.
+  (4) Every ledger record is stamped with `project_id` + `exec_mode`; a reader detects a fork and refuses to
+  mis-resume (`ledger.fork_reasons`). Each fail-closed path has a negative test, plus a self-dogfood
+  isolation test (both sides refuse on one project).
+- **tier-2 → tier-3 migration (no ledger fork).** Re-binding a project from tier-2 to tier-3 keeps the same
+  `project_id`, so the ledger's `project_id` stamp is unchanged and `fork_reasons` sees no project fork; the
+  `exec_mode` stamp is what a reader compares, so a mode change is caught **within a unit** (refuse) while a
+  clean re-bind between units simply starts stamping the new mode. `is_base_project`'s fail-safe-to-base
+  (never relocate on a registry read error) is unchanged — the ledger fork detection is the safety net.
+- **Operator view.** `/status` shows whether the active project is an internal target (its exec_mode / tier /
+  plugin) or runs the normal process; the REFUSE messages name the reason (plugin inactive / internal target
+  / ledger fork).
+- **Public tool = DEV-1.** No `dev_process` runtime switch ships; the internal process + its extension +
+  descriptor are private. This supersedes ADR-0009's operator-tier-selection wording.

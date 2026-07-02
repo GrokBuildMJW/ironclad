@@ -28,8 +28,13 @@ A tier resolves to a small bundle of **capability flags** (`ack.devprocess.tiers
 **Presets** (cumulative, OD10): DEV1 = all off/prose; DEV2 = guards `native`, push `switchable`,
 orchestrator `native`; tier 3 = push `on`, orchestrator `engine`, extension `on`.
 
-`resolve(tier, plugin_active)` is the SSOT. The operator selects `config.dev_process.tier = 1|2|3`;
-the engine applies the resolved flags. **tier-3 flags that need the extension plugin** (`orchestrator=engine`,
+`resolve(tier, plugin_active)` is the SSOT for what each tier *means*. **Historical (superseded by
+[ADR-0011](0011-dev-process-rework-project-isolation.md) + epic #974):** this ADR originally had the operator
+select `config.dev_process.tier = 1|2|3` and the engine apply the resolved flags. The engine **does NOT read
+`config.dev_process.tier`** — the shipped tool runs DEV-1; the resolver/presets are a PRIVATE dev-loop detail
+(`scripts/devprocess`), and a project is bound to the INTERNAL (extension-driven) process per-project via the
+injection descriptor (#974: `<devloop_home>/dev-target.json`, mutually exclusive with the normal process), not
+a global tier switch. **tier-3 flags that need the extension plugin** (`orchestrator=engine`,
 `extension=on`, `push=on`) are **inert without an activated plugin** → tier 3 degrades to the DEV-2
 value for those (OD4/OD11), so the extension orchestration is never advertised when it isn't installed.
 An unknown tier is **fail-closed** (never a silent default).

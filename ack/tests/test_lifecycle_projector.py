@@ -324,6 +324,37 @@ def test_lifecycle_gate_command_no_slug_blocked(tmp_path, monkeypatch):
     assert "BLOCKED" in out and "slug" in out
 
 
+# ── #933: the --tree resolver (git HEAD tree default, fail-soft) ──────────────────────────────────────
+def test_git_head_tree_resolves_in_a_repo():
+    # the monorepo IS a git repo → the committed HEAD tree sha resolves (40 hex chars)
+    sha = gx10._git_head_tree(Path(__file__).resolve().parents[3])
+    assert len(sha) == 40 and all(c in "0123456789abcdef" for c in sha)
+
+
+def test_git_head_tree_failsoft_outside_a_repo(tmp_path):
+    # a non-repo dir → "" so the BLOCKED-no-tree path still fires (never binds a bogus tree)
+    assert gx10._git_head_tree(tmp_path) == ""
+
+
+def test_lifecycle_gate_defaults_tree_to_head_when_omitted(tmp_path, monkeypatch):
+    # #933: --tree omitted → the resolver supplies the HEAD tree → the tree check passes (blocks later on
+    # the missing ledger, not on 'no delivery tree_sha')
+    monkeypatch.setattr(gx10, "_git_head_tree", lambda root=None: "a" * 40)
+    with pc.use(ProjectContext("p", str(tmp_path), "ns")):
+        gx10.initiative_new("Demo", "software")
+        out = gx10._lifecycle_command("gate")            # no --tree
+        assert "no delivery tree_sha" not in out         # the resolver default kicked in
+
+
+def test_lifecycle_gate_explicit_tree_overrides_resolver(tmp_path, monkeypatch):
+    # an explicit --tree wins even if the resolver would return "" (e.g. the operator's DELIVER-GO tree)
+    monkeypatch.setattr(gx10, "_git_head_tree", lambda root=None: "")
+    with pc.use(ProjectContext("p", str(tmp_path), "ns")):
+        gx10.initiative_new("Demo", "software")
+        out = gx10._lifecycle_command(f"gate --tree {TS}")
+        assert "no delivery tree_sha" not in out         # explicit --tree used despite empty resolver
+
+
 def test_lifecycle_gate_command_tampered_ledger_blocked(tmp_path):
     with pc.use(ProjectContext("p", str(tmp_path), "ns")):
         gx10.initiative_new("Demo", "software")

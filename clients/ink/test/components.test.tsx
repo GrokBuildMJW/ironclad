@@ -75,8 +75,8 @@ test('InputBox — ruled prompt with buffer + caret', () => {
 });
 
 test('InputBox — empty shows hint', () => {
-  const {frame, unmount} = renderToString(<InputBox buffer="" caret={false} hint="Frag etwas …" />, 80, 4);
-  assert.match(frame(), /Frag etwas …/);
+  const {frame, unmount} = renderToString(<InputBox buffer="" caret={false} hint="Ask something …" />, 80, 4);
+  assert.match(frame(), /Ask something …/);
   unmount();
 });
 
@@ -87,7 +87,7 @@ test('CommandMenu — lists matches and marks the selected row (MEM-16(2))', () 
   assert.match(f, /\/reset/);
   assert.match(f, /\/resume/);
   assert.match(f, /›/, 'has a selection marker');
-  assert.match(f, /Tab vervollständigen/, 'shows the key hint');
+  assert.match(f, /Tab complete/, 'shows the key hint');
   unmount();
 });
 

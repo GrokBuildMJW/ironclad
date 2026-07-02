@@ -222,7 +222,7 @@ def _input_box():
         line.append(caret, style=ACCENT)
     else:
         line.append(caret, style=ACCENT)
-        line.append(_INPUT["hint"] or "Frag etwas …", style=SUBTLE)
+        line.append(_INPUT["hint"] or "Ask something …", style=SUBTLE)
     return Group(Rule(style=SUBTLE), line, Rule(style=SUBTLE))
 
 
@@ -232,7 +232,7 @@ def _hint_line() -> Text:
     t.append("  /help", style=ACCENT)
     t.append(" · ", style=SUBTLE)
     t.append("exit", style=ACCENT)
-    t.append(" · Maus markiert/kopiert nativ", style=DIM)
+    t.append(" · Mouse selects/copies natively", style=DIM)
     return t
 
 
@@ -371,7 +371,12 @@ def _stream_turn(srv: Server, payload: str) -> None:
     try:
         # X-Local-Tools:1 is set by client.Server → passed-through code-tools run
         # LOCALLY here via the tool-bridge, against this machine's working copy.
-        srv.chat_stream(payload, on_text)
+        res = srv.chat_stream(payload, on_text)
+        if res and res.get("needs_confirm"):   # #935: destructive → not executed; re-run with --yes
+            ci = res["needs_confirm"]   # #956: reason is the full localized line → single-language
+            _commit(Text(f"  ⚠ {ci.get('command', '?')}: {ci.get('reason', 'destructive command')}", style=WARNING))
+        elif res and res.get("needs_guide"):   # #955: structured guided input — show fields, don't execute
+            client.render_guide(res["needs_guide"], lambda s: _commit(Text(s, style=DIM)))
     except KeyboardInterrupt:
         try:
             srv.cancel()
@@ -663,6 +668,9 @@ def repl(srv: Server, codedir: Path, max_agents: int = client.DEFAULT_MAX_AGENTS
 
             kind, name, payload = classify(line)
             if kind == "empty":
+                continue
+            if kind == "suggest":   # #934: unknown command → did-you-mean hint, never forwarded (no turn)
+                _commit(Text(f"  unknown command — did you mean  /{name} ?", style=DIM))
                 continue
             if kind == "local" and name in ("exit", "quit"):
                 break

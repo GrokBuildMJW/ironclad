@@ -1,60 +1,59 @@
-# MPR `eval/` — A/B-Harness · Rubric · Judge · Eval-Sets (Spec 08)
+# MPR `eval/` — A/B harness · rubric · judge · eval sets (spec 08)
 
-Heimat der **Live-/Eval-Schicht** des MPR-Plugins (Spec 08 §3–§5, §10). Getrennt von den
-deterministischen Unit-Tests unter `../tests/` (die laufen modell-/netzfrei im Merge-Gate); was hier
-liegt, treibt **echte** Turns gegen den deployten Orchestrator und kostet Tokens → läuft **nicht** bei
-jedem Commit, sondern vor dem Merge eines MPR-relevanten Changes (Gate-Stufe 4, Spec 08 §7).
+Home of the MPR plugin's **live/eval layer** (spec 08 §3–§5, §10). Separate from the deterministic unit
+tests under `../tests/` (those run model-/net-free in the merge gate); what lives here drives **real** turns
+against the deployed orchestrator and costs tokens → it does **not** run on every commit, but before merging
+an MPR-relevant change (gate stage 4, spec 08 §7).
 
 ## Layout
 
 ```
 eval/
-  README.md            # dieses Dokument
-  harness.py           # A/B-Harness „MPR on/off" (ctx_harness-Stil, stdlib-only, --selftest)   [Ev-3]
-  rubric.py            # Rubric als Daten (pure, unit-getestet)                                  [Ev-5]
-  judge.py             # LLM-Judge-Panel (3 Stimmen, gestubbt im Gate; live nur im A/B-Report)   [Ev-5]
-  gate.py              # Merge-Gate-Auswertung (liest gate.toml, prüft Schwellen)                [Ev-6]
-  gate.toml            # Gate-Schwellen (coverage_floor/budget/epsilon/decline_rate), tunebar    [Ev-6]
-  sets/                # kuratierte Eval-Sets je Domäne (jsonl) — KALIBRIERUNG, braucht User     [Ev-8]
-  refs/                # Referenz-Dimensionslisten je Query (Ground-Truth-Achsen)                [Ev-8]
-  recordings/          # Record/Replay-Manifeste (Test-Fixtures, generiert)                       [Ev-4]
+  README.md            # this document
+  harness.py           # A/B harness "MPR on/off" (ctx_harness style, stdlib-only, --selftest)      [Ev-3]
+  rubric.py            # rubric as data (pure, unit-tested)                                          [Ev-5]
+  judge.py             # LLM judge panel (3 votes, stubbed in the gate; live only in the A/B report) [Ev-5]
+  gate.py              # merge-gate evaluation (reads gate.toml, checks thresholds)                  [Ev-6]
+  gate.toml            # gate thresholds (coverage_floor/budget/epsilon/decline_rate), tunable       [Ev-6]
+  sets/                # curated eval sets per domain (jsonl) — CALIBRATION, needs the user          [Ev-8]
+  refs/                # reference-dimension lists per query (ground-truth axes)                     [Ev-8]
+  recordings/          # record/replay manifests (test fixtures, generated)                          [Ev-4]
 ```
 
-Alle Module (`harness.py`/`rubric.py`/`judge.py`/`gate.py`/`gate.toml`) sind **gebaut** (Phase-2-Einheiten
-Ev-3/5/6); die Datenordner `sets/`/`refs/`/`recordings/` sind mit kuratierten Eval-Daten/Fixtures gefüllt
-(`.gitkeep` hält sie auch leer versionierbar).
+All modules (`harness.py`/`rubric.py`/`judge.py`/`gate.py`/`gate.toml`) are **built** (phase-2 units
+Ev-3/5/6); the data folders `sets/`/`refs/`/`recordings/` are filled with curated eval data/fixtures
+(`.gitkeep` keeps them versionable even when empty).
 
-## Reconcile gegen Spec 08 §1 (WICHTIG — die Spec beschreibt ein früheres Layout)
+## Reconcile against spec 08 §1 (IMPORTANT — the spec describes an earlier layout)
 
-Spec 08 §1/§2 wurden gegen die **ursprünglich angenommene** Modul-Aufteilung geschrieben
-(`mpr.py`, `registry.py`, `effort.py`, `test_router.py`, gx10-Global-Fixtures `_StubWorkers`/
-`restore_flags`). Die **gebaute** Phase-1-Architektur weicht bewusst ab — die Garantien sind identisch,
-die Form anders:
+Spec 08 §1/§2 were written against the **originally assumed** module split (`mpr.py`, `registry.py`,
+`effort.py`, `test_router.py`, the gx10 global fixtures `_StubWorkers`/`restore_flags`). The **built**
+phase-1 architecture deliberately differs — the guarantees are identical, the shape is different:
 
-| Spec 08 §1 nimmt an | Ist (Phase 1) | warum |
+| Spec 08 §1 assumes | Actual (phase 1) | why |
 |---|---|---|
-| `mpr.py` (CASE+run) | `entry.py` + dünner `skills/mpr_research.py` | Loader scannt nur `**/skills/*.py`; Logik importierbar+stubbar |
-| `registry.py` (flach) | `registry/`-Package | konsolidiert (schema/resolve/synthesis/loader/guards/adaptive/config) |
-| `effort.py` | `registry/resolve.py` | Effort-/Policy-Resolution gehört zur Registry |
-| `test_router.py` etc. | `test_router_*.py` (8 Dateien) + `test_registry_*.py` … | per-Unit gewachsen; **ein** Test-Root |
-| gx10-Global-Fixtures (`_StubWorkers`, `restore_flags`) | **Injected-Deps** (`Deps`-Dataclass, Stubs als Argumente) | netzfrei OHNE gx10 auf sys.path; sauberer als Monolith-Globals |
+| `mpr.py` (CASE+run) | `entry.py` + a thin `skills/mpr_research.py` | the loader scans only `**/skills/*.py`; logic importable+stubbable |
+| `registry.py` (flat) | a `registry/` package | consolidated (schema/resolve/synthesis/loader/guards/adaptive/config) |
+| `effort.py` | `registry/resolve.py` | effort/policy resolution belongs to the registry |
+| `test_router.py` etc. | `test_router_*.py` (8 files) + `test_registry_*.py` … | grown per unit; **one** test root |
+| gx10 global fixtures (`_StubWorkers`, `restore_flags`) | **injected deps** (`Deps` dataclass, stubs as arguments) | net-free WITHOUT gx10 on sys.path; cleaner than monolith globals |
 
-Die vollständige **§2.1–§2.9 → bestehende-Tests Coverage-Map** liegt in der Ev-1+Ev-2-Quittung in
-`vault/Plan/mpr/TASKS.md`. Der strukturelle Sammel-Gate (`tests/test_eval_coverage.py`) erzwingt die
-Invarianten (kein eigener Dispatcher; §2-Komponenten-Testdateien vorhanden).
+The full **§2.1–§2.9 → existing-tests coverage map** lives in the Ev-1+Ev-2 record under
+`vault/Plan/mpr/` (private). The structural aggregate gate (`tests/test_eval_coverage.py`) enforces the
+invariants (no own dispatcher; the §2 component test files are present).
 
-## P0-Dispatch-Wiring — GEBAUT (war: deferred)
+## P0 dispatch wiring — BUILT (was: deferred)
 
-Das „run_mpr → P0-Dispatch"-Wiring ist verdrahtet **und getestet**: `tests/test_p0_dispatch.py` (PW-1)
-treibt die Perspektiven über den P0 `ProviderDispatcher` und prüft net-frei via injiziertem
-`_StubDispatcher` die §2.4-Seam (`RouteRequest[]`/`DispatchPolicy`) und §2.6-Provenance. Damit sind die
-zuvor deferreten Spec-08-Tests un-deferred (der vormalige Tracking-Skip-Stub existiert nicht mehr):
+The "run_mpr → P0 dispatch" wiring is wired **and tested**: `tests/test_p0_dispatch.py` (PW-1) drives the
+perspectives through the P0 `ProviderDispatcher` and checks the §2.4 seam (`RouteRequest[]`/`DispatchPolicy`)
+and §2.6 provenance net-free via an injected `_StubDispatcher`. This un-defers the previously deferred
+spec-08 tests (the former tracking skip-stub no longer exists):
 
-- §2.4 Dispatch-Seam (`_StubDispatcher` captured `RouteRequest[]`/`DispatchPolicy` via `ProviderDispatcher.dispatch`)
-- §2.6 Provenance-aus-`DispatchResult` (Manifest trägt heute in-engine-Substrat, nicht Dispatch-Provenance)
-- §2.3 Envelope/Governor (`ReasoningWorkers._plan_concurrency` über ein Panel)
-- §2.7 argv-grep / §2.8 sealed-no-egress (kein externer Argv-/Egress-Pfad im in-engine-MVP)
+- §2.4 dispatch seam (`_StubDispatcher` captures `RouteRequest[]`/`DispatchPolicy` via `ProviderDispatcher.dispatch`)
+- §2.6 provenance from `DispatchResult` (the manifest today carries the in-engine substrate, not dispatch provenance)
+- §2.3 envelope/governor (`ReasoningWorkers._plan_concurrency` over a panel)
+- §2.7 argv-grep / §2.8 sealed-no-egress (no external argv/egress path in the in-engine MVP)
 
-Die **lasttragenden** Garantien dieser §§ (local-only nie extern, Policy-Passthrough, Effort-Clamp,
-fail-closed) werden **heute** an der **Plan-Naht** (`plan_perspective_dispatch` → `ProviderChoice`) in
-`tests/test_sovereignty.py` deterministisch bewiesen.
+The **load-bearing** guarantees of these §§ (local-only never external, policy passthrough, effort clamp,
+fail-closed) are proven **today** at the **plan seam** (`plan_perspective_dispatch` → `ProviderChoice`) in
+`tests/test_sovereignty.py`, deterministically.

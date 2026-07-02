@@ -36,7 +36,7 @@ class Effort(str, Enum):
 
 
 class ProviderPolicy(str, Enum):
-    """Sovereignty flag (01-befund §E). ``local-only`` = NEVER dispatched externally."""
+    """Sovereignty flag (spec 01, §E). ``local-only`` = NEVER dispatched externally."""
 
     LOCAL_ONLY = "local-only"
     OFFLOADABLE = "offloadable"

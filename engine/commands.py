@@ -109,10 +109,9 @@ Commands (with a / prefix) — plain text without / is sent to the orchestrator 
     /watcher on|off    auto-advance (reconciler)
     /autopilot on|off  autopilot
     /autoplan on|off [N]
-    /initiative new <name> --type mpr|software   create + activate an initiative
-    /initiative list | use <slug> | active | reconcile [slug]
-    /project list | new <name> [--type mpr|software] [--path <dir>] | active | track new|use|list
-                   manage isolated projects (the guided setup command; /initiative is a deprecated alias)
+    /project new <name> [--path <dir>]   create + activate a project (the guided setup command)
+    /project list | use <slug> | active | track new|use|list | delete <id> [--purge] | archive|unarchive <id>
+    /initiative …   deprecated alias for /project (kept one release)
     /switch <project_id>   rebind the engine to a project (own paths + memory partition)
     /generate <args>   scaffold a paved-road capability into the active project library
     /tool <name> <args>   run a tool directly/deterministically (no model election, no RAG)
@@ -143,4 +142,22 @@ def classify(line: str) -> Tuple[str, str, str]:
     name = body.split()[0].lower()
     if name in LOCAL_COMMANDS:
         return ("local", name, body)
+    # #934: deterministic, zero-cost alias / unambiguous-prefix / did-you-mean (no model). Resolves against
+    # the command-spec (SSOT) ∪ the client-local set. An exact/forwardable token forwards verbatim as before
+    # (so a prompt-name /<name> still reaches the server's prompt resolver); an alias or a non-destructive
+    # unique prefix is corrected transparently; a close typo becomes a 'suggest' (never auto-run, no turn).
+    try:
+        import command_spec as _cs
+        known = {v.split()[0] for v in _cs.verbs()} | LOCAL_COMMANDS | SERVER_COMMANDS
+        kind, value = _cs.resolve_command(name, known, _cs.ALIASES, _cs.unsafe_first_words())
+        if kind == "alias":
+            return classify("/" + value + body[len(name):])          # expand, then re-classify
+        if kind == "prefix":
+            rest = body[len(name):]
+            return (("local", value, value + rest) if value in LOCAL_COMMANDS
+                    else ("server", value, value + rest))
+        if kind == "suggest":
+            return ("suggest", value, body)                          # did-you-mean; caller shows, no forward
+    except Exception:  # noqa: BLE001 — resolution is a convenience; never break dispatch
+        pass
     return ("server", name, body)

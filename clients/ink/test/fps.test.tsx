@@ -16,7 +16,7 @@ function Live({n}: {n: number}): React.ReactElement {
       <Text>{`row spinner ${n % 6}`}</Text>
       <Text>{'────────────────────────────'}</Text>
       <Text>{`> partial answer chunk number ${n}`}</Text>
-      <Text>{'/help · exit · Maus markiert nativ'}</Text>
+      <Text>{'/help · exit · Mouse selects natively'}</Text>
       <Text>{`◆ Ironclad · model x · ●conn · ${n}P/0IP/0D`}</Text>
     </Box>
   );

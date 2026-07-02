@@ -1,7 +1,7 @@
 """comparison-matrix template (Spec 06 §4.3) — like decision-matrix, no forced recommendation.
 
 Structure = the decision matrix without ``fallback``/``recommendation``; instead the mandatory
-"Lücken/Chancen" (gaps/opportunities) sections (02 §7 competitive). Weighted score computed by MPR;
+"Gaps/Opportunities" sections (02 §7 competitive). Weighted score computed by MPR;
 conflict zones embedded identically.
 """
 from __future__ import annotations

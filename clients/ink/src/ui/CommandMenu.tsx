@@ -15,12 +15,13 @@ export function CommandMenu({items, sel}: {items: readonly Command[]; sel: numbe
   const s = clampSel(sel, items.length);
   const {slice, offset} = menuWindow(items, s);
   const hidden = items.length - slice.length;
-  const hint = (hidden > 0 ? `+${hidden} weitere · ` : '') + 'Tab vervollständigen · ↑↓ wählen · Esc schließen';
+  const hint = (hidden > 0 ? `+${hidden} more · ` : '') + 'Tab complete · ↑↓ select · Esc close';
   return (
     <Box flexDirection="column" paddingLeft={2}>
       {slice.map((c, i) => {
         const selected = offset + i === s;
-        const lhs = `/${c.name}${c.usage ? ' ' + c.usage : ''}`;
+        // #937: an argument completion (subcommand/flag/choice) shows its bare token; a verb shows `/verb`
+        const lhs = c.arg ? c.name : `/${c.name}${c.usage ? ' ' + c.usage : ''}`;
         return (
           <Box key={c.name} flexDirection="row">
             <Text color={selected ? ACCENT_HI : DIM}>{selected ? '› ' : '  '}</Text>

@@ -15,7 +15,7 @@ PANEL = Panel(
                 "and threat lenses.",
     roles=[
         {
-            "role": "Produkt",
+            "role": "Product",
             "lens_prompt": "You are a product analyst. Compare solely feature scope, UX and roadmap "
                            "signals of the competitors against the question; name clear differentiators "
                            "and parity points.",
@@ -34,13 +34,13 @@ PANEL = Panel(
             "effort": "high",
         },
         {
-            "role": "Kunde / Use-Case",
+            "role": "Customer / Use-Case",
             "lens_prompt": "You take the customer's view. Compare per core use-case/segment: whose "
                            "solution fits whom better and why (jobs-to-be-done)?",
             "effort": "medium",
         },
         {
-            "role": "Risiko / Bedrohung",
+            "role": "Risk / Threat",
             "lens_prompt": "You are a competitive-intelligence scout. Identify the biggest threats: "
                            "emerging players, substitution, strategic moves by incumbents.",
             "effort": "medium",

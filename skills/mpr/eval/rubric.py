@@ -14,11 +14,11 @@ from typing import Dict, List, Optional
 
 #: §5.1 rubric — weights sum to 1.0, every dimension 0-5.
 RUBRIC: Dict[str, dict] = {
-    "coverage":           {"weight": 0.30, "scale": "0-5", "desc": "deckt die Referenz-Achsen der Frage ab"},
-    "conflict_surfacing": {"weight": 0.20, "scale": "0-5", "desc": "macht divergierende Sichten/Spannungen explizit"},
-    "grounding":          {"weight": 0.20, "scale": "0-5", "desc": "Claims belegt (Zitate/Quellen) statt behauptet"},
-    "decision_clarity":   {"weight": 0.20, "scale": "0-5", "desc": "klare Matrix + Empfehlung + Rückzug (decision)"},
-    "cost_latency":       {"weight": 0.10, "scale": "0-5", "desc": "Mehraufwand vertretbar vs. Mehrwert (Penalty)"},
+    "coverage":           {"weight": 0.30, "scale": "0-5", "desc": "covers the reference axes of the question"},
+    "conflict_surfacing": {"weight": 0.20, "scale": "0-5", "desc": "makes divergent views/tensions explicit"},
+    "grounding":          {"weight": 0.20, "scale": "0-5", "desc": "claims grounded (citations/sources), not asserted"},
+    "decision_clarity":   {"weight": 0.20, "scale": "0-5", "desc": "clear matrix + recommendation + fallback (decision)"},
+    "cost_latency":       {"weight": 0.10, "scale": "0-5", "desc": "extra effort justified vs. added value (penalty)"},
 }
 #: the four dimensions a model can judge from the answer text; cost_latency is computed (see below).
 JUDGED_DIMS = ["coverage", "conflict_surfacing", "grounding", "decision_clarity"]

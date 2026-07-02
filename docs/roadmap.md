@@ -81,4 +81,8 @@ Maturing the project itself toward a dependable, versioned release.
 - **A stable (1.0) release** once the APIs settle (today: tagged `0.0.x` alpha
   previews on PyPI `ironclad-ai` + GitHub Releases).
 
+## Usability & command ergonomics
+
+Raise user-friendliness of the command surface: a hand-authored command-spec (parallel description of the untouched dispatch, guarded by #940) driving the client surfaces (L0) + a server-side guided-input & confirm contract (L1) + a deterministic alias/did-you-mean safety net (L2). NL-intent routing (L3) is a deferred follow-up. Epic #927.
+
 Issues and discussions are welcome — this is an early, openly-developed project.

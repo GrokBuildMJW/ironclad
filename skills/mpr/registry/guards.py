@@ -125,7 +125,9 @@ _AXIS_KEYWORDS: dict[str, set[str]] = {
 
 
 def _axis_keywords(axis: str) -> set[str]:
-    return _AXIS_KEYWORDS.get(axis, {axis})
+    # Always match the axis's own (English) name too — so an English role label/text (e.g. "Technical",
+    # "Market Analyst") covers its axis just as the German keyword set does (the sets are DE+EN, #969).
+    return _AXIS_KEYWORDS.get(axis, set()) | {axis}
 
 
 def axes_covered(role_texts: Iterable[str], axes: Iterable[str]) -> set[str]:

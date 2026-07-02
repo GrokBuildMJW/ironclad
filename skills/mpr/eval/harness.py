@@ -112,7 +112,7 @@ def assert_off_byte_identical(off: List[dict], plain: List[dict]) -> None:
             drift.append(i)                       # a failed turn can never be claimed byte-identical
         elif ro.get("answer") != rp.get("answer"):
             drift.append(i)
-    assert not drift, f"MPR-off weicht vom MPR-freien Build ab (oder Turn fehlgeschlagen) für: {sorted(set(drift))}"
+    assert not drift, f"MPR-off diverges from the MPR-free build (or the turn failed) for: {sorted(set(drift))}"
 
 
 def load_set(path: str) -> List[dict]:
@@ -132,7 +132,7 @@ def load_refs(path: str) -> Dict[str, dict]:
 
 def _render_md(diff: Dict[str, dict]) -> str:
     lines = ["# MPR A/B-Report", "",
-             "| query_id | Domäne | A ok | B ok | Δ prompt-tok | Δ compl-tok | Δ Kosten $ | Δ Latenz s |",
+             "| query_id | domain | A ok | B ok | Δ prompt-tok | Δ compl-tok | Δ cost $ | Δ latency s |",
              "|---|---|:--:|:--:|--:|--:|--:|--:|"]
     for qid in sorted(diff):
         d = diff[qid]
@@ -219,7 +219,7 @@ def _selftest() -> None:
     p = extract_perf("[perf] TTFT 0.5s · 120 tok/2.0s = 60 tok/s · prompt 2175")
     assert p == {"prompt_tokens": 2175, "ttft_s": 0.5, "completion_tokens": 120}, p
     assert extract_perf("a prompt 10 b prompt 20")["prompt_tokens"] == 20      # last prompt wins
-    assert extract_perf("keine perf") == {"prompt_tokens": None, "ttft_s": None, "completion_tokens": None}
+    assert extract_perf("no perf") == {"prompt_tokens": None, "ttft_s": None, "completion_tokens": None}
     assert extract_perf(None)["prompt_tokens"] is None
     pricing = {"claude-sonnet": {"cost_per_1k_in_usd": 0.003, "cost_per_1k_out_usd": 0.015},
                "spark-vllm": {"cost_per_1k_in_usd": 0.0, "cost_per_1k_out_usd": 0.0}}
@@ -253,24 +253,24 @@ def _selftest() -> None:
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="MPR A/B-Harness — MPR on/off über eine Query-Menge")
+    ap = argparse.ArgumentParser(description="MPR A/B harness — MPR on/off over a query set")
     ap.add_argument("--base", default="http://localhost:8100", help="Orchestrator-Base (MPR-on-Arm)")
-    ap.add_argument("--base-off", default=None, help="Baseline-Base (MPR-off-Build); aktiviert den A/B-Diff")
+    ap.add_argument("--base-off", default=None, help="baseline base (MPR-off build); enables the A/B diff")
     ap.add_argument("--base-free", default=None, help="MPR-freier Build; aktiviert das §3.3(2) off==free-Gate")
     ap.add_argument("--set", dest="set_path", default=None, help="Eval-Set jsonl")
-    ap.add_argument("--refs", default=None, help="Referenz-Dimensionen json (für den Judge, Ev-5)")
-    ap.add_argument("--token", default=None, help="Deployment-Secret für token/sealed-Profile")
+    ap.add_argument("--refs", default=None, help="reference-dimensions json (for the judge, Ev-5)")
+    ap.add_argument("--token", default=None, help="deployment secret for token/sealed profiles")
     ap.add_argument("--out", default="runs/ab/", help="Report-Ausgabeverzeichnis")
-    ap.add_argument("--runs-dir", default=None, help="lokales runs/mpr/ (falls erreichbar) → Kosten aus Manifest")
-    ap.add_argument("--pricing", default=None, help="json mit dem Provider-Pool (cost_per_1k_in/out_usd) → Kosten")
+    ap.add_argument("--runs-dir", default=None, help="local runs/mpr/ (if reachable) → cost from the manifest")
+    ap.add_argument("--pricing", default=None, help="json with the provider pool (cost_per_1k_in/out_usd) → cost")
     ap.add_argument("--timeout", type=float, default=120.0)
-    ap.add_argument("--selftest", action="store_true", help="reine Funktionen, kein Netz")
+    ap.add_argument("--selftest", action="store_true", help="pure functions, no network")
     args = ap.parse_args()
     if args.selftest:
         _selftest()
         return
     if not args.set_path:
-        ap.error("--set ist erforderlich (oder --selftest)")
+        ap.error("--set is required (or --selftest)")
     queries = load_set(args.set_path)
     pricing = json.loads(Path(args.pricing).read_text(encoding="utf-8")) if args.pricing else None
     arm = lambda base, mpr: run_arm(base, queries, mpr=mpr, token=args.token, timeout=args.timeout,
@@ -290,7 +290,7 @@ def main() -> None:
         Path(args.out).mkdir(parents=True, exist_ok=True)
         p = Path(args.out) / "arm_a.json"
         p.write_text(json.dumps(a, ensure_ascii=False, indent=2), encoding="utf-8")
-        print(f"Arm A (MPR on) → {p}  (kein --base-off → kein A/B-Diff)")
+        print(f"Arm A (MPR on) → {p}  (no --base-off → no A/B diff)")
 
 
 if __name__ == "__main__":

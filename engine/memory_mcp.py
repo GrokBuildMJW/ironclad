@@ -76,16 +76,19 @@ def server_path() -> str:
     return os.path.abspath(__file__)
 
 
-def render_mcp_launch(mcp_template: Optional[str], *, sealed: bool, memory_url: str,
-                      namespace: str, py: str = "", path: str = "") -> Tuple[str, Dict[str, str]]:
-    """#480: the GATED Memory-MCP launch args + env for one code agent. The Memory MCP is wired into the
-    agent's launch ONLY when **all** hold: the trust profile is ``sealed`` (operator 2026-06-25), a memory
-    service is configured (``memory_url``), and the agent ships a per-CLI ``mcp_template``. Returns
-    ``(mcp_args, mcp_env)`` — ``("", {})`` when not gated on (so the agent launches byte-identically to
-    today). The ``{mcp_server}`` token in the template renders to the python invocation of this script; the
-    memory connection travels in ``mcp_env`` (inherited by the spawned MCP), NEVER on the MCP wire
-    (secret-free). Pure → unit-tested."""
-    if not (sealed and memory_url and mcp_template):
+def render_mcp_launch(mcp_template: Optional[str], *, memory_url: str, namespace: str,
+                      sealed: bool = False, py: str = "", path: str = "") -> Tuple[str, Dict[str, str]]:
+    """#480 / #994-S10: the Memory-MCP launch args + env for one code agent. The read-only Memory MCP is
+    ALWAYS ON (operator 2026-07-03) whenever a memory service is configured (``memory_url``) AND the agent
+    ships a per-CLI ``mcp_template`` — regardless of the trust profile. Safe un-gate: the MCP exposes ONLY
+    read tools (``memory_search`` + ``memory_deep_query``, no write), so a coder can only READ project
+    memory, never write/corrupt it. (The ``sealed`` requirement of the original #480 wiring was dropped so
+    the self-learning loop's coders always have live memory; ``sealed`` is kept as an ignored kwarg for
+    backward compatibility.) Returns ``(mcp_args, mcp_env)`` — ``("", {})`` when memory is unconfigured or the
+    agent has no template (so the agent launches byte-identically). The ``{mcp_server}`` token renders to the
+    python invocation of this script; the memory connection travels in ``mcp_env`` (inherited by the spawned
+    MCP), NEVER on the MCP wire (secret-free). Pure → unit-tested."""
+    if not (memory_url and mcp_template):
         return "", {}
     cmd = (py or sys.executable).replace("\\", "/")
     script = (path or server_path()).replace("\\", "/")   # forward slashes: valid inside a JSON/TOML

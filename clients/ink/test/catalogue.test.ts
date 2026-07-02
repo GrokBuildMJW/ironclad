@@ -59,5 +59,27 @@ test('#149 Server.catalogue() defaults missing arrays to []', async () => {
   const s = new Server('http://h:8100');
   (s as unknown as {req: () => Promise<unknown>}).req = async () => ({});
   const cat = await s.catalogue();
-  assert.deepEqual(cat, {prompts: [], skills: []});
+  assert.deepEqual(cat, {prompts: [], skills: [], commands: []});   // #931: + commands
+});
+
+test('#931 catalogueToCommands generates server commands from the spec + skips local verbs', () => {
+  const cmds = catalogueToCommands({
+    commands: [
+      {name: 'lifecycle', usage: 'gate --tree', summary: 'run the DELIVER gate', tier: 'mutating'},
+      {name: 'help', usage: '', summary: 'server help', tier: 'read_only'},   // local verb → skipped
+    ],
+    prompts: [{name: 'code-review', description: 'review', languages: ['en']}],
+  });
+  const byName = new Map(cmds.map((c) => [c.name, c]));
+  // the missing-from-static server verb is generated, with server scope + usage + desc
+  const lc = byName.get('lifecycle') as Command;
+  assert.equal(lc.scope, 'server');
+  assert.equal(lc.usage, 'gate --tree');
+  assert.equal(lc.desc, 'run the DELIVER gate');
+  assert.ok(!byName.has('help'));                 // client-only (local) verb is not injected
+  assert.ok(byName.has('code-review'));           // prompts still injected
+});
+
+test('#931 catalogueToCommands tolerates a missing commands array', () => {
+  assert.deepEqual(catalogueToCommands({prompts: []}), []);
 });

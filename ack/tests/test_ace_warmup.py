@@ -64,8 +64,9 @@ def test_store_warmup_noop_without_a_model(tmp_path):
 # ─── the /ace warmup command ─────────────────────────────────────────────────────────────────────────
 def test_ace_command_usage():
     assert "usage: /ace warmup" in gx10._ace_command("")
-    assert "usage: /ace warmup" in gx10._ace_command("warmup")          # missing --ledger
-    assert "usage: /ace warmup" in gx10._ace_command("frobnicate")      # unknown subcommand
+    assert "usage: /ace warmup" in gx10._ace_command("frobnicate")      # unknown subcommand → usage
+    # #936: 'warmup' with no --ledger now DEFAULTS the ledger (no longer a usage error) → hits the store check
+    assert "no ACE playbook store" in gx10._ace_command("warmup")       # ledger defaulted; no store registered
 
 
 def test_ace_command_warmup_flow(tmp_path, monkeypatch):
@@ -107,8 +108,38 @@ def test_ace_command_eval_flow(tmp_path, monkeypatch):
     store = gx10._ACE_STORE = PlaybookStore(tmp_path / "pb"); store.set_transports(chat=_chat("x"))
     monkeypatch.setattr(gx10, "_read_ledger_payloads", lambda p: (_merged(100) + _merged(101), []))
     out = gx10._ace_command("eval --ledger /some/.devloop/ledger.jsonl")
-    assert "ace eval" in out and "no-full-rewrite (J-001): PASS" in out and "J-002 >50%" in out
+    # #936: plain-language first, the paper's J-001/J-002 kept as a parenthetical
+    assert "ace eval" in out and "model call" in out and "J-001 no-full-rewrite: PASS" in out and "J-002: PASS" in out
     # usage covers eval too; a chain-tampered ledger blocks eval
-    assert "usage: /ace warmup" in gx10._ace_command("") and "/ace eval" in gx10._ace_command("")
+    assert "usage: /ace warmup" in gx10._ace_command("") and "warmup|eval" in gx10._ace_command("")  # #953 spec-derived
     monkeypatch.setattr(gx10, "_read_ledger_payloads", lambda p: ([], ["hash mismatch"]))
     assert "BLOCKED" in gx10._ace_command("eval --ledger /x")
+
+
+def test_ace_ledger_defaults_when_omitted(tmp_path, monkeypatch):
+    # #936: `/ace eval` with no --ledger defaults to <root>/.devloop/ledger.jsonl (no required flag to type)
+    seen: dict = {}
+    store = gx10._ACE_STORE = PlaybookStore(tmp_path / "pb"); store.set_transports(chat=_chat("x"))
+    monkeypatch.setattr(gx10, "_project_root", lambda: tmp_path)
+    monkeypatch.setattr(gx10, "_read_ledger_payloads", lambda p: (seen.setdefault("path", str(p)), (_merged(100), []))[1])
+    gx10._ace_command("eval")                                    # NO --ledger
+    assert seen["path"].replace("\\", "/").endswith(".devloop/ledger.jsonl")   # resolved the default path
+
+
+# ── #938: engine-chrome i18n for the new command-ergonomics strings ──────────────────────────────────
+def test_ace_eval_verdict_localizes_via_msg(tmp_path, monkeypatch):
+    # the verdict is engine chrome → localized via _msg; EN is the source/default, DE is an overlay
+    store = gx10._ACE_STORE = PlaybookStore(tmp_path / "pb"); store.set_transports(chat=_chat("x"))
+    monkeypatch.setattr(gx10, "_read_ledger_payloads", lambda p: (_merged(100) + _merged(101), []))
+    monkeypatch.setattr(gx10, "LANGUAGE", "de", raising=False)
+    out = gx10._ace_command("eval --ledger /x")
+    assert "Modellaufruf" in out and "J-002: PASS" in out   # German prose; the J-001/J-002 marker is universal
+
+
+def test_engine_messages_de_covers_the_new_keys():
+    import importlib
+    m = importlib.import_module("messages")
+    for k in ("confirm.destructive", "ace.warmup_done", "ace.eval_verdict",
+              "ace.eval_j1_pass", "ace.eval_j1_fail", "ace.eval_j2_over", "ace.eval_j2_under"):
+        assert k in m._MESSAGES["en"], f"EN missing {k}"
+        assert k in m._MESSAGES["de"], f"DE missing {k}"   # no hardcoded German in core — it lives here

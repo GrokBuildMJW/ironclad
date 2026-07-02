@@ -104,6 +104,85 @@ _CHAT_CHROME_RE = __import__("re").compile(
     r"^\s*(?:\x1b\[[0-9;]*m)*\[(?:GX10|Qwen \((?:planning|running)\))\](?:\x1b\[[0-9;]*m)*\s*$")
 
 
+def _confirm_required(message: str):
+    """#935: the server-side confirm-before-execute gate (the single, uniform authority — clients only
+    render). Returns ``{command, tier, reason}`` for a DESTRUCTIVE operation that must be confirmed
+    (currently ``project delete`` — irreversible), else ``None``. Slash-commands only; the danger-tier is
+    the command-spec's (never model-graded); an alias (e.g. ``/pj delete``) resolves to its verb first.
+    Fail-soft (``None``) — a gate hiccup must never block a normal turn."""
+    try:
+        s = (message or "").strip()
+        # BUGFIX #962: every client POSTs the slash-STRIPPED body (matching what _dispatch consumes), so a
+        # gate that REQUIRED a leading "/" never fired on the real wire form → the contract was dead through
+        # all clients. Tolerate an optional leading "/" and fire on the same form _dispatch executes.
+        if s.startswith("/"):
+            s = s[1:].strip()
+        toks = s.split()
+        if not toks:
+            return None
+        import command_spec as _cs
+        kind, val = _cs.resolve_command(toks[0].lower(), _cs.verbs(), _cs.ALIASES, _cs.unsafe_first_words())
+        verb = (val if kind in ("alias", "prefix", "exact") else toks[0]).split()[0].lower()
+        spec = _cs.by_verb(verb)
+        if spec is None or spec.tier != _cs.DESTRUCTIVE:
+            return None
+        sub = toks[1].lower() if len(toks) > 1 else ""
+        # a family verb is destructive only in its `delete` form (project list/new/… are not)
+        if spec.subcommands and "delete" in spec.subcommands and sub != "delete":
+            return None
+        return {"command": (verb + (" " + sub if sub else "")).strip(), "tier": spec.tier,
+                "reason": gx10._msg("confirm.destructive")}   # #938: localized engine chrome
+    except Exception:  # noqa: BLE001 — the confirm gate is fail-soft; never block a normal turn
+        return None
+
+
+def _guide_required(message: str):
+    """#954: the server-side structured guided-input contract (the single, uniform authority — clients only
+    render). On an EXPLICIT ask (`/<verb> ?` or `/<verb> --guide`, per C0 #6 — never auto-launch on a bare
+    or partial command) it returns, for a known command-spec verb, the fields the operator must supply:
+    ``{command, subcommands, fields:[{name, required, choices, default, type}], usage, canonical_echo}``.
+    Returns ``None`` otherwise. Fail-soft; ``_dispatch`` is untouched — this is a pre-execution info reply,
+    the spec describes the executor, it never drives it."""
+    try:
+        s = (message or "").strip()
+        # BUGFIX #962: every client POSTs the slash-STRIPPED body (matching what _dispatch consumes), so a
+        # gate that REQUIRED a leading "/" never fired on the real wire form → the contract was dead through
+        # all clients. Tolerate an optional leading "/" and fire on the same form _dispatch executes.
+        if s.startswith("/"):
+            s = s[1:].strip()
+        toks = s.split()
+        if not toks:
+            return None
+        rest_all = [t.lower() for t in toks[1:]]
+        if "?" not in toks and "--guide" not in rest_all:   # explicit affordance only
+            return None
+        import command_spec as _cs
+        # resolve the leading token(s) to a spec verb: a two-word verb (config get|set|keys) first,
+        # then an alias that expands to a (possibly two-word) verb, then the bare first word.
+        two = f"{toks[0].lower()} {toks[1].lower()}" if len(toks) > 1 else ""
+        if two and _cs.by_verb(two):
+            verb = two
+        else:
+            kind, val = _cs.resolve_command(toks[0].lower(), _cs.verbs(), _cs.ALIASES, _cs.unsafe_first_words())
+            verb = val if (kind == "alias" and _cs.by_verb(val)) else toks[0].lower()
+        spec = _cs.by_verb(verb)
+        if spec is None:
+            return None
+
+        def _field(f):
+            default = ""
+            if "default:" in f.summary:
+                default = f.summary.split("default:", 1)[1].strip().rstrip(").").strip()
+            return {"name": f.name, "required": f.required, "choices": list(f.choices),
+                    "default": default, "type": ("enum" if f.choices else "value")}
+
+        return {"command": verb, "subcommands": list(spec.subcommands),
+                "fields": [_field(f) for f in spec.flags],
+                "usage": _cs.guided_usage(verb), "canonical_echo": "/" + verb}
+    except Exception:  # noqa: BLE001 — fail-soft; a guide hiccup must never block a normal turn
+        return None
+
+
 def _strip_chat_chrome(text: str) -> str:
     """Drop the ``[GX10]`` / ``[Qwen (planning|running)]`` status lines from a captured /chat output and
     collapse the blank lines they leave; the answer + perf/DONE status remain. Fail-soft (returns *text* as-is
@@ -381,8 +460,7 @@ def _probe_cached() -> Dict[str, Any]:
 
 def _coders_snapshot() -> Dict[str, Any]:
     """#452: which CODING agents are bound (the code-agent registry + the prompt-free boot probe) plus
-    the fan-out provider lane (the dispatcher snapshot). Answers '/coders zeigt welche agents aktuell
-    aktiv angebunden sind'. Never raises — a probe/dispatcher hiccup degrades to an empty view."""
+    the fan-out provider lane (the dispatcher snapshot). Answers '/coders shows which agents are currently actively bound'. Never raises — a probe/dispatcher hiccup degrades to an empty view."""
     coding: list[Dict[str, Any]] = []
     try:
         reg = gx10._code_agent_registry()
@@ -626,6 +704,14 @@ class _Handler(BaseHTTPRequestHandler):
                 if not message:
                     self._send(400, {"ok": False, "error": "missing 'message'"})
                     return
+                guide = _guide_required(message)    # #954: explicit ?/--guide → structured guidance, no execute
+                if guide:
+                    self._send(200, {"ok": True, "needs_guide": guide})
+                    return
+                info = _confirm_required(message)   # #935: destructive op needs an explicit confirm
+                if info and not data.get("confirm"):
+                    self._send(200, {"ok": True, "needs_confirm": info})   # do NOT execute; client confirms
+                    return
                 with _Captured() as cap:
                     with _AGENT_LOCK:
                         gx10.bind_active()      # S5b: this request thread → the active project's ctx
@@ -636,6 +722,14 @@ class _Handler(BaseHTTPRequestHandler):
                 message = (data.get("message") or "").strip()
                 if not message:
                     self._send(400, {"ok": False, "error": "missing 'message'"})
+                    return
+                guide = _guide_required(message)    # #954: explicit ?/--guide → JSON needs_guide (no stream)
+                if guide:
+                    self._send(200, {"ok": True, "needs_guide": guide})
+                    return
+                info = _confirm_required(message)   # #935: destructive op → a JSON needs_confirm (no stream)
+                if info and not data.get("confirm"):
+                    self._send(200, {"ok": True, "needs_confirm": info})
                     return
                 # Live: no Content-Length, Connection: close → the client reads until
                 # EOF. Every _ui_print chunk is flushed to the socket immediately.

@@ -28,9 +28,9 @@ memory) and switch between them within a running engine.
 
 ```
 project list                 list registered projects (* marks the active one)
-project new <name> [--type mpr|software] [--path <dir>]
+project new <name> [--path <dir>]
                              mint a fresh isolated project (root = --path or <cwd>/<slug>, minted mem_ns,
-                             made active; --type seeds the first vault unit) — the guided setup command
+                             made active; seeds the first software vault unit) — the guided setup command
 project active               show the active project
 project track new <t>        create a parallel track AND switch to it (like git checkout -b)
 project track use <t>        switch to an existing track (vault + memory follow)

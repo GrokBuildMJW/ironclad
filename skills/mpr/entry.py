@@ -38,14 +38,14 @@ def _clamp_audit_level(level: str) -> str:
 # CASE-Dict (§3) — name == capability per Spec 10 §3 (packaging spec is authoritative; reconciles the
 # 'mpr.research' form in Spec 09 §9.0). The description IS the layer-1 gate + the sentinel instruction.
 _DESCRIPTION = (
-    "Beleuchtet EINE Frage durch ein domänenspezifisches Experten-Rollen-Panel parallel und "
-    "synthetisiert die Sichten zu EINEM begründeten Urteil/Report. Reasoning-only (Analyse, Suche, "
-    "Datei-I/O) — KEINE Code-Mutation. WOFÜR: mehrdimensionale Entscheidungen (Architektur-Trade-offs), "
-    "Evidenz-Recherche über mehrere Quellen/Jurisdiktionen, Wettbewerbs-/Risiko-Analysen — Fragen mit "
-    "mehreren legitimen, widerstreitenden Blickwinkeln. NICHT FÜR: Ein-Fakt-Fragen, Single-Source-"
-    "Lookups, einfache Definitionen, Code-Änderungen — in diesen Fällen NICHT aufrufen (der Router lehnt "
-    "sonst ohnehin früh ab). Gib den MPR-Report zwischen den Sentinels "
-    f"{REPORT_OPEN} … {REPORT_CLOSE} WÖRTLICH aus."
+    "Illuminates ONE question through a domain-specific expert-role panel in parallel and "
+    "synthesizes the views into ONE reasoned judgment/report. Reasoning-only (analysis, search, "
+    "file I/O) — NO code mutation. FOR: multi-dimensional decisions (architecture trade-offs), "
+    "evidence research across multiple sources/jurisdictions, competitive/risk analyses — questions with "
+    "several legitimate, conflicting viewpoints. NOT FOR: single-fact questions, single-source "
+    "lookups, simple definitions, code changes — do NOT call it in those cases (the router rejects "
+    "them early anyway). Emit the MPR report between the sentinels "
+    f"{REPORT_OPEN} … {REPORT_CLOSE} VERBATIM."
 )
 
 
@@ -182,11 +182,9 @@ def _engine_deps() -> Deps:
         d.reducer = getattr(gx10, "_reduce_worker_results", None)
         d.writer = getattr(gx10, "_atomic_write", None)
         d.store = _resolve_store(gx10)
-        # #52: only index the run in the TaskStore when the #15 contract allows the task pipeline in the
-        # ACTIVE initiative — i.e. NOT in a reasoning-only mpr initiative (there the gate would refuse
-        # create and task_id would silently stay None). #15 is the single source of truth; fail-soft → True.
-        _blk = getattr(gx10, "_mpr_blocks_tasks", None)
-        d.index_runs = not (callable(_blk) and _blk())
+        # #984: MPR is an embedded dev-process function (there is no reasoning-only project type any more),
+        # so an embedded run's manifest is always indexed in the active (software) initiative's TaskStore.
+        d.index_runs = True
         d.registry = get_registry(_MPR_ROOT)
         workers = getattr(gx10, "_WORKERS", None)
         if workers is not None and getattr(workers, "client", None) is not None:
@@ -401,7 +399,7 @@ def run_mpr(query: str, *, route_hint: str = "", domain_hint: str = "", mode_hin
     if out is None:
         return "ERROR: mpr_research: synthesis: no synthesis client"
 
-    # 4. audit (verbindlich) + 5. memory (best-effort) — never sink the run ------------------------
+    # 4. audit (mandatory) + 5. memory (best-effort) — never sink the run ------------------------
     try:
         _write_audit(run_dir, run_id, query, decision, perspectives, choices, rendered, results, out,
                      level, deps)

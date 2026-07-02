@@ -4,7 +4,7 @@
 validated ``RouterDecision`` (run | decline) via a deterministic pipeline around a SINGLE classifier
 LLM call (§3.1). Everything before/after the call is deterministic → snapshot-/replay-testable.
 
-Reiten, nicht duplizieren: the router brings no client, no fan-out, no store. It consumes the schema
+Ride, don't duplicate: the router brings no client, no fan-out, no store. It consumes the schema
 (``.schema``) and the registry layer (panels/resolve/guards/synthesis). The ONE LLM call goes through
 the injected ``ClassifierLLM`` port. Adhoc panels come straight from that one call's output (NOT a
 second ``generate_adhoc_panel`` call — that would break the one-call invariant; §3.1 + §8 "panel comes

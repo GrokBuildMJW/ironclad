@@ -239,13 +239,25 @@ class Server:
     def chat(self, message: str) -> Dict[str, Any]:
         return self._req("POST", "/chat", {"message": message})
 
-    def chat_stream(self, message: str, on_text) -> None:
+    def chat_stream(self, message: str, on_text, confirm: bool = False):
         """Stream a turn from /chat/stream, calling ``on_text(chunk)`` as text arrives.
         Code-tools the orchestrator passes through (``\\x00TR{json}\\x00`` frames) are run
         LOCALLY here and their result posted back to /tool-result, so the remote agent
-        operates on YOUR filesystem. Decodes UTF-8 incrementally; blocks until done."""
+        operates on YOUR filesystem. Decodes UTF-8 incrementally; blocks until done.
+
+        #935: for a destructive command the server replies with a JSON ``{needs_confirm}`` (Content-Type
+        application/json) INSTEAD of a stream — this returns that dict (nothing streamed) so the caller can
+        confirm and re-call with ``confirm=True``. A normal turn streams and returns ``None``."""
         import codecs
-        body = json.dumps({"message": message}).encode("utf-8")
+        # #935: uniform confirm affordance — a trailing `--yes`/`--confirm` on a destructive command is the
+        # confirmation (stripped here, sent as confirm=True). Keeps every client's flow input-free: on a
+        # needs_confirm reply the caller just tells the user to re-run with --yes.
+        _m = message.rstrip()
+        for _flag in (" --yes", " --confirm"):
+            if _m.endswith(_flag):
+                message, confirm = _m[: -len(_flag)].rstrip(), True
+                break
+        body = json.dumps({"message": message, "confirm": confirm}).encode("utf-8")
         req = urllib.request.Request(self.base + "/chat/stream", data=body, method="POST")
         req.add_header("Content-Type", "application/json")
         req.add_header("X-Local-Tools", "1")          # opt in: pass code-tools through to us
@@ -255,6 +267,12 @@ class Server:
         buf = ""
         expecting_frame = False                       # toggles on every \x00 (text↔frame)
         with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+            # #935: a destructive command → JSON needs_confirm (not a stream); return it to the caller.
+            if (resp.headers.get_content_type() == "application/json"):
+                try:
+                    return json.loads(resp.read().decode("utf-8", "replace"))
+                except Exception:  # noqa: BLE001 — malformed → fall through to normal (no confirm)
+                    return None
             # read1: return data from ONE underlying read, don't block for a full buffer —
             # essential for streaming (a small tool-call frame must surface immediately,
             # not wait for 256 bytes / EOF).
@@ -612,6 +630,23 @@ def http_error_msg(e: "urllib.error.HTTPError") -> str:
         return str(e)
 
 
+def render_guide(g: Dict[str, Any], emit) -> None:
+    """#955: render a server ``needs_guide`` contract (#954) as plain lines via ``emit(str)`` — the fields
+    the operator must supply, from the command-spec. Client chrome is English (thin renderer); shared by
+    the three Python clients so the rendering never drifts between them."""
+    emit(f"  guided input for /{g.get('command', '?')}:")
+    emit(f"    usage: {g.get('usage', '')}")
+    if g.get("subcommands"):
+        emit("    subcommands: " + " | ".join(g["subcommands"]))
+    for f in g.get("fields", []):
+        bits = ["required" if f.get("required") else "optional"]
+        if f.get("choices"):
+            bits.append("choices: " + "|".join(f["choices"]))
+        if f.get("default"):
+            bits.append("default: " + str(f["default"]))
+        emit(f"    {f.get('name', '')}  ({', '.join(bits)})")
+
+
 def _print_coders(data: Dict[str, Any]) -> None:
     """#452: render which coding agents are bound (● green) vs not found (○ red), then the fan-out
     provider lane (active/spend + per-provider reachability + last routing reason)."""
@@ -678,6 +713,9 @@ def repl(srv: Server, codedir: Path, max_agents: int = DEFAULT_MAX_AGENTS) -> No
             break
         kind, name, payload = classify(line)
         if kind == "empty":
+            continue
+        if kind == "suggest":   # #934: unknown command → did-you-mean hint, never forwarded (no turn)
+            print(f"  unknown command — did you mean  /{name} ?")
             continue
         if kind == "local" and name in ("exit", "quit"):
             break
@@ -764,7 +802,13 @@ def repl(srv: Server, codedir: Path, max_agents: int = DEFAULT_MAX_AGENTS) -> No
                 while "\n" in buf["s"]:
                     out, buf["s"] = buf["s"].split("\n", 1)
                     print(_style_stream_line(out), flush=True)
-            srv.chat_stream(payload, _emit)
+            res = srv.chat_stream(payload, _emit)
+            if res and res.get("needs_confirm"):   # #935: destructive → not executed; re-run with --yes
+                ci = res["needs_confirm"]
+                # #956: the reason is the full localized line (reason + how-to-confirm) → print it single-language
+                print(_c(f"  ⚠ {ci.get('command', '?')}: {ci.get('reason', 'destructive command')}", "yellow"))
+            elif res and res.get("needs_guide"):   # #955: structured guided input — show fields, don't execute
+                render_guide(res["needs_guide"], lambda s: print(_c(s, "yellow")))
             if buf["s"]:
                 print(_style_stream_line(buf["s"]), flush=True)
         except urllib.error.URLError as e:

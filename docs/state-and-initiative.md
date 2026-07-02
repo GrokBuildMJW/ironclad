@@ -45,23 +45,22 @@ An initiative is created **explicitly** — there is no artifact-producing opera
 initiative (fail-closed). Pure conversational turns (no artifacts) need none.
 
 > **`/initiative` is a deprecated alias for `/project`** — new work flows through the guided
-> `/project new <name> --type mpr|software` (see [`project-isolation.md`](project-isolation.md)). The
+> `/project new <name>` (see [`project-isolation.md`](project-isolation.md)). The
 > `/initiative …` verbs below stay functional and are documented here for the state/vault layout they drive.
 
 ```text
-/initiative new <name> --type mpr|software   create + activate (writes meta.md + the type skeleton)
+/project new <name>                         create + activate (writes meta.md + the software skeleton)
 /initiative list                            all initiatives (* = active)
 /initiative use <slug>                      switch the active initiative
 /initiative active                          show the active initiative
 /initiative reconcile [slug]                rebuild INDEX.md + [[links]] (see below)
 ```
 
-- **`--type software`** seeds `tasks/`, `decisions/`, `proposals/`, `reviews/`, and the hidden
-  `.work/` plumbing — the full task → handover → feedback → done pipeline.
-- **`--type mpr`** seeds `runs/` and `decisions/` — reasoning runs only. The task pipeline
-  (`stage_handover` / `advance_pipeline` / `TaskStore`) is **fail-closed** in an mpr initiative.
-  MPR itself is gated by the runtime flag **`mpr.enabled`** (default off): enable a real reasoning
-  run with `/config set mpr.enabled on`.
+- There is **one** initiative type, `software` (#984). It seeds `tasks/`, `decisions/`, `proposals/`,
+  `reviews/`, a `runs/` home, and the hidden `.work/` plumbing — the full task → handover → feedback →
+  done pipeline, plus `runs/` for the **embedded MPR** architecture-decision panel. MPR is a
+  dev-process function invoked at an architecture fork (`/fork`, gated by `ace.fork_mpr.enabled` /
+  `mpr.enabled`), **not** a project type of its own.
 - The slug is derived from the name (kebab-case, German umlauts folded, collision-suffixed).
 - The **active** initiative (a slug in `.ironclad/active`) is the routing target. The **engine-routed**
   artifacts — the `TaskStore`, the `stage_handover` / `advance_pipeline` plumbing, and MPR `runs_dir` —
@@ -69,7 +68,7 @@ initiative (fail-closed). Pure conversational turns (no artifacts) need none.
   (no dedicated engine router). Switching the active initiative switches the whole task view.
 
 Artifact-producing operations are **fail-closed**: with no active initiative they return a clear
-"kein aktives Initiative — `/initiative new …` zuerst" instead of writing into the project root.
+"no active project — run `/project new …` first" instead of writing into the project root.
 The reconciler and the autopilot poller soft-skip when no initiative is active — they never crash the
 daemon. (The `/doctor` self-check is independent of initiative state.)
 

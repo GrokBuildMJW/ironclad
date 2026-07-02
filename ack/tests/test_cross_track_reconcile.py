@@ -26,25 +26,25 @@ def test_project_vault_base_is_track_independent(tmp_path):
 
 def test_project_tracks_main_only_when_no_subtree(tmp_path):
     with pc.use(ProjectContext("p", str(tmp_path), "ns")):
-        gx10.initiative_new("Main Work", "mpr")
+        gx10.initiative_new("Main Work", "software")
         assert gx10._project_tracks() == ["main"]
 
 
 def test_project_tracks_lists_main_plus_sorted_tracks(tmp_path):
     with pc.use(ProjectContext("p", str(tmp_path), "ns")):
-        gx10.initiative_new("M", "mpr")
+        gx10.initiative_new("M", "software")
     with pc.use(ProjectContext("p", str(tmp_path), "ns", track="b")):
-        gx10.initiative_new("B", "mpr")
+        gx10.initiative_new("B", "software")
     with pc.use(ProjectContext("p", str(tmp_path), "ns", track="a")):
-        gx10.initiative_new("A", "mpr")
+        gx10.initiative_new("A", "software")
     with pc.use(ProjectContext("p", str(tmp_path), "ns")):
         assert gx10._project_tracks() == ["main", "a", "b"]
 
 
 def test_reconcile_active_project_reconciles_all_in_track(tmp_path):
     with pc.use(ProjectContext("p", str(tmp_path), "ns")):
-        gx10.initiative_new("One", "mpr")
-        gx10.initiative_new("Two", "mpr")
+        gx10.initiative_new("One", "software")
+        gx10.initiative_new("Two", "software")
         out = gx10.reconcile_active_project(links=False)
         assert len(out) == 2
         assert all("indexed" in r for r in out)
@@ -52,9 +52,9 @@ def test_reconcile_active_project_reconciles_all_in_track(tmp_path):
 
 def test_reconcile_all_tracks_covers_every_track(tmp_path):
     with pc.use(ProjectContext("p", str(tmp_path), "ns")):
-        mv = gx10.initiative_new("Main Work", "mpr")
+        mv = gx10.initiative_new("Main Work", "software")
     with pc.use(ProjectContext("p", str(tmp_path), "ns", track="feature")):
-        fv = gx10.initiative_new("Feat Work", "mpr")
+        fv = gx10.initiative_new("Feat Work", "software")
     with pc.use(ProjectContext("p", str(tmp_path), "ns")):
         res = gx10.reconcile_all_tracks(links=False)
         assert set(res.keys()) == {"main", "feature"}
@@ -81,6 +81,6 @@ def test_reconcile_all_tracks_no_active_ignores_stray_tracks_dir(monkeypatch, tm
 
 def test_initiative_reconcile_all_command(tmp_path):
     with pc.use(ProjectContext("p", str(tmp_path), "ns")):
-        gx10.initiative_new("Main Work", "mpr")
+        gx10.initiative_new("Main Work", "software")
         out = gx10._initiative_command("reconcile all")
         assert "reconcile all" in out and "track" in out.lower()

@@ -19,7 +19,7 @@ PANEL = Panel(
                 "and reputation lenses.",
     roles=[
         {
-            "role": "Technisch",
+            "role": "Technical",
             "lens_prompt": "You judge technical risks: architecture weaknesses, scaling/stability "
                            "limits, technical debt, single points of failure. Severity × likelihood "
                            "per risk.",
@@ -27,19 +27,19 @@ PANEL = Panel(
             "provider_policy": "local-only",  # inspects internal code → never offloaded
         },
         {
-            "role": "Operativ",
+            "role": "Operational",
             "lens_prompt": "You judge operational risks: process/staffing/supply-chain/dependency "
                            "failures and business continuity.",
             "effort": "medium",
         },
         {
-            "role": "Regulatorisch",
+            "role": "Regulatory",
             "lens_prompt": "You judge regulatory/compliance risks: violations, licensing/permit gaps, "
                            "changing requirements.",
             "effort": "medium",
         },
         {
-            "role": "Finanziell",
+            "role": "Financial",
             "lens_prompt": "You judge financial risks: cost runaway, cashflow, market/exchange-rate/"
                            "concentration exposure.",
             "effort": "medium",

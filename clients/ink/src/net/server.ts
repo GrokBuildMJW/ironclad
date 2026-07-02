@@ -91,9 +91,13 @@ export class Server {
 
   /** Loaded prompt/skill registry snapshot (#149) — backs slash autocomplete. Same
    *  `_catalogue_snapshot` that powers the `/prompts`/`/skills` commands server-side. */
-  async catalogue(): Promise<{prompts: Json[]; skills: Json[]}> {
+  async catalogue(): Promise<{prompts: Json[]; skills: Json[]; commands: Json[]}> {
     const r = await this.req('GET', '/catalogue');
-    return {prompts: (r['prompts'] as Json[]) ?? [], skills: (r['skills'] as Json[]) ?? []};
+    return {
+      prompts: (r['prompts'] as Json[]) ?? [],
+      skills: (r['skills'] as Json[]) ?? [],
+      commands: (r['commands'] as Json[]) ?? [],   // #931: server-command spec for generated completions
+    };
   }
 
   chat(message: string): Promise<Json> {

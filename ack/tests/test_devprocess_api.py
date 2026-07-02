@@ -133,3 +133,19 @@ def test_all_exports_present():
         "__version__",
     ):
         assert name in api.__all__
+
+
+def test_orchestrator_surface_is_wheel_carried():
+    # #994-S1: the pre-publish-orchestrator proof mirrored as a counted unit test — the published wheel must
+    # carry the dev-process orchestration verbs (the surface the self-hosting orchestrator drives through)
+    # over a driver seam AND fail-close without a driver, plus a callable ack.sdk.gate. Kept in lock-step
+    # with the clean-room.yml `Orchestrator-surface proof` step so a self-mod that breaks the surface is
+    # caught here (private) and there (pre-publish, fail-closed).
+    from ack import sdk
+    verbs = ("select_unit", "stage_handover", "record_feedback", "advance", "deliver",
+             "set_driver", "get_driver")
+    assert all(hasattr(api, v) for v in verbs), [v for v in verbs if not hasattr(api, v)]
+    assert api.get_driver() is None
+    with pytest.raises(api.SubstrateUnavailable):
+        api.advance("t", "a")                 # fail-closed without a driver — the safe default the wheel ships
+    assert callable(sdk.gate)

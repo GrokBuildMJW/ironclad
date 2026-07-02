@@ -45,14 +45,23 @@ export function menuKey(sel: number, items: readonly Command[], key: Key, buffer
   // Enter accepts the highlighted suggestion — this makes ↓-then-Enter work AND lets a single
   // match be accepted (it has no ↓ feedback). Once the buffer already IS the completed command,
   // fall through (none) so the line submits instead of re-completing.
-  if (key.return) return completionText(items[cur]!) !== buffer ? {type: 'complete', cmd: items[cur]!} : {type: 'none'};
+  if (key.return) return completionText(items[cur]!, buffer) !== buffer ? {type: 'complete', cmd: items[cur]!} : {type: 'none'};
   if (key.escape) return {type: 'close'};
   return {type: 'none'};
 }
 
 /** Completing fills `/<name>` plus a trailing space when the command takes an argument (usage), so
- *  the caret is ready for it; no-arg commands get no trailing space. */
-export function completionText(cmd: Command): string {
+ *  the caret is ready for it; no-arg commands get no trailing space.
+ *  #937: an argument completion (`cmd.arg`, from {@link argCompletions}) instead REPLACES the token
+ *  currently being typed in `buffer` with the chosen subcommand / flag / choice, leaving a trailing
+ *  space for the next argument — so accepting inserts into the line, it doesn't reset it to `/verb`. */
+export function completionText(cmd: Command, buffer = ''): string {
+  if (cmd.arg) {
+    const trailing = /\s$/.test(buffer);
+    const toks = buffer.trimEnd().split(/\s+/);
+    if (!trailing) toks.pop(); // drop the partial token being completed
+    return `${toks.join(' ')} ${cmd.name} `;
+  }
   return `/${cmd.name}${cmd.usage ? ' ' : ''}`;
 }
 

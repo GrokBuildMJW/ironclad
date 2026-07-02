@@ -199,7 +199,7 @@ python -m pytest ack/tests -q          # contract kernel + engine + split tests
 # Smoke the endpoint wiring (expects your model to answer):
 python engine/server.py --port 8100 &
 GX10_SERVER_URL=http://localhost:8100 python engine/client.py --codedir .
-# then type:  was ist 17 mal 23?
+# then type:  what is 17 times 23?
 ```
 
 ## 7. Troubleshooting

@@ -16,28 +16,28 @@ PANEL = Panel(
                 "and precedent lenses.",
     roles=[
         {
-            "role": "Jurisdiktion: EU",
+            "role": "Jurisdiction: EU",
             "lens_prompt": "You are a regulatory analyst for the EU. Judge the question strictly by "
                            "current and foreseeable EU law (regulations/directives, relevant agencies). "
                            "Cite concrete legal acts/articles; flag uncertainty explicitly.",
             "effort": "high",
         },
         {
-            "role": "Jurisdiktion: US",
+            "role": "Jurisdiction: US",
             "lens_prompt": "You are a regulatory analyst for the US (federal + relevant states). Judge by "
                            "current US law/regulator guidance; cite statutes/agency rules; separate the "
                            "federal level from the state level.",
             "effort": "high",
         },
         {
-            "role": "Jurisdiktion: UAE",
+            "role": "Jurisdiction: UAE",
             "lens_prompt": "You are a regulatory analyst for the UAE (incl. free zones like DIFC/ADGM). "
                            "Judge by current UAE law and free-zone regimes; flag where onshore vs. free "
                            "zone diverge.",
             "effort": "high",
         },
         {
-            "role": "Markt-Analyst",
+            "role": "Market Analyst",
             "lens_prompt": "You judge the practical market/business consequences of the regulation: which "
                            "business models are enabled/blocked, what market dynamic emerges?",
             "effort": "medium",
@@ -49,7 +49,7 @@ PANEL = Panel(
             "effort": "medium",
         },
         {
-            "role": "Präzedenz / Case-Law",
+            "role": "Precedent / Case-Law",
             "lens_prompt": "You judge relevant case law/administrative precedent: which cases shape the "
                            "interpretation, where is the line trending?",
             "effort": "high",

@@ -147,7 +147,7 @@ class IroncladApp(App):
         # The chat history is a Static inside a scroll container — Static supports
         # mouse text-selection (RichLog does not), so you can select/copy in the chat.
         yield VerticalScroll(Static(id="log", markup=False), id="logwrap")
-        yield Input(id="inp", placeholder="Frag etwas · /help · exit")
+        yield Input(id="inp", placeholder="Ask something · /help · exit")
         yield Static(self._status_text(), id="status")
 
     def _log(self, renderable) -> None:
@@ -169,7 +169,7 @@ class IroncladApp(App):
         self._log(Text("◆ Ironclad", style="bold cyan") + Text("  ·  Orchestrator Client", style="grey50"))
         self._log(Text(f"  server  {self.srv.base}", style="grey50"))
         self._log(Text(f"  code    {self.codedir}", style="grey50"))
-        self._log(Text("  /help · exit · Esc = abbrechen · Strg+C = letzte Antwort kopieren", style="grey50"))
+        self._log(Text("  /help · exit · Esc = cancel · Ctrl+C = copy last answer", style="grey50"))
         self.query_one("#inp", Input).focus()
         self.set_interval(0.12, self._tick)   # animate the thinking indicator
         threading.Thread(target=self._poll_loop, daemon=True).start()
@@ -187,6 +187,9 @@ class IroncladApp(App):
             return
         if kind == "local":
             self._handle_local(name, payload)
+            return
+        if kind == "suggest":   # #934: unknown command → did-you-mean hint, never forwarded (no turn)
+            self._log(Text(f"  unknown command — did you mean  /{name} ?", style="dim"))
             return
         self._log(Text(f"\n❯ {payload}", style="bold cyan"))
         self._run_turn(payload)
@@ -251,7 +254,7 @@ class IroncladApp(App):
     # ----- streaming worker (own daemon thread → never blocks shutdown) -----
     def _run_turn(self, payload: str) -> None:
         if self._thinking:
-            self._log(Text("  (turn läuft noch — Esc zum Abbrechen)", style="yellow"))
+            self._log(Text("  (turn still running — Esc to cancel)", style="yellow"))
             return
         threading.Thread(target=self._turn_thread, args=(payload,), daemon=True).start()
 
@@ -300,7 +303,13 @@ class IroncladApp(App):
                 emit_line(ln)
 
         try:
-            self.srv.chat_stream(payload, on_text)
+            res = self.srv.chat_stream(payload, on_text)
+            if res and res.get("needs_confirm"):   # #935: destructive → not executed; re-run with --yes
+                ci = res["needs_confirm"]   # #956: reason is the full localized line → single-language
+                self._safe_call(self._log, Text(
+                    f"  ⚠ {ci.get('command', '?')}: {ci.get('reason', 'destructive command')}", style="yellow"))
+            elif res and res.get("needs_guide"):   # #955: structured guided input — show fields, don't execute
+                client.render_guide(res["needs_guide"], lambda s: self._safe_call(self._log, Text(s, style="dim")))
         except Exception as e:  # noqa: BLE001
             self._safe_call(self._log, Text(f"  ✗ /chat/stream failed: {e!r}", style="red"))
         finally:
@@ -330,17 +339,17 @@ class IroncladApp(App):
         except Exception:  # noqa: BLE001
             sel = None
         if sel:
-            text, what = sel, f"Auswahl ({len(sel)} Zeichen)"
+            text, what = sel, f"Selection ({len(sel)} chars)"
             self.screen.clear_selection()
         elif self._last_response:
-            text, what = self._last_response, "letzte Antwort"
+            text, what = self._last_response, "last answer"
         else:
-            self._log(Text("  (noch nichts zum Kopieren)", style="grey50"))
+            self._log(Text("  (nothing to copy yet)", style="grey50"))
             return
         if _write_clipboard(text):
-            self._log(Text(f"  ✓ kopiert — {what}", style="green"))
+            self._log(Text(f"  ✓ copied — {what}", style="green"))
         else:
-            self._log(Text("  ✗ Zwischenablage nicht erreichbar", style="red"))
+            self._log(Text("  ✗ clipboard unavailable", style="red"))
 
     def _cancel_thread(self) -> None:
         try:
@@ -361,7 +370,7 @@ class IroncladApp(App):
             secs = int(time.time() - self._think_t0) if self._think_t0 else 0
             # #453: the spinner replaces the footer while thinking, so surface the live coder here too
             coder = f" · coder {s['agent']}" if s.get("agent") else ""
-            return Text(f" {frame} {s['model']} denkt… {secs}s{coder}     Esc = cancel", style="cyan")
+            return Text(f" {frame} {s['model']} thinking… {secs}s{coder}     Esc = cancel", style="cyan")
         t = Text(" model ", style="grey50")
         t.append(s["model"], style="cyan")
         t.append("  ·  ", style="grey50")

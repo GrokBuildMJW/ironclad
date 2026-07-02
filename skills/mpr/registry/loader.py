@@ -130,7 +130,7 @@ class PanelRegistry:
         """``domain -> Panel.version`` for every registered panel (audit/replay, Spec 05 §9).
 
         The run-manifest (Spec 07) records the ``panel_version`` a run executed against, so a replay
-        knows which panel fassung it ran with. Bumping ``Panel.version`` on a content change is the
+        knows which panel version it ran with. Bumping ``Panel.version`` on a content change is the
         registry's versioning contract; adding a new domain is just a new file (discover picks it up).
         """
         return {dom: panel.version for dom, panel in self._panels.items()}

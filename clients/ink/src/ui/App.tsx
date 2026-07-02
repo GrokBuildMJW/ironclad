@@ -12,7 +12,7 @@
 import React, {useEffect, useMemo, useRef, useState, type ReactNode} from 'react';
 import {Box, Spacer, Static, Text, useApp, useInput, useStdout} from '../render/ink-compat.js';
 import type {Server} from '../net/server.js';
-import {classify, completions, catalogueToCommands, HELP_TEXT, type Command} from '../commands.js';
+import {classify, completions, argCompletions, catalogueToCommands, HELP_TEXT, type Command} from '../commands.js';
 import {chatStream} from '../net/stream.js';
 import {answerBody, createRouter} from '../stream/route.js';
 import {renderMarkdown, StreamMarkdown} from '../markdown.js';
@@ -185,7 +185,7 @@ export function App({
     const ac = new AbortController();
     abortRef.current = ac;
     try {
-      await chatStream(
+      const res = await chatStream(
         srv,
         payload,
         {
@@ -206,9 +206,30 @@ export function App({
         },
         ac.signal,
       );
+      if (res?.needs_confirm) {   // #935: destructive → not executed; re-run with --yes
+        const ci = res.needs_confirm;
+        // #956: the reason is the full localized line (reason + how-to-confirm) → print it single-language
+        commit(<Text color={DIM}>{`  ⚠ ${ci.command}: ${ci.reason}`}</Text>);
+        abortRef.current = null;
+        return;
+      }
+      if (res?.needs_guide) {   // #955: structured guided input — show the fields; nothing executed
+        const g = res.needs_guide;
+        commit(<Text color={DIM}>{`  guided input for /${g.command}:`}</Text>);
+        commit(<Text color={DIM}>{`    usage: ${g.usage}`}</Text>);
+        if (g.subcommands?.length) commit(<Text color={DIM}>{`    subcommands: ${g.subcommands.join(' | ')}`}</Text>);
+        for (const f of g.fields ?? []) {
+          const bits = [f.required ? 'required' : 'optional'];
+          if (f.choices?.length) bits.push(`choices: ${f.choices.join('|')}`);
+          if (f.default) bits.push(`default: ${f.default}`);
+          commit(<Text color={DIM}>{`    ${f.name}  (${bits.join(', ')})`}</Text>);
+        }
+        abortRef.current = null;
+        return;
+      }
     } catch (e) {
       // a user-initiated abort (Esc / Ctrl+C) is expected — note it quietly, don't show a ✗ error
-      if (ac.signal.aborted) commit(<Text color={DIM}> abgebrochen</Text>);
+      if (ac.signal.aborted) commit(<Text color={DIM}> cancelled</Text>);
       else commit(<Text color={ERROR}>{`  ✗ ${String(e)}`}</Text>);
     } finally {
       abortRef.current = null;
@@ -247,7 +268,7 @@ export function App({
       else if (name === 'sh') {
         // MEM-15: run a shell command locally (PowerShell on Windows) in the codedir — no server
         // turn, not persisted. Output to the transcript. (-NonInteractive: interactive cmds time out.)
-        if (!payload) commit(<Text color={DIM}> (leerer Befehl)</Text>);
+        if (!payload) commit(<Text color={DIM}> (empty command)</Text>);
         else {
           commit(<Box marginTop={1}><Text color={DIM}>{`! ${payload}`}</Text></Box>);
           const out = await runTool('execute_command', {command: payload});
@@ -274,10 +295,10 @@ export function App({
         // `cd clients/ink && …`. The Node process can't hot-swap itself, so it stages the build and
         // asks for a restart. `/update pull` does a git pull first.
         if (!srcDir) {
-          commit(<Text color={ERROR}> /update braucht den Quellpfad — setze GX10_SRC (Repo-Wurzel) oder srcDir in config.json.</Text>);
+          commit(<Text color={ERROR}> /update needs the source path — set GX10_SRC (repo root) or srcDir in config.json.</Text>);
         } else {
           const pull = (payload.split(/\s+/)[1] ?? '').toLowerCase() === 'pull';
-          commit(<Text color={DIM}>{`  /update — baue + installiere aus ${srcDir}${pull ? ' (mit git pull)' : ''} …`}</Text>);
+          commit(<Text color={DIM}>{`  /update — building + installing from ${srcDir}${pull ? ' (with git pull)' : ''} …`}</Text>);
           const {ok, log} = await runUpdate(srcDir, pull);
           log.forEach((l) => commit(<Text color={ok ? DIM : ERROR}>{`  ${l}`}</Text>));
         }
@@ -403,6 +424,10 @@ export function App({
       await handleLocal(name, payload);
       return;
     }
+    if (kind === 'suggest') {   // #934: unknown command → did-you-mean hint, never forwarded (no turn)
+      commit(<Text color={DIM}>{`  unknown command — did you mean  /${name} ?`}</Text>);
+      return;
+    }
     await streamTurn(payload, kind === 'turn'); // MEM-11: server slash-commands aren't persisted
   }
 
@@ -428,7 +453,13 @@ export function App({
   // being typed the prefix stops matching and the menu closes on its own. #149: the server-fed
   // prompt items (catalogueCmds) are merged in so loaded prompts autocomplete as `/<name>`.
   const menuItems = useMemo(
-    () => (buffer.startsWith('/') && !menuDismissed ? completions(buffer.slice(1), catalogueCmds) : []),
+    () => {
+      if (!buffer.startsWith('/') || menuDismissed) return [];
+      // #937: once past the verb, offer argument completions (subcommands / flags / choices) from the
+      // command-spec; while still typing the verb, plain name completion (with the prompt catalogue).
+      const args = argCompletions(buffer, catalogueCmds);
+      return args.length ? args : completions(buffer.slice(1), catalogueCmds);
+    },
     [buffer, menuDismissed, catalogueCmds],
   );
   const menuOpen = !thinking && menuItems.length > 0;
@@ -447,7 +478,7 @@ export function App({
         return;
       }
       if (act.type === 'complete') {
-        setBuffer(completionText(act.cmd));
+        setBuffer(completionText(act.cmd, buffer));
         setMenuSel(0);
         setMenuDismissed(true); // stays closed until the buffer is edited again
         return;

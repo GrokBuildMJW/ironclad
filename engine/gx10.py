@@ -133,7 +133,9 @@ _ORCH_VERSION: Optional[str] = None
 def orchestrator_version() -> str:
     """The orchestrator build identity (surfaced in /health + at boot). Read once, then cached.
     Source order: env GX10_ORCHESTRATOR_VERSION → a sibling VERSION file (written by the deploy/install
-    stamp) → "unknown". Pure read — NO git/SHA logic in core (the deploy stamps it); generic + secret-free."""
+    stamp) → "unknown". Pure read — NO git/SHA logic in core for the version (the deploy stamps it); generic
+    + secret-free. (The ONE deliberate, scoped git call in core is ``_git_head_tree`` (#933) — a fail-soft,
+    read-only delivery-tree DEFAULT for ``/lifecycle gate`` when ``--tree`` is omitted, never a version.)"""
     global _ORCH_VERSION
     if _ORCH_VERSION is None:
         v = os.environ.get("GX10_ORCHESTRATOR_VERSION")
@@ -422,7 +424,7 @@ def _vault_lock():
 # frontmatter) is the SSOT; the ONE active initiative is stored as a slug in state_root()/active.
 # Artefact-producing ops (tasks, handovers, decisions, MPR runs) route relative to the active
 # initiative (B3) — fail-closed without an active initiative. Pure conversation turns need none.
-INITIATIVE_TYPES = ("mpr", "software")
+INITIATIVE_TYPES = ("software",)
 
 # Hidden machine plumbing per initiative (hybrid layout, 06-20): active.md + handover/
 # feedback inbox + history live under <initiative>/.work/ (out of sight); the visible
@@ -430,13 +432,14 @@ INITIATIVE_TYPES = ("mpr", "software")
 WORKFLOW_DIR = ".work"
 
 # Skeleton directories per type (relative to vault/<slug>/). software = task pipeline +
-# file-communication plumbing; mpr = reasoning runs + decision reports.
+# file-communication plumbing + a runs/ home for the EMBEDDED MPR (the off-hot-path
+# architecture-decision panel writes its run artefacts here — MPR is a dev-process function,
+# never a project type of its own).
 _INITIATIVE_SKELETON: Dict[str, List[str]] = {
     "software": ["tasks/pending", "tasks/in_progress", "tasks/done",
-                 "decisions", "proposals", "reviews",
+                 "decisions", "proposals", "reviews", "runs",
                  f"{WORKFLOW_DIR}/handovers", f"{WORKFLOW_DIR}/feedback",
                  f"{WORKFLOW_DIR}/archive/handovers", f"{WORKFLOW_DIR}/archive/feedback"],
-    "mpr":      ["runs", "decisions"],
 }
 
 # Umlaut folding for readable ASCII slugs (ä→ae …). Pure convenience; Unicode slugs would work too.
@@ -519,9 +522,12 @@ class Initiative:
     def from_meta(cls, slug: str, meta_path: Optional[Path] = None) -> "Initiative":
         p = Path(meta_path) if meta_path else (vault_root() / slug / "meta.md")
         fm = _parse_frontmatter(p.read_text(encoding="utf-8"))
+        # Forward-safety (#984): degrade an unknown/legacy type (e.g. a pre-#984 `type: mpr`) to the
+        # single supported type so an old vault loads without a KeyError on the skeleton lookup.
+        _t = (fm.get("type") or "").strip().lower()
         return cls(
             slug=slug,
-            type=fm.get("type", ""),
+            type=_t if _t in INITIATIVE_TYPES else "software",
             title=fm.get("title", slug),
             created=fm.get("created", ""),
             status=fm.get("status", "active"),
@@ -579,9 +585,10 @@ def initiative_list() -> List[Initiative]:
     return out
 
 
-def initiative_new(name: str, type: str) -> Initiative:
+def initiative_new(name: str, type: str = "software") -> Initiative:
     """Creates a new initiative (meta.md + type skeleton), sets it active. Colliding slugs
-    get a -N suffix. Unknown type / empty name → ValueError."""
+    get a -N suffix. Unknown type / empty name → ValueError. ``software`` is the only type
+    (MPR is an embedded dev-process function, not a project type)."""
     t = (type or "").strip().lower()
     if t not in INITIATIVE_TYPES:
         raise ValueError(_msg("init.unknown_type", type=type, allowed=", ".join(INITIATIVE_TYPES)))
@@ -626,16 +633,6 @@ def active_initiative_path() -> Path:
     if v is None:
         raise RuntimeError(_msg("init.no_active"))
     return v.path
-
-
-def _mpr_blocks_tasks() -> Optional[str]:
-    """Issue #15 — the task pipeline (tasks/handovers/feedback) is software-only. If the ACTIVE
-    initiative is type mpr (reasoning-only), return a clear refusal message; otherwise None. The type
-    becomes a real contract instead of only choosing the seed skeleton."""
-    v = initiative_active()
-    if v is not None and v.type == "mpr":
-        return _msg("mpr.blocks_tasks", slug=v.slug)
-    return None
 
 
 # ─── Artefact routing (B3) ────────────────────────────────────
@@ -690,7 +687,7 @@ def archive_feedback_dir(soft: bool = False) -> Optional[Path]:
 # builds an AUTO-maintained INDEX.md (grouped by category/date, Obsidian [[links]]) plus —
 # optionally — an idempotent "Verwandt (auto)" (related) block in the curated docs (shared tags /
 # title reference in the text). Deterministic, no model call. Like the MEMORY.md pattern.
-_INDEX_AUTO_START = "<!-- ironclad:index:auto START — generiert von reconcile_vault, nicht von Hand ändern -->"
+_INDEX_AUTO_START = "<!-- ironclad:index:auto START — generiert von reconcile_vault, nicht von Hand ändern -->"  # noqa: E501 — deliberately FROZEN marker (test_frozen_markers_unchanged): existing vault INDEX.md files match it verbatim; do NOT translate — the english-only guard allowlists it as a frozen migration exception
 _INDEX_AUTO_END   = "<!-- ironclad:index:auto END -->"
 _LINKS_AUTO_START = "<!-- ironclad:related:auto START -->"
 _LINKS_AUTO_END   = "<!-- ironclad:related:auto END -->"
@@ -2283,14 +2280,14 @@ def _is_sealed_profile() -> bool:
 
 def _mcp_for_launch(spec) -> Tuple[str, Dict[str, str]]:
     """#480: the (mcp_args, mcp_env) to inject into a code agent's launch — the read-only Memory MCP,
-    GATED on the sealed profile + a configured memory service + the agent's mcp_template. ("", {}) when not
-    gated (the agent launches byte-identically). Fail-soft."""
+    ALWAYS ON (#994-S10) when a memory service is configured + the agent's mcp_template — the read-only Memory
+    MCP is no longer sealed-gated. ("", {}) when memory is unconfigured (the agent launches byte-identically).
+    Fail-soft."""
     try:
         import memory_mcp
         cfg = _MEMORY_CONFIG or {}
         return memory_mcp.render_mcp_launch(
             getattr(spec, "mcp_template", None),
-            sealed=_is_sealed_profile(),
             memory_url=str(cfg.get("base_url") or ""),
             namespace=_active_mem_ns(default=str(cfg.get("agent_id") or "ironclad")),  # S3b: the active project's partition
         )
@@ -2546,9 +2543,9 @@ def _advance_pipeline_impl(task_id: str, agent: str, next_task_id: Optional[str]
 
     if artifact_root_soft() is None:
         return f"ERROR: {_msg('init.no_active')}"     # B3: fail-closed — artefacts route to the active initiative
-    _mpr = _mpr_blocks_tasks()
-    if _mpr:
-        return f"ERROR: {_mpr}"               # #15: mpr initiative is reasoning-only
+    _blk = _internal_target_blocks_normal()           # #979: normal pipeline is off on an internal target
+    if _blk:
+        return f"ERROR: {_blk}"
 
     store = _store()
     log: List[str] = []
@@ -2762,9 +2759,9 @@ def _stage_handover_impl(task_id: Optional[str], agent: str, handover_md: str,
         return f"ERROR: unknown agent {agent!r} (configured: {', '.join(_agent_names()) or 'none'})"
     if not handover_md or not handover_md.strip():
         return "ERROR: handover_md is empty — the full handover text is required."
-    _mpr = _mpr_blocks_tasks()
-    if _mpr:
-        return f"ERROR: {_mpr}"               # #15: mpr initiative is reasoning-only
+    _blk = _internal_target_blocks_normal()           # #979: normal pipeline is off on an internal target
+    if _blk:
+        return f"ERROR: {_blk}"
 
     store = _store()
     log: List[str] = []
@@ -2943,10 +2940,10 @@ class TaskStore:
         b = self._base()
         if b is None:
             raise RuntimeError(_msg("init.no_active"))
-        if self.root is None:                  # #15: only gate when routed to the ACTIVE initiative
-            _mpr = _mpr_blocks_tasks()
-            if _mpr:
-                raise RuntimeError(_mpr)
+        if self.root is None:                          # #979: only gate when routed to the ACTIVE project
+            _blk = _internal_target_blocks_normal()    # normal pipeline is off on an internal target
+            if _blk:
+                raise RuntimeError(_blk)
         return b
 
     def _dir(self, status: str) -> Optional[Path]:
@@ -4606,6 +4603,17 @@ class GX10:
     def _inject_platform_guidance(self):
         self._append_guidance(_platform_guidance(self.platform))
         self._append_guidance(_language_guidance(LANGUAGE))
+        # #967: inject the spec-derived command surface (canonical verbs + deprecated + danger tiers) so the
+        # model names commands correctly and never recommends a deprecated one (the operator hit exactly this
+        # — the model pushed /initiative and denied /project). Fail-soft + additive: the prompt FILE is
+        # untouched, and a missing/empty spec injects nothing.
+        try:
+            import command_spec as _command_spec
+            _cmd_surface = _command_spec.context_summary()
+        except Exception:
+            _cmd_surface = ""
+        if _cmd_surface:
+            self._append_guidance(_cmd_surface)
 
     # OPT-4: one completion call with 1× retry on a transient API error
     def _preflight_context(self, think: bool) -> None:
@@ -5531,10 +5539,10 @@ HELP = """
     ace warmup --ledger <path>   offline warm-start the active playbook from a dev-loop ledger's history
     ace eval --ledger <path>     efficiency diagnostic: ACE vs full-rewrite/evolutionary (J-001/J-002)
     generate <args>  scaffold a paved-road capability into the active project library
-    initiative new <name> --type mpr|software   create + activate a initiative (artefact home)
-    initiative list | use <slug> | active | reconcile [slug]
-    project list | new <name> [--type mpr|software] [--path <dir>] | active | track new|use|list
-                  manage registered, isolated projects (the guided setup command; /initiative is a deprecated alias)
+    project new <name> [--path <dir>]   create + activate a project (the guided setup command)
+    project list | use <slug> | active | track new|use|list | delete <id> [--purge] | archive|unarchive <id>
+                  manage registered, isolated projects (artefact home under vault/<slug>/)
+    initiative …  deprecated alias for /project (kept one release)
     switch <project_id>   rebind this engine to a project (own paths + memory partition)
     watcher on|off        enable / disable the feedback watcher
     autopilot on|off      toggle autopilot (auto-launch of Claude)
@@ -5637,6 +5645,19 @@ def _cfg_get(cfg: Dict[str, Any], dotted: str):
     return node
 
 
+def _cfg_flatten_keys(cfg: Dict[str, Any], prefix: str = "") -> "List[str]":
+    """All dotted leaf keys of a config tree (e.g. ``context.rag_enabled``). Backs ``/config keys``
+    discovery + the config-set unknown-root guard (#932)."""
+    out: "List[str]" = []
+    for k, v in cfg.items():
+        dotted = f"{prefix}{k}"
+        if isinstance(v, dict) and v:
+            out.extend(_cfg_flatten_keys(v, dotted + "."))
+        else:
+            out.append(dotted)
+    return out
+
+
 # ─── Setup type (server | local) → offload runner wiring ──────
 # Boot-only derivation: the setup.type (docs/setup-types.md) selects WHERE the orchestrator + agents run,
 # and thus how the provider dispatcher's runner is wired. Orchestrator + agents are ALWAYS co-located
@@ -5713,25 +5734,17 @@ def _initiative_command(arg_str: str) -> str:
     rest = arg_str[len(parts[0]):].strip() if parts else ""
     try:
         if sub == "new":
-            m = re.search(r"--type[=\s]+(\S+)", rest)   # --type X or --type=X (position-independent)
-            if not m:
-                return "usage: /initiative new <name> --type mpr|software"
-            name = (rest[:m.start()] + rest[m.end():]).strip()
-            v = initiative_new(name, m.group(1))
-            # Name the artefacts ACTUALLY seeded for this type (derived from the skeleton, so the
-            # message can never drift from reality) — mpr has no tasks/handovers.
+            # #984: MPR is an embedded dev-process function, not a project type — there is one type
+            # (software). `--type` is dropped; a stray `--type <val>` is tolerated + ignored (back-compat).
+            rest = re.sub(r"--type[=\s]+\S+", "", rest).strip()
+            if not rest:
+                return "usage: /initiative new <name>"
+            v = initiative_new(rest)
+            # Name the artefacts ACTUALLY seeded (derived from the skeleton, so the message can never drift).
             visible = ", ".join(sorted(
                 {d.split("/")[0] for d in _INITIATIVE_SKELETON[v.type] if not d.startswith(WORKFLOW_DIR)}
             ))
-            out = _msg("init.cmd_created", slug=v.slug, type=v.type, path=v.path.as_posix(), visible=visible)
-            _cfg = _EFFECTIVE_CFG if _EFFECTIVE_CFG is not None else _code_defaults()
-            # #503 MPR-ENV-2: mpr.enabled defaults to ON (MprConfig.enabled=True). The engine config tree
-            # carries no mpr default, so `_cfg_get` returns None when the key is unset — only warn "MPR not
-            # active" when it is EXPLICITLY disabled (a falsy value that is actually present), never on unset.
-            _mpr_enabled = _cfg_get(_cfg, "mpr.enabled")
-            if v.type == "mpr" and _mpr_enabled is not None and not _mpr_enabled:
-                out += _msg("init.cmd_mpr_hint")
-            return out
+            return _msg("init.cmd_created", slug=v.slug, type=v.type, path=v.path.as_posix(), visible=visible)
         if sub == "use":
             if not rest:
                 return "usage: /initiative use <slug>"
@@ -5766,7 +5779,7 @@ def _initiative_command(arg_str: str) -> str:
             if not slug:
                 return _msg("init.cmd_reconcile_needs_slug")
             return f"[initiative] reconcile {slug}: {fn(slug)}"
-        return ("usage: /initiative new <name> --type mpr|software | list | use <slug> | "
+        return ("usage: /initiative new <name> | list | use <slug> | "
                 "active | reconcile [slug|all]")
     except (ValueError, RuntimeError) as e:
         return f"[initiative] {e}"
@@ -5839,6 +5852,89 @@ def _read_ledger_payloads(path: Path) -> "tuple[List[Dict[str, Any]], List[str]]
     return payloads, errors
 
 
+def _git_head_tree(root: "Optional[Path]" = None) -> str:
+    """#933: resolve the git HEAD *tree* sha (the COMMITTED tree) as the default delivery tree for
+    ``/lifecycle gate`` when ``--tree`` is omitted. A DELIBERATE, scoped exception to the 'no git/SHA in
+    core' convention (see ``_orchestrator_version``): a single read-only ``git rev-parse HEAD^{tree}``,
+    **fail-soft to ""** so the existing ``BLOCKED: no delivery tree_sha`` path still fires — it never binds a
+    bogus tree. An explicit ``--tree`` (e.g. the operator's DELIVER-GO tree) always overrides this default,
+    so the automated GO path is unaffected; this only gives the INTERACTIVE gate a sensible default."""
+    try:
+        cwd = str(root or _project_root() or Path.cwd())
+        out = subprocess.run(["git", "-C", cwd, "rev-parse", "HEAD^{tree}"],
+                             capture_output=True, text=True, timeout=5)
+        sha = (out.stdout or "").strip()
+        return sha if out.returncode == 0 and re.fullmatch(r"[0-9a-f]{7,64}", sha) else ""
+    except Exception:  # noqa: BLE001 — no git / no repo / timeout → fail-soft to "" (BLOCKED stands)
+        return ""
+
+
+def _dev_target_descriptor(root: "Optional[Path]" = None) -> "Optional[Dict[str, Any]]":
+    """#974/#977: the active project's INJECTION descriptor — marks the project as running the INTERNAL
+    (extension-driven) dev process rather than the normal (public DEV-1) one. Read as PLAIN DATA from
+    ``<project_root>/.devloop/dev-target.json`` (mirroring the ledger read) — the engine NEVER imports the
+    private ``scripts/devloop`` machinery (the tool<->process edge stays data-only). ``None`` when absent /
+    unreadable / not an object. The fail-closed mutual-exclusion gate (#978) consumes this."""
+    p = (root or _project_root() or Path.cwd()) / ".devloop" / "dev-target.json"
+    try:
+        d = json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return d if isinstance(d, dict) else None
+
+
+def _dev_target_drift() -> "List[str]":
+    """#977: fail-closed reconcile at the ``/lifecycle`` gate — if the active project carries an injection
+    descriptor, its ``project_id`` MUST name a registered project. Returns [] when consistent, when there is
+    no descriptor, or when the registry is unavailable (never block the gate on registry-read uncertainty —
+    the #978 gate is the real enforcement). Inline (no private import)."""
+    d = _dev_target_descriptor()
+    if not d:
+        return []
+    pid = d.get("project_id")
+    if not pid:
+        return ["injection descriptor has no project_id"]
+    try:
+        ids = {p.id for p in _REGISTRY.list()} if _REGISTRY is not None else None
+    except Exception:  # noqa: BLE001
+        ids = None
+    if ids is None:
+        return []
+    return [] if pid in ids else [f"injection descriptor names project {pid!r} which is not registered"]
+
+
+def _active_is_internal_target() -> bool:
+    """#979: True iff the active project is bound as an INTERNAL dev-process target (it carries an injection
+    descriptor). Data-only (the plain-JSON marker); the engine never imports the private devloop machinery."""
+    return _dev_target_descriptor() is not None
+
+
+def _dev_target_status_line() -> str:
+    """#982: a one-line operator view (for ``/status``) of the active project's dev-process mode — whether it
+    is bound as an INTERNAL dev-process target (with its exec_mode / tier / plugin) or runs the NORMAL
+    (public DEV-1) process. Data-only (reads the plain-JSON marker; the live plugin health is a run-time
+    concern the internal driver checks, #978)."""
+    d = _dev_target_descriptor()
+    if not d:
+        return "  dev-process : normal (public DEV-1) — no internal target bound"
+    return (f"  dev-process : INTERNAL target — exec_mode={d.get('exec_mode')} tier={d.get('tier')} "
+            f"plugin={d.get('plugin_id') or '-'}"
+            f"{' (required)' if d.get('plugin_required') else ''}  · the normal in-engine pipeline is OFF")
+
+
+def _internal_target_blocks_normal() -> "Optional[str]":
+    """#979 mutual exclusion — the NORMAL (in-engine DEV-1) task pipeline (stage_handover / advance /
+    TaskStore) must NOT run on a project bound as an INTERNAL dev-process target: the internal
+    (extension-driven) process drives it instead. Returns a clear refusal iff the active project has an
+    injection descriptor; otherwise None. The symmetric counterpart to the internal driver's #978 gate."""
+    d = _dev_target_descriptor()
+    if d:
+        return (f"the normal dev-process pipeline is disabled on project {d.get('project_id')!r} — it is an "
+                f"INTERNAL dev-process target (exec_mode {d.get('exec_mode')!r}); drive it with the internal "
+                f"dev-loop, not the in-engine pipeline.")
+    return None
+
+
 def _lifecycle_command(arg_str: str) -> str:
     """`/lifecycle gate --slug <slug> --tree <sha> [--ledger <path>] [--stages tests,reviews,delivery]`
     (S13b / AD-7) — the functioning engine DELIVER-leg lifecycle-completeness gate (Fork A1, engine-side).
@@ -5853,8 +5949,10 @@ def _lifecycle_command(arg_str: str) -> str:
     parts = arg_str.split()
     sub = parts[0].lower() if parts else ""
     if sub != "gate":
-        return ("usage: /lifecycle gate --slug <slug> --tree <sha> [--ledger <path>] "
-                "[--stages tests,reviews,delivery]")
+        # #936: spec-derived guidance (single source — cannot drift from the command-spec)
+        import command_spec as _command_spec
+        return _command_spec.guided_usage("lifecycle") or (
+            "usage: /lifecycle gate --slug <slug> --tree <sha> [--ledger <path>] [--stages tests,reviews,delivery]")
     rest = arg_str[len(parts[0]):].strip()
 
     def _flag(name: str) -> "Optional[str]":
@@ -5864,7 +5962,9 @@ def _lifecycle_command(arg_str: str) -> str:
     if _lifecycle_projector is None:
         return "[lifecycle] BLOCKED: lifecycle projector unavailable (engine module not importable)"
     slug = (_flag("slug") or active_slug() or "").strip()
-    tree_sha = (_flag("tree") or "").strip()
+    # #933: --tree wins (e.g. the operator's DELIVER-GO tree); else default to the committed HEAD tree
+    # (fail-soft to "" → the BLOCKED-no-tree path below still fires; never binds a diverging/bogus tree).
+    tree_sha = (_flag("tree") or _git_head_tree()).strip()
     stages_arg = _flag("stages")
     required_stages = ([s.strip() for s in stages_arg.split(",") if s.strip()]
                        if stages_arg else list(_LIFECYCLE_DEFAULT_STAGES))
@@ -5874,6 +5974,9 @@ def _lifecycle_command(arg_str: str) -> str:
         return "[lifecycle] BLOCKED: no delivery tree_sha — pass --tree <sha>"
     if not required_stages:
         return "[lifecycle] BLOCKED: no required stages — pass --stages a,b,c"
+    _drift = _dev_target_drift()   # #977: fail-closed if the active project's injection descriptor is stale
+    if _drift:
+        return "[lifecycle] BLOCKED: dev-target drift — " + "; ".join(_drift)
     ledger_arg = _flag("ledger")
     ledger_path = (Path(ledger_arg) if ledger_arg
                    else (_project_root() or Path.cwd()) / ".devloop" / "ledger.jsonl")
@@ -5997,6 +6100,20 @@ def _project_in_flight(pid: str) -> bool:
         return True
 
 
+def _switch_serialize():
+    """#979: a repo-global lock context so concurrent ``/switch`` operations serialize — at most one active
+    mode/project transition at a time (a second session waits, never races the quiesce/rebind). Fail-soft:
+    if locking is unavailable, a no-op context (a missing lock must never block a switch). The boundary
+    itself (normal-off on an internal target) is enforced by ``_internal_target_blocks_normal`` on the next
+    pipeline op AFTER the switch commits, so this only serializes the transition."""
+    import contextlib
+    try:
+        from project_registry import FileLock, ironclad_home
+        return FileLock(ironclad_home() / "locks" / "switch.lock")
+    except Exception:  # noqa: BLE001
+        return contextlib.nullcontext()
+
+
 def _switch_command(agent: "GX10", arg_str: str) -> str:
     """`/switch <project_id>` — quiesce this engine and rebind it to a registered project (per-process
     active; the continuity pointer is persisted). Saves the leaving conversation under its own root, binds
@@ -6018,22 +6135,23 @@ def _switch_command(agent: "GX10", arg_str: str) -> str:
         return f"[switch] {pid!r} is archived — /project unarchive {pid} first"
     if _BASE_CFG is None:
         return "[switch] no live base config (the switch rebuilds the project config from it)"
-    try:
-        target, dropped = _ps.switch_project(
-            pid,
-            registry=shim,
-            agent=_SwitchAgent(agent),
-            base_cfg=_BASE_CFG,
-            apply_config=_switch_apply_config,
-            overlay_for=_project_overlay_for,
-            in_flight=_project_in_flight,
-            ctx_for=_engine_ctx_for,
-        )
-    except _ps.SwitchRefused as e:
-        return f"[switch] refused — {e}"
-    except Exception as e:   # noqa: BLE001 — switch_project rolled the ctx back to the leaving project
-        return f"[switch] failed — {e!r}"
-    _set_active_project(target)               # publish to this process's other threads (only AFTER commit)
+    with _switch_serialize():                 # #979: serialize concurrent switches (at most one active mode)
+        try:
+            target, dropped = _ps.switch_project(
+                pid,
+                registry=shim,
+                agent=_SwitchAgent(agent),
+                base_cfg=_BASE_CFG,
+                apply_config=_switch_apply_config,
+                overlay_for=_project_overlay_for,
+                in_flight=_project_in_flight,
+                ctx_for=_engine_ctx_for,
+            )
+        except _ps.SwitchRefused as e:
+            return f"[switch] refused — {e}"
+        except Exception as e:   # noqa: BLE001 — switch_project rolled the ctx back to the leaving project
+            return f"[switch] failed — {e!r}"
+        _set_active_project(target)           # publish to this process's other threads (only AFTER commit)
     # S11a-2 (#630): reload skills so the NEW project's library is discovered (and the previous project's
     # library items dropped) — build-then-swap, so a reload hiccup never empties the live registries and an
     # already-committed switch is never failed by it. plugins_dir is a locked key (stable across projects).
@@ -6086,44 +6204,40 @@ def _project_track_command(args: "List[str]") -> str:
     return "usage: /project track new <track> | use <track> | list"
 
 
-_PROJECT_NEW_USAGE = "usage: /project new <name> [--type mpr|software] [--path <dir>]"
+_PROJECT_NEW_USAGE = "usage: /project new <name> [--path <dir>]"
 
 
 def _parse_project_new(arg_str: str) -> "Tuple[Optional[str], Optional[str], Optional[str], Optional[str]]":
-    """Parse `new <name> [--type T] [--path P]` (P may be quoted) → (name, type|None, path|None, error|None).
-    The name is every remaining positional token (a multi-word name is slugified). ``--type`` is validated
-    against the initiative types; an unknown type is an error (fail-closed, nothing is created)."""
-    s = arg_str
-    typ: Optional[str] = None
+    """Parse `new <name> [--path P]` (P may be quoted) → (name, "software", path|None, error|None).
+    The name is every remaining positional token (a multi-word name is slugified). #984: MPR is an
+    embedded dev-process function, not a project type — there is one type (``software``). ``--type`` is
+    dropped; any ``--type[ =]<val>`` (or a bare ``--type``) is tolerated + IGNORED (back-compat), never
+    validated. The mint always seeds a software unit."""
+    s = re.sub(r"--type(?:[=\s]+\S*)?", "", arg_str)     # tolerate + ignore a legacy --type (incl. bare/empty)
     path: Optional[str] = None
-    mt = re.search(r"--type(?:=|\s+)(\S+)", s)
-    if mt:
-        typ = mt.group(1)
-        s = s[:mt.start()] + s[mt.end():]
     mp = re.search(r"--path(?:=|\s+)(\"[^\"]*\"|'[^']*'|\S+)", s)
     if mp:
         raw = mp.group(1)
         path = raw[1:-1] if len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in "\"'" else raw
         s = s[:mp.start()] + s[mp.end():]
     name = " ".join(s.split())
-    # A bare / empty-valued flag (e.g. `--type`, `--type=`, `--path`) does not match the value-bearing regex
-    # above, so it would otherwise survive in the name and mint a bogus project — fail-closed instead.
-    if re.search(r"--(?:type|path)\b", name):
-        return (None, None, None, "a --type/--path flag needs a value")
+    # A bare / empty-valued --path does not match the value-bearing regex above, so it would otherwise
+    # survive in the name and mint a bogus project — fail-closed instead.
+    if re.search(r"--path\b", name):
+        return (None, "software", None, "a --path flag needs a value")
     if not name:
-        return (None, None, None, _PROJECT_NEW_USAGE)
-    if typ is not None and typ.strip().lower() not in INITIATIVE_TYPES:
-        return (None, None, None, f"unknown --type {typ!r} (allowed: {', '.join(INITIATIVE_TYPES)})")
-    return (name, (typ.strip().lower() if typ else None), path, None)
+        return (None, "software", None, _PROJECT_NEW_USAGE)
+    return (name, "software", path, None)
 
 
 def _project_new_mint(agent: "GX10", arg_str: str) -> str:
-    """`/project new <name> [--type mpr|software] [--path <dir>]` — the guided-setup mint (ADR-0011 / S16):
+    """`/project new <name> [--path <dir>]` — the guided-setup mint (ADR-0011 / S16):
     register a fresh isolated PROJECT (root = ``--path`` or ``<cwd>/<slug>``; a minted ``mem_ns``), then
     **activate it through the full quiesced switch** (so the leaving conversation is saved, a fresh one is
     started, the rolling summary / last-response are cleared, and in-flight work is refused — exactly like
     ``/switch``, so a mid-session ``new`` never bleeds the old conversation into the new project), and finally
-    — when a ``--type`` is given — seed its first work unit (a typed vault initiative) under the new project.
+    seed its first work unit (a ``software`` vault initiative) under the new project (#984: one type only —
+    MPR is an embedded dev-process function, not a project type).
     **Atomic**: a bad name / duplicate root / a refused-or-failed switch leaves nothing registered; the unit
     seed is fail-soft (a project without a seeded unit is still valid — add one later)."""
     if _REGISTRY is None:
@@ -6339,7 +6453,7 @@ def _project_command(arg_str: str, agent: "Optional[GX10]" = None) -> str:
             projs = sorted(_REGISTRY.list(), key=lambda p: p.id)
             shown = [p for p in projs if show_all or not getattr(p, "archived", False)]
             if not shown:
-                return "[project] none registered — /project new <name> [--type mpr|software]"
+                return "[project] none registered — /project new <name>"
             cur = _ACTIVE_PROJECT.id if _ACTIVE_PROJECT is not None else None
             n_arch = sum(1 for p in projs if getattr(p, "archived", False))
             head = "[project]  (* = active" + (", [archived] hidden — /project list --all" if (n_arch and not show_all) else "") + ")"
@@ -6365,8 +6479,8 @@ def _project_command(arg_str: str, agent: "Optional[GX10]" = None) -> str:
             return _project_archive(parts[1:], archive=True)
         if sub == "unarchive":
             return _project_archive(parts[1:], archive=False)
-        return ("usage: /project list [--all] | new <name> [--type mpr|software] [--path <dir>] | active | "
-                "track new|use|list | delete <id> [--purge] | archive <id> | unarchive <id>")
+        import command_spec as _command_spec   # #953: spec-derived usage (single source)
+        return _command_spec.guided_usage("project")
     except Exception as e:   # noqa: BLE001 — registry I/O / lock / validation → a clean message, never a crash
         return f"[project] {e}"
 
@@ -6390,9 +6504,21 @@ def _catalogue_snapshot() -> Dict[str, List[Dict[str, Any]]]:
         skills.append({"name": cap, "kind": "playbook", "description": pb.description})
     for name in sorted(_PLUGIN_TOOLS):
         fn = (_PLUGIN_TOOLS[name].get("schema") or {}).get("function") or {}
-        skills.append({"name": name, "kind": "tool", "description": str(fn.get("description", "") or "")})
+        pa = fn.get("parameters") or {}
+        params = pa.get("required") or list((pa.get("properties") or {}).keys())
+        skills.append({"name": name, "kind": "tool", "description": str(fn.get("description", "") or ""),
+                       "params": [str(p) for p in params]})   # #932: surface tool params for /skills + /tool
     skills.sort(key=lambda s: s["name"])
-    return {"prompts": prompts, "skills": skills}
+    # #931: also serve the command-spec (server verbs + danger-tier) so the client generates its
+    # server-command completions FROM this one source (its static list is the cold-start fallback).
+    # Additive + fail-soft: a spec import hiccup must never break discovery of prompts/skills.
+    commands: List[Dict[str, Any]] = []
+    try:
+        import command_spec as _command_spec
+        commands = _command_spec.catalogue_entries()
+    except Exception:  # noqa: BLE001 — discovery degrades to prompts/skills, never crashes
+        commands = []
+    return {"prompts": prompts, "skills": skills, "commands": commands}
 
 
 def _render_prompts() -> str:
@@ -6417,8 +6543,27 @@ def _render_skills() -> str:
     lines = [col(f"  Loaded skills ({len(items)}) — kind  name  description:", C.CYAN)]
     for it in items:
         lines.append(f"    {it['kind']:<9} {it['name']:<22} {it['description']}")
+        if it.get("params"):   # #932: show a tool's parameters so /tool <name> is callable without reading the schema
+            lines.append(col(f"    {'':<9} {'':<22} {_msg('skills.params')} {', '.join(it['params'])}", C.GRAY))
     lines.append(col("  → playbooks load via the use_skill tool; typed tools are model-elected (or /tool <name>).", C.GRAY))
     return "\n".join(lines)
+
+
+def _render_command_tiers() -> str:
+    """#932: the server commands grouped by danger-tier (from the command-spec) so ``/help`` conveys which
+    commands change/cost/destroy vs merely read. Fail-soft — empty string on any spec import hiccup."""
+    try:
+        import command_spec as _cs
+    except Exception:  # noqa: BLE001 — /help must never break on a spec issue
+        return ""
+    order = [(_cs.READ_ONLY, _msg("tiers.read_only")), (_cs.MUTATING, _msg("tiers.mutating")),
+             (_cs.COSTLY, _msg("tiers.costly")), (_cs.DESTRUCTIVE, _msg("tiers.destructive"))]
+    out = [col("  " + _msg("tiers.header"), C.CYAN)]
+    for tier, label in order:
+        verbs = sorted(c.verb for c in _cs.COMMAND_SPECS if c.tier == tier)
+        if verbs:
+            out.append(f"    {label}: {', '.join(verbs)}")
+    return "\n".join(out)
 
 
 _LANG_TAIL_RE = re.compile(r"\s+--lang(?:=|\s+)(\S+)\s*$")
@@ -6564,8 +6709,8 @@ def _generate_command(arg_str: str) -> str:
     import shlex
     from ack import generator as _gen        # lazy import (S6b lesson)
     if not arg_str.strip():
-        return ("usage: /generate [--kind case|prompt] --domain <d> --case <c> --description <text> "
-                "[--prefix x] [--dry-run]\n"
+        import command_spec as _command_spec   # #953: spec-derived usage (single source)
+        return (_command_spec.guided_usage("generate") + "\n"
                 "  renders the paved-road template (case=tool [default], prompt=prompt item) into the "
                 "active project's library (guarded vs built-ins)")
     try:
@@ -6601,16 +6746,31 @@ def _dispatch(agent: GX10, user_input: str):
     cmd = user_input.lower()
     if cmd == "help":
         _ui_print(col(HELP, C.YELLOW))
+        _tiers = _render_command_tiers()   # #932: append the danger-tier grouping from the command-spec
+        if _tiers:
+            _ui_print(_tiers)
     elif cmd == "clear":
         _ui_print(agent.clear_context())
     elif cmd == "status":
         _ui_print(agent.status())
+        _ui_print(_dev_target_status_line())     # #982: surface the injection (internal-target) mode
     elif cmd == "prompts":
         _ui_print(_render_prompts())
     elif cmd == "skills":
         _ui_print(_render_skills())
     elif cmd == "config":
         _ui_print(_render_config())
+    elif cmd == "config keys":
+        # #932: discovery — the dotted keys `/config get|set` accept (boot-only keys flagged). Closes the
+        # "opaque dotted keys with zero discovery" gap the C0 review named.
+        cfg = _EFFECTIVE_CFG if _EFFECTIVE_CFG is not None else _code_defaults()
+        keys = sorted(_cfg_flatten_keys(cfg))
+        out = [col("  " + _msg("keys.header", n=len(keys)), C.CYAN)]
+        for k in keys:
+            v = _cfg_get(cfg, k)   # #956: show the current value + inferred type (AC-2 "+values/types")
+            flag = col("  " + _msg("keys.boot_only"), C.YELLOW) if k in _FROZEN_CONFIG_KEYS else ""
+            out.append(f"    {k} = {v!r}  ({type(v).__name__}){flag}")
+        _ui_print("\n".join(out))
     elif cmd == "config get" or cmd.startswith("config get "):
         parts = user_input.split(None, 2)            # config get <dotted.key>
         if len(parts) < 3 or not parts[2].strip():   # bare `config get` (clients trim) or a trailing space (raw HTTP)
@@ -6622,12 +6782,19 @@ def _dispatch(agent: GX10, user_input: str):
     elif cmd.startswith("config set "):
         parts = user_input.split(None, 3)            # config set <dotted.key> <value...>  (original case)
         if len(parts) < 4:
-            _ui_print(col("  usage: /config set <dotted.key> <value>", C.YELLOW))
+            import command_spec as _command_spec   # #953: spec-derived usage (single source)
+            _ui_print(col("  " + _command_spec.guided_usage("config set"), C.YELLOW))
         elif _EFFECTIVE_CFG is None:
             _ui_print(col("  [config] no live config to set (start the server first)", C.YELLOW))
         elif parts[2].strip() in _FROZEN_CONFIG_KEYS:
             _ui_print(col(f"  [config] '{parts[2].strip()}' is boot-only — set it in the deploy "
                           f"(env/config-file), not at runtime.", C.YELLOW))
+        elif parts[2].strip().split(".")[0] not in _EFFECTIVE_CFG:
+            # #932 gap-2: an unknown ROOT section is a typo, not a real key — REFUSE (no silent write, no
+            # false-GREEN). Known core sections + existing plugin namespaces (e.g. mpr.*) have a live root,
+            # so they still set; only a mistyped/unknown root is rejected. (A wrong leaf under a known root
+            # cannot be caught without a schema — accepted oracle limit.)
+            _ui_print(col("  " + _msg("config.unknown_key", name=parts[2].strip()), C.RED))
         else:
             key, val = parts[2].strip(), _coerce_cfg_value(parts[3])
             _cfg_set(_EFFECTIVE_CFG, key, val)
@@ -8126,11 +8293,12 @@ _ACE_TERMINAL_OUTCOMES = frozenset({"reached-human-merge-gate", "aborted"})
 
 
 def _ace_devscan_path() -> "Optional[Path]":
-    """The persisted exactly-once record (the set of dev-loop units already submitted), under the install
-    home. ``None`` if the home can't resolve."""
+    """The persisted exactly-once record (the set of dev-loop units already submitted), scoped PER-PROJECT
+    (#979) under the install home — so one project's submitted-units set never masks another's. ``None`` if
+    the home can't resolve."""
     try:
         from project_registry import ironclad_home   # bare engine-sibling import (like project_registry)
-        return ironclad_home() / "ace_devscan.json"
+        return ironclad_home() / "ace_devscan" / f"{_active_mem_ns() or 'base'}.json"
     except Exception:   # noqa: BLE001
         return None
 
@@ -8211,11 +8379,12 @@ def _ace_scan_dev_ledger(payloads: "Any" = None, chain_errors: "Any" = None, *,
 
 # ─── M5-2 (#883): the gated MPR-at-fork panel (MPR-A-2 gated invocation + MPR-A-5 pre-informed query) ──
 def _ace_forkscan_path() -> "Optional[Path]":
-    """The persisted exactly-once record (fork keys already dispatched to MPR), under the install home.
+    """The persisted exactly-once record (fork keys already dispatched to MPR), scoped PER-PROJECT (#979)
+    under the install home — a project's fork proposals never bleed into another's (the C0-review finding).
     Separate file from the dev-scan units set so neither save clobbers the other. ``None`` if unresolved."""
     try:
         from project_registry import ironclad_home   # bare engine-sibling import
-        return ironclad_home() / "ace_forkscan.json"
+        return ironclad_home() / "ace_forkscan" / f"{_active_mem_ns() or 'base'}.json"
     except Exception:   # noqa: BLE001
         return None
 
@@ -8402,13 +8571,14 @@ def _ace_command(arg: str) -> str:
     parts = (arg or "").split()
     sub = parts[0] if parts else ""
     if sub not in ("warmup", "eval"):
-        return _ACE_USAGE
+        import command_spec as _command_spec   # #953: spec-derived usage (single source)
+        return _command_spec.guided_usage("ace")
     ledger = ""
     if "--ledger" in parts:
         i = parts.index("--ledger")
         ledger = parts[i + 1] if i + 1 < len(parts) else ""
-    if not ledger:
-        return f"usage: /ace {sub} --ledger <path>"
+    if not ledger:   # #936: default the ledger like /lifecycle (no more required flag to type)
+        ledger = str((_project_root() or Path.cwd()) / ".devloop" / "ledger.jsonl")
     store = _ACE_STORE
     if store is None or not hasattr(store, sub if sub == "warmup" else "benchmark"):
         return f"ace {sub}: no ACE playbook store is registered"
@@ -8427,20 +8597,22 @@ def _ace_command(arg: str) -> str:
             report = store.warmup(scope, trajectories)
             if report.get("skipped"):
                 return "ace warmup: skipped — no orchestrator model reachable (nothing seeded)"
-            return (f"ace warmup: replayed {report.get('samples_seen', 0)} trajectory record(s) into the playbook "
-                    f"— +{report.get('added', 0)} bullet(s), {report.get('pruned', 0)} pruned")
+            return _msg("ace.warmup_done", samples=report.get("samples_seen", 0),
+                        added=report.get("added", 0), pruned=report.get("pruned", 0))
         # sub == "eval" — the efficiency diagnostic (J-001/J-002); no playbook mutated
         rep = store.benchmark(trajectories)
         if rep.get("skipped"):
             return "ace eval: skipped — no orchestrator model reachable"
         ace, fr, evo = rep["ace"], rep["full_rewrite"], rep["evolutionary"]
-        j1 = "PASS" if rep.get("no_full_rewrite") else "FAIL"
-        j2 = "PASS" if rep.get("rollout_target_met") else "FAIL"
+        j1_ok = rep.get("no_full_rewrite")
+        j2_ok = rep.get("rollout_target_met")
         red = rep.get("rollout_reduction_vs_evolutionary", 0.0)
-        return (f"ace eval (over {len(trajectories)} trajectories): "
-                f"ACE={ace.rollouts} rollouts / {ace.full_rewrites} full-rewrites / {ace.llm_merges} LLM-merges; "
-                f"full-rewrite={fr.rollouts}; evolutionary={evo.rollouts}. "
-                f"rollout-reduction vs evolutionary={red:.0%} (J-002 >50%: {j2}); no-full-rewrite (J-001): {j1}")
+        # #936: plain-language first; #938: localized via _msg (the paper's J-001/J-002 kept as a parenthetical)
+        return _msg("ace.eval_verdict", n=len(trajectories), calls=ace.rollouts,
+                    j1clause=_msg("ace.eval_j1_pass" if j1_ok else "ace.eval_j1_fail"),
+                    j1="PASS" if j1_ok else "FAIL", reduction=f"{red:.0%}",
+                    j2clause=_msg("ace.eval_j2_over" if j2_ok else "ace.eval_j2_under"),
+                    j2="PASS" if j2_ok else "FAIL", ace=ace.rollouts, fr=fr.rollouts, evo=evo.rollouts)
     except Exception as ex:   # noqa: BLE001 — the command must never crash the REPL
         return f"ace {sub}: failed ({ex!r})"
 

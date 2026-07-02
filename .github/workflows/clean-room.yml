@@ -45,6 +45,26 @@ jobs:
           /tmp/cr/bin/python -m pip install dist/*.whl
       - name: Import-smoke from a neutral dir (installed package, not the source tree)
         run: cd /tmp && /tmp/cr/bin/python -c "import ack, ack.lodestar, ack.sdk; print('import OK ->', ack.__file__, '| sdk exports:', len(ack.sdk.__all__))"
+      - name: Orchestrator-surface proof (#994-S1 — the published wheel is orchestrator-capable, fail-closed)
+        # Prove the wheel ships the dev-process orchestration facade the self-hosting orchestrator drives
+        # through (stable verbs over a driver seam) AND that it fail-closes without a driver — from the
+        # INSTALLED wheel in a neutral dir, so a self-mod that breaks/omits the surface blocks the release.
+        run: |
+          cd /tmp && /tmp/cr/bin/python - <<'PY'
+          import ack.devprocess.api as api, ack.sdk as sdk
+          verbs = ("select_unit", "stage_handover", "record_feedback", "advance", "deliver",
+                   "set_driver", "get_driver")
+          missing = [v for v in verbs if not hasattr(api, v)]
+          assert not missing, f"wheel is missing dev-process orchestration verbs: {missing}"
+          assert api.get_driver() is None, "the wheel must ship NO driver by default (the extension wires it)"
+          try:
+              api.advance("t", "a")
+              raise SystemExit("FAIL: advance() did not fail-closed without a driver")
+          except api.SubstrateUnavailable:
+              pass  # correct: the orchestration facade fail-closes when no driver is registered
+          assert callable(sdk.gate), "the wheel must ship a callable ack.sdk.gate"
+          print("orchestrator-surface OK -> verbs present, fail-closed without a driver, sdk.gate callable")
+          PY
       - name: Optional extras resolve (catch forgotten dependency declarations)
         run: /tmp/cr/bin/python -m pip install "ironclad-ai[engine,memory]" --find-links dist
       - name: Build the example plugin against the installed SDK + verify discovery (#138)
@@ -120,3 +140,24 @@ jobs:
           done
           [ "${ok:-0}" = "1" ] || { echo "::error::ironclad-ai==${version} never appeared on the index"; exit 1; }
           cd /tmp && python -c "import ack, ack.lodestar, ack.sdk; print('PyPI install OK ->', ack.__file__, '| sdk exports:', len(ack.sdk.__all__))"
+      - name: Orchestrator-surface proof on the RELEASED wheel (#994-S2 — the shipped artifact is orchestrator-capable)
+        # Post-publish counterpart of the pre-publish proof (#994-S1): prove the package users actually got
+        # FROM THE INDEX (test-PyPI first, then production) carries the dev-process orchestration facade +
+        # fail-closes without a driver — closing the "untested on the released artifact" gap of the
+        # self-hosting bootstrap.
+        run: |
+          cd /tmp && python - <<'PY'
+          import ack.devprocess.api as api, ack.sdk as sdk
+          verbs = ("select_unit", "stage_handover", "record_feedback", "advance", "deliver",
+                   "set_driver", "get_driver")
+          missing = [v for v in verbs if not hasattr(api, v)]
+          assert not missing, f"released wheel is missing dev-process orchestration verbs: {missing}"
+          assert api.get_driver() is None, "the released wheel must ship NO driver by default"
+          try:
+              api.advance("t", "a")
+              raise SystemExit("FAIL: advance() did not fail-closed without a driver")
+          except api.SubstrateUnavailable:
+              pass  # correct: the released orchestration facade fail-closes when no driver is registered
+          assert callable(sdk.gate), "the released wheel must ship a callable ack.sdk.gate"
+          print("released-artifact orchestrator-surface OK -> verbs present, fail-closed, sdk.gate callable")
+          PY

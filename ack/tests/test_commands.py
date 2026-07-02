@@ -68,3 +68,61 @@ def test_ink_client_offers_every_server_command():
     ink_server = set(re.findall(r"name:\s*'([a-z0-9-]+)',\s*scope:\s*'server'", ts.read_text(encoding="utf-8")))
     missing = set(SERVER_COMMANDS) - ink_server
     assert not missing, f"clients/ink commands.ts is missing server commands from commands.py SERVER_COMMANDS: {sorted(missing)}"
+
+
+# ── #934: alias / unambiguous-prefix / did-you-mean in classify ──────────────────────────────────────
+def test_classify_alias_expands_to_canonical():
+    assert classify("/lg --tree X") == ("server", "lifecycle", "lifecycle gate --tree X")
+
+
+def test_classify_typo_suggests_and_is_not_forwarded():
+    kind, name, _ = classify("/confog rag on")
+    assert kind == "suggest" and name == "config"     # did-you-mean, never sent (no billed turn)
+
+
+def test_classify_prompt_name_still_forwards():
+    # a bare /<prompt-name> (not close to any command) must reach the server's prompt resolver, not 'suggest'
+    assert classify("/code-review diff=x")[0] == "server"
+
+
+def test_classify_destructive_prefix_suggests_not_auto():
+    kind, name, _ = classify("/proj list")             # 'proj' → project, but project is destructive
+    assert kind == "suggest" and name == "project"
+
+
+def test_classify_known_verb_forwards_verbatim():
+    assert classify("/config get mpr.enabled") == ("server", "config", "config get mpr.enabled")
+
+
+def test_classify_local_and_turn_unchanged():
+    assert classify("/help")[0] == "local" and classify("hello")[0] == "turn"
+
+
+def test_guidance_recommends_project_not_the_deprecated_initiative():
+    # #964 regression: the model system prompt + client HELP_TEXT + the fail-closed messages must teach
+    # /project (the primary/guided command), NOT the deprecated /initiative alias, for creating a project.
+    # (The alias's own `_initiative_command` help legitimately keeps /initiative; this guards the GUIDANCE.)
+    from commands import HELP_TEXT
+    assert "/project new" in HELP_TEXT and "/initiative new" not in HELP_TEXT
+    import importlib
+    m = importlib.import_module("messages")
+    for lang in ("en", "de"):
+        msg = m.msg("init.no_active", lang=lang)
+        assert "/project new" in msg and "/initiative new" not in msg, f"{lang} init.no_active still teaches /initiative"
+    from pathlib import Path
+    import gx10
+    prompt = (Path(gx10.__file__).parent / "prompts" / "GX10_Orchestrator_SystemPrompt.md").read_text(encoding="utf-8")
+    assert "/project new" in prompt and "/project active" in prompt
+    assert "`/initiative new" not in prompt and "`/initiative active" not in prompt   # no deprecated-alias advice
+
+
+def test_orchestrator_system_prompt_is_english():
+    # #966: the exported base system prompt must be English (English-only export). The German rendering
+    # lives as a private, non-exported override (deploy/prompts/, selected via GX10_PROMPT).
+    from pathlib import Path
+    import gx10
+    p = (Path(gx10.__file__).parent / "prompts" / "GX10_Orchestrator_SystemPrompt.md").read_text(encoding="utf-8")
+    assert "You are the **ironclad Orchestrator**" in p            # English intro
+    assert "Du bist der" not in p and "Nicht erfinden" not in p    # no German prose
+    import re
+    assert not re.search(r"[äöüÄÖÜß]", p), "the base prompt must carry no German umlauts"

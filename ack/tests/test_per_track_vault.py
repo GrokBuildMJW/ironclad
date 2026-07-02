@@ -85,7 +85,7 @@ def test_two_tracks_have_distinct_subtrees(tmp_path):
 
 def test_initiative_isolated_per_track(tmp_path):
     with pc.use(ProjectContext("p", str(tmp_path), "ns", track="feature")):
-        v = gx10.initiative_new("Track Work", "mpr")
+        v = gx10.initiative_new("Track Work", "software")
         assert (Path(str(tmp_path)) / "vault" / ".tracks" / "feature" / v.slug / "meta.md").is_file()
         assert [iv.slug for iv in gx10.initiative_list()] == [v.slug]
     with pc.use(ProjectContext("p", str(tmp_path), "ns")):  # main track

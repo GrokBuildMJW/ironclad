@@ -27,7 +27,7 @@ def _in_project(tmp_path, monkeypatch):
 
 
 def test_engine_deps_routes_runs_dir_to_active_initiative(tmp_path):
-    gx10.initiative_new("Risk Review", "mpr")
+    gx10.initiative_new("Risk Review", "software")
     deps = _engine_deps()
     # runs land under vault/<slug>/runs (workdir-relative, posix)
     assert deps.runs_dir.replace("\\", "/").endswith("vault/risk-review/runs")
@@ -52,6 +52,6 @@ def test_mpr_research_run_passes_gate_with_initiative(tmp_path):
     # with a initiative active the fail-closed gate is cleared; the run then proceeds into the
     # orchestration (which, with no live LLM bound, returns its own router/degrade string — the point
     # here is only that it is NOT the "kein aktives Initiative" refusal).
-    gx10.initiative_new("Decide", "mpr")
+    gx10.initiative_new("Decide", "software")
     out = mpr_research_run("Soll X auf Postgres laufen?")
     assert "kein aktives Initiative" not in out

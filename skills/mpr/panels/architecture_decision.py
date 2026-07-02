@@ -31,7 +31,7 @@ PANEL = Panel(
             "effort": "high",
         },
         {
-            "role": "Security-Architekt",
+            "role": "Security Architect",
             "lens_prompt": "You are a security architect with a zero-trust mandate. Judge exclusively the "
                            "security/trust-boundary consequences: attack surface, secrets/tenancy, "
                            "permissions, data-flow sovereignty. Where does this decision open a gap?",
@@ -45,7 +45,7 @@ PANEL = Panel(
             "effort": "high",
         },
         {
-            "role": "Reversibilität / Lock-in",
+            "role": "Reversibility / Lock-in",
             "lens_prompt": "You specialise in option value. Judge solely how reversible this decision is: "
                            "lock-in (vendor/format/API), exit costs, one-way vs. two-way door. How "
                            "expensive would backing out be in 12 months?",
@@ -59,7 +59,7 @@ PANEL = Panel(
             "effort": "medium",
         },
         {
-            "role": "Kosten / TCO",
+            "role": "Cost / TCO",
             "lens_prompt": "You judge total cost of ownership: build, operations, licensing, compute and "
                            "opportunity cost across the lifecycle — not just acquisition.",
             "effort": "medium",

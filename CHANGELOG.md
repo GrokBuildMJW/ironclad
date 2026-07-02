@@ -9,6 +9,280 @@ Released versions are listed below; upcoming work accumulates under *Unreleased*
 
 ## [Unreleased]
 
+## [0.0.23]
+- **Coder Memory MCP is always-on** (epic #994 / #1015): the read-only Memory MCP for the code agents is
+  no longer gated on the `sealed` trust profile — `memory_mcp.render_mcp_launch` wires it whenever a
+  memory service (`memory_url`) is configured AND the agent ships a per-CLI `mcp_template`, in ANY
+  profile. Safe: the MCP exposes only read tools (`memory_search` + `memory_deep_query`, no write), so a
+  coder can only READ project memory. All four roster coders (OPUS/SONNET/CODEX/KIMI) now ship a template
+  (KIMI's was added). Inert until a memory service is configured (byte-identical launch otherwise).
+
+### Added
+- **The remaining command-ergonomics chrome is localized + `/config keys` shows values** (epic #927 / #956,
+  completing the audit follow-up): the `/config keys` header, the danger-tier `/help` block, the config-set
+  unknown-root refusal, and the `/skills` params label now route through `_msg`/`messages.py` (EN source + DE
+  overlay, no hardcoded German); `/config keys` renders each key's **current value + inferred type** (not just
+  the name); and the destructive-confirm message is a **single localized line** (reason + how-to-confirm from
+  the server, printed verbatim by every client — no English wrapper mixing into a translated reason). The
+  shipped **destructive-only** confirm scope is reconciled across the epic AC + docs (costly keeps its own
+  guards; boot-only via the frozen-key refusal).
+- **Every client renders the guided-input contract** (epic #927 / #955): the ink client (field-by-field,
+  with choice pick-lists + defaults + the canonical echo) and the three Python REPLs (via a shared
+  `client.render_guide`) now detect the server's `needs_guide` reply on `/chat/stream` exactly as they
+  detect `needs_confirm`, so `/<verb> ?` or `/<verb> --guide` shows the fields the operator must supply
+  instead of a blank or a billed turn. Client chrome stays English (thin renderer).
+- **Server-side structured guided-input contract** (epic #927 / #954): on an explicit `/<verb> ?` or
+  `/<verb> --guide`, the server (`_guide_required`, sibling to the confirm gate) replies
+  `{needs_guide: {command, subcommands, fields:[{name, required, choices, default, type}], usage,
+  canonical_echo}}` — the fields the operator must supply, derived from the command-spec — instead of
+  executing. Uniform across every client; the explicit affordance only (never auto-launch on a bare or
+  partial command, C0 #6); served on `/chat` + `/chat/stream`; fail-soft; `_dispatch` untouched (it is a
+  pre-execution info reply, the spec describes the executor and never drives it).
+- **Every flag-heavy worst-offender is now guided from the command-spec, not a hand-written string**
+  (epic #927 / #953): `/config set`, `/ace`, `/project`, and `/generate` emit `command_spec.guided_usage(verb)`
+  when under-specified (previously each hand-wrote its own usage line, free to drift from the spec + the
+  `/catalogue` hint). A `usage` override on the spec carries the one multi-form verb (`/project`'s
+  `new <name>` / `delete <id>` forms) that a flat subcommands+flags render cannot; `render_usage`
+  (the `/catalogue` hint) and `guided_usage` (the dispatch line) share that single source.
+- **The terminal client's static command mirror is now complete + coverage-guarded** (epic #927 / #952):
+  the ink `COMMANDS` server subset was missing `lifecycle`/`fork`/`ace`, which silently blinded the
+  did-you-mean net to exactly those worst-offender verbs (a typo like `/lifecyle` was forwarded and billed a
+  model turn instead of being suggested). The three verbs are added, `check_ink_command_parity.py` now
+  asserts the ink server subset **covers** `command_spec.verbs()` (fail-closed — completing #940's
+  spec↔generated-client binding), and argument autocomplete now prefers the richer `/catalogue` entry over
+  the static fallback so a completed verb's flags/choices still resolve.
+- **Two fail-closed drift guards for the terminal client** (epic #927 / #939, completing the epic):
+  `check_ink_command_parity.py` asserts the ink client's static `ALIASES`/`UNSAFE` mirror equals
+  `engine.command_spec.ALIASES` / `unsafe_first_words()` (the single source — the ink cold-start fallback
+  can no longer silently drift), wired into private CI alongside the command_spec↔dispatch guard (#940).
+  `check_ink_test_count.mjs` runs the `node:test` suite and asserts the documented TypeScript counts
+  (README + status + test-report) match it — the TS analogue of `gen_test_counts.py` — wired into
+  node-client.yml.
+- **Command-ergonomics documentation + engine-chrome i18n** (epic #927 / #938): a public
+  [`docs/command-ergonomics.md`](docs/command-ergonomics.md) documents the whole surface — aliases,
+  did-you-mean, unambiguous prefix, argument autocomplete, discovery, confirm-before-destructive, and the
+  `/ace` ergonomics. The new user-facing **engine** outputs (the destructive-confirm reason and the `/ace`
+  verdict) are localized through the message catalog (`engine/messages.py`, `_msg`) — English is the source
+  and default, German is an overlay, and no German is hardcoded in core.
+- **Argument autocomplete in the terminal client** (`clients/ink`, epic #927 / #937): once past the verb,
+  the slash-menu completes a command's **subcommands, flag names, and flag choices** from the structured
+  `flags`/`subcommands` the server now serves in `GET /catalogue` (#936) — e.g. `/lifecycle ` → `gate`,
+  `/lifecycle gate --` → `--slug --tree --ledger --stages`, `--stages ` → `tests|reviews|delivery`.
+  Deterministic + zero-cost (no model); accepting inserts the token into the line (it does not reset it to
+  `/verb`), and the already-server-driven did-you-mean (#934) + confirm (#935) surfaces render in the same
+  client. The static command list stays the cold-start fallback.
+- **Spec-derived command guidance + `/ace` ergonomics** (epic #927 / #936): the command-spec now renders a
+  single-source usage line (`command_spec.guided_usage(verb)` — subcommands + flags, required bare /
+  optional `[bracketed]` / choices `{a|b}`), wired into `/lifecycle`'s usage so it can never drift from
+  the spec; and `GET /catalogue` entries carry structured `subcommands` + `flags`
+  (`{name, required, choices, summary}`) so a client can build argument autocomplete + guided input from
+  the one source. `/ace warmup|eval` now **defaults its `--ledger`** to `<root>/.devloop/ledger.jsonl`
+  (like `/lifecycle gate`, no required flag to type), and `/ace eval` reports a **plain-language verdict**
+  ("ACE learned from N run(s) using X model call(s) … that is Y% fewer than the evolutionary baseline")
+  with the paper's J-001/J-002 kept only as a parenthetical.
+- **Server-side confirm-before-execute for destructive commands** (`engine.server._confirm_required` +
+  the `/chat` + `/chat/stream` gate + the clients' `--yes` affordance, epic #927 / #935): a destructive op
+  (currently `/project delete`, incl. `--purge`) is no longer run on first ask — the server (the single,
+  uniform authority; danger-tier from the command-spec, never model-graded) replies with a
+  `{needs_confirm: {command, tier, reason}}` instead of executing. Every client (ink + the Python
+  line/rich/TUI REPLs) shows the warning and re-runs with a trailing `--yes` to confirm (stripped +
+  sent as `confirm: true`). Read-only/mutating/costly commands are unaffected (operator-scoped to
+  destructive only); `_dispatch` untouched; fail-soft (a gate hiccup never blocks a normal turn).
+- **Alias / unambiguous-prefix / did-you-mean in the command router — a mistyped `/verb` no longer costs a
+  model turn** (`engine.command_spec.resolve_command` + `engine.commands.classify` + `clients/ink`
+  `classify`, epic #927 / #934): short aliases (`/lg`→`lifecycle gate`, `/cfg`→`config`, …), an unambiguous
+  **non-destructive** prefix (auto-resolved; a destructive/costly verb only *suggests*), and a did-you-mean
+  for a close typo — all **deterministic + zero-cost** (no model), resolving to the exact canonical command
+  re-parsed through the untouched `_dispatch`. A typo becomes a suggestion (`kind='suggest'`, shown by every
+  client, never forwarded) instead of an unknown `/verb` that reached the server and billed a turn; a
+  `/<prompt-name>` still forwards so the server's prompt resolver runs. The alias table + the destructive/
+  costly "unsafe" set are the command-spec's (single source; the ink mirror is parity-guarded).
+- **`/lifecycle gate` resolves a default delivery tree from git HEAD when `--tree` is omitted**
+  (`engine.gx10._git_head_tree`, epic #927 / #933): the worst-offender's un-typable `--tree <sha>` now
+  defaults to the committed HEAD tree (`git rev-parse HEAD^{tree}`) so an operator can run `/lifecycle gate`
+  without copying a sha. **Fail-soft to `""`** — a non-repo / no-git / timeout keeps the existing
+  `BLOCKED: no delivery tree_sha` path, so it never binds a bogus tree; an explicit `--tree` (e.g. the
+  operator's DELIVER-GO tree) always overrides the default, so the automated gate path is unchanged. A
+  single, deliberate, read-only git call — the one scoped exception to the "no git/SHA in core" convention,
+  documented at the version helper.
+- **Spec-derived discovery: `/config keys`, tool params on `/skills`, and a danger-grouped `/help`**
+  (`engine.gx10`, epic #927 / #932): `/config keys` lists the settable dotted config keys (boot-only keys
+  flagged) — closing the "opaque keys, zero discovery" gap; `/skills` now surfaces each tool's parameters
+  (so `/tool <name>` is callable without reading the schema); `/help` appends the commands grouped by
+  danger-tier from the command-spec. Plus a **config-set unknown-root guard**: `/config set` now REFUSES a
+  key whose root section is not in the live config (a typo) instead of silently writing it and reporting a
+  false success — known core sections + existing plugin namespaces (e.g. `mpr.*`) still set. `_dispatch`
+  stays the untouched executor (`config keys` is an additive read-only verb, covered by the parity guard).
+- **`GET /catalogue` serves the command-spec; the terminal client generates its server-command
+  completions from it** (`engine.gx10._catalogue_snapshot` + `clients/ink` `catalogueToCommands`, epic
+  #927 / #931): the catalogue snapshot gains a `commands` block (verb, danger-tier, usage, summary) from
+  the command-spec, and the Ink client generates its server-command autocomplete FROM it — so verbs the
+  static client list missed (lifecycle/fork/ace) now surface. The static `COMMANDS` list is the cold-start
+  fallback for a `token`/`sealed` deployment where the guarded `/catalogue` fetch can fail (discovery + the
+  alias net stay alive). Additive + fail-soft; `_dispatch` untouched.
+- **Command-spec foundation — a hand-authored, parity-guarded description of the command surface**
+  (`engine.command_spec` + `scripts/ci/check_command_spec_parity.py`, epic #927 Phase A / #929/#930/#940):
+  a machine-readable parallel description of every slash-command verb (flags, choices, and a per-command
+  danger-tier: read-only / mutating / destructive / costly, plus the six boot-only config keys). It does
+  NOT drive dispatch — `_dispatch` stays the untouched fail-closed executor — it exists so the upcoming
+  friendly-UX layers (discovery/autocomplete, a server-side guided-input + confirm contract, an
+  alias/did-you-mean net) can be derived from ONE source. A non-vacuous spec↔dispatch parity guard derives
+  the verb set from `_dispatch` source (AST over the branch literals, excluding the dynamic prompt-name +
+  `else` branches), imports the real `_FROZEN_CONFIG_KEYS`, and introspects `ack.generator.build_parser` —
+  failing the build on any drift (the drift that had already dropped lifecycle/fork/ace from both client
+  registries).
+
+### Fixed
+- **Self-hosting bootstrap machinery complete** (epic #994 / #1013): the full set of guards for a safe
+  self-modifying orchestrator is built + tested (S1–S8: the pre/post-publish orchestrator proofs, the
+  ledger schema versioning, drain-before-update, the immutable protected floor, the staged-release
+  guards + local rollback, the plugin backstop, and the staged-flip readiness harness), anchored by an
+  operational runbook + the ADR-0004 Realized mapping + an un-testable-window fallback SOP. Executing
+  the flip + the public delivery stay operator-gated. Private internal machinery — the public tool is
+  unchanged (DEV-1).
+- **Staged-flip readiness harness** (epic #994 / #1011): the pure guards that gate the Claude→ironclad
+  orchestrator flip — `flip.stage_ready_reasons` (fail-closed readiness per Shadow/Canary/Flip stage: a
+  real agent + a clean ledger chain + zero halts + enough units at the MERGE park), `agent_was_real`
+  (the no-fake-agent invariant — a readiness record only counts from a REAL coder), and `select_coder`
+  (pick from the OPUS/SONNET/CODEX/KIMI roster among the env-available, fail-closed on a missing
+  request). Machinery only — the flip is never executed (that runs on real infra, operator-gated).
+  Private dev-loop substrate.
+- **Plugin backstop — consumer fail-closed** (epic #994 / #1009): the internal dev-process contain layer
+  is complete — a plugin health gate that is present + resolvable but RAISES at call time is treated as
+  inactive (`plugin_active` False), so `decide()` refuses and the internal loop never runs against a
+  broken plugin. Complements the absent / import-error / unresolvable / falsy cases (#978/#983). The
+  extension's OWN protected floor (prevent layer) is external + operator-gated. Private dev-loop substrate.
+- **Staged-release guards + local rollback** (epic #994 / #1007): the machinery for a safe self-hosting
+  release — `release_preflight.staging_route_ok` (a release routes through Test-PyPI first, never
+  straight to production) + `main_safe_reasons` (refuse a release while a rollback is pending but main
+  is not reverted, so a bad build is never re-shipped), and `scripts/ci/rollback.py` (the local
+  wheel-cache recovery: pick the newest cached wheel strictly older than the bad one + a
+  `--no-index --force-reinstall` pin, recovering the running instance without touching PyPI). Pure +
+  tested; the actual push/release execution stays operator-gated. Private CI substrate.
+- **Immutable protected floor** (epic #994 / #1005): the self-mod protected class now has a hard-coded,
+  immutable `PROTECTED_FLOOR` (the engine, the guard SSOT, the CI-enforcement scripts, the delivery
+  workflows, the branch-protection SSOT) that is baked into `_PROTECTED` AND re-unioned at the guard
+  boundary, so protection can only GROW — never drop below the floor. A negative test pins
+  `PROTECTED_FLOOR ⊆ _PROTECTED`, so a self-mod that thins it turns the gate red (structural, not just
+  review); the floor also covers its own source. Private dev-loop substrate.
+- **Drain-before-update guard** (epic #994 / #1003): the self-update path now refuses fail-closed while a
+  unit is in-flight — a live driver holding the single-driver lock, or a unit left between BRANCH and the
+  human MERGE (`drain.in_flight_units`/`update_reasons` + `run.py --drain-check`, preflighted by
+  `ironclad-install.ps1`). The running orchestrator quiesces before it replaces itself, so a new engine
+  never resumes half-finished state. Private dev-loop substrate.
+- **Ledger schema versioning** (epic #994 / #1001): every dev-loop ledger record now carries a
+  `schema_version` (`major.minor`) in its hash-protected payload; readers are forward-tolerant within a
+  major (unknown fields ignored, missing defaulted, a higher minor accepted) and **fail-closed** on a
+  newer major (`schema_reasons` → `run_unit` refuses `ledger-schema`), so a self-modification's ledger
+  change can never break resume across versions — a non-additive change requires a migration + a major
+  bump. Private dev-loop substrate.
+- **Post-publish-orchestrator proof** (epic #994 / #999): the `post-publish-smoke` job now runs the same
+  orchestrator-surface proof against the package installed FROM THE INDEX (test-PyPI first, then
+  production) — proving the artifact users actually get ships the dev-process orchestration facade +
+  fail-closes without a driver. With #997 (pre-publish) this proves the surface on exactly what ships,
+  before AND after publish. Counts unchanged — #997's counted test already guards the surface.
+- **Pre-publish-orchestrator proof** (epic #994 / #997): the clean-room `pre-publish-python` job now proves
+  the freshly-installed wheel is orchestrator-capable — it ships the dev-process orchestration verbs
+  (`ack.devprocess.api`: select_unit/stage_handover/record_feedback/advance/deliver over a driver seam)
+  AND fail-closes without a driver (`SubstrateUnavailable`), plus a callable `ack.sdk.gate`. A self-mod
+  that breaks or omits the surface blocks the release; a counted unit test keeps it in lock-step.
+- **Health-gate wiring** (epic #974 / #983): `devtarget.plugin_active` now RESOLVES + CALLS the
+  descriptor's `health_gate` (`module:function`) on top of the entry-point import check, so the internal
+  process arms on the EXTENSION's own activation (the private internal-process extension's
+  `tier3_activation.plugin_active`: present + operator secret + driver-wired), not merely on the package
+  being importable — fail-closed on a falsy / unresolvable / raising gate. A live binding uses
+  `plugin_id="internal"` + that health_gate.
+- **Plugin contract seam** (epic #974 / #983): pinned + tested the `ironclad.plugins` entry-point
+  contract the private internal-process extension must satisfy — `plugin_active` returns True iff the
+  named entry point is present AND loads cleanly (fail-closed). The extension itself + its driver stay
+  out of the public wheel and, with the C2 delivery, are operator-gated.
+- **Dev-process docs + `/status` injection view** (epic #974 / #982): ADR-0011 gains an *internal
+  dev-process injection* amendment (descriptor storage/lifecycle, the validation/health/fail-closed
+  gates, tier-2→tier-3 migration), the stale ADR-0009 body + `tiers.py` comment are corrected (the
+  engine does NOT read `config.dev_process.tier`; the shipped tool is DEV-1; per-project injection is
+  the mechanism), and `/status` now shows whether the active project is an internal dev-process target
+  (its exec_mode / tier / plugin) or runs the normal process.
+- **The injection invariant's negative-test suite** (epic #974 / #981): a consolidated fail-closed
+  suite — the **self-dogfood isolation test** (on ONE project bound as an internal target, BOTH the
+  internal driver AND the normal in-engine pipeline refuse — never both) plus the full descriptor ×
+  plugin decision matrix. The individual fail-closed paths stay pinned where they live (#978/#979/#980).
+- **Ledger integrity across modes** (epic #974 / #980): every dev-loop transition is stamped with its
+  `project_id` + `exec_mode`, and the driver refuses to start (fail-closed `ledger-fork`) if the ledger
+  carries records for a different project or exec_mode — so a stale / wrong-ledger read (the
+  `is_base_project` error-fallback fork the C0 review flagged) can never drive a unit twice on resume.
+  Legacy pre-#980 (unstamped) records are tolerated. Private substrate; the engine still reads the ledger
+  as plain data.
+- **Mutual exclusion — the normal process is off on an internal target** (epic #974 / #979): a project
+  bound as an INTERNAL dev-process target refuses the normal in-engine task pipeline
+  (`_internal_target_blocks_normal` at stage_handover / advance / TaskStore — the internal driver drives
+  it instead); `/switch` runs under a repo-global lock so concurrent switches serialize (at most one
+  active mode); and the `/fork` + dev-scan exactly-once records are scoped per-project `mem_ns` (fixing
+  the cross-project fork-proposal bleed the C0 review flagged). The engine reads the marker as plain
+  data — it never imports the private dev-loop machinery.
+- **Fail-closed injection gate** (epic #974 / #978, the core invariant): the internal dev-loop driver
+  REFUSES to start on a project whose injection descriptor REQUIRES the extension when the plugin is
+  not active — it never silently degrades tier-3 to the normal process on an internal target. A stdlib
+  `plugin_active` health probe (is the `ironclad.plugins` entry-point present + does it load?),
+  `spec.injection_refused` + a rewired `entry_plan` (a `refused`/`blocked` outcome instead of a silent
+  degrade), `devtarget.decide`, and the `run_unit` pre-check wired INSIDE the single-driver lock (before
+  `Driver.run`). Private substrate (not in the wheel); a negative test pins tier-3 + inactive plugin ⇒
+  REFUSE.
+- **Per-project injection descriptor** (epic #974 / #977): a project can be bound as an INTERNAL
+  dev-process target via a runtime side-file (`<devloop_home>/dev-target.json`), SEPARATE from the
+  delivery target table. The engine reads it as plain data (`_dev_target_descriptor` — never importing
+  the private `scripts/devloop`) and the `/lifecycle` gate fail-closed-reconciles it against the project
+  registry; the pure schema/validators (`devprocess.spec.validate_injection`/`injection_drift`) + the
+  atomic registry-locked bind + reconcile CLI (`scripts/devloop/devtarget.py register|reconcile`) are
+  the private substrate (not in the wheel). Foundation for the fail-closed mutual-exclusion gate (#978).
+- **MPR is an embedded dev-process function, not a project type** (#984): `mpr` is removed from the
+  initiative types — there is one type, `software`, which now also seeds a `runs/` home for the embedded
+  MPR architecture-decision panel. The `--type` flag is dropped from `/project new` + `/initiative new`
+  (a legacy `--type` is tolerated + ignored); the old reasoning-only task-pipeline gate is gone. The
+  embedded MPR (the `ace.fork_mpr` architecture-decision panel + `/fork` + `run_mpr`) is unchanged, and
+  `Initiative.from_meta` degrades a legacy `type: mpr` to `software` (fail-soft).
+- **The orchestrator is told the real command surface** (epic #927 / #967): the engine now injects a
+  spec-derived command digest — the canonical verbs + their summaries, the deprecated ones to avoid, and
+  the destructive/costly ones to confirm — into the orchestrator's system context, derived from
+  `command_spec` so it can't drift from the real dispatch. Fixes the class of bug the operator hit (the
+  model recommended the deprecated `/initiative` and denied `/project` existed). Fail-soft + additive:
+  the system-prompt file is untouched, and an empty spec injects nothing.
+- **A fail-closed english-only-export guard + the last doc translations** (epic #927 / #971, part 3): the
+  last German doc snippets (`state-and-initiative.md`, `SETUP.md`) are English, and
+  `scripts/ci/check_english_only_export.py` now fails the build if German (umlauts or ≥2 German
+  stopwords) appears in the exported `core/` + `clients/ink` + `skills/mpr` — with a documented allowlist
+  for the deliberate multilingual features (intent keywords, umlaut-folding, the `messages.py`/MPR
+  `locales` de-overlays, the German eval corpus fixtures, the frozen INDEX marker, tests). Wired into
+  ci.yml + node-client.yml. So the whole English-only-export sweep (#966/#969/#971) can never regress.
+- **The MPR skill is English** (epic #927 / #969, English-only-export part 2): the flagship MPR example
+  shipped German — panel role labels (rendered to users), the tool description, module docstrings, the
+  README (which also wrongly claimed MPR was "private / never exported" — it is a public core built-in),
+  the eval README/harness/rubric, and `gate.toml` comments — all translated to English. The deliberate
+  multilingual features stay: the German intent keywords + umlaut regexes (German-input handling), the
+  de-overlay label maps, the `_STOP` set, and the German eval corpus (sets/refs/recordings) as fixtures;
+  `check_coverage` now also matches an axis by its English name so English role labels cover their axis.
+- **The exported orchestrator system prompt + engine/client user-facing strings are English** (epic
+  #927 / #966, pre-release English-only-export pass, part 1): the entire orchestrator system prompt was
+  German and shipped byte-identically to the public export; it is now translated to English (the German
+  rendering is preserved as a private, non-exported `deploy/prompts/` override, selected via `GX10_PROMPT`).
+  The hardcoded German TUI/CLI/ink strings (input hints, copy/cancel messages, the `/update` log, the
+  command-menu hint, the auto-INDEX marker) are translated too. Deliberate multilingual features (the
+  German intent keywords, umlaut-folding, the `messages.py` `de` overlay) are unchanged.
+- **Guidance teaches the primary `/project`, not the deprecated `/initiative` alias** (epic #927 / #964,
+  pre-release): the orchestrator **system prompt**, the client + server `/help`, the fail-closed
+  `no active project` messages (EN + DE), and the docs all led with `/initiative new …` — the deprecated
+  alias — so the orchestrator told an operator to run `/initiative new TEST --type software` and asserted
+  "/project does not exist". They now lead with `/project new <name> --type …` (the guided setup command);
+  `/initiative` is shown only as "(deprecated alias, kept one release)". A regression test asserts the
+  prompt + `HELP_TEXT` + `init.no_active` recommend `/project`, not `/initiative`.
+- **The confirm-before-execute and structured guided-input gates now fire on the real client wire form**
+  (epic #927 / #962, pre-release): `engine.server._confirm_required` (#935) and `_guide_required` (#954)
+  had required a leading `/`, but every client strips it in `classify()` before POSTing (the payload matches
+  what `engine.gx10._dispatch` consumes). So the server saw `project delete <id>` / `config set ?` with no
+  slash, both gates returned `None`, and the command executed — a **destructive-confirm bypass** and a dead
+  `needs_guide` contract through every client (the unit tests passed because they called the gate with a
+  `/`-prefixed literal). The gates now tolerate an optional leading `/` and fire on the slash-stripped form;
+  a regression test ties `commands.classify(...)`'s payload to the gate so it cannot recur.
+
 ## [0.0.22] - 2026-07-01
 
 ### Added

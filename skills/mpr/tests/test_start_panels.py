@@ -67,8 +67,8 @@ def test_competitive_roles_are_offloadable():
 def test_risk_technical_role_is_local_only_override():
     panel = _registry().resolve("risk-assessment")  # mixed → default offloadable
     by_role = {r.role: resolve_policy(panel, r) for r in panel.roles}
-    assert by_role["Technisch"] == ProviderPolicy.LOCAL_ONLY      # per-role override
-    assert by_role["Operativ"] == ProviderPolicy.OFFLOADABLE      # inherits mixed default
+    assert by_role["Technical"] == ProviderPolicy.LOCAL_ONLY      # per-role override
+    assert by_role["Operational"] == ProviderPolicy.OFFLOADABLE   # inherits mixed default
     # the override genuinely matters: not all roles are local-only here.
     assert ProviderPolicy.OFFLOADABLE in by_role.values()
 

@@ -150,7 +150,7 @@ def test_new_initiative_seeds_index(tmp_path):
 
 def test_index_seed_h1_uses_title_not_slug(tmp_path):
     # #11: the seeded INDEX H1 must use the title (consistent with meta.md/wikilink), not the slug
-    gx10.initiative_new("Mein Projekt", "mpr")
+    gx10.initiative_new("Mein Projekt", "software")
     idx = (tmp_path / "vault" / "mein-projekt" / "INDEX.md").read_text(encoding="utf-8")
     assert idx.splitlines()[0] == "# Mein Projekt — INDEX"
 

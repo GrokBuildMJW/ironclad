@@ -36,7 +36,6 @@ def test_messages_keys_present_en_and_de():
         "init.needs_name",
         "init.unknown_slug",
         "init.meta_body",
-        "mpr.blocks_tasks",
     ):
         en = messages.msg(key, lang="en")
         de = messages.msg(key, lang="de")
@@ -47,7 +46,7 @@ def test_messages_keys_present_en_and_de():
 def test_reconcile_english_by_default(monkeypatch, tmp_path):
     monkeypatch.setattr(gx10, "LANGUAGE", "en", raising=False)
     with pc.use(ProjectContext("p", str(tmp_path), "ns")):
-        v = gx10.initiative_new("Demo", "mpr")
+        v = gx10.initiative_new("Demo", "software")
         out = gx10.reconcile_vault(v.slug, links=False)
         assert "indexed" in out and "index only" in out
         idx = (v.path / "INDEX.md").read_text(encoding="utf-8")
@@ -56,7 +55,7 @@ def test_reconcile_english_by_default(monkeypatch, tmp_path):
 
 def test_reconcile_german_when_language_de(lang_de, tmp_path):
     with pc.use(ProjectContext("p", str(tmp_path), "ns")):
-        v = gx10.initiative_new("Demo", "mpr")
+        v = gx10.initiative_new("Demo", "software")
         out = gx10.reconcile_vault(v.slug, links=False)
         assert "indiziert" in out
         idx = (v.path / "INDEX.md").read_text(encoding="utf-8")
@@ -65,7 +64,7 @@ def test_reconcile_german_when_language_de(lang_de, tmp_path):
 
 def test_html_markers_frozen_regardless_of_language(lang_de, tmp_path):
     with pc.use(ProjectContext("p", str(tmp_path), "ns")):
-        v = gx10.initiative_new("Demo", "mpr")
+        v = gx10.initiative_new("Demo", "software")
         gx10.reconcile_vault(v.slug, links=True)
         idx = (v.path / "INDEX.md").read_text(encoding="utf-8")
         assert "ironclad:index:auto" in idx                       # machine marker never localized
@@ -79,7 +78,7 @@ def test_initiative_error_english_by_default(monkeypatch, tmp_path):
     import pytest as _pt
 
     with _pt.raises(ValueError) as ei:
-        gx10.initiative_new("", "mpr")
+        gx10.initiative_new("", "software")
     assert "needs a name" in str(ei.value)
 
 
@@ -88,7 +87,7 @@ def test_initiative_error_german_when_de(lang_de, monkeypatch, tmp_path):
     import pytest as _pt
 
     with _pt.raises(ValueError) as ei:
-        gx10.initiative_new("", "mpr")
+        gx10.initiative_new("", "software")
     assert "braucht einen Namen" in str(ei.value)
 
 

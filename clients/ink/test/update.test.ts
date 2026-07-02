@@ -23,7 +23,7 @@ test('runUpdate — runs every step in order, reports ok + restart note', async 
   assert.equal(ok, true);
   assert.equal(seen.length, 3, 'git pull + build + install all ran');
   assert.match(seen[0]!, /git .* pull/);
-  assert.ok(log.some((l) => /starte ironclad neu/.test(l)), 'asks for a restart');
+  assert.ok(log.some((l) => /restart ironclad/.test(l)), 'asks for a restart');
 });
 
 test('runUpdate — stops at the first failure (no later steps), ok=false', async () => {
@@ -35,7 +35,7 @@ test('runUpdate — stops at the first failure (no later steps), ok=false', asyn
   const {ok, log} = await runUpdate('/repo', false, exec);
   assert.equal(ok, false);
   assert.equal(seen.length, 1, 'build failed → install never ran');
-  assert.ok(log.some((l) => /FEHLGESCHLAGEN/.test(l)));
+  assert.ok(log.some((l) => /FAILED/.test(l)));
   assert.ok(log.some((l) => /tsc error/.test(l)), 'surfaces the failing output');
-  assert.ok(!log.some((l) => /starte ironclad neu/.test(l)), 'no restart note on failure');
+  assert.ok(!log.some((l) => /restart ironclad/.test(l)), 'no restart note on failure');
 });

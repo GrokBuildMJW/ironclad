@@ -47,10 +47,10 @@ export async function runUpdate(
   const log: string[] = [];
   for (const step of updatePlan(srcDir, pull)) {
     const {code, out} = await exec(step.command);
-    log.push(`• ${step.label}: ${code === 0 ? 'ok' : `FEHLGESCHLAGEN (exit ${code})`}`);
+    log.push(`• ${step.label}: ${code === 0 ? 'ok' : `FAILED (exit ${code})`}`);
     if (out) log.push(out);
     if (code !== 0) return {ok: false, log};
   }
-  log.push('✓ aktualisiert — starte ironclad neu, damit die neue Version greift.');
+  log.push('✓ updated — restart ironclad so the new version takes effect.');
   return {ok: true, log};
 }

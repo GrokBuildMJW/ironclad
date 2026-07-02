@@ -661,20 +661,17 @@ def _mcp_spec():
         mcp_template='--mcp-config \'{"x":"{mcp_cmd}","y":"{mcp_script}"}\'')
 
 
-def test_mcp_for_launch_is_sealed_gated(monkeypatch):
+def test_mcp_for_launch_is_always_on_when_memory_configured(monkeypatch):
+    # #994-S10: the read-only Memory MCP is ALWAYS ON when memory + a per-CLI template — the profile no
+    # longer gates it (a coder can only READ memory, never write).
     spec = _mcp_spec()
     monkeypatch.setattr(gx10, "_MEMORY_CONFIG", {"base_url": "http://mem:8800", "agent_id": "ironclad"}, raising=False)
-    # open profile (default) → NO mcp, byte-identical launch
-    monkeypatch.setattr(gx10, "_EFFECTIVE_CFG", {"security": {"profile": "open"}}, raising=False)
     monkeypatch.delenv("GX10_PROFILE", raising=False)
-    assert gx10._is_sealed_profile() is False
-    assert gx10._mcp_for_launch(spec) == ("", {})
-    # sealed profile + memory + mcp_template → mcp args + the secret-free connection env
-    monkeypatch.setattr(gx10, "_EFFECTIVE_CFG", {"security": {"profile": "sealed"}}, raising=False)
-    assert gx10._is_sealed_profile() is True
-    args, env = gx10._mcp_for_launch(spec)
-    assert "--mcp-config" in args and env["GX10_MEMORY_URL"] == "http://mem:8800"
-    assert env["GX10_MCP_MEMORY_NS"] == "ironclad"                # project namespace, not the code-agent id
+    for profile in ("open", "sealed"):     # open (default) AND sealed both wire the memory MCP now
+        monkeypatch.setattr(gx10, "_EFFECTIVE_CFG", {"security": {"profile": profile}}, raising=False)
+        args, env = gx10._mcp_for_launch(spec)
+        assert "--mcp-config" in args and env["GX10_MEMORY_URL"] == "http://mem:8800"
+        assert env["GX10_MCP_MEMORY_NS"] == "ironclad"            # project namespace, not the code-agent id
 
 
 def test_mcp_for_launch_off_without_memory(monkeypatch):
@@ -694,3 +691,77 @@ def test_pending_handover_carries_mcp_fields(tmp_path, monkeypatch):
     monkeypatch.setattr(gx10, "_EFFECTIVE_CFG", gx10._code_defaults(), raising=False)  # open profile default
     item = server._pending_handovers()[0]
     assert "mcp" in item and item["mcp"] == "" and item["mcp_env"] == {}   # present + empty under open
+
+
+# ── #935: server-side confirm-before-execute gate (destructive only) ─────────────────────────────────
+def test_confirm_required_gates_only_destructive_project_delete():
+    assert server._confirm_required("/project delete demo")["command"] == "project delete"
+    assert server._confirm_required("/project delete demo --purge")["tier"] == "destructive"
+    assert server._confirm_required("/pj delete demo")["command"] == "project delete"   # alias resolves first
+    assert server._confirm_required("/project list") is None       # a safe project op → no confirm
+    assert server._confirm_required("/project new x") is None       # non-destructive project sub
+    assert server._confirm_required("/config set x on") is None     # mutating, not destructive
+    assert server._confirm_required("/autoplan on") is None         # costly, not destructive (operator scope)
+    assert server._confirm_required("hello there") is None          # not a command → no gate
+
+
+# ── #954: server-side structured guided-input contract (explicit ?/--guide only) ─────────────────────
+def test_guide_required_explicit_trigger_returns_structured_fields():
+    g = server._guide_required("/config set ?")
+    assert g and g["command"] == "config set" and g["canonical_echo"] == "/config set" and "usage" in g
+    names = {f["name"] for f in g["fields"]}
+    assert "<dotted.key>" in names and any(f["required"] for f in g["fields"])
+    lg = server._guide_required("/lifecycle gate --guide")   # --guide flag → structured guidance
+    assert lg and lg["command"] == "lifecycle" and "gate" in lg["subcommands"]
+    pj = server._guide_required("/project ?")                 # family verb → subcommands + rich usage
+    assert pj and "delete" in pj["subcommands"] and "new <name>" in pj["usage"]
+    assert any(f["choices"] for f in server._guide_required("/generate ?")["fields"])  # enum flag → choices
+
+
+def test_guide_required_no_trigger_is_none():
+    assert server._guide_required("/config set mpr.enabled on") is None   # partial command → dispatch, not guide
+    assert server._guide_required("/status") is None                       # bare, no explicit trigger
+    assert server._guide_required("hello there") is None                   # not a command
+    assert server._guide_required("/nonesuch ?") is None                   # unknown verb
+
+
+def test_render_guide_emits_fields_choices_and_defaults():
+    # #955: the shared Python-client renderer for the needs_guide contract (client chrome is English)
+    import client
+    lines: list = []
+    g = {"command": "config set", "subcommands": ["a", "b"], "usage": "usage: /config set <k> <v>",
+         "fields": [{"name": "<dotted.key>", "required": True, "choices": [], "default": "", "type": "value"},
+                    {"name": "--type", "required": False, "choices": ["mpr", "software"], "default": "sw", "type": "enum"}],
+         "canonical_echo": "/config set"}
+    client.render_guide(g, lines.append)
+    blob = "\n".join(lines)
+    assert "guided input for /config set" in blob and "usage: /config set <k> <v>" in blob
+    assert "subcommands: a | b" in blob
+    assert "<dotted.key>  (required)" in blob
+    assert "choices: mpr|software" in blob and "default: sw" in blob
+
+
+def test_confirm_message_is_single_language_full_line():
+    # #956: the confirm reason is now the whole user-facing line (reason + how-to-confirm), so a client
+    # prints it verbatim with no English wrapper mixing into a localized reason.
+    r = server._confirm_required("/project delete demo")["reason"]
+    assert "--yes" in r and "nothing changed" in r.lower()
+
+
+# ── #962 regression: the confirm + guide gates must fire on the CLIENT WIRE FORM (slash-stripped) ────
+def test_confirm_and_guide_fire_on_the_client_wire_form():
+    # The bug: clients POST the slash-STRIPPED body (what _dispatch consumes), but the gates REQUIRED a
+    # leading '/', so both contracts were dead through every client. This ties classify() (the real wire
+    # payload) to the gate so it cannot silently regress.
+    import commands   # sibling engine module (server import put engine/ on sys.path)
+    _, _, payload = commands.classify("/project delete demo")
+    assert payload == "project delete demo"                              # slash-stripped on the wire
+    assert server._confirm_required(payload) is not None                 # confirm FIRES (was None = the bug)
+    assert server._confirm_required("/project delete demo") is not None  # slashed form still works (tolerant)
+    _, _, gp = commands.classify("/config set ?")
+    assert gp == "config set ?" and server._guide_required(gp) is not None
+    assert server._guide_required("/lifecycle gate --guide")["command"] == "lifecycle"
+    # safe/turn forms still pass through untouched
+    assert server._confirm_required(commands.classify("/project list")[2]) is None
+    assert server._guide_required(commands.classify("/config set x on")[2]) is None
+    assert server._confirm_required("hello there") is None

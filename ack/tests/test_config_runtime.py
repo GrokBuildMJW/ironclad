@@ -75,8 +75,9 @@ def test_dispatch_config_set_mutates_and_reapplies(monkeypatch, captured):
 
 
 def test_dispatch_config_set_stores_even_when_apply_raises(monkeypatch, captured):
-    # A plugin/non-core key: _apply_config may raise — the dict write must still stand.
-    monkeypatch.setattr(gx10, "_EFFECTIVE_CFG", {})
+    # A plugin/non-core LEAF under a live root: _apply_config may raise — the dict write must still stand
+    # (#932 gap-2: the root 'mpr' exists, so it is a known namespace, not a rejected unknown-root typo).
+    monkeypatch.setattr(gx10, "_EFFECTIVE_CFG", {"mpr": {}})
     def _boom(cfg):
         raise KeyError("connection")
     monkeypatch.setattr(gx10, "_apply_config", _boom)
@@ -94,6 +95,46 @@ def test_dispatch_config_set_usage(monkeypatch, captured):
     monkeypatch.setattr(gx10, "_EFFECTIVE_CFG", {})
     gx10._dispatch(types.SimpleNamespace(), "config set mpr.enabled")   # missing value
     assert any("usage:" in s for s in captured)
+
+
+# ── #932: discovery (/config keys), the unknown-root guard (gap-2), tiers + tool params ───────────────
+def test_cfg_flatten_keys():
+    assert set(gx10._cfg_flatten_keys({"a": {"b": 1, "c": {"d": 2}}, "e": 3})) == {"a.b", "a.c.d", "e"}
+
+
+def test_dispatch_config_keys_lists_keys_with_boot_only_flag(monkeypatch, captured):
+    monkeypatch.setattr(gx10, "_EFFECTIVE_CFG",
+                        {"context": {"rag_enabled": True}, "security": {"profile": "open"}})
+    gx10._dispatch(types.SimpleNamespace(), "config keys")
+    blob = "\n".join(captured)
+    assert "context.rag_enabled" in blob
+    assert "security.profile" in blob and "boot-only" in blob      # a frozen key is flagged
+    assert "= True" in blob and "(bool)" in blob                   # #956: current value + inferred type
+
+
+def test_dispatch_config_set_rejects_unknown_root(monkeypatch, captured):
+    # #932 gap-2: a typo'd root section is refused — no silent write, no false-GREEN.
+    monkeypatch.setattr(gx10, "_EFFECTIVE_CFG", {"context": {"rag_enabled": True}})
+    gx10._dispatch(types.SimpleNamespace(), "config set contextt.rag_enabled on")   # typo root
+    assert "contextt" not in gx10._EFFECTIVE_CFG                    # nothing written
+    assert any("unknown key" in s for s in captured)               # explicit refusal, not GREEN 'set'
+    assert not any("set contextt" in s for s in captured)
+
+
+def test_render_command_tiers_groups_by_danger():
+    out = gx10._render_command_tiers()
+    assert "read-only" in out and "destructive" in out
+    assert "project" in out and "help" in out                      # destructive vs read-only, from the spec
+
+
+def test_catalogue_snapshot_tool_params(monkeypatch):
+    # #932: /skills surfaces a tool's parameters (so /tool <name> is callable without reading the schema).
+    schema = {"function": {"name": "demo_tool", "description": "d",
+                           "parameters": {"required": ["query"], "properties": {"query": {}, "n": {}}}}}
+    monkeypatch.setattr(gx10, "_PLUGIN_TOOLS", {"demo_tool": {"schema": schema}})
+    snap = gx10._catalogue_snapshot()
+    tool = next(s for s in snap["skills"] if s["name"] == "demo_tool")
+    assert tool["params"] == ["query"]
 
 
 def test_dispatch_config_get(monkeypatch, captured):
@@ -142,3 +183,26 @@ def test_security_profile_is_frozen(monkeypatch, captured):
     gx10._dispatch(types.SimpleNamespace(), "config set security.profile sealed")
     assert any("boot-only" in s for s in captured)
     assert gx10._EFFECTIVE_CFG["security"]["profile"] == "open"   # unchanged
+
+
+# ── #956: engine i18n of the remaining command-ergonomics chrome + single-language confirm ────────────
+def test_config_keys_and_tiers_localize_via_msg(monkeypatch, captured):
+    # the new engine outputs route through _msg → a DE overlay renders (EN is the source/default)
+    monkeypatch.setattr(gx10, "LANGUAGE", "de", raising=False)
+    monkeypatch.setattr(gx10, "_EFFECTIVE_CFG", {"context": {"rag_enabled": True}})
+    gx10._dispatch(types.SimpleNamespace(), "config keys")
+    assert any("Config-Keys" in s for s in captured)                # German header
+    captured.clear()
+    tiers = gx10._render_command_tiers()
+    assert "Gefahren-Stufe" in tiers and "destruktiv" in tiers       # German tier header + label
+    captured.clear()
+    gx10._dispatch(types.SimpleNamespace(), "config set nope.leaf on")
+    assert any("unbekannter Key" in s for s in captured)             # German unknown-root refusal
+
+
+def test_engine_i18n_keys_present_in_both_langs():
+    import importlib
+    m = importlib.import_module("messages")
+    for k in ("keys.header", "keys.boot_only", "tiers.header", "tiers.read_only", "tiers.mutating",
+              "tiers.costly", "tiers.destructive", "config.unknown_key", "skills.params"):
+        assert k in m._MESSAGES["en"] and k in m._MESSAGES["de"], f"missing {k}"

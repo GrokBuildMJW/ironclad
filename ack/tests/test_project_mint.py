@@ -22,26 +22,30 @@ import gx10                     # noqa: E402
 # ---------------------------------------------------------------------------
 
 def test_parse_name_only():
+    # #984: one type (software); the parser always reports it.
     name, typ, path, err = gx10._parse_project_new("myproj")
-    assert (name, typ, path, err) == ("myproj", None, None, None)
+    assert (name, typ, path, err) == ("myproj", "software", None, None)
 
 
-def test_parse_type_lowercased():
+def test_parse_type_is_ignored():
+    # #984: --type is dropped — any value (incl. a legacy 'mpr' or a bogus one) is tolerated + ignored,
+    # never validated; the project is always software.
     assert gx10._parse_project_new("myproj --type software")[:3] == ("myproj", "software", None)
-    assert gx10._parse_project_new("myproj --type MPR")[:3] == ("myproj", "mpr", None)
+    assert gx10._parse_project_new("myproj --type MPR")[:3] == ("myproj", "software", None)
+    assert gx10._parse_project_new("myproj --type nope")[:3] == ("myproj", "software", None)
 
 
 def test_parse_quoted_path_with_space():
     name, typ, path, err = gx10._parse_project_new('foo --type mpr --path "/a/b c"')
-    assert (name, typ, path, err) == ("foo", "mpr", "/a/b c", None)
+    assert (name, typ, path, err) == ("foo", "software", "/a/b c", None)
 
 
 def test_parse_path_simple():
-    assert gx10._parse_project_new("foo --path /x/y")[:3] == ("foo", None, "/x/y")
+    assert gx10._parse_project_new("foo --path /x/y")[:3] == ("foo", "software", "/x/y")
 
 
 def test_parse_multiword_name():
-    assert gx10._parse_project_new("my cool project")[:3] == ("my cool project", None, None)
+    assert gx10._parse_project_new("my cool project")[:3] == ("my cool project", "software", None)
 
 
 def test_parse_empty_is_usage():
@@ -49,17 +53,14 @@ def test_parse_empty_is_usage():
     assert name is None and err is not None and err.lower().startswith("usage")
 
 
-def test_parse_unknown_type_error():
-    name, typ, path, err = gx10._parse_project_new("foo --type nope")
-    assert name is None and err is not None and "unknown --type" in err
-
-
-def test_parse_bare_flag_rejected():
-    # a flag with no value must fail closed (not survive in the name and mint a bogus 'foo-type' project)
-    for bad in ("foo --type", "foo --type=", "foo --path", "foo --path="):
+def test_parse_bare_path_flag_rejected():
+    # a bare --path (no value) must fail closed; a bare/legacy --type is tolerated + ignored (#984).
+    for bad in ("foo --path", "foo --path="):
         name, typ, path, err = gx10._parse_project_new(bad)
-        assert name is None and err is not None, bad
-        assert "needs a value" in err, bad
+        assert name is None and err is not None and "needs a value" in err, bad
+    for ok in ("foo --type", "foo --type=", "foo --type mpr"):
+        name, typ, path, err = gx10._parse_project_new(ok)
+        assert (name, typ, err) == ("foo", "software", None), ok
 
 
 # ---------------------------------------------------------------------------
@@ -131,10 +132,11 @@ def test_mint_creates_registry_project_at_cwd_slug(mint_env):
     assert "now on alpha" in out          # activation went through the real switch
 
 
-def test_mint_with_type_seeds_unit(mint_env):
+def test_mint_seeds_software_unit(mint_env):
+    # #984: /project new always seeds a software unit (no --type needed).
     wd = mint_env
-    out = gx10._project_command("new beta --type software", FakeGx())
-    assert "seeded" in out
+    out = gx10._project_command("new beta", FakeGx())
+    assert "seeded software" in out
     assert list((wd / "beta").rglob("meta.md"))   # the seeded vault unit under the new project root
 
 
@@ -160,10 +162,11 @@ def test_mint_duplicate_failclosed(mint_env):
     assert sum(1 for p in gx10._REGISTRY.list() if p.id == "dup") == 1
 
 
-def test_mint_unknown_type_registers_nothing(mint_env):
+def test_mint_ignores_legacy_type(mint_env):
+    # #984: a legacy/bogus --type is tolerated + ignored — the project is created as software.
     out = gx10._project_command("new eps --type bogus", FakeGx())
-    assert "unknown --type" in out
-    assert not any(p.id == "eps" for p in gx10._REGISTRY.list())
+    assert "created" in out and "seeded software" in out
+    assert any(p.id == "eps" for p in gx10._REGISTRY.list())
 
 
 def test_mint_bad_name_rejected(mint_env):

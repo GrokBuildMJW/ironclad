@@ -61,3 +61,43 @@ test('req() throws HttpError (with the status) on a non-2xx response', async () 
     globalThis.fetch = realFetch;
   }
 });
+
+test('#935 chatStream detects a destructive needs_confirm reply + strips --yes → confirm', async () => {
+  const realFetch = globalThis.fetch;
+  let sentBody: {message?: string; confirm?: boolean} = {};
+  globalThis.fetch = (async (_url: string, opts: {body?: string}) => {
+    sentBody = JSON.parse(opts.body ?? '{}');
+    return new Response(
+      JSON.stringify({ok: true, needs_confirm: {command: 'project delete', tier: 'destructive', reason: 'irreversible'}}),
+      {status: 200, headers: {'content-type': 'application/json'}},
+    );
+  }) as unknown as typeof fetch;
+  try {
+    const srv = new Server('http://h:8100');
+    const res = await chatStream(srv, '/project delete demo', {onText: () => {}});
+    assert.equal(res?.needs_confirm?.command, 'project delete');   // detected the JSON confirm reply (not a stream)
+    assert.equal(sentBody.confirm, false);                          // no --yes → confirm=false
+    await chatStream(srv, '/project delete demo --yes', {onText: () => {}});
+    assert.equal(sentBody.confirm, true);                           // --yes → confirm=true
+    assert.equal(sentBody.message, '/project delete demo');         // --yes stripped from the message
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
+test('#955 chatStream returns a needs_guide reply for an explicit ?/--guide', async () => {
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = (async () => new Response(
+    JSON.stringify({ok: true, needs_guide: {command: 'config set', subcommands: [],
+      fields: [{name: '<dotted.key>', required: true, choices: [], default: '', type: 'value'}],
+      usage: 'usage: /config set <dotted.key> <value>', canonical_echo: '/config set'}}),
+    {status: 200, headers: {'content-type': 'application/json'}})) as unknown as typeof fetch;
+  try {
+    const srv = new Server('http://h:8100');
+    const res = await chatStream(srv, '/config set ?', {onText: () => {}});
+    assert.equal(res?.needs_guide?.command, 'config set');
+    assert.equal(res?.needs_guide?.fields[0]?.name, '<dotted.key>');
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});

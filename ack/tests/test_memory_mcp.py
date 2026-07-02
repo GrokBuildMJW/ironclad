@@ -2,8 +2,8 @@
 
 Covers the dependency-free stdio MCP server (`engine/memory_mcp.py`): the JSON-RPC protocol
 (initialize / tools/list / tools/call / notifications), the read-only tool set (search + deep_query, NO
-write), fail-soft behaviour, the serve() loop framing, and the GATED launch renderer `render_mcp_launch`
-(sealed profile + memory + per-CLI mcp_template, secret-free env, forward-slash path).
+write), fail-soft behaviour, the serve() loop framing, and the always-on launch renderer `render_mcp_launch`
+(#994-S10: read-only Memory MCP when memory + per-CLI mcp_template, any profile; secret-free env, forward-slash path).
 """
 from __future__ import annotations
 
@@ -109,16 +109,17 @@ def test_serve_loop_skips_garbage_and_replies_per_line():
 _TMPL = '--mcp-config \'{"mcpServers":{"memory":{"command":"{mcp_cmd}","args":["{mcp_script}"]}}}\''
 
 
-def test_render_mcp_launch_is_sealed_gated():
-    # ON only when sealed + memory + a per-CLI template
-    args, env = memory_mcp.render_mcp_launch(_TMPL, sealed=True, memory_url="http://mem:8800",
-                                             namespace="ironclad", py="python", path="C:/x/memory_mcp.py")
-    assert '"command":"python"' in args and '"args":["C:/x/memory_mcp.py"]' in args   # forward-slash path → valid JSON
-    assert env == {"GX10_MEMORY_URL": "http://mem:8800", "GX10_MCP_MEMORY_NS": "ironclad"}
-    # OFF in every other case → byte-identical launch (no args, no env)
-    assert memory_mcp.render_mcp_launch(_TMPL, sealed=False, memory_url="http://mem:8800", namespace="ns") == ("", {})
-    assert memory_mcp.render_mcp_launch(_TMPL, sealed=True, memory_url="", namespace="ns") == ("", {})
-    assert memory_mcp.render_mcp_launch(None, sealed=True, memory_url="http://mem:8800", namespace="ns") == ("", {})
+def test_render_mcp_launch_is_always_on_when_configured():
+    # #994-S10: the read-only Memory MCP is ALWAYS ON when memory + a per-CLI template — no longer
+    # sealed-gated (the profile no longer matters; a coder can only READ memory, never write).
+    for sealed in (False, True):
+        args, env = memory_mcp.render_mcp_launch(_TMPL, sealed=sealed, memory_url="http://mem:8800",
+                                                 namespace="ironclad", py="python", path="C:/x/memory_mcp.py")
+        assert '"command":"python"' in args and '"args":["C:/x/memory_mcp.py"]' in args   # forward-slash → valid JSON
+        assert env == {"GX10_MEMORY_URL": "http://mem:8800", "GX10_MCP_MEMORY_NS": "ironclad"}
+    # OFF only when memory is unconfigured OR the agent has no template → byte-identical launch (no args/env)
+    assert memory_mcp.render_mcp_launch(_TMPL, memory_url="", namespace="ns") == ("", {})
+    assert memory_mcp.render_mcp_launch(None, memory_url="http://mem:8800", namespace="ns") == ("", {})
 
 
 def test_render_mcp_launch_normalizes_windows_path():

@@ -26,7 +26,7 @@ from pydantic import BaseModel, Field, field_validator
 
 # #449 (review B): the agent_id is a filename token matched by the ASCII-only regexes
 # _HO_AGENT_RE/_FB_RE (r"_([A-Za-z]+)…"). Validate against the SAME ASCII class — `str.isalpha()`
-# would accept non-ASCII letters (e.g. "ÄGENT") that pass here but can never round-trip a filename.
+# would accept non-ASCII letters (e.g. "ÉGENT") that pass here but can never round-trip a filename.
 _AGENT_ID_RE = re.compile(r"[A-Za-z]+")
 
 
@@ -102,7 +102,7 @@ class ProviderSpec(BaseModel):
     def _agent_token(cls, v: Optional[str]) -> Optional[str]:
         # #449/§C0R-1: the agent_id is the handover/feedback FILENAME token — must be ASCII LETTERS ONLY
         # so it round-trips _HO_AGENT_RE (r"_([A-Za-z]+)\.md$") and _FB_RE; no underscores/hyphens/digits/
-        # non-ASCII (review B: `str.isalpha()` accepts e.g. "ÄGENT", which then strands the handover).
+        # non-ASCII (review B: `str.isalpha()` accepts e.g. "ÉGENT", which then strands the handover).
         if v is not None and not _AGENT_ID_RE.fullmatch(v):
             raise ValueError(f"agent_id must be ASCII letters only (filename-safe token): {v!r}")
         return v

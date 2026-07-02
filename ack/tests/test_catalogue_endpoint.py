@@ -57,7 +57,7 @@ def test_catalogue_route_open_returns_loaded_registry():
             snap = json.loads(r.read().decode())
     finally:
         httpd.shutdown()
-    assert set(snap) == {"prompts", "skills"}
+    assert set(snap) == {"prompts", "skills", "commands"}   # #931: + the command-spec
     pnames = {p["name"] for p in snap["prompts"]}
     snames = {s["name"] for s in snap["skills"]}
     assert {"code-review", "commit-message", "bug-report", "explain-code"} <= pnames
@@ -84,6 +84,17 @@ def test_catalogue_is_gated_under_token(monkeypatch, tmp_path):
         req.add_header("Authorization", "Bearer s3cret")
         with urllib.request.urlopen(req, timeout=5) as r:
             snap = json.loads(r.read().decode())
-        assert set(snap) == {"prompts", "skills"}
+        assert set(snap) == {"prompts", "skills", "commands"}   # #931: + the command-spec
     finally:
         httpd.shutdown()
+
+
+def test_catalogue_snapshot_includes_command_spec():
+    # #931: the snapshot serves the command-spec so the client generates server-command completions from it.
+    snap = gx10._catalogue_snapshot()
+    assert snap.get("commands"), "catalogue must serve the command-spec (#931)"
+    names = {c["name"] for c in snap["commands"]}
+    assert {"lifecycle", "fork", "ace", "config set"} <= names   # served from the spec (also in the static list since #952)
+    for c in snap["commands"]:
+        assert c["tier"] in {"read_only", "mutating", "destructive", "costly"}
+        assert "usage" in c and "summary" in c

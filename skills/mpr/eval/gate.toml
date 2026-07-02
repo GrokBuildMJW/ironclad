@@ -1,20 +1,20 @@
-# MPR eval regression-gate thresholds (Spec 08 §6) — tunebar OHNE Code-Edit (gelesen via stdlib tomllib).
-# Diese Schwellen sind Start-Werte; sie werden mit der Ev-8-Kalibrierung (reale Eval-Sets, Provider-
-# Pricing, Judge-Panel) nachgezogen — nicht der Gate-CODE.
+# MPR eval regression-gate thresholds (spec 08 §6) — tunable WITHOUT a code edit (read via stdlib tomllib).
+# These thresholds are starting values; they are tuned with the Ev-8 calibration (real eval sets, provider
+# pricing, judge panel) — not the gate CODE.
 
 [regression]
-# §6.1 — Anteil des Negativ-Sets (single_fact_decline.jsonl), der declinen MUSS (Über-Feuern ausgeschlossen).
+# §6.1 — the fraction of the negative set (single_fact_decline.jsonl) that MUST decline (over-firing ruled out).
 decline_rate_min = 0.95
 
 [ab]
-# §6.2 — aus dem JUDGED A/B-Report (harness diff_arms + judge_panel-Scores) abgeleitet.
-coverage_floor = 3.0            # mediane MPR(A)-Coverage muss diese Schwelle erreichen (Skala 0-5)
-coverage_epsilon = 0.0          # A_coverage >= B_coverage - epsilon (kein Coverage-Rückschritt)
-pairwise_epsilon = 0.10         # A-Gesamt-Win-Rate >= B-Win-Rate - epsilon (A nicht systematisch schlechter)
-max_cost_usd_per_run = 2.00     # Summe der A-Arm-Kosten <= Budget (Kosten-Runaway-Guard, Risiko §12)
+# §6.2 — derived from the JUDGED A/B report (harness diff_arms + judge_panel scores).
+coverage_floor = 3.0            # median MPR(A) coverage must reach this threshold (scale 0-5)
+coverage_epsilon = 0.0          # A_coverage >= B_coverage - epsilon (no coverage regression)
+pairwise_epsilon = 0.10         # A overall win-rate >= B win-rate - epsilon (A not systematically worse)
+max_cost_usd_per_run = 2.00     # sum of the A-arm cost <= budget (cost-runaway guard, risk §12)
 
 [judge]
-# §5.2 — 3-Stimmen-Blind-A/B-Panel (Provider aus mpr.providers; Default Sonnet·Opus·Spark, User-bestätigt
-# Ev-8). Nach erster Kalibrierung gegen Human-Spot-Checks justieren (Inter-Judge-Agreement als Metrik).
+# §5.2 — a 3-vote blind A/B panel (providers from mpr.providers; default Sonnet·Opus·Spark, user-confirmed
+# Ev-8). After the first calibration, tune against human spot-checks (inter-judge agreement as the metric).
 panel = ["claude-sonnet", "claude-opus", "spark-vllm"]
-self_consistency_tol = 1.0      # eine Stimme verwerfen, deren zwei temp=0-Läufe je Dim um mehr abweichen
+self_consistency_tol = 1.0      # drop a vote whose two temp=0 runs diverge by more than this per dim

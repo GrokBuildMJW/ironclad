@@ -200,3 +200,19 @@ def test_inline_publish_preflight_agrees_with_release_preflight_on_tag_version()
     assert '"${TAG#v}" != "${VER}"' in text                    # inline: tag (sans v) must equal version
     assert rp.release_preflight("v0.0.14", "0.0.15", _RELEASED, []) , "release_preflight must flag a mismatch"
     assert rp.release_preflight("v0.0.15", "0.0.15", _RELEASED, []) == []   # agree -> pass
+
+
+# ── #994-S6 (C0-6/C0-7): staged-release guards ──
+def test_staging_route_ok_requires_test_pypi_first():
+    rp = _load()
+    assert rp.staging_route_ok("https://test.pypi.org/legacy/") is True    # test-PyPI first → ok
+    assert rp.staging_route_ok("https://upload.pypi.org/legacy/") is False # straight to production → refuse
+    assert rp.staging_route_ok("") is False                                # empty = production default → refuse
+
+
+def test_main_safe_reasons_blocks_a_pending_rollback_not_reverted():
+    rp = _load()
+    assert rp.main_safe_reasons(rollback_pending=False, main_reverted=False) == []   # nothing rolled back
+    assert rp.main_safe_reasons(rollback_pending=True, main_reverted=True) == []      # rolled back + reverted
+    reasons = rp.main_safe_reasons(rollback_pending=True, main_reverted=False)
+    assert reasons and "re-ship the rolled-back break" in reasons[0]                  # fail-closed

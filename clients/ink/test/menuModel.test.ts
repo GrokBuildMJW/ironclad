@@ -73,6 +73,15 @@ test('completionText — trailing space only when the command takes an argument'
   assert.equal(completionText(help), '/help');
 });
 
+test('#937 completionText — an argument completion inserts the token into the line', () => {
+  const gate: Command = {name: 'gate', scope: 'server', desc: '', arg: true};
+  const slug: Command = {name: '--slug', scope: 'server', desc: '', arg: true};
+  const tests: Command = {name: 'tests', scope: 'server', desc: '', arg: true};
+  assert.equal(completionText(gate, '/lifecycle '), '/lifecycle gate ');           // fill the first arg after a space
+  assert.equal(completionText(slug, '/lifecycle gate --sl'), '/lifecycle gate --slug ');  // replace the partial flag
+  assert.equal(completionText(tests, '/lifecycle gate --stages '), '/lifecycle gate --stages tests '); // fill a choice
+});
+
 test('menuWindow — short list returned whole; long list windows around sel', () => {
   assert.deepEqual(menuWindow(res, 0), {slice: [...res], offset: 0});
   const all = completions(''); // every command — longer than MENU_MAX_VISIBLE

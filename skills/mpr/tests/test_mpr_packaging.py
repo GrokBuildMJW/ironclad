@@ -65,7 +65,7 @@ def _deps(tmp_path, llm, *, store=None, reducer=None, run_id="mpr-test-0001",
 def test_case_has_unique_capability_and_gate():
     c = build_case()
     assert c["capability"] == "mpr_research" == c["name"]
-    assert "NICHT FÜR" in c["description"]                       # the layer-1 gate
+    assert "NOT FOR" in c["description"]                       # the layer-1 gate
     assert "<<<MPR_REPORT>>>" in c["description"]                # sentinel instruction (§6.1)
 
 
@@ -312,28 +312,26 @@ def test_full_pipeline_indexes_taskstore_and_backfills_task_id(tmp_path):
     assert m["task_id"] == "KGC-001" and store.created       # indexed + id backfilled (not None)
 
 
-def test_engine_deps_index_runs_follows_mpr_gate(monkeypatch):
-    # #52: index_runs mirrors the #15 contract (single source of truth) — off when _mpr_blocks_tasks()
-    # refuses (reasoning-only mpr initiative), on otherwise (software). Drives the real _engine_deps seam.
+def test_engine_deps_index_runs_always_on(monkeypatch):
+    # #984: MPR is embedded (no reasoning-only project type) — an embedded run's manifest is always
+    # indexed in the active (software) initiative's TaskStore. Drives the real _engine_deps seam.
     import sys
     from types import SimpleNamespace
     from mpr.entry import _engine_deps
     base = dict(_EFFECTIVE_CFG=None, _reduce_worker_results=None, _atomic_write=None,
                 _store=lambda: None, _DISPATCHER=None, _WORKERS=None)
-    monkeypatch.setitem(sys.modules, "gx10", SimpleNamespace(_mpr_blocks_tasks=lambda: "blocked: mpr", **base))
-    assert _engine_deps().index_runs is False                # #15 blocks the pipeline → don't index
-    monkeypatch.setitem(sys.modules, "gx10", SimpleNamespace(_mpr_blocks_tasks=lambda: None, **base))
-    assert _engine_deps().index_runs is True                 # pipeline allowed (software) → index
+    monkeypatch.setitem(sys.modules, "gx10", SimpleNamespace(**base))
+    assert _engine_deps().index_runs is True
 
 
-def test_mpr_initiative_run_skips_taskstore_index(tmp_path):
-    # #52: with index_runs off (mpr initiative), the run writes its manifest but creates NO TaskStore
-    # entry and task_id stays None — no create() attempt, so no swallowed #15-gate exception.
+def test_run_skips_taskstore_index_when_index_runs_off(tmp_path):
+    # Defensive: the writer honours index_runs=False (manifest written, NO TaskStore entry, task_id None).
+    # #984: production always sets index_runs=True, but the branch stays guarded.
     store = _FakeStore()
     llm = FakeClassifierLLM(run_panel(domain="architecture-decision", route="wide", mode="decision"))
     deps = _deps(tmp_path, llm, store=store, run_id="mpr-noidx")
     deps.index_runs = False
-    out = run_mpr("Sollen wir von Modulith auf Microservices umstellen?", deps=deps)
+    out = run_mpr("Should we move from a monolith to microservices?", deps=deps)
     assert out.startswith("<<<MPR_REPORT>>>")
     m = json.loads((tmp_path / "mpr-noidx" / "manifest.json").read_text(encoding="utf-8"))
-    assert m["task_id"] is None and store.created == []      # no TaskStore entry in a reasoning-only initiative
+    assert m["task_id"] is None and store.created == []      # no TaskStore entry when indexing is off

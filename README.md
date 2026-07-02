@@ -56,7 +56,7 @@ write the code, write the test, and run it** — you describe, they build; no pr
 needed.
 
 > **One step first:** any work that produces artefacts (a task, a handover, an MPR run)
-> needs an active **project** — `/project new <name> --type software|mpr` (`/initiative` is a
+> needs an active **project** — `/project new <name>` (`/initiative` is a
 > deprecated alias). It is fail-closed: without one the macros refuse rather than scatter
 > state into your project root. Plain Q&A turns need no project. See
 > [`docs/project-isolation.md`](docs/project-isolation.md) and
@@ -117,11 +117,11 @@ Ironclad's engine comes from a **proven, in-production orchestrator**, now **reb
 the server + client architecture above and **wired and tested**. It is still
 **pre-release** (0.0.x, alpha): single-tenant by design (no multi-user auth yet) and
 APIs/layout/config may change. Tagged releases ship on **PyPI** (`ironclad-ai`) and as
-**GitHub Releases** (currently `v0.0.22`) — treat them as early previews and `main` as a
+**GitHub Releases** (currently `v0.0.23`) — treat them as early previews and `main` as a
 development snapshot. The internal DEV → Prod → Public **promote pipeline** that hardens our
 releases is in development (today a manual gated path).
 
-Verified by **2419 Python tests** (2410 offline + 9 live) plus **355 TypeScript client
+Verified by **2497 Python tests** (2488 offline + 9 live) plus **367 TypeScript client
 tests**, and a **full end-to-end run with a real code-agent**. Read these before relying on
 anything:
 
@@ -129,6 +129,7 @@ anything:
 - **[`docs/test-report.md`](docs/test-report.md)** — what was tested, results, and the
   issues found **and fixed** during the campaign.
 - **[`docs/roadmap.md`](docs/roadmap.md)** — what's **planned or in progress** (future only).
+- **[`docs/command-ergonomics.md`](docs/command-ergonomics.md)** — aliases, did-you-mean, argument autocomplete, discovery, and confirm-before-destructive for the slash-command surface.
 - **[`docs/docs-guide.md`](docs/docs-guide.md)** — how the docs are organised (one responsibility per doc).
 
 ## Reference environment & benchmarks

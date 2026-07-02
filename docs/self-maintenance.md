@@ -34,7 +34,7 @@ artefact-producing work; see [`state-and-initiative.md`](state-and-initiative.md
 concrete:
 
 ```text
-> /initiative new calc-demo --type software
+> /project new calc-demo --type software
 > Build a function add(a, b) in calc.py that returns a + b,
   plus a pytest test that checks add(2, 3) == 5. Run the test and make sure it's green.
 ```

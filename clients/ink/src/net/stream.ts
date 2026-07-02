@@ -60,17 +60,31 @@ export function createStreamParser(h: StreamHandlers): (chunk: Uint8Array | null
   };
 }
 
+// #954/#955: the server-side structured guided-input contract, rendered field-by-field by the client.
+export interface GuideField {name: string; required: boolean; choices: string[]; default: string; type: string}
+export interface NeedsGuide {command: string; subcommands: string[]; fields: GuideField[]; usage: string; canonical_echo: string}
+export type ChatStreamReply =
+  | {needs_confirm?: {command: string; tier: string; reason: string}; needs_guide?: NeedsGuide}
+  | undefined;
+
 export async function chatStream(
   srv: Server,
   message: string,
   h: StreamHandlers,
   signal?: AbortSignal,
-): Promise<void> {
+): Promise<ChatStreamReply> {
   const headers: Record<string, string> = {
     'Content-Type': 'application/json',
     'X-Local-Tools': '1',
     ...srv.headers(),
   };
+  // #935: uniform confirm affordance — a trailing `--yes`/`--confirm` on a destructive command IS the
+  // confirmation (stripped here, sent as confirm=true). Keeps the flow input-free.
+  let confirm = false;
+  const msg = message.replace(/\s+--(?:yes|confirm)\s*$/i, () => {
+    confirm = true;
+    return '';
+  });
   // Combine the caller's cancel signal (Esc / Ctrl+C) with the request timeout, so aborting a turn
   // tears down the fetch + reader IMMEDIATELY instead of waiting on the server to stop generating.
   const timeout = AbortSignal.timeout(srv.timeoutMs);
@@ -78,10 +92,15 @@ export async function chatStream(
   const res = await fetch(srv.base + '/chat/stream', {
     method: 'POST',
     headers,
-    body: JSON.stringify({message}),
+    body: JSON.stringify({message: msg, confirm}),
     signal: sig,
   });
   if (!res.ok) throw new HttpError(res.status, `POST /chat/stream → HTTP ${res.status}`);
+  // #935/#954: a destructive command → JSON {needs_confirm}; an explicit ?/--guide → JSON {needs_guide};
+  // either way the server replies with JSON instead of a stream.
+  if (res.headers.get('content-type')?.includes('application/json')) {
+    return (await res.json()) as ChatStreamReply;
+  }
   if (!res.body) throw new HttpError(0, 'POST /chat/stream → no response body');
   const feed = createStreamParser(h);
   const reader = res.body.getReader();
