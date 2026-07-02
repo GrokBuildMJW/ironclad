@@ -3,12 +3,14 @@
 Turns the cryptic raw vLLM 400 (`maximum context length is 32768`) into a guarded, recoverable
 path. Before the call, `_make_completion` checks that the prompt + the reserves it must leave free
 (output `self.max_tokens` + the tools schema + the CONDITIONAL thinking budget) fit the model window;
-if not it does ONE emergency trim of the oldest WHOLE rounds, and if it still can't fit it raises a
-clear `ContextOverflowError`. Validated WITHOUT a live model:
+if not it does ONE emergency trim of the oldest WHOLE rounds, and if a single oversized turn still can't
+fit it TRUNCATES that turn to fit (#994-S16 recovery) rather than raising a raw vLLM 400. Validated
+WITHOUT a live model:
 
   * no-op when it fits; emergency trim of the oldest whole rounds when over (the last user turn and
     the system partition are never dropped; tool rounds stay atomic — no orphan `tool` message);
-  * raises `ContextOverflowError` on an irreducible single oversized turn (never a raw vLLM 400);
+  * TRUNCATES an irreducible single oversized turn to fit (#994-S16), so an autonomous turn degrades
+    gracefully instead of dying (never a raw vLLM 400);
   * the thinking reserve is applied ONLY when `think=True`; the tools schema is reserved;
   * skipped when token budgeting is off (negative path);
   * `_make_completion` runs the guard BEFORE the API call (raises without ever calling vLLM);
@@ -125,14 +127,17 @@ def test_preflight_emergency_trims_oldest_rounds(monkeypatch, tmp_path):
     assert "OLDEST-SENTINEL" not in str(g.messages)                 # the oldest round was evicted
 
 
-def test_preflight_raises_on_irreducible_single_turn(monkeypatch, tmp_path):
+def test_preflight_truncates_irreducible_single_turn(monkeypatch, tmp_path):
+    # #994-S16: a single oversized turn that whole-round eviction can't reduce is now TRUNCATED to fit
+    # (head+tail + marker) instead of raising — an autonomous turn degrades gracefully, it does not die.
     _setup(monkeypatch)
     g = _mk_agent(monkeypatch, tmp_path)
     g.messages = [{"role": "system", "content": "SYS"},
-                  {"role": "user", "content": "x" * 20000}]         # one turn, can't trim below it
-    with pytest.raises(gx10.ContextOverflowError) as ei:
-        g._preflight_context(think=False)
-    assert "context overflow" in str(ei.value) and str(gx10.MAX_MODEL_LEN) in str(ei.value)
+                  {"role": "user", "content": "x" * 20000}]         # one oversized turn, no round to evict
+    g._preflight_context(think=False)                               # must NOT raise now
+    assert gx10._count_prompt_tokens(g.messages) <= gx10.MAX_MODEL_LEN - g.max_tokens   # fits the wall
+    assert g.messages[0]["content"] == "SYS"                        # system preserved
+    assert "truncated to fit the context window" in g.messages[-1]["content"]           # the turn shrank
 
 
 def test_preflight_thinking_reserve_only_when_think(monkeypatch, tmp_path):
@@ -271,11 +276,14 @@ def test_emergency_trim_archives_evicted_to_cold(monkeypatch, tmp_path):
 
 
 # ── _make_completion integration ─────────────────────────────────────────────
-def test_make_completion_runs_guard_before_api_and_raises(monkeypatch, tmp_path):
+def test_make_completion_raises_when_even_truncation_cannot_fit(monkeypatch, tmp_path):
+    # a TRULY irreducible turn — the SYSTEM partition alone exceeds the window, so neither whole-round
+    # eviction nor content-truncation (#994-S16 preserves the system message) can help → the guard still
+    # raises BEFORE the API, never a raw vLLM 400.
     _setup(monkeypatch)
     g = _mk_agent(monkeypatch, tmp_path)
     g.client = _FakeClient()
-    g.messages = [{"role": "system", "content": "SYS"}, {"role": "user", "content": "x" * 20000}]
+    g.messages = [{"role": "system", "content": "x" * 200000}]     # system alone overflows any window
     with pytest.raises(gx10.ContextOverflowError):
         g._make_completion(think=False, stream=False)
     assert g.client.chat.completions.calls == []                  # raised BEFORE ever calling vLLM

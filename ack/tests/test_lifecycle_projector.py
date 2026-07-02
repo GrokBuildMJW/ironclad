@@ -327,7 +327,7 @@ def test_lifecycle_gate_command_no_slug_blocked(tmp_path, monkeypatch):
 # ── #933: the --tree resolver (git HEAD tree default, fail-soft) ──────────────────────────────────────
 def test_git_head_tree_resolves_in_a_repo():
     # the monorepo IS a git repo → the committed HEAD tree sha resolves (40 hex chars)
-    sha = gx10._git_head_tree(Path(__file__).resolve().parents[3])
+    sha = gx10._git_head_tree(Path(__file__).resolve().parent)
     assert len(sha) == 40 and all(c in "0123456789abcdef" for c in sha)
 
 

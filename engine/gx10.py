@@ -34,6 +34,7 @@ import shutil
 import subprocess
 import threading
 import queue as _q
+import contextvars
 from contextlib import contextmanager
 import argparse
 import math
@@ -216,7 +217,23 @@ _RAG_MARKER     = "## Relevant context (retrieved)"
 # body-keyed vector hits + optional relational hits). Enforced in real tokens. Config context.memory_brief_tokens.
 MEMORY_BRIEF_TOKENS = 1200
 LANGUAGE         = "en"          # the orchestrator's reply language (OSS default en; via GX10_LANGUAGE/config)
-MAX_FILE_CHARS   = 24_000        # PERF-05: read_file cap (head+tail)
+MAX_FILE_CHARS   = 24_000        # PERF-05: read_file cap (head+tail) — the CEILING; the live budget-aware
+                                 # cap (#994-S16) may lower it per-turn so one read can't overflow the window.
+_READ_FLOOR_CHARS = 2_000        # #994-S16: always allow at least a small excerpt (emergency-trim backstops)
+#: #994-S16: the per-turn safe char cap for a file/tool read, set by the session before each tool dispatch
+#: from the live remaining window budget. None ⇒ read_file uses the fixed MAX_FILE_CHARS (convenience callers,
+#: no live budget). A contextvar so concurrent workers never clobber each other's per-turn cap.
+_READ_BUDGET_CV: "contextvars.ContextVar[Optional[int]]" = contextvars.ContextVar(
+    "_ironclad_read_budget", default=None)
+
+
+def _read_char_cap() -> int:
+    """The active char cap for a file/tool read: the live per-turn budget (#994-S16) if the session set one,
+    else the fixed ``MAX_FILE_CHARS``. So a single read can never by itself overflow the model window."""
+    b = _READ_BUDGET_CV.get()
+    return b if b is not None else MAX_FILE_CHARS
+
+
 LIST_DIR_HARD_CAP = 200          # HV-B: hard cap in list_directory
 TEMPERATURE      = 0.3
 RETRY_BACKOFF    = 1.5           # OPT-4: wait time (s) before 1× retry on an API error
@@ -4221,15 +4238,17 @@ def run_tool(name: str, args: Dict[str, Any]) -> str:
                 return f"ERROR: Not found: {args['path']}"
             # errors="replace": a non-UTF-8 file is read lossily, never crashes the read.
             text = p.read_text(encoding="utf-8", errors="replace")
-            # PERF-05: don't load very large files uncapped into the context
-            if len(text) > MAX_FILE_CHARS:
-                head_n = MAX_FILE_CHARS * 2 // 3
-                tail_n = MAX_FILE_CHARS - head_n
+            # PERF-05 + #994-S16: don't load a large file uncapped into the context; the cap is the live
+            # per-turn window budget (so one read can't overflow), falling back to the fixed ceiling.
+            cap = _read_char_cap()
+            if len(text) > cap:
+                head_n = cap * 2 // 3
+                tail_n = cap - head_n
                 omitted = len(text) - head_n - tail_n
                 return (
                     text[:head_n]
                     + f"\n\n... [Ironclad: {omitted} chars omitted — file {len(text)} "
-                      f"chars, capped at {MAX_FILE_CHARS}. For targeted excerpts use "
+                      f"chars, capped at {cap}. For targeted excerpts use "
                       f"execute_command, e.g. findstr/Select-String.] ...\n\n"
                     + text[-tail_n:]
                 )
@@ -4675,7 +4694,48 @@ class GX10:
             except Exception:  # noqa: BLE001 — the archive is best effort
                 pass
         self.messages = system + others
+        est = _count_prompt_tokens(self.messages)
+        if est > budget:                                # #994-S16: an irreducible oversized turn (one huge
+            est = self._trim_oversized_message(budget)  # tool result / paste) → truncate it, don't just raise
+        return est
+
+    def _trim_oversized_message(self, budget: int) -> int:
+        """#994-S16: last-resort recovery — when whole-round eviction can't fit an irreducible oversized turn
+        (one huge tool result / paste), truncate the LARGEST message's string content (head+tail + a marker)
+        so the prompt fits ``budget``, instead of leaving the caller to raise. Only the content string
+        shrinks, so the assistant.tool_calls ↔ tool-response pairing is untouched. Best effort — returns the
+        final estimated prompt tokens (the caller still raises if this somehow can't reduce it)."""
+        cands = [(i, _count_tokens(_message_text(m))) for i, m in enumerate(self.messages)
+                 if m.get("role") != "system" and isinstance(m.get("content"), str) and m.get("content")]
+        if not cands:
+            return _count_prompt_tokens(self.messages)
+        i, _ = max(cands, key=lambda t: t[1])
+        over = _count_prompt_tokens(self.messages) - budget
+        if over <= 0:
+            return _count_prompt_tokens(self.messages)
+        content = self.messages[i]["content"]
+        cut_chars = min(len(content), int((over + 128) * float(CHARS_PER_TOKEN)))   # +128 tok margin
+        keep = max(256, len(content) - cut_chars)
+        head_n = keep * 2 // 3
+        tail_n = keep - head_n
+        self.messages[i]["content"] = (
+            content[:head_n]
+            + f"\n\n... [Ironclad: {len(content) - keep} chars truncated to fit the context window] ...\n\n"
+            + (content[-tail_n:] if tail_n > 0 else ""))
         return _count_prompt_tokens(self.messages)
+
+    def _live_read_budget(self) -> int:
+        """#994-S16: the safe char cap for a tool result THIS turn — the model window minus the reserves it
+        must leave free (output + tools schema + thinking) minus what the transcript already uses, in chars,
+        with a 0.8 safety margin and a small floor. So a single read/tool result can't by itself overflow the
+        window, on any model. Fails soft to the fixed ``MAX_FILE_CHARS`` when budgeting is off / no exact
+        tokenizer (the calibrated estimate over-counts → don't starve a read that would actually fit)."""
+        if not TOKEN_BUDGET or _live_token_counter() is None:
+            return MAX_FILE_CHARS
+        reserve = int(self.max_tokens) + _tools_schema_tokens() + int(THINKING_RESERVE)
+        free_tok = MAX_MODEL_LEN - reserve - _count_prompt_tokens(self.messages)
+        free_chars = int(max(0, free_tok) * float(CHARS_PER_TOKEN) * 0.8)
+        return max(_READ_FLOOR_CHARS, min(MAX_FILE_CHARS, free_chars))
 
     def _make_completion(self, think: bool, stream: bool):
         self._preflight_context(think)              # #372: guard + emergency trim (raises on irreducible overflow)
@@ -5405,7 +5465,11 @@ class GX10:
                     end="  "
                 )
 
-                result_t = run_tool(name, args)
+                _rb = _READ_BUDGET_CV.set(self._live_read_budget())   # #994-S16: cap a read to the live window
+                try:
+                    result_t = run_tool(name, args)
+                finally:
+                    _READ_BUDGET_CV.reset(_rb)
                 preview  = result_t.replace("\n", " ")[:70]
                 _ui_print(col(
                     f"✓ {preview}",

@@ -10,6 +10,12 @@ Released versions are listed below; upcoming work accumulates under *Unreleased*
 ## [Unreleased]
 
 ## [0.0.23]
+- **Budget-aware read cap + emergency-trim recovery** (epic #994 / #1028): an agent can no longer overflow
+  the model window with a single tool result. `read_file` now caps to the live per-turn window budget
+  (window − reserve − transcript, ×0.8, floored) instead of a fixed ceiling — so one read can't overflow on
+  any model — falling soft to the fixed cap without an exact tokenizer; and the pre-flight guard's emergency
+  trim now TRUNCATES an irreducible single oversized turn (with a marker) instead of raising, so the turn
+  degrades gracefully rather than failing.
 - **Coder Memory MCP is always-on** (epic #994 / #1015): the read-only Memory MCP for the code agents is
   no longer gated on the `sealed` trust profile — `memory_mcp.render_mcp_launch` wires it whenever a
   memory service (`memory_url`) is configured AND the agent ships a per-CLI `mcp_template`, in ANY

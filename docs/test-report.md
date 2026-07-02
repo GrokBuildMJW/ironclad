@@ -9,9 +9,9 @@
 
 | | |
 |---|---|
-| Automated tests (offline, no model) | **2488 passed** |
+| Automated tests (offline, no model) | **2494 passed** |
 | Live smoke tests (skipped without a model) | **9** |
-| **Total Python** | **2497** |
+| **Total Python** | **2503** |
 | TypeScript client tests (`node:test`) | **367 passed** (371 total, 4 skipped) |
 | Full agentic loop, end to end, with a **real** code-agent | **verified** |
 | Issues found during the campaign | **1 functional gap + 5 review findings — all found and fixed** (see below) |
@@ -24,7 +24,7 @@ default** and only runs when pointed at a real server.
 
 ```bash
 # 1) offline suite — deterministic, no model needed
-pytest -q                                   # from core/  → 2488 passed, 9 skipped
+pytest -q                                   # from core/  → 2494 passed, 9 skipped
 
 # 2) live smoke — against your own running orchestrator
 GX10_LIVE_URL=http://<your-host>:8100 pytest -k live -q     # 9 passed
@@ -34,7 +34,7 @@ GX10_LIVE_URL=http://<your-host>:8100 pytest -k live -q     # 9 passed
 ## Coverage by area
 
 The breakdown below groups the suite by capability area and sums to
-the **2497** total (2488 offline + 9 live). It is a high-level view of internal QA
+the **2503** total (2494 offline + 9 live). It is a high-level view of internal QA
 coverage; the granular test names and the maintainers' internal tracker are
 intentionally not enumerated here.
 
@@ -115,7 +115,7 @@ intentionally not enumerated here.
 | **Parallelism** — governed fan-out, the in-engine tool, single-writer reduce, the parallel router | 29 |
 | **Thin client + BYO code-agent** — the agent pool, a configurable agent-command template, managed transport, the config-driven code-agent registry, a per-agent boot probe, result classification, and onboarded-but-disabled agents | 85 |
 | **Runtime-aware output & language** — encoding safety, color gating, reply language | 14 |
-| **Token budget / context trimming** — token-accurate budgeting, a pre-flight overflow guard with emergency trim, the char-fallback watermark reserving sys+tools+thinking, and live context-length discovery | 59 |
+| **Token budget / context trimming** — token-accurate budgeting, a pre-flight overflow guard with emergency trim, the char-fallback watermark reserving sys+tools+thinking, and live context-length discovery, plus the **budget-aware read cap + emergency-trim recovery** (#994-S16): `read_file` caps to the live per-turn window budget (a contextvar cap = window − reserve − transcript, ×0.8, floored) so a single read can't overflow — falling soft to the fixed ceiling without an exact tokenizer — and `_emergency_trim` TRUNCATES an irreducible single oversized turn (marker) instead of raising | 65 |
 | **Misc** — manual cat tool, orchestrator version | 7 |
 | **Demo vessel** — the example-workspace doctor preflight | 1 |
 | **Documentation & release integrity (internal QA)** — documentation-reality checks, the generated roadmap and test counts, export-sync verification, the clean-room pre-publish proof, deploy-consistency checks, and the maintainers' release-process guards | 72 |
