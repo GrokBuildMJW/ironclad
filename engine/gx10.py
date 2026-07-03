@@ -181,6 +181,19 @@ MAX_TOKENS       = 8192          # output (generation) token reserve. PERF-10: r
                                  # window; the token budget (#371/#372) reserves it accurately. Tunable —
                                  # generation.max_tokens / GX10_MAX_TOKENS: raise for longer single
                                  # outputs, lower for more context headroom (#379, default kept at 8192).
+# #366: the SMALLEST output budget still worth proceeding with. The output reserve above is a CEILING,
+# not a fixed floor: when the full reserve would push the prompt over the window, `_preflight_context`
+# reserves LESS output — down to this minimum — so the turn proceeds LOSSLESSLY (all context kept, a
+# shorter answer) instead of failing. Only when even this minimum will not fit do we trim/raise. Tunable
+# via context.min_output_tokens / GX10_MIN_OUTPUT_TOKENS.
+MIN_OUTPUT_TOKENS = 1024
+# #366: extra headroom the pre-flight guard keeps BELOW the model window, on top of the output + tools +
+# thinking reserves, to absorb the gap between the engine's token ESTIMATE and vLLM's EXACT rendered-prompt
+# count — the chat-template framing (role markers, tool-call wrapping) and the tools-schema serialization
+# that `_count_prompt_tokens` cannot see token-exactly. Without it the adaptive clamp targets the wall to
+# the token and any undercount slips a raw vLLM 400 through; a generous margin is cheap. Tunable via
+# context.overflow_safety_tokens / GX10_OVERFLOW_SAFETY.
+OVERFLOW_SAFETY_TOKENS = 1536
 # MEM-9 / §3-mechanism 3 — token-accurate budgeting: couple the trim working set to the MODEL WINDOW
 # instead of fixed chars. When TOKEN_BUDGET=True, _apply_config derives MAX_CTX_CHARS/
 # TRIM_TARGET_CHARS from MAX_MODEL_LEN (minus reserve for output+RAG+summary, 10 % headroom). The
@@ -234,6 +247,190 @@ def _read_char_cap() -> int:
     return b if b is not None else MAX_FILE_CHARS
 
 
+#: #1046 (L1-choke, epic #1043): the ingestion tools whose result is INGESTED into the model context and
+#: must be capped to the live per-turn budget at the SINGLE run-loop choke point. `read_file` caps itself,
+#: but `search_files`/`list_directory`/`execute_command` do NOT, and the local-tool bridge returns before
+#: read_file's cap — so ALL of them are capped here. Deliberately NOT web_search/parallel_reason/MPR/memory:
+#: those return already-budgeted or structured JSON payloads a blind head+tail cap would corrupt.
+_INGESTION_TOOLS = frozenset({"read_file", "list_directory", "search_files", "execute_command", "fetch_url"})
+_INGEST_MARKER_SLACK = 512   # a result read_file already capped (cap + its own marker) must pass through here
+
+
+def _cap_ingested_result(name: str, result: str, cap_chars: int) -> str:
+    """Cap an INGESTION tool's result to ``cap_chars`` (head+tail + a steering marker) at the ONE run-loop
+    choke point, so a single tool result can never overflow the window — for EVERY ingestion tool, not just
+    read_file, and including the local-bridge path (which returns before read_file's own cap). Idempotent
+    with read_file's internal cap (its cap+marker fits within the slack) and a no-op for non-ingestion tools
+    / short results, so a web_search/parallel_reason/MPR/memory payload is never touched (#366/#1046)."""
+    if (name not in _INGESTION_TOOLS or not isinstance(result, str)
+            or len(result) <= cap_chars + _INGEST_MARKER_SLACK):
+        return result
+    head_n = cap_chars * 2 // 3
+    tail_n = cap_chars - head_n
+    omitted = len(result) - head_n - tail_n
+    return (
+        result[:head_n]
+        + f"\n\n... [Ironclad: {omitted} chars omitted — the {name} result was {len(result)} chars, capped "
+          f"at {cap_chars} to fit the context window. Narrow it: use search_files to locate the relevant "
+          f"lines, then read only those.] ...\n\n"
+        + result[-tail_n:]
+    )
+
+
+# #1084: per-action audit — the mutating/outward tool surface whose actions are recorded (content-free) into
+# the tamper-evident audit ledger when `audit.enabled`. The minimal first step of the audit-log epic (#1067).
+_AUDIT_TOOLS = frozenset({"write_file", "write_last_reply", "edit_file", "execute_command", "create_issue"})
+
+
+def _audit_detail(name: str, args: "Dict[str, Any]") -> str:
+    """A short, CONTENT-FREE descriptor of an action for the audit trail — the target (path/command/title/
+    query/url), never the file body or command output (an audit records WHAT was done, not the payload)."""
+    a = args or {}
+    if name in ("write_file", "write_last_reply", "edit_file", "read_file"):
+        return str(a.get("path", ""))
+    if name == "execute_command":
+        return str(a.get("command", ""))
+    if name == "create_issue":
+        return str(a.get("title", ""))
+    if name in ("search_files", "query_memory", "deep_query_memory", "web_search", "remember"):
+        return str(a.get("query", a.get("pattern", a.get("text", ""))))
+    if name == "list_directory":
+        return str(a.get("path", "."))
+    if name == "fetch_url":
+        return str(a.get("url", ""))
+    return name   # fallback (full-surface scope): at least record which tool ran
+
+
+def _audit_principal() -> str:
+    """WHO — the acting principal. Single-tenant today (the orchestrator on the operator's behalf);
+    per-principal identity + RBAC is #1071, which will make this the authenticated caller."""
+    return "orchestrator"
+
+
+def _audit_reason() -> str:
+    """WHY — the context the action served: the active project/track scope. Coarse today (a per-task reason
+    is a follow-up); best-effort, never raises."""
+    try:
+        return _active_mem_ns() or "default"
+    except Exception:   # noqa: BLE001
+        return ""
+
+
+def _is_audit_path(p: "Any") -> bool:
+    """#1067 tamper-RESISTANCE: True iff *p* resolves under the active audit directory — the agent's own
+    write tools refuse it, so an autonomous agent can't edit/delete its own audit trail (beyond the
+    hash-chain's tamper-EVIDENCE). Never raises."""
+    try:
+        audit_dir = (state_root() / "audit").resolve()
+        target = Path(p).resolve()
+        return target == audit_dir or audit_dir in target.parents
+    except Exception:   # noqa: BLE001
+        return False
+
+
+def _authorize_action(role: str, tier: str) -> bool:
+    """#1071: RBAC gate a server can call for a resolved principal. Single-tenant (MULTI_TENANT off) ⇒ every
+    action allowed (byte-identical to today's model). Multi-tenant ⇒ delegate to `ack.authz.authorize`
+    (deny-by-default). Fail-OPEN on a wiring error — the foundation is default-off and not yet the sole gate,
+    so a bug must never lock out the operator; full request-path enforcement is remaining scope (ADR-0014)."""
+    if not MULTI_TENANT:
+        return True
+    try:
+        from ack import authz   # lazy: never import ack at gx10 top-level (S6b lesson)
+        return authz.authorize(role, tier)
+    except Exception:   # noqa: BLE001
+        return True
+
+
+def _tenant_mem_scope(scope: str, tenant: str = "default") -> str:
+    """#1071: namespace a memory scope by *tenant* when multi-tenant is on (else byte-identical). Fail-soft."""
+    if not MULTI_TENANT:
+        return scope
+    try:
+        from ack import authz
+        return authz.tenant_scope(scope, tenant)
+    except Exception:   # noqa: BLE001
+        return scope
+
+
+def _maybe_audit(name: str, args: "Dict[str, Any]", result: str) -> None:
+    """#1084/#1067: append a tamper-evident per-action record when auditing is enabled (default-off). Records
+    WHO (actor) / WHAT (action + content-free target) / WHEN (ts) / WHY (active scope) / ok. `audit.scope`
+    selects the surface — `mutating` (write/exec/create, #1084) or `all` (EVERY tool call, #1067). Fail-soft;
+    a core-owned hash-chain ledger (`engine.audit_ledger`), not the private one."""
+    if not (AUDIT_ENABLED and (name in _AUDIT_TOOLS or AUDIT_SCOPE == "all")):
+        return
+    try:
+        import audit_ledger
+        path = state_root() / "audit" / "ledger.jsonl"
+        ok = not str(result or "").startswith("ERROR")
+        audit_ledger.record_action(path, name, _audit_detail(name, args), ok=ok, ts=time.time(),
+                                   actor=_audit_principal(), reason=_audit_reason())
+    except Exception:   # noqa: BLE001 — an audit failure must never break the tool/turn
+        pass
+
+
+def _metrics_report() -> "Dict[str, Any]":
+    """#1060: the GET /metrics payload — all-time + recent-window rolling telemetry (turns, error rate,
+    latency p50/p95, token cost) + the SLO verdict + a recent-vs-baseline anomaly signal. Thresholds are
+    config-tunable (`metrics.window_s` / `slo_error_rate` / `slo_p95_latency_s`). Fail-soft."""
+    try:
+        import telemetry as _tel
+        cfg = (_EFFECTIVE_CFG or {}).get("metrics") or {}
+        window_s = float(cfg.get("window_s", 3600) or 3600)
+        err_slo = float(cfg.get("slo_error_rate", 0.2) or 0.2)
+        lat_slo = float(cfg.get("slo_p95_latency_s", 60.0) or 60.0)
+        now = time.time()
+        all_time = _tel.snapshot(now=now)
+        window = _tel.snapshot(now=now, window_s=window_s)
+        return {"all_time": all_time, "window": window, "window_s": window_s,
+                "slo": _tel.slo_status(window, max_error_rate=err_slo, max_p95_latency_s=lat_slo),
+                "anomaly": _tel.anomaly(window, all_time)}
+    except Exception as ex:   # noqa: BLE001 — /metrics must never 500
+        return {"error": repr(ex)}
+
+
+def _notify_alert(alert: "Dict[str, Any]") -> bool:
+    """#1061: page one alert to the configured webhook (#1083). No-op (False) when no webhook. Fail-soft."""
+    if not NOTIFY_WEBHOOK:
+        return False
+    try:
+        import alerting as _alerting
+        import notify as _notify
+        return _notify.notify_webhook(NOTIFY_WEBHOOK, _alerting.format_alert(alert),
+                                      extra={"kind": alert.get("kind"), "severity": alert.get("severity")})
+    except Exception:   # noqa: BLE001 — a paging failure must never break a scan/receive
+        return False
+
+
+def _alert_scan() -> "List[Dict[str, Any]]":
+    """#1061: evaluate the telemetry SLO/anomaly (#1060) against the alert rules + page each alert (correlated
+    with the running deploy version). Returns the alerts fired. Fail-soft."""
+    try:
+        import alerting as _alerting
+        alerts = _alerting.evaluate(_metrics_report(), version=orchestrator_version())
+        for a in alerts:
+            _notify_alert(a)
+        return alerts
+    except Exception:   # noqa: BLE001
+        return []
+
+
+def _receive_alert(payload: "Any") -> "Dict[str, Any]":
+    """#1061: inbound alert receiver — normalize an EXTERNAL alert + page it (correlated with the running
+    deploy version). Returns ``{ok, notified, severity}`` or ``{ok: False, error}``. Fail-soft."""
+    try:
+        import alerting as _alerting
+        alert, err = _alerting.normalize_inbound(payload)
+        if err:
+            return {"ok": False, "error": err}
+        alert["version"] = orchestrator_version()
+        sent = _notify_alert(alert)
+        return {"ok": True, "notified": bool(sent), "severity": alert["severity"]}
+    except Exception as ex:   # noqa: BLE001
+        return {"ok": False, "error": repr(ex)}
+
+
 LIST_DIR_HARD_CAP = 200          # HV-B: hard cap in list_directory
 TEMPERATURE      = 0.3
 RETRY_BACKOFF    = 1.5           # OPT-4: wait time (s) before 1× retry on an API error
@@ -271,6 +468,27 @@ TASK_PREFIX = "KGC"
 # buildable types). Both config-driven (ack.enabled / lodestar.enabled).
 ACK_ENABLED      = True
 LODESTAR_ENABLED = False
+# #1073: forge (code-host) issue-filing. OFF by default — an autonomous agent writing to GitHub is a
+# deliberate operator opt-in (forge.enabled / GX10_FORGE_ENABLED). FORGE_REPO is optional (empty ⇒ the gh
+# CLI's default repo for the cwd); never a repo literal baked into core. Uses the ambient gh auth (secret-free).
+FORGE_ENABLED    = False
+FORGE_REPO       = ""
+# #1083: outbound escalation notification. A HUMAN_ESCALATION fires the `escalation` hook; when a webhook is
+# configured (deploy secret via GX10_NOTIFY_WEBHOOK / notify.webhook — NEVER a URL literal in core) the
+# notifier POSTs it to an off-duty human. Empty ⇒ no consumer registered (byte-identical default-off).
+NOTIFY_WEBHOOK   = ""
+# #1084: per-action audit ledger. Default OFF (a record per mutating tool call is a deliberate opt-in);
+# when on, write_file/edit_file/execute_command append a hash-chained, tamper-evident record under
+# STATE_ROOT/audit/ledger.jsonl. Boundary-clean (a core-owned ledger, not the private dev-process one).
+AUDIT_ENABLED    = False
+AUDIT_SCOPE      = "mutating"   # #1067: "mutating" (write/exec/create — #1084) | "all" (every tool call)
+INJECTION_DEFENSE = False       # #1068: fence untrusted ingested content (data-not-instructions) — default OFF
+SANDBOX          = "off"        # #1069: OS exec sandbox for execute_command — off | auto | bwrap | firejail
+MULTI_TENANT     = False        # #1071: per-principal RBAC + tenant memory isolation — default OFF (single-tenant)
+# #1061: alerting pipeline. When enabled AND a notify webhook (#1083) is configured, a periodic self-scan
+# pages the telemetry SLO/anomaly (#1060) to the webhook, and an inbound POST /alert receiver pages external
+# alerts. Default OFF (paging is a deliberate opt-in). No endpoint literal in core (the webhook is #1083's).
+ALERT_ENABLED    = False
 
 # Onboarding mode: proactive duplicate pre-check BEFORE the (expensive) handover.
 # Default off (store dedup guarantees correctness anyway). Helpful when
@@ -1943,6 +2161,8 @@ TOOLS = [
             "name": "write_file",
             "description": (
                 "Write content to a file. Creates missing parent directories. "
+                "For LARGE content, prefer write_last_reply (small models mis-escape a big JSON 'content'). "
+                "Set mode='append' to add to an existing file (build a large file in chunks). "
                 "Handover naming: KGC-XXX_OPUS.md, KGC-XXX_SONNET.md. "
                 "Feedback: KGC-XXX_OPUS-feedback.md, KGC-XXX_SONNET-feedback.md. "
                 "IMPORTANT: If a conflicting ID exists, use move_file to rename first."
@@ -1951,9 +2171,53 @@ TOOLS = [
                 "type": "object",
                 "properties": {
                     "path":    {"type": "string"},
-                    "content": {"type": "string"}
+                    "content": {"type": "string"},
+                    "mode":    {"type": "string", "enum": ["write", "append"],
+                                "description": "write (default: replace) or append to the end"}
                 },
                 "required": ["path", "content"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "write_last_reply",
+            "description": (
+                "Write your PREVIOUS message's text to a file — ESCAPE-FREE authoring for LARGE content. "
+                "Produce the full file body as your normal reply text, THEN call write_last_reply(path); "
+                "do NOT stuff large content into write_file's JSON 'content' (small models mis-escape it and "
+                "the write is dropped). Use mode='append' to extend a file built in chunks."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "mode": {"type": "string", "enum": ["write", "append"]}
+                },
+                "required": ["path"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "edit_file",
+            "description": (
+                "Replace an EXACT string in a file — a targeted edit, cheaper and safer than rewriting the "
+                "whole file with write_file. old_string must match EXACTLY (whitespace/indentation included) "
+                "and appear ONCE (include surrounding context to make it unique) unless replace_all is true. "
+                "Fails if old_string is absent or (without replace_all) not unique."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path":        {"type": "string"},
+                    "old_string":  {"type": "string"},
+                    "new_string":  {"type": "string"},
+                    "replace_all": {"type": "boolean", "description": "replace every occurrence (default false)"},
+                },
+                "required": ["path", "old_string", "new_string"],
             }
         }
     },
@@ -2173,6 +2437,29 @@ DEEP_MEMORY_TOOL = {
     }
 }
 
+# #1076 (epic #1043 quick-win): DELIBERATE memory write — the model persists a durable fact/decision so it
+# survives the session and is retrieved later (query_memory / RAG). Offered only when memory is configured;
+# scope-aware (the active project partition) + fail-soft (best-effort, like the eviction archive).
+MEMORY_WRITE_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "remember",
+        "description": (
+            "Deliberately persist a durable fact / decision / gotcha into the project's long-term memory so "
+            "it survives THIS session and is retrieved later via query_memory / RAG. Use for cross-session "
+            "knowledge worth keeping (a resolved gotcha, a chosen approach, a key constraint) — NOT for "
+            "transient turn state. Confirm you stored it."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "text": {"type": "string", "description": "the fact/decision to remember (self-contained)"},
+            },
+            "required": ["text"],
+        },
+    },
+}
+
 # Phase-e: server-side parallel reasoning. Offered only when the governed fan-out
 # workers are present (i.e. running under the server). The model uses it to process
 # many INDEPENDENT items in one concurrent batch instead of a serial tool loop.
@@ -2250,6 +2537,87 @@ WEBSEARCH_TOOL = {
                 },
             },
             "required": ["query"],
+        },
+    },
+}
+
+# #1073 (epic #1043 quick-win): let the orchestrator FILE its own tracker issues instead of falling back to
+# writing a body file it cannot submit. Gated (default OFF — forge.enabled / GX10_FORGE_ENABLED), secret-free
+# (uses the ambient `gh` CLI auth — no token on the wire, no repo literal in core), and ESCAPE-FREE (the body
+# comes from a FILE the model already wrote via write_last_reply, never a giant JSON arg). Registered in
+# _effective_tools ONLY when enabled → byte-identical when off.
+CREATE_ISSUE_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "create_issue",
+        "description": (
+            "Create a tracker issue in the project's code forge (GitHub, via the `gh` CLI). The body comes "
+            "from a FILE (escape-free): FIRST write the issue body with write_last_reply / write_file, THEN "
+            "pass its path as body_file (do NOT inline a large body). Optional labels (comma-separated) + "
+            "milestone. Returns the created issue URL."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "title":     {"type": "string"},
+                "body_file": {"type": "string", "description": "path to a file holding the issue body (escape-free)"},
+                "labels":    {"type": "string", "description": "optional comma-separated labels"},
+                "milestone": {"type": "string", "description": "optional milestone title"},
+            },
+            "required": ["title", "body_file"],
+        },
+    },
+}
+
+# #1074 (epic #1043 quick-win): read a specific http(s) page verbatim (RFCs/standards/API specs/docs) —
+# web_search FINDS pages, fetch_url READS one. Offered only when the trust profile allows outbound
+# (blocked under sealed unless security.web_in_sealed). Bounded: a hard byte cap + a basic SSRF guard
+# (http/https only, no loopback/private/link-local target) + the ingestion choke-point char cap.
+_FETCH_MAX_BYTES = 2_000_000
+
+
+def _fetch_url_blocked(url: str) -> Optional[str]:
+    """Return a BLOCKED reason if *url* is not plain http(s) or resolves to a loopback/private/link-local
+    address (an autonomous agent must not pivot to internal services via fetch_url), else None. A DNS
+    failure is NOT treated as blocked — the fetch itself then fails with a clear error. Never raises."""
+    try:
+        u = urllib.parse.urlparse(url)
+    except Exception:  # noqa: BLE001
+        return "malformed URL"
+    if u.scheme not in ("http", "https"):
+        return f"scheme {u.scheme or '(none)'} not allowed — http/https only"
+    host = (u.hostname or "").lower()
+    if not host:
+        return "no host in URL"
+    if host == "localhost" or host.endswith(".localhost"):
+        return "loopback host blocked (SSRF guard)"
+    try:
+        import ipaddress
+        import socket
+        port = u.port or (443 if u.scheme == "https" else 80)
+        for _fam, _t, _p, _c, sockaddr in socket.getaddrinfo(host, port, proto=socket.IPPROTO_TCP):
+            ip = ipaddress.ip_address(sockaddr[0])
+            if (ip.is_loopback or ip.is_private or ip.is_link_local or ip.is_reserved
+                    or ip.is_multicast or ip.is_unspecified):
+                return f"host resolves to a non-public address ({ip}) — blocked (SSRF guard)"
+    except Exception:  # noqa: BLE001 — resolution failure: let the fetch fail with its own error
+        pass
+    return None
+
+
+FETCH_URL_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "fetch_url",
+        "description": (
+            "Fetch the raw text of an http(s) URL verbatim (RFCs, standards, API specs, docs), size-capped. "
+            "Use web_search to FIND pages; use fetch_url to READ a specific one. Returns the decoded body "
+            "(truncated to fit the window). Blocked under the sealed trust profile and for non-public hosts."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {"url": {"type": "string", "description": "the http(s) URL to fetch"}},
+            "required": ["url"],
         },
     },
 }
@@ -2448,8 +2816,8 @@ def _all_tool_names(include_plugins: bool = True) -> frozenset:
             n = ((t or {}).get("function") or {}).get("name")
             if n:
                 names.add(n)
-    for sn in ("MEMORY_TOOL", "DEEP_MEMORY_TOOL", "PARALLEL_TOOL", "WEBSEARCH_TOOL",
-               "USE_SKILL_TOOL", "USE_PROMPT_TOOL"):
+    for sn in ("MEMORY_TOOL", "DEEP_MEMORY_TOOL", "MEMORY_WRITE_TOOL", "PARALLEL_TOOL", "WEBSEARCH_TOOL",
+               "CREATE_ISSUE_TOOL", "FETCH_URL_TOOL", "USE_SKILL_TOOL", "USE_PROMPT_TOOL"):
         t = g.get(sn)
         n = ((t or {}).get("function") or {}).get("name") if isinstance(t, dict) else None
         if n:
@@ -2463,15 +2831,17 @@ def _effective_tools() -> List[Dict[str, Any]]:
     """Tool list depending on the mode — onboarding tools only when active."""
     # Offer the tool only when memory is CONFIGURED (not just the module present) —
     # otherwise the tool would be offered even though every call would return "unavailable".
-    mem = [MEMORY_TOOL, DEEP_MEMORY_TOOL] if _MEMORY is not None else []
+    mem = [MEMORY_TOOL, DEEP_MEMORY_TOOL, MEMORY_WRITE_TOOL] if _MEMORY is not None else []
     par = [PARALLEL_TOOL] if _WORKERS is not None else []
     # #459 / epic #505: offer web_search only when a usable search adapter is configured (else every
     # call would return "unavailable"). Adapter-aware (cli / brave / mock) — not dispatcher-only.
     web = [WEBSEARCH_TOOL] if _web_search_available() else []
+    iss = [CREATE_ISSUE_TOOL] if FORGE_ENABLED else []   # #1073: gated (default off) forge issue-filing
+    fet = [FETCH_URL_TOOL] if _web_search_trust_ok() else []   # #1074: outbound fetch, blocked under sealed
     plug = [t["schema"] for t in _PLUGIN_TOOLS.values()]
     skl = [USE_SKILL_TOOL] if _PLAYBOOKS else []
     prm = [USE_PROMPT_TOOL] if _PROMPTS else []
-    return (_tools_with_agent_enum(TOOLS) + mem + par + web + plug + skl + prm
+    return (_tools_with_agent_enum(TOOLS) + mem + par + web + iss + fet + plug + skl + prm
             + (ONBOARDING_TOOLS if ONBOARDING_MODE else []))
 
 # ─── Macro tool: deterministic pipeline (HV-A) ─────────────
@@ -3396,6 +3766,22 @@ def _parse_tool_args(name: str, raw: Optional[str]) -> "tuple[Optional[Dict[str,
     return args, None
 
 
+def _valid_tool_args_json(raw: Optional[str]) -> str:
+    """The ``arguments`` stored on an assistant ``tool_call`` in the history MUST be valid JSON. On the NEXT
+    request vLLM's tool-call rendering ``json.loads()`` them, so a model's MALFORMED arguments string (a
+    small model emitting a huge escaped ``content`` for ``write_file`` gets it wrong) would hard-400 the
+    reask (``Expecting ',' delimiter``) and DEFEAT Validate→Reask — the turn dies before the model can
+    re-emit. Keep a parseable string; replace an unparseable one with ``{}``. The parse error is still fed
+    back as the tool result (see ``_parse_tool_args``), so the model re-emits — but the request always
+    renders. Never raises, idempotent."""
+    raw = raw if (isinstance(raw, str) and raw) else "{}"
+    try:
+        json.loads(raw)
+        return raw
+    except (json.JSONDecodeError, ValueError):
+        return "{}"
+
+
 _TOOLCALL_TAG_RE = re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.DOTALL)
 _FENCED_JSON_RE = re.compile(r"```(?:json|tool_call)?\s*(\{.*?\})\s*```", re.DOTALL)
 
@@ -4248,19 +4634,101 @@ def run_tool(name: str, args: Dict[str, Any]) -> str:
                 return (
                     text[:head_n]
                     + f"\n\n... [Ironclad: {omitted} chars omitted — file {len(text)} "
-                      f"chars, capped at {cap}. For targeted excerpts use "
-                      f"execute_command, e.g. findstr/Select-String.] ...\n\n"
+                      f"chars, capped at {cap}. For targeted excerpts, use search_files to "
+                      f"locate the relevant lines, then read only those.] ...\n\n"
                     + text[-tail_n:]
                 )
             return text
 
         elif name == "write_file":
             p   = _resolve_exec_path(args["path"])
+            if _is_audit_path(p):                                     # #1067 tamper-resistance
+                return "ERROR: refusing to write into the audit directory (tamper-resistant audit trail)."
             p.parent.mkdir(parents=True, exist_ok=True)
+            content = args["content"]
+            if args.get("mode") == "append":                          # #1048: build a large file in chunks
+                with p.open("a", encoding="utf-8") as fh:
+                    fh.write(content)
+                return f"OK: Appended {len(content)} chars to {args['path']}"
             tmp = p.with_name(p.name + ".tmp")
-            tmp.write_text(args["content"], encoding="utf-8")
+            tmp.write_text(content, encoding="utf-8")
             tmp.replace(p)
-            return f"OK: Written {len(args['content'])} chars to {args['path']}"
+            return f"OK: Written {len(content)} chars to {args['path']}"
+
+        elif name == "edit_file":
+            # #1075: targeted string edit — cheaper/safer than a whole-file write_file. Exact match, unique
+            # unless replace_all; atomic write with the retry-on-lock helper.
+            p = _resolve_exec_path(args["path"])
+            if _is_audit_path(p):                                     # #1067 tamper-resistance
+                return "ERROR: refusing to edit the audit directory (tamper-resistant audit trail)."
+            if not p.exists():
+                return f"ERROR: Not found: {args['path']}"
+            old = args.get("old_string", "")
+            new = args.get("new_string", "")
+            if not old:
+                return "ERROR: edit_file needs a non-empty old_string (use write_file to create a file)."
+            text = p.read_text(encoding="utf-8", errors="replace")
+            hits = text.count(old)
+            if hits == 0:
+                return f"ERROR: old_string not found in {args['path']} — it must match EXACTLY (whitespace included)."
+            if hits > 1 and not args.get("replace_all"):
+                return (f"ERROR: old_string is not unique in {args['path']} ({hits} occurrences) — add "
+                        f"surrounding context to make it unique, or set replace_all=true.")
+            updated = text.replace(old, new) if args.get("replace_all") else text.replace(old, new, 1)
+            _atomic_write(p, updated)
+            return f"OK: edited {args['path']} ({hits if args.get('replace_all') else 1} replacement(s))"
+
+        elif name == "create_issue":
+            # #1073: file a forge issue via the ambient gh CLI. Double-gated (registered only when
+            # FORGE_ENABLED, and refused here too), secret-free (gh auth), escape-free (body from a file).
+            if not FORGE_ENABLED:
+                return ("ERROR: create_issue is disabled — the operator must enable the forge "
+                        "(config forge.enabled / GX10_FORGE_ENABLED).")
+            if not shutil.which("gh"):
+                return "ERROR: create_issue needs the GitHub CLI ('gh') on PATH + authenticated (gh auth login)."
+            bf = _resolve_exec_path(args["body_file"])
+            if not bf.exists():
+                return (f"ERROR: body_file not found: {args['body_file']} — write the issue body to a FILE "
+                        f"first (write_last_reply / write_file), then pass its path.")
+            cmd = ["gh", "issue", "create", "--title", str(args.get("title", "")), "--body-file", str(bf)]
+            if FORGE_REPO:
+                cmd += ["--repo", FORGE_REPO]
+            for _lb in str(args.get("labels", "") or "").split(","):
+                _lb = _lb.strip()
+                if _lb:
+                    cmd += ["--label", _lb]
+            if args.get("milestone"):
+                cmd += ["--milestone", str(args["milestone"])]
+            try:
+                r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8",
+                                   errors="replace", timeout=60)
+            except Exception as ex:   # noqa: BLE001 — a forge/network hiccup is a tool error, not a crash
+                return f"ERROR: create_issue could not run gh: {ex!r}"
+            if r.returncode != 0:
+                return f"ERROR: gh issue create failed: {((r.stderr or r.stdout) or '').strip()[:400]}"
+            return f"OK: created issue {r.stdout.strip()}"
+
+        elif name == "fetch_url":
+            # #1074: verbatim, size-capped http(s) fetch. Trust-gated (sealed) + SSRF-guarded + byte-capped;
+            # the run-loop choke point (fetch_url ∈ _INGESTION_TOOLS) additionally caps the returned chars.
+            if not _web_search_trust_ok():
+                return ("BLOCKED: fetch_url is disabled under the sealed trust profile "
+                        "(operator opt-in: security.web_in_sealed).")
+            url = str(args.get("url", "")).strip()
+            reason = _fetch_url_blocked(url)
+            if reason:
+                return f"BLOCKED: fetch_url refuses {url!r} — {reason}."
+            try:
+                req = urllib.request.Request(url, headers={"User-Agent": "Ironclad-fetch_url/1.0"})
+                with urllib.request.urlopen(req, timeout=20) as resp:
+                    raw = resp.read(_FETCH_MAX_BYTES + 1)
+                    ctype = resp.headers.get("Content-Type", "")
+            except Exception as ex:   # noqa: BLE001 — network/HTTP error is a tool error, not a crash
+                return f"ERROR: fetch_url failed for {url}: {ex!r}"
+            over = len(raw) > _FETCH_MAX_BYTES
+            text = raw[:_FETCH_MAX_BYTES].decode("utf-8", errors="replace")
+            tail = f"\n\n... [Ironclad: response exceeded {_FETCH_MAX_BYTES} bytes, truncated] ..." if over else ""
+            return f"[fetch_url {url}{(' · ' + ctype) if ctype else ''}]\n{text}{tail}"
 
         elif name == "list_directory":
             p = _resolve_exec_path(args.get("path", "."))
@@ -4319,8 +4787,15 @@ def run_tool(name: str, args: Dict[str, Any]) -> str:
                     timeout=timeout, cwd=_exec_cwd()       # S9c: run in the active project's root (None → process workdir)
                 )
             else:
+                run_cmd = command
+                if SANDBOX not in ("", "off", "none"):     # #1069: OS-isolate the command when a backend is present
+                    try:
+                        import sandbox as _sbx
+                        run_cmd, _ = _sbx.sandbox_command(command, SANDBOX)   # net-isolated; unchanged if no backend
+                    except Exception:   # noqa: BLE001 — sandboxing must never break the command path
+                        run_cmd = command
                 r = subprocess.run(
-                    command, shell=True, stdin=subprocess.DEVNULL,
+                    run_cmd, shell=True, stdin=subprocess.DEVNULL,
                     capture_output=True, text=True, encoding="utf-8", errors="replace",
                     timeout=timeout, cwd=_exec_cwd()       # S9c: run in the active project's root (None → process workdir)
                 )
@@ -4434,6 +4909,17 @@ def run_tool(name: str, args: Dict[str, Any]) -> str:
                 args.get("query", ""),
                 int(args.get("limit", 5)),
             )
+
+        elif name == "remember":
+            # #1076: deliberate durable memory write. Gated on a configured store; scope-aware + fail-soft
+            # (add_bulk is fire-and-forget on a daemon thread, like the eviction archive) — best-effort.
+            if _MEMORY is None or not _MEMORY.is_available():
+                return "[Memory] unavailable — remember needs the memory stack (docker compose --profile memory up -d in core/)."
+            text = str(args.get("text", "")).strip()
+            if not text:
+                return "ERROR: remember needs a non-empty `text` (the fact/decision to persist)."
+            _MEMORY.add_bulk(text, {"source": "model_remember"})
+            return f"OK: remembered ({len(text)} chars persisted to project memory; retrievable via query_memory / RAG)."
 
         elif name == "web_search":
             # #459 / epic #505: run the search through the standalone adapter seam (cli-delegate runs
@@ -4635,39 +5121,56 @@ class GX10:
             self._append_guidance(_cmd_surface)
 
     # OPT-4: one completion call with 1× retry on a transient API error
-    def _preflight_context(self, think: bool) -> None:
-        """Epic #366 (#372): before the vLLM call, make sure the full prompt + the reserves it must
-        leave free — output (``self.max_tokens``) + the tools schema vLLM serializes into the prompt
-        + the CONDITIONAL thinking budget (only when ``think``) — fit the model window. If not, do
-        ONE emergency trim of the oldest WHOLE rounds; if it still can't fit, raise a clear
-        ``ContextOverflowError`` instead of letting vLLM return a raw HTTP 400. Fail-fast (no retry
-        against vLLM) and fail-soft: skipped when token budgeting is off OR no EXACT tokenizer is
-        reachable — the calibrated estimate over-counts, so trusting it here could raise a FALSE
-        ContextOverflowError on input that would actually fit; #371's calibrated ``_trim_context`` has
-        already budgeted conservatively in that mode."""
+    def _preflight_context(self, think: bool) -> int:
+        """Epic #366 (#372/#379): decide the output-token budget for the imminent vLLM call so the full
+        prompt + the reserves it must leave free — output + the tools schema vLLM serializes into the
+        prompt + the CONDITIONAL thinking budget (only when ``think``) — fit the model window. Returns the
+        EFFECTIVE ``max_tokens`` for this request (``<= self.max_tokens``).
+
+        The output reserve is a CEILING, not a fixed floor. When the full reserve would push the prompt
+        over the window, we reserve LESS output — down to ``MIN_OUTPUT_TOKENS`` — so the turn proceeds
+        LOSSLESSLY (all context kept, just a shorter answer) instead of failing. Only when even a minimal
+        answer will not fit do we emergency-trim the oldest WHOLE rounds (then, as a last resort, truncate
+        an irreducible oversized turn); only when THAT still cannot free room do we raise a clear
+        ``ContextOverflowError`` instead of letting vLLM return a raw HTTP 400.
+
+        Fail-fast (no retry against vLLM) and fail-soft: when token budgeting is off OR no EXACT tokenizer
+        is reachable, return the full reserve unchanged — the calibrated estimate over-counts, so trusting
+        it here could shrink/raise on input that would actually fit; #371's calibrated ``_trim_context``
+        has already budgeted conservatively in that mode."""
+        ceiling = int(self.max_tokens)
         if not TOKEN_BUDGET or _live_token_counter() is None:
-            return
+            return ceiling
         tools_tok = _tools_schema_tokens()
-        think_tok = THINKING_RESERVE if think else 0
-        reserve = int(self.max_tokens) + tools_tok + int(think_tok)
-        budget = MAX_MODEL_LEN - reserve
+        think_tok = int(THINKING_RESERVE if think else 0)
+        # non-output reserves — these cannot be shrunk. OVERFLOW_SAFETY_TOKENS is headroom kept BELOW the
+        # wall so the adaptive clamp never targets it to the token: `est` undercounts vLLM's exact rendered
+        # prompt (chat-template framing + tools/tool-call serialization), so a zero-margin send still 400s.
+        fixed = tools_tok + think_tok + int(OVERFLOW_SAFETY_TOKENS)
         est = _count_prompt_tokens(self.messages)
         if _live_token_counter() is None:
-            return                                  # tokenizer DIED mid-count ⇒ `est` is contaminated by
-                                                    # the over-counting char fallback ⇒ abort (no false raise)
-        if est <= budget:
-            return
-        est = self._emergency_trim(budget)          # ONE pass: drop oldest whole rounds
+            return ceiling                              # tokenizer DIED mid-count ⇒ `est` is contaminated by
+                                                        # the over-counting char fallback ⇒ trust the trim
+        avail = MAX_MODEL_LEN - fixed - est             # room left for generation at the full prompt
+        if avail >= ceiling:
+            return ceiling                              # the full output reserve fits — nothing to do
+        if avail >= MIN_OUTPUT_TOKENS:
+            return int(avail)                           # reserve LESS output, keep ALL context (lossless)
+        # even a minimal answer will not fit → free room by dropping the oldest whole rounds (then, as a
+        # last resort inside _emergency_trim, truncating an irreducible oversized turn).
+        est = self._emergency_trim(MAX_MODEL_LEN - fixed - MIN_OUTPUT_TOKENS)
         if _live_token_counter() is None:
-            return                                  # died mid-trim ⇒ don't raise on a contaminated count
-        if est > budget:
-            raise ContextOverflowError(
-                f"context overflow: prompt ~{est} tok + reserve {reserve} "
-                f"(output {self.max_tokens}"
-                + (f" + thinking {THINKING_RESERVE}" if think else "")
-                + f" + tools {tools_tok}) exceeds the model window {MAX_MODEL_LEN}. "
-                f"Shorten this turn (smaller paste / file excerpt / tool output) or raise the model "
-                f"window (GX10_MAX_MODEL_LEN / a larger --max-model-len).")
+            return ceiling                              # died mid-trim ⇒ don't raise on a contaminated count
+        avail = MAX_MODEL_LEN - fixed - est
+        if avail >= MIN_OUTPUT_TOKENS:
+            return min(ceiling, int(avail))
+        raise ContextOverflowError(
+            f"context overflow: prompt ~{est} tok + reserve {fixed + MIN_OUTPUT_TOKENS} "
+            f"(min output {MIN_OUTPUT_TOKENS}"
+            + (f" + thinking {THINKING_RESERVE}" if think else "")
+            + f" + tools {tools_tok}) exceeds the model window {MAX_MODEL_LEN}. "
+            f"Shorten this turn (smaller paste / file excerpt / tool output) or raise the model "
+            f"window (GX10_MAX_MODEL_LEN / a larger --max-model-len).")
 
     def _emergency_trim(self, budget: int) -> int:
         """Drop the oldest WHOLE rounds (the round's user turn + its assistant.tool_calls + their
@@ -4695,33 +5198,43 @@ class GX10:
                 pass
         self.messages = system + others
         est = _count_prompt_tokens(self.messages)
-        if est > budget:                                # #994-S16: an irreducible oversized turn (one huge
-            est = self._trim_oversized_message(budget)  # tool result / paste) → truncate it, don't just raise
+        if est > budget:                                 # #994-S16 / #366: whole-round eviction couldn't fit
+            est = self._trim_oversized_messages(budget)   # → truncate the biggest turns' content, don't raise
         return est
 
-    def _trim_oversized_message(self, budget: int) -> int:
-        """#994-S16: last-resort recovery — when whole-round eviction can't fit an irreducible oversized turn
-        (one huge tool result / paste), truncate the LARGEST message's string content (head+tail + a marker)
-        so the prompt fits ``budget``, instead of leaving the caller to raise. Only the content string
-        shrinks, so the assistant.tool_calls ↔ tool-response pairing is untouched. Best effort — returns the
-        final estimated prompt tokens (the caller still raises if this somehow can't reduce it)."""
-        cands = [(i, _count_tokens(_message_text(m))) for i, m in enumerate(self.messages)
-                 if m.get("role") != "system" and isinstance(m.get("content"), str) and m.get("content")]
-        if not cands:
-            return _count_prompt_tokens(self.messages)
-        i, _ = max(cands, key=lambda t: t[1])
-        over = _count_prompt_tokens(self.messages) - budget
-        if over <= 0:
-            return _count_prompt_tokens(self.messages)
-        content = self.messages[i]["content"]
-        cut_chars = min(len(content), int((over + 128) * float(CHARS_PER_TOKEN)))   # +128 tok margin
-        keep = max(256, len(content) - cut_chars)
-        head_n = keep * 2 // 3
-        tail_n = keep - head_n
-        self.messages[i]["content"] = (
-            content[:head_n]
-            + f"\n\n... [Ironclad: {len(content) - keep} chars truncated to fit the context window] ...\n\n"
-            + (content[-tail_n:] if tail_n > 0 else ""))
+    _TRUNCATE_FLOOR_CHARS = 256   # smallest a message's content is shrunk to (keep a head+tail excerpt)
+
+    def _trim_oversized_messages(self, budget: int) -> int:
+        """#994-S16 / #366: last-resort recovery — when whole-round eviction can't fit the transcript,
+        ITERATIVELY truncate the largest non-system string-content messages (head+tail + a marker) until it
+        fits ``budget`` or nothing reducible remains. Iterative (not one message): an agentic loop is ONE
+        user turn with MANY accumulated tool reads and no user boundary to evict — a single truncation left
+        the turn over the wall (the operator's #1035 follow-up: ~28–34k after one cut). Only content strings
+        shrink, so the assistant.tool_calls ↔ tool-response pairing is untouched. Returns the final estimate
+        (still > budget only when the system partition + framing alone overflow — then the caller raises)."""
+        floor = self._TRUNCATE_FLOOR_CHARS
+        for _ in range(len(self.messages) + 8):          # bounded: at most one pass per message (+ slack)
+            est = _count_prompt_tokens(self.messages)
+            over = est - budget
+            if over <= 0:
+                return est
+            cands = [(i, len(m["content"])) for i, m in enumerate(self.messages)
+                     if m.get("role") != "system" and isinstance(m.get("content"), str)
+                     and len(m["content"]) > floor]
+            if not cands:
+                return est                               # everything reducible is at the floor → caller raises
+            i, clen = max(cands, key=lambda t: t[1])
+            content = self.messages[i]["content"]
+            cut_chars = min(clen - floor, int((over + 128) * float(CHARS_PER_TOKEN)))   # +128 tok margin
+            if cut_chars <= 0:
+                return est
+            keep = clen - cut_chars
+            head_n = keep * 2 // 3
+            tail_n = keep - head_n
+            self.messages[i]["content"] = (
+                content[:head_n]
+                + f"\n\n... [Ironclad: {clen - keep} chars truncated to fit the context window] ...\n\n"
+                + (content[-tail_n:] if tail_n > 0 else ""))
         return _count_prompt_tokens(self.messages)
 
     def _live_read_budget(self) -> int:
@@ -4737,15 +5250,31 @@ class GX10:
         free_chars = int(max(0, free_tok) * float(CHARS_PER_TOKEN) * 0.8)
         return max(_READ_FLOOR_CHARS, min(MAX_FILE_CHARS, free_chars))
 
+    def _sanitize_tool_call_history(self) -> None:
+        """#1039 defense-in-depth: EVERY assistant tool_call's arguments in the history must be valid JSON
+        before the request goes out — vLLM json.loads() them when it renders the prompt. #1039 sanitises at
+        the APPEND site, but a tool_call can also enter the history from a LOADED session (session.json
+        persists the raw arguments verbatim) or a resume/handover — a persisted MALFORMED call would 400 the
+        FIRST request after a restart (operator hit exactly this: a truncated `write_file` call reloaded from
+        session.json → `Expecting ',' delimiter`, 0-gen 400). One cheap, idempotent pass over the history at
+        the single send choke-point covers every entry path."""
+        for m in self.messages:
+            for tc in (m.get("tool_calls") or []):
+                fn = tc.get("function")
+                if isinstance(fn, dict):
+                    fn["arguments"] = _valid_tool_args_json(fn.get("arguments"))
+
     def _make_completion(self, think: bool, stream: bool):
-        self._preflight_context(think)              # #372: guard + emergency trim (raises on irreducible overflow)
+        self._sanitize_tool_call_history()   # #1039: no malformed tool-call args (incl. loaded session) reach vLLM
+        # #372/#379: guard + adaptive output reserve + emergency trim (raises only on irreducible overflow).
+        eff_max_tokens = self._preflight_context(think)   # <= self.max_tokens; shrinks to fit rather than fail
         kwargs: Dict[str, Any] = dict(
             model=self.model,
             messages=self.messages,
             tools=_effective_tools(),
             tool_choice="auto",
             temperature=TEMPERATURE,
-            max_tokens=self.max_tokens,
+            max_tokens=eff_max_tokens,
             extra_body={"chat_template_kwargs": {"enable_thinking": think}},
         )
         if stream:
@@ -5166,6 +5695,7 @@ class GX10:
         chunk_q: _q.Queue = _q.Queue()
         err     = [None]
         usage   = [None]          # OPT-3: usage from the last chunk
+        finish  = [None]          # #1048: last finish_reason (=="length" ⇒ generation cut off by the token cap)
         done    = threading.Event()
 
         def _worker():
@@ -5183,6 +5713,8 @@ class GX10:
                         usage[0] = u
                     if not chunk.choices:
                         continue
+                    if getattr(chunk.choices[0], "finish_reason", None):
+                        finish[0] = chunk.choices[0].finish_reason      # #1048: capture the terminal reason
                     chunk_q.put(chunk.choices[0].delta)
             except Exception as e:
                 err[0] = e
@@ -5256,6 +5788,7 @@ class GX10:
             "total": t_end - t0,
             "prompt_tokens":     getattr(usage[0], "prompt_tokens", None) if usage[0] else None,
             "completion_tokens": getattr(usage[0], "completion_tokens", None) if usage[0] else None,
+            "finish_reason":     finish[0],                             # #1048: "length" ⇒ output truncated
         }
         tool_calls = [tool_acc[i] for i in sorted(tool_acc)]
         return "".join(parts), tool_calls, cancelled, err[0], metrics
@@ -5304,6 +5837,7 @@ class GX10:
             "total": t_end - t0,
             "prompt_tokens":     getattr(usage, "prompt_tokens", None) if usage else None,
             "completion_tokens": getattr(usage, "completion_tokens", None) if usage else None,
+            "finish_reason":     getattr(res[0].choices[0], "finish_reason", None),   # #1048
         }
         disp = clean(content)
         if disp:
@@ -5383,6 +5917,17 @@ class GX10:
             content, tool_calls, cancelled, err, metrics = self._generate(think)
             spinner.stop()
 
+            if not cancelled:   # #1060: telemetry — record every real generation (success + error), skip aborts
+                try:
+                    import telemetry as _tel
+                    _m = metrics or {}
+                    _tel.record_turn(latency_s=_m.get("total") or 0.0,
+                                     prompt_tokens=_m.get("prompt_tokens") or 0,
+                                     completion_tokens=_m.get("completion_tokens") or 0,
+                                     ok=not err, ts=time.time())
+                except Exception:   # noqa: BLE001 — telemetry must never break a turn
+                    pass
+
             if cancelled:
                 outcome = {"kind": "abort"}
                 return
@@ -5416,6 +5961,8 @@ class GX10:
             # tool call was recovered from the text, `content` is the call marker
             # itself — don't duplicate it as assistant.content (confuses some templates).
             cleaned = "" if recovered_from_text else clean(content)
+            if cleaned:
+                self.last_response = cleaned   # #1048: track the latest model text so write_last_reply can persist it escape-free
             msg_dict: Dict[str, Any] = {"role": "assistant", "content": cleaned or None}
             if tool_calls:
                 msg_dict["tool_calls"] = [
@@ -5424,7 +5971,9 @@ class GX10:
                         "type":     "function",
                         "function": {
                             "name":      t["name"] or "",
-                            "arguments": t["arguments"] or "{}",
+                            # the arguments stored in history MUST be valid JSON — vLLM json.loads() them on
+                            # the next request; a malformed string would hard-400 the reask (defeats reask).
+                            "arguments": _valid_tool_args_json(t["arguments"]),
                         },
                     }
                     for i, t in enumerate(tool_calls)
@@ -5465,9 +6014,45 @@ class GX10:
                     end="  "
                 )
 
-                _rb = _READ_BUDGET_CV.set(self._live_read_budget())   # #994-S16: cap a read to the live window
+                cap = self._live_read_budget()                        # #994-S16/#1046: LIVE per-turn budget
+                _rb = _READ_BUDGET_CV.set(cap)                        # read_file reads it for its own cap
                 try:
-                    result_t = run_tool(name, args)
+                    if name == "write_last_reply":
+                        # #1048 (L1-write): escape-free authoring — persist the model's PREVIOUS reply text
+                        # (already produced as ordinary output) instead of a huge JSON-escaped write_file
+                        # 'content'. Delegates to write_file so path resolution / the local bridge / append
+                        # all apply. Returns a short status (not ingested content) → no _cap.
+                        body = self.last_response or ""
+                        if not body:
+                            result_t = ("ERROR: no previous reply to write — produce the file body as your "
+                                        "message text FIRST, then call write_last_reply(path).")
+                        else:
+                            result_t = run_tool("write_file", {"path": args.get("path", ""),
+                                                               "content": body,
+                                                               "mode": args.get("mode", "write")})
+                    else:
+                        result_t = run_tool(name, args)
+                        # #1046 (L1-choke): cap EVERY ingestion tool's result at this one choke point — not
+                        # just read_file (which caps itself) but search_files/list_directory/execute_command
+                        # AND the local-bridge return (which bypasses read_file's cap). Idempotent + scoped;
+                        # other tools (web_search/parallel_reason/MPR/memory) pass through untouched.
+                        result_t = _cap_ingested_result(name, result_t, cap)
+                        if INJECTION_DEFENSE and name in _INGESTION_TOOLS:   # #1068: fence untrusted content
+                            try:
+                                from ack import injection as _inj
+                                result_t = _inj.wrap_untrusted(result_t, source=name)
+                            except Exception:   # noqa: BLE001 — the defense must never break a turn
+                                pass
+                    # #1048: warn-only integrity guard — if the generation that EMITTED this write was cut off
+                    # by the token limit (finish_reason=length), the body may be silently truncated (a
+                    # char-count can't detect it). Warn + steer to append; never block.
+                    if (name in ("write_file", "write_last_reply")
+                            and (metrics or {}).get("finish_reason") == "length"
+                            and not result_t.startswith("ERROR")):
+                        result_t += ("\n\n[Ironclad: WARNING — the generation that produced this write was cut "
+                                     "off by the token limit (finish_reason=length); the file may be truncated. "
+                                     "Continue it with mode='append'.]")
+                    _maybe_audit(name, args, result_t)   # #1084: tamper-evident per-action audit (default-off)
                 finally:
                     _READ_BUDGET_CV.reset(_rb)
                 preview  = result_t.replace("\n", " ")[:70]
@@ -7491,6 +8076,29 @@ def _code_defaults() -> Dict[str, Any]:
             "count":            10,                     # results per native (http) search request
             "max_output_chars": 100_000,                # cap on the model-facing tool result (S5)
         },
+        "forge": {                                      # #1073: code-host issue filing (default OFF)
+            "enabled": FORGE_ENABLED,                   # opt-in: register the create_issue tool
+            "repo":    FORGE_REPO,                       # optional owner/repo; empty ⇒ gh's cwd default
+        },
+        "notify": {                                     # #1083: escalation → webhook (default OFF)
+            "webhook": NOTIFY_WEBHOOK,                   # deploy secret via GX10_NOTIFY_WEBHOOK; empty ⇒ off
+        },
+        "audit": {                                      # #1084/#1067: per-action tamper-evident audit ledger
+            "enabled": AUDIT_ENABLED,                   # opt-in: record tool actions (default OFF)
+            "scope":   AUDIT_SCOPE,                      # #1067: "mutating" (default) | "all" (full tool surface)
+        },
+        "metrics": {                                    # #1060: runtime telemetry — GET /metrics + SLO/anomaly
+            "window_s":          3600,                  # rolling window (s) for the recent-window aggregate
+            "slo_error_rate":    0.2,                   # SLO: max error rate over the window
+            "slo_p95_latency_s": 60.0,                  # SLO: max p95 generation latency (s)
+        },
+        "alert": {                                      # #1061: alerting pipeline (default OFF)
+            "enabled":    ALERT_ENABLED,                # opt-in: periodic SLO/anomaly self-scan → webhook page
+            "interval_s": 300,                          # how often the self-scan evaluates the SLO/anomaly
+        },
+        "safety": {                                     # #1065: autonomy-safety pre-flight gates (default OFF)
+            "ambiguity_detect": False,                  # #1066 Variant-B: warn on an ambiguous handover requirement
+        },
         "platform": {
             "mode": PLATFORM_MODE,   # "auto" | "windows" | "linux"
         },
@@ -7553,6 +8161,7 @@ def _code_defaults() -> Dict[str, Any]:
             "rounds":      1,      # reflection rounds per online adaptation (L-001)
             "top_k":       8,      # bullets injected into the Generator handover context (H-001)
             "cost":        1,      # budget units charged per online adaptation (when a budget is wired)
+            "safe_promote": False, # #1070 learned-state safety: snapshot-before-adapt + eval-gate (default OFF)
             "embed_url":   "",     # the memory-service /embed endpoint (semantic dedup/retrieval); "" ⇒ derive
                                    # from GX10_MEMORY_URL, else lexical fallback (the dependency-free default)
         },
@@ -7585,6 +8194,9 @@ def _code_defaults() -> Dict[str, Any]:
             "session_heartbeat_s": 30,
             "code_locality":       "mount",   # sealed forces "local"
             "web_in_sealed":       False,     # epic #505 S7: opt-in to allow outbound web_search under sealed
+            "injection_defense":   False,     # #1068: fence untrusted ingested content (data-not-instructions)
+            "sandbox":             "off",     # #1069: OS exec sandbox — off | auto | bwrap | firejail (Linux)
+            "multi_tenant":        False,     # #1071: per-principal RBAC + tenant memory isolation (default OFF)
         },
         "setup": {
             # Boot-fixed deployment topology (docs/setup-types.md). NOT runtime-switchable — a frozen
@@ -7719,6 +8331,8 @@ def _code_defaults() -> Dict[str, Any]:
             "token_budget":       TOKEN_BUDGET,     # MEM-9: couple the trim to the window (default ON)
             "chars_per_token":    CHARS_PER_TOKEN,  # #366: calibrated chars/token FALLBACK (live tokenizer is primary)
             "thinking_reserve":   THINKING_RESERVE, # #366 D5: output headroom reserved when think=True
+            "min_output_tokens":  MIN_OUTPUT_TOKENS, # #366: floor the adaptive output reserve can shrink to
+            "overflow_safety_tokens": OVERFLOW_SAFETY_TOKENS, # #366: headroom below the wall (estimate slop)
             "memory_brief_tokens": MEMORY_BRIEF_TOKENS,  # #458 D1: token budget of the handover memory brief
             "max_file_chars":     MAX_FILE_CHARS,
             "list_dir_hard_cap":  LIST_DIR_HARD_CAP,
@@ -7870,6 +8484,16 @@ def _apply_env(cfg: Dict[str, Any]) -> Dict[str, Any]:
     # epic #505 S8: web-search knobs (the secret VALUE GX10_SEARCH_API_KEY is read from env at boot,
     # NOT here — non-secret only). search.web_in_sealed lives under security (S7).
     setif("GX10_SEARCH_ENABLED",          "search", "enabled", _truthy)
+    setif("GX10_FORGE_ENABLED",           "forge",  "enabled", _truthy)   # #1073: opt-in issue filing
+    setif("GX10_FORGE_REPO",              "forge",  "repo")
+    setif("GX10_NOTIFY_WEBHOOK",          "notify", "webhook")            # #1083: escalation webhook (deploy secret)
+    setif("GX10_AUDIT_ENABLED",           "audit",  "enabled", _truthy)   # #1084: opt-in per-action audit ledger
+    setif("GX10_AUDIT_SCOPE",             "audit",  "scope")              # #1067: mutating | all
+    setif("GX10_INJECTION_DEFENSE",       "security", "injection_defense", _truthy)   # #1068: fence ingested content
+    setif("GX10_SANDBOX",                 "security", "sandbox")                      # #1069: OS exec sandbox backend
+    setif("GX10_MULTI_TENANT",            "security", "multi_tenant", _truthy)        # #1071: per-principal RBAC
+    setif("GX10_ALERT_ENABLED",           "alert",  "enabled", _truthy)   # #1061: opt-in alerting self-scan
+    setif("GX10_AMBIGUITY_DETECT",        "safety", "ambiguity_detect", _truthy)   # #1066: Variant-B pre-flight
     setif("GX10_SEARCH_ADAPTER",          "search", "adapter")
     setif("GX10_SEARCH_COUNT",            "search", "count", int)
     setif("GX10_SEARCH_MAX_OUTPUT_CHARS", "search", "max_output_chars", int)
@@ -7898,6 +8522,8 @@ def _apply_env(cfg: Dict[str, Any]) -> Dict[str, Any]:
     setif("GX10_CHARS_PER_TOKEN",    "context", "chars_per_token",    float)   # #366: calibrated fallback ratio
     setif("GX10_MEMORY_BRIEF_TOKENS", "context", "memory_brief_tokens", int)   # #458 D1: handover brief budget
     setif("GX10_THINKING_RESERVE",   "context", "thinking_reserve",   int)     # #366 D5: thinking output reserve
+    setif("GX10_MIN_OUTPUT_TOKENS",  "context", "min_output_tokens",  int)     # #366: adaptive output-reserve floor
+    setif("GX10_OVERFLOW_SAFETY",    "context", "overflow_safety_tokens", int) # #366: estimate-slop headroom below the wall
     setif("GX10_AUTOPILOT",  "autopilot",  "enabled", _truthy)
     setif("GX10_AUTOPILOT_STREAM",    "autopilot", "stream",          _truthy)
     setif("GX10_AUTOPILOT_TERMINATE", "autopilot", "terminate_on_advance", _truthy)
@@ -7912,13 +8538,13 @@ def _apply_config(cfg: Dict[str, Any]):
     existing references (run_tool, macros, _trim_context, _classify_thinking,
     watcher, UI …) keep running unchanged."""
     global DEFAULT_BASE_URL, DEFAULT_MODEL, API_KEY_ENV, STATE_ROOT, VAULT_ROOT, SESSION_FILE, CODE_ROOT
-    global PLATFORM_MODE, PLATFORM, TASKS_DEDUP_THRESHOLD, ONBOARDING_MODE, TASK_PREFIX, _TASK_ID_RE, ACK_ENABLED, LODESTAR_ENABLED
+    global PLATFORM_MODE, PLATFORM, TASKS_DEDUP_THRESHOLD, ONBOARDING_MODE, TASK_PREFIX, _TASK_ID_RE, ACK_ENABLED, LODESTAR_ENABLED, FORGE_ENABLED, FORGE_REPO, NOTIFY_WEBHOOK, AUDIT_ENABLED, AUDIT_SCOPE, INJECTION_DEFENSE, SANDBOX, MULTI_TENANT, ALERT_ENABLED
     global AUTOPILOT_ENABLED, AUTOPILOT_CLAUDE_BIN, AUTOPILOT_EXTRA_ARGS
     global AUTOPILOT_DEFAULT_EFFORT, AUTOPILOT_LOGS_DIR, AUTOPILOT_MAX_CONCURRENT, AUTOPILOT_STREAM, AUTOPILOT_TERMINATE_ON_ADVANCE, AUTOPILOT_AUTOPLAN, AUTOPILOT_MAX_TASKS, AUTOPILOT_LOG_TERMINAL
     global TEMPERATURE, MAX_TOKENS, RETRY_BACKOFF, LANGUAGE
     global MAX_ITERATIONS, MAX_CTX_CHARS, TRIM_TARGET_CHARS, MAX_FILE_CHARS, LIST_DIR_HARD_CAP
     global SUMMARIZE_EVICTED, SUMMARY_MAX_TOKENS, RAG_ENABLED, RAG_TOP_K, RAG_MAX_TOKENS
-    global MAX_MODEL_LEN, TOKEN_BUDGET, CHARS_PER_TOKEN, THINKING_RESERVE, MEMORY_BRIEF_TOKENS
+    global MAX_MODEL_LEN, TOKEN_BUDGET, CHARS_PER_TOKEN, THINKING_RESERVE, MEMORY_BRIEF_TOKENS, MIN_OUTPUT_TOKENS, OVERFLOW_SAFETY_TOKENS
     global WORKER_MEMORY, WORKER_WRITE, WORKER_WRITE_MODE, WARM_SESSION_ID
     global _PLANNING_KW, _ROUTINE_KW, WORKSPACE_DIRS, _IDLE_ACTIVE
     global WATCHER_FEEDBACK_DIR, _WATCHER_ENABLED, RECONCILER_INTERVAL
@@ -7944,6 +8570,15 @@ def _apply_config(cfg: Dict[str, Any]):
     TASK_PREFIX           = str(cfg["tasks"].get("id_prefix", TASK_PREFIX))
     _TASK_ID_RE           = re.compile(rf"^{re.escape(TASK_PREFIX)}-[A-Za-z0-9_]+$")
     ACK_ENABLED           = bool(cfg.get("ack", {}).get("enabled", ACK_ENABLED))
+    FORGE_ENABLED         = bool(cfg.get("forge", {}).get("enabled", FORGE_ENABLED))   # #1073 default OFF
+    FORGE_REPO            = str(cfg.get("forge", {}).get("repo", FORGE_REPO) or "")
+    NOTIFY_WEBHOOK        = str(cfg.get("notify", {}).get("webhook", NOTIFY_WEBHOOK) or "")   # #1083
+    AUDIT_ENABLED         = bool(cfg.get("audit", {}).get("enabled", AUDIT_ENABLED))   # #1084 default OFF
+    AUDIT_SCOPE           = str(cfg.get("audit", {}).get("scope", AUDIT_SCOPE) or "mutating").lower()   # #1067
+    INJECTION_DEFENSE     = bool(cfg.get("security", {}).get("injection_defense", INJECTION_DEFENSE))   # #1068
+    SANDBOX               = str(cfg.get("security", {}).get("sandbox", SANDBOX) or "off").lower()   # #1069
+    MULTI_TENANT          = bool(cfg.get("security", {}).get("multi_tenant", MULTI_TENANT))   # #1071 default OFF
+    ALERT_ENABLED         = bool(cfg.get("alert", {}).get("enabled", ALERT_ENABLED))   # #1061 default OFF
     LODESTAR_ENABLED      = bool(cfg.get("lodestar", {}).get("enabled", LODESTAR_ENABLED))
     ONBOARDING_MODE       = bool(cfg["onboarding"]["enabled"])
 
@@ -7982,6 +8617,8 @@ def _apply_config(cfg: Dict[str, Any]):
     TOKEN_BUDGET       = bool(ctx.get("token_budget", True))
     CHARS_PER_TOKEN    = float(ctx.get("chars_per_token", CHARS_PER_TOKEN))   # #366 calibrated fallback
     THINKING_RESERVE   = int(ctx.get("thinking_reserve", THINKING_RESERVE))   # #366 D5
+    MIN_OUTPUT_TOKENS  = max(1, int(ctx.get("min_output_tokens", MIN_OUTPUT_TOKENS)))   # #366 adaptive-reserve floor
+    OVERFLOW_SAFETY_TOKENS = max(0, int(ctx.get("overflow_safety_tokens", OVERFLOW_SAFETY_TOKENS)))   # #366 estimate-slop headroom
     MEMORY_BRIEF_TOKENS = int(ctx.get("memory_brief_tokens", MEMORY_BRIEF_TOKENS))   # #458 D1 handover brief budget
     if TOKEN_BUDGET and not (os.environ.get("GX10_MAX_CTX_CHARS") or os.environ.get("GX10_TRIM_TARGET_CHARS")):
         # MEM-9: derive the char watermark from the window (output/RAG/summary reserve). BUDGET-3 (#503):
@@ -8050,12 +8687,14 @@ def _apply_config(cfg: Dict[str, Any]):
         _UI_MAX_LINES = new_max
         _UI_LINES = deque(_UI_LINES, maxlen=new_max)
 
+    _apply_notify(cfg)             # #1083: (un)register the escalation → webhook notifier (default-off)
     _apply_ace(cfg)                # epic #855 ACE-WIRE (#863): the ALWAYS-ON ACE loop-intelligence core —
                                    # registers the PlaybookStore provider + the post_feedback ACE consumer +
                                    # the background ReflectionWorker, and SUPERSEDES the #602 string lessons
                                    # (_apply_lessons_provider/_apply_lessons_consumer) + Process-SC consumer
                                    # (_apply_process_consumer): those #602 reflection seams are no longer wired.
     _apply_quality_breaker(cfg)    # epic #602 SUB-9: build/clear the opt-in quality breaker
+    _apply_ambiguity(cfg)          # #1066: register/clear the Variant-B ambiguity pre-flight (pre_handover)
     _apply_verifier(cfg)           # epic #602 SUB-4/2.1: register/clear the opt-in pre_handover Verifier
     _apply_quality_consumer(cfg)   # epic #602 SUB-9/2.7: register/clear the post_handover quality consumer
     _apply_strategy(cfg)           # epic #602 SUB-3/2.4: capture strategy.enabled for the failure recorder
@@ -8115,6 +8754,29 @@ def _lessons_consumer_hook(ctx) -> None:
             _lessons.report_lesson(_active_mem_ns(), _fb, {"task_id": task_id, "source": "task_completion"})
     except Exception:   # noqa: BLE001 — advisory: a lesson write must never break a turn
         return
+
+
+_NOTIFY_CONSUMER = None   # #1083: the currently-registered escalation → webhook consumer (None = none)
+
+
+def _apply_notify(cfg: Dict[str, Any]) -> None:
+    """#1083: (un)register the `escalation` → webhook notifier per `notify.webhook` (a deploy secret via
+    GX10_NOTIFY_WEBHOOK — never a URL literal in core). DEFAULT-OFF: an empty URL removes the consumer, so a
+    dispatch is an O(1) no-op → byte-identical. Idempotent — tracks the registered consumer so a URL change
+    swaps cleanly. Lazy-imports ``ack`` (S6b). Fail-soft: notification wiring never breaks config apply."""
+    global _NOTIFY_CONSUMER
+    try:
+        url = str(((cfg or {}).get("notify") or {}).get("webhook", "") or "").strip()
+        from ack import hooks as _hooks       # lazy: never import ack at gx10 top-level (S6b lesson)
+        if _NOTIFY_CONSUMER is not None:
+            _hooks.unregister_hook("escalation", _NOTIFY_CONSUMER)
+            _NOTIFY_CONSUMER = None
+        if url:
+            import notify as _notify
+            _NOTIFY_CONSUMER = _notify.make_escalation_consumer(url)
+            _hooks.register_hook("escalation", _NOTIFY_CONSUMER)
+    except Exception:   # noqa: BLE001 — notification wiring must never break config application
+        _NOTIFY_CONSUMER = None
 
 
 def _apply_lessons_consumer(cfg: Dict[str, Any]) -> None:
@@ -8634,6 +9296,8 @@ def _ace_command(arg: str) -> str:
     J-001/J-002 verdict (measurement only; no playbook is mutated)."""
     parts = (arg or "").split()
     sub = parts[0] if parts else ""
+    if sub in ("snapshot", "versions", "rollback", "unlearn"):   # #1082: playbook safety verbs (active scope)
+        return _ace_playbook_command(sub, parts[1:])
     if sub not in ("warmup", "eval"):
         import command_spec as _command_spec   # #953: spec-derived usage (single source)
         return _command_spec.guided_usage("ace")
@@ -8677,6 +9341,40 @@ def _ace_command(arg: str) -> str:
                     j1="PASS" if j1_ok else "FAIL", reduction=f"{red:.0%}",
                     j2clause=_msg("ace.eval_j2_over" if j2_ok else "ace.eval_j2_under"),
                     j2="PASS" if j2_ok else "FAIL", ace=ace.rollouts, fr=fr.rollouts, evo=evo.rollouts)
+    except Exception as ex:   # noqa: BLE001 — the command must never crash the REPL
+        return f"ace {sub}: failed ({ex!r})"
+
+
+def _ace_playbook_command(sub: str, args: "List[str]") -> str:
+    """#1082: operator-facing ACE playbook SAFETY verbs over the ACTIVE scope's learned playbook —
+    `/ace snapshot` (record a rollback point), `/ace versions`, `/ace rollback [<version>]` (restore the
+    previous or a named snapshot), `/ace unlearn <id…>` (selectively forget bullets). Wired to the
+    PlaybookStore (M-002 versioning + Q-001 unlearn); each mutating verb snapshots first, so it is itself
+    reversible. Fail-soft; never crashes the REPL."""
+    store = _ACE_STORE
+    if store is None or not hasattr(store, sub):
+        return f"ace {sub}: no ACE playbook store is registered"
+    scope = _active_mem_ns()
+    if not scope:
+        return f"ace {sub}: no active project scope (open a project first)"
+    try:
+        if sub == "snapshot":
+            r = store.snapshot(scope)
+            return (f"ace snapshot: failed — {r['error']}" if r.get("error")
+                    else f"ace snapshot: recorded version {r['version']} ({r['versions']} kept)")
+        if sub == "versions":
+            vs = store.versions(scope)
+            return "ace versions: " + (", ".join(vs) if vs else "(none — run /ace snapshot first)")
+        if sub == "rollback":
+            r = store.rollback(scope, args[0] if args else None)
+            return (f"ace rollback: failed — {r['error']}" if r.get("error")
+                    else f"ace rollback: restored to {r['rolled_back_to']} ({r['size']} bullet(s))")
+        # sub == "unlearn"
+        if not args:
+            return "ace unlearn: give one or more bullet ids to forget (e.g. /ace unlearn b12 b7)"
+        r = store.unlearn(scope, args)
+        return (f"ace unlearn: failed — {r['error']}" if r.get("error")
+                else f"ace unlearn: removed {r['removed']}, {len(r.get('missing', []))} not found")
     except Exception as ex:   # noqa: BLE001 — the command must never crash the REPL
         return f"ace {sub}: failed ({ex!r})"
 
@@ -8883,7 +9581,8 @@ def _apply_ace(cfg: Dict[str, Any]) -> None:
                 ironclad_home() / "ace_playbooks", max_bullets=max_bullets,
                 config=AdaptConfig(rounds=rounds, max_bullets=max_bullets, cost=cost))
             store.set_transports(chat=_ace_chat_adapter(), embed=_ace_embed_adapter())
-            store.configure(max_bullets=max_bullets, top_k=top_k)
+            store.configure(max_bullets=max_bullets, top_k=top_k,
+                            safe_promote=bool(ace.get("safe_promote", False)))   # #1070 learned-state safety
             if current is not store:
                 _lessons.set_provider(store)
             _ACE_STORE = store
@@ -9061,6 +9760,40 @@ def _verifier_hook(ctx) -> None:
         pass
 
 
+def _ambiguity_hook(ctx) -> None:
+    """#1066 (Variant-B): pre-flight ambiguity auto-detector — a ``pre_handover`` Hook-Bus subscriber. Scans
+    the handover's requirement (``handover_md``) for underspecification / ambiguity and, on a hit, SURFACES a
+    halt-to-ask ForkSignal (warn) so an autonomous agent that did NOT notice the ambiguity is stopped, not
+    left to guess. Observer-only (mark/warn, never gates the fail-closed path) + fail-soft (never raises; the
+    bus swallows too). Registered only while ``safety.ambiguity_detect`` (see :func:`_apply_ambiguity`)."""
+    try:
+        from ack.ace.fork import detect_ambiguity   # lazy: never import ack at gx10 top-level (S6b lesson)
+        td = ctx if isinstance(ctx, dict) else {}
+        sig = detect_ambiguity(str(td.get("handover_md") or ""), unit=str(td.get("task_id") or ""))
+        if sig is not None and not sig.is_empty():
+            _ui_print(col(f"  [ambiguity] {sig.question}", C.YELLOW))
+            _ui_print(col(f"  [ambiguity] options: {' | '.join(sig.options)}", C.GRAY))
+    except Exception:   # noqa: BLE001 — the detector must never break a handover
+        pass
+
+
+def _apply_ambiguity(cfg: Dict[str, Any]) -> None:
+    """#1066: register (or unregister) the Variant-B ambiguity pre-flight on the ``pre_handover`` event per
+    ``safety.ambiguity_detect`` (default OFF → no hook → dispatch O(1) no-op → byte-identical). Idempotent
+    (dedup by identity); lazy-imports ``ack`` (S6b); fail-soft (never breaks config application)."""
+    try:
+        from ack import hooks as _hooks       # lazy: never import ack at gx10 top-level (S6b lesson)
+    except Exception:   # noqa: BLE001 — bus unavailable ⇒ leave the no-op default
+        return
+    try:
+        if bool(((cfg or {}).get("safety") or {}).get("ambiguity_detect", False)):
+            _hooks.register_hook("pre_handover", _ambiguity_hook)
+        else:
+            _hooks.unregister_hook("pre_handover", _ambiguity_hook)
+    except Exception:   # noqa: BLE001 — advisory wiring: never break config application
+        pass
+
+
 def _apply_verifier(cfg: Dict[str, Any]) -> None:
     """Register (or unregister) the mark-only Verifier on the ``pre_handover`` Hook-Bus event per
     ``verify.enabled`` (#602 2.1). Runs on every config application (boot + ``/config set`` + ``/switch``).
@@ -9217,6 +9950,8 @@ def _revise_on_failure(task_id, result_cls):
         if getattr(strat, "escalate", False):
             _ui_print(col(f"  [strategy] human escalation after {n} attempt(s) on {task_id} "
                           f"({result_cls}) → {strat.action.value}", C.YELLOW))
+            _emit_hook("escalation", {"task_id": task_id, "attempts": n,   # #1083: reach an off-duty human
+                                      "result_cls": result_cls, "action": strat.action.value})
         return strat.action.value
     except Exception:   # noqa: BLE001 — advisory: a strategy hiccup must never break the feedback path
         return None

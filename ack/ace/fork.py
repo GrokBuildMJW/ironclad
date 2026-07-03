@@ -20,6 +20,7 @@ a thinner `ForkSignal` (or is skipped), matching `devtraj`'s conservative parse.
 """
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
@@ -79,6 +80,62 @@ class ForkSignal:
 
     def is_empty(self) -> bool:
         return not (self.unit or self.question or self.options)
+
+
+# ── #1066: Variant-B ambiguity auto-detector ──────────────────────────────────────────────────────────
+# The no-guessing rule is a PROMPT CONVENTION today (Variant A relies on the agent/operator NOTICING the
+# ambiguity and declaring a ForkSignal). Variant B is the safety net for the autonomous case: a pure,
+# deterministic pre-flight scan that flags requirement underspecification / ambiguity and emits the SAME
+# ForkSignal — so an agent that does NOT notice the ambiguity is stopped (halt-to-ask), not left to guess.
+# Precision-first (it must not cry wolf): only clear signals fire.
+_AMBIGUITY_MARKERS = (
+    "tbd", "to be decided", "to be determined", "not sure", "unclear", "unspecified",
+    "figure out", "figure it out", "somehow", "or something", "???",
+)
+_AMBIGUITY_PATTERNS = (
+    (re.compile(r"\b(either|and/or|or should|whichever|one of|any of)\b", re.I), "multiple interpretations (either/or)"),
+    (re.compile(r"\b(appropriately|as appropriate|as needed|as required|etc\.?|and so on|properly|reasonably)\b", re.I),
+     "vague qualifier (appropriately/as needed/etc.)"),
+    (re.compile(r"\b(but not|however not|except maybe|not sure (if|whether))\b", re.I), "internal contradiction / hedge"),
+)
+
+
+def ambiguity_signals(text: str) -> "List[str]":
+    """The concrete ambiguity/underspecification signals in *text* (empty ⇒ reads unambiguous). Pure,
+    precision-first: an explicit uncertainty marker, an open question posed inside the requirement, a
+    multiple-interpretation phrase, a vague qualifier, or an internal hedge/contradiction."""
+    t = (text or "").strip()
+    if not t:
+        return []
+    low = t.lower()
+    signals: "List[str]" = []
+    for m in _AMBIGUITY_MARKERS:
+        if m in low:
+            signals.append(f"uncertainty marker: '{m}'")
+    if "?" in t:
+        signals.append("contains an open question ('?')")
+    for rx, label in _AMBIGUITY_PATTERNS:
+        if rx.search(low):
+            signals.append(label)
+    # de-dupe preserving order
+    seen: "set" = set()
+    return [s for s in signals if not (s in seen or seen.add(s))]
+
+
+def detect_ambiguity(text: str, *, unit: str = "", area: str = "requirements") -> "Optional[ForkSignal]":
+    """Variant-B auto-detector: if *text* carries ambiguity/underspecification signals, return a ForkSignal
+    (halt-to-ask) reusing the Variant-A schema; else None. Never raises. The engine gates whether a positive
+    result HALTS or merely warns (default-off) — this function only detects."""
+    try:
+        signals = ambiguity_signals(text)
+    except Exception:   # noqa: BLE001 — detection must never raise into the loop
+        return None
+    if not signals:
+        return None
+    question = "Ambiguity detected — clarify before building: " + "; ".join(signals[:4])
+    options = ["Ask the operator to specify the missing detail",
+               "Proceed with an explicitly stated assumption (record it)"]
+    return ForkSignal(unit=unit, area=area, question=question, options=options)
 
 
 @dataclass

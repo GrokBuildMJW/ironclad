@@ -37,3 +37,27 @@ jobs:
           gitleaks version   # >=8.19 for the `gitleaks dir` subcommand
       - name: gitleaks (secret scan)
         run: gitleaks dir . --no-banner --redact
+
+  dependency-audit:
+    # Surface known CVEs in the shipped dependencies (pip-audit for the Python package, npm audit for the
+    # bundled ink client); dependabot (.github/dependabot.yml) proposes the fixes. ADVISORY (continue-on-error)
+    # so a newly-disclosed transitive CVE surfaces in the log without blocking unrelated PRs — NOT a required
+    # check. Tighten to blocking once a triaged baseline / ignore-list is established.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: pip-audit (Python deps)
+        continue-on-error: true
+        run: |
+          python -m pip install --upgrade pip pip-audit
+          pip install -e ".[engine]"
+          pip-audit --strict --desc
+      - name: npm audit (ink client)
+        continue-on-error: true
+        working-directory: clients/ink
+        run: |
+          npm ci --ignore-scripts || npm install --ignore-scripts
+          npm audit --audit-level=high

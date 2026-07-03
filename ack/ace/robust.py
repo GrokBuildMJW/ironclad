@@ -138,6 +138,18 @@ def version_id(playbook: Playbook) -> str:
         return ""
 
 
+def regression_verdict(before: "Any", after: "Any", *, tolerance: float = 0.0) -> dict:
+    """#1070 learned-state safety: decide whether a just-applied adaptation REGRESSED a measured quality
+    score (higher = better) and must be reverted. Reverts iff ``after < before - tolerance``. Returns
+    ``{revert, before, after, delta}``. Pure; a non-numeric score is treated as NO regression (never revert
+    on a broken measurement — fail-open to keeping the learned change, the auditable snapshot still exists)."""
+    try:
+        b, a = float(before), float(after)
+    except (TypeError, ValueError):
+        return {"revert": False, "before": before, "after": after, "delta": None}
+    return {"revert": a < b - float(tolerance), "before": b, "after": a, "delta": a - b}
+
+
 def diff_versions(before: Playbook, after: Playbook) -> dict:
     """M-002: the traceable change between two playbook states — the added / removed bullet ids and the net
     size delta (so a version's changes are auditable). Never raises."""
@@ -173,6 +185,20 @@ class PlaybookHistory:
 
     def versions(self) -> List[str]:
         return [v for v, _ in self._log]
+
+    def to_log(self) -> "List[Tuple[str, str]]":
+        """The ``(version_id, json)`` pairs oldest→newest — for persistence (#1082)."""
+        return list(self._log)
+
+    @classmethod
+    def from_log(cls, log) -> "PlaybookHistory":
+        """Reconstruct from a :meth:`to_log` list; drops malformed entries, never raises (#1082)."""
+        h = cls()
+        try:
+            h._log = [(str(v), str(j)) for v, j in (log or []) if isinstance(v, str) and isinstance(j, str)]
+        except Exception:  # noqa: BLE001 — a corrupt persisted log → empty history
+            h._log = []
+        return h
 
     def rollback(self, target: "Optional[str]" = None) -> "Optional[Playbook]":
         """Reconstruct the playbook at *target* version (default: the previous version — undo the last

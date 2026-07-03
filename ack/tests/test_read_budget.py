@@ -74,7 +74,8 @@ def test_live_read_budget_shrinks_with_transcript(monkeypatch):
 
 class _FakeGX10:
     _emergency_trim = gx10.GX10._emergency_trim
-    _trim_oversized_message = gx10.GX10._trim_oversized_message
+    _trim_oversized_messages = gx10.GX10._trim_oversized_messages
+    _TRUNCATE_FLOOR_CHARS = gx10.GX10._TRUNCATE_FLOOR_CHARS
 
     def __init__(self, messages):
         self.messages = messages

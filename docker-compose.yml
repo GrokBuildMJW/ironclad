@@ -15,6 +15,15 @@
 # API). Bring it up and point the orchestrator at it:
 #   NEO4J_PASSWORD=change-me GX10_MEMORY_URL=http://localhost:8800 \
 #     docker compose --profile model --profile memory up -d
+#
+# Log retention (#1079): every long-lived service caps its json-file logs (max-size × max-file) via the
+# shared anchor below, so an always-on deployment can't fill the disk with unbounded container logs.
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"      # rotate a container log at 10 MB
+    max-file: "3"        # keep 3 rotations → ≤30 MB per service
+
 services:
   # Model server (vLLM). Only started with `--profile model`; otherwise bring your own
   # OpenAI-compatible endpoint and run just the orchestrator.
@@ -22,6 +31,7 @@ services:
     profiles: ["model"]
     image: ${IRONCLAD_VLLM_IMAGE:-vllm/vllm-openai:cu130-nightly}
     container_name: vllm
+    logging: *default-logging
     network_mode: host
     ipc: host
     restart: unless-stopped
@@ -54,6 +64,7 @@ services:
     build: .
     image: ironclad-orchestrator
     container_name: ironclad-orchestrator
+    logging: *default-logging
     network_mode: host          # reach vLLM on localhost:8000, bind 8100 on the host
     restart: unless-stopped
     depends_on:
@@ -82,6 +93,7 @@ services:
     profiles: ["memory"]
     image: qdrant/qdrant:latest
     container_name: mem-qdrant
+    logging: *default-logging
     restart: unless-stopped
     volumes:
       - qdrant-data:/qdrant/storage
@@ -90,6 +102,7 @@ services:
     profiles: ["memory"]
     image: neo4j:5.26.4
     container_name: mem-neo4j
+    logging: *default-logging
     restart: unless-stopped
     environment:
       NEO4J_AUTH: neo4j/${NEO4J_PASSWORD:-ironclad-memory}
@@ -104,6 +117,7 @@ services:
     build: ./memory-service
     image: ironclad-memory-api
     container_name: mem-api
+    logging: *default-logging
     restart: unless-stopped
     ports:
       - "8800:8000"                    # orchestrator reaches it at localhost:8800
@@ -146,6 +160,7 @@ services:
     profiles: ["memory"]
     image: valkey/valkey:8-alpine
     container_name: mem-valkey
+    logging: *default-logging
     restart: unless-stopped
     command: ["valkey-server", "--appendonly", "yes", "--save", "60", "1000"]
     ports:

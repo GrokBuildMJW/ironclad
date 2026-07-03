@@ -46,11 +46,12 @@ POST_HANDOVER = "post_handover"  #: after a handover is staged (the Quality-brea
 POST_FEEDBACK = "post_feedback"  #: task completion (the lessons + process-lesson write site)
 PRE_ADVANCE = "pre_advance"      #: before the pipeline advances
 POST_TOOLRESULT = "post_toolresult"  #: a tool returned (ctx carries the tool name to disambiguate)
+ESCALATION = "escalation"        #: #1083: a HUMAN_ESCALATION fired (budget spent) — the off-duty-notify site
 
 #: The one canonical, frozen event set. :func:`register_hook` rejects anything outside it (fail-loud).
 HOOK_EVENTS: "Tuple[str, ...]" = (
     PRE_TURN, POST_GENERATE, PRE_HANDOVER, POST_HANDOVER,
-    POST_FEEDBACK, PRE_ADVANCE, POST_TOOLRESULT,
+    POST_FEEDBACK, PRE_ADVANCE, POST_TOOLRESULT, ESCALATION,
 )
 
 #: A hook receives the boundary *ctx* (opaque to this module) and returns nothing the bus reads.

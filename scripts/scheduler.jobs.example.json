@@ -1,0 +1,7 @@
+{
+  "_comment": "#1064 example operate-phase schedule. Copy to scripts/scheduler.jobs.json and adjust. Drive it with one cron entry: `* * * * * cd /path/to/ironclad && python3 scripts/scheduler.py --run-due`. interval_s is seconds between runs.",
+  "jobs": [
+    {"name": "backup",     "command": "bash scripts/backup.sh",                                              "interval_s": 86400},
+    {"name": "prune-runs", "command": "python3 scripts/prune_runs.py ./ironclad-workdir --keep-days 30 --apply", "interval_s": 604800}
+  ]
+}

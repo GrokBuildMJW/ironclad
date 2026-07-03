@@ -7,6 +7,13 @@
 #   # a dev orchestrator (open profile, limited), pointed at an endpoint you choose
 #   GX10_BASE_URL=http://host.docker.internal:8000/v1 \
 #     docker compose -f docker-compose.dev.yml up -d orchestrator-dev
+# Log retention (#1079): cap the long-lived dev orchestrator's json-file logs (shared anchor).
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
 services:
   # Build + full test suite inside the container. A green run is the promote precondition.
   test:
@@ -27,6 +34,7 @@ services:
     build: .                      # the slim runtime Dockerfile
     image: ironclad-orchestrator
     container_name: ironclad-orchestrator-dev
+    logging: *default-logging
     network_mode: host            # reach a host model on localhost, bind :8100
     restart: unless-stopped
     environment:

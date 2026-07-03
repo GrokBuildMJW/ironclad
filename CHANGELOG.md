@@ -9,6 +9,201 @@ Released versions are listed below; upcoming work accumulates under *Unreleased*
 
 ## [Unreleased]
 
+## [0.0.24]
+- **Per-principal identity + RBAC + multi-tenant memory namespacing (foundation)** (epic #1065 / #1071):
+  Ironclad's trust model was single-tenant (one token for the whole server, no per-principal identity/authz,
+  no tenant isolation). A pure core authz foundation (`ack.authz`): a `Principal` (id/role/tenant), a
+  deny-by-default `DEFAULT_ROLES` RBAC policy (role → allowed danger-tiers; admin=all, operator/agent=
+  all-but-destructive, reader=read_only), `authorize(role, tier)`, `resolve_principal(token, principals)`
+  (secret-free — token values from env), and `tenant_scope(scope, tenant)` for isolated multi-tenant memory
+  (default tenant = no-op). Gated `security.multi_tenant` / `GX10_MULTI_TENANT` (default off, byte-identical);
+  engine seam `_authorize_action` / `_tenant_mem_scope`. **Foundation only**
+  ([ADR-0014](docs/adr/0014-rbac-multi-tenant.md)) — full request-path authz, ABAC, memory-service tenant
+  enforcement, and per-tenant routing are explicit remaining scope (overlaps the Enterprise milestone #20).
+  **Completes the Autonomy-safety epic (#1065).**
+- **OS-level execution sandbox for agent-run commands** (epic #1065 / #1069): `execute_command` ran agent-
+  generated shell with the orchestrator's own privileges. A core sandbox seam (`engine/sandbox.py`) now wraps
+  the command in an unprivileged OS isolation backend (bubblewrap / firejail) when one is configured + on PATH
+  — the foundational win is **network isolation** (`--net=none` / `--unshare-net`: no exfiltration / no C2)
+  while the filesystem stays accessible so legit commands work. `available_backend` detects the tool;
+  `wrap_command` builds the wrapper (pure); wired into `execute_command`'s POSIX branch via `security.sandbox`
+  / `GX10_SANDBOX` = off | auto | bwrap | firejail (default off). The seam never claims containment it can't
+  provide (no backend → runs as-is). Defense-in-depth ([ADR-0013](docs/adr/0013-exec-sandbox.md)) — full FS
+  isolation, seccomp, a container-runtime backend, and Windows containment are explicit remaining scope.
+- **Prompt-injection defense on the ingestion paths** (epic #1065 / #1068): ingested content (files, search/
+  web results, directory listings, tool output) had **no trust boundary** — an autonomous agent reading it
+  could be steered by an embedded instruction-override / role-switch / tool-injection. A layered core defense
+  (`ack.injection`): a precision-first `scan` for injection patterns + a `wrap_untrusted` trust boundary that
+  fences every ingested result as *data, not instructions* at the #1046 ingestion choke point, with a warning
+  when injection is detected. Gated `security.injection_defense` / `GX10_INJECTION_DEFENSE` (default off,
+  byte-identical). Defense-in-depth ([ADR-0012](docs/adr/0012-ingestion-injection-defense.md)) — **not** a
+  complete solution; an LLM classifier, per-source trust levels, and output-side checks are explicit
+  remaining scope.
+- **Full-surface, immutable per-action audit log — who/what/when/why + tamper-resistance** (epic #1065 /
+  #1067): extends #1084 from the mutating subset to the FULL tool surface. `audit.scope: all` (vs the default
+  `mutating`) records EVERY tool call (reads, searches, memory queries, …); each record now carries
+  who/what/when/why (actor + action + content-free target + `reason` = the active project scope + ts). And
+  the agent's own write tools (`write_file`/`edit_file`) REFUSE any path under the audit directory
+  (`_is_audit_path`), so an autonomous agent can't tamper with its own trail — tamper-RESISTANCE on top of the
+  hash-chain's tamper-EVIDENCE. Default-off; append-only OS enforcement / an external WORM sink is explicit
+  remaining scope.
+- **Learned-state safety — eval-gated ACE promotion + snapshot + auto-revert** (epic #1065 / #1070): ACE
+  deltas were applied without a snapshot or an eval gate, so a bad learned delta could silently degrade
+  behavior. With `ace.safe_promote` on, `PlaybookStore.adapt` now **snapshots the pre-adapt playbook** (an
+  operator/auto rollback point, reusing the #1082 history) before every online adaptation, and — when an eval
+  scorer is wired (`set_transports(eval_fn=…)`, a held-out eval / telemetry-derived signal, deploy-provided)
+  — **auto-reverts a measured regression** (`ack.ace.robust.regression_verdict`: never persists a delta that
+  lowered the score; fail-open on a broken measurement). Default-off (byte-identical); a built-in live-eval
+  signal is explicit remaining scope. Builds on #1082's snapshot/rollback/unlearn.
+- **Ambiguity auto-detector — the no-guessing rule becomes a pre-flight gate** (epic #1065 / #1066): the
+  no-guessing rule was a prompt CONVENTION (Variant A: the agent had to NOTICE an ambiguity and declare a
+  `ForkSignal`). Variant B is the autonomous safety net — `ack.ace.fork.detect_ambiguity` is a pure,
+  precision-first pre-flight scan that flags requirement underspecification (uncertainty markers, an open
+  question inside the requirement, either/or, vague qualifiers, hedges) and emits the same halt-to-ask
+  `ForkSignal`. Wired (**default-off** `safety.ambiguity_detect` / `GX10_AMBIGUITY_DETECT`) into the
+  `pre_handover` Hook-Bus, so an autonomous agent that did NOT notice the ambiguity is warned with the fork
+  question + options instead of guessing. **Observer-only** (warns; never gates the fail-closed path — full
+  pipeline-HALT enforcement is operator policy, explicit remaining scope); byte-identical when off. First
+  sub-issue of the Autonomy-safety epic.
+- **Alerting pipeline — page the SLO/anomaly + receive external alerts** (epic #1059 / #1061): a degradation
+  no longer only prints to a console. `engine/alerting.py` turns the telemetry SLO/anomaly verdict (#1060)
+  into alerts (SLO breach → critical, anomaly → warning), each correlated with the running deploy version;
+  the engine **outbound**-pages them to the configured webhook (#1083). A gated periodic self-scan
+  (`alert.enabled` + a webhook → a server daemon every `alert.interval_s`) fires them automatically, and a
+  token-gated **inbound** `POST /alert` receiver pages an external monitor's alert. Default-off (no scanner
+  thread when off, byte-identical); stdlib-only; fail-soft. **Completes the Operate & Maintain epic (#1059).**
+- **Operate-phase scheduler primitive** (epic #1059 / #1064): the orchestrator's `execute_command` is
+  single-shot (and refuses `schtasks`/`start-job`), so periodic operate jobs (backup, prune, drift checks)
+  had no in-product scheduler. `scripts/scheduler.py` fills the gap — a jobs config (`{name, command,
+  interval_s}`), a last-run state file, and a `--run-due` pass that runs whatever is due (a failed job retried
+  only after its interval, never in a hot loop). Driven by ONE host cron entry that fans out to every job;
+  `scripts/scheduler.jobs.example.json` seeds backup (daily) + prune-runs (weekly); `docs/scheduler.md` is
+  the runbook. Third sub-issue of the Operate & Maintain epic.
+- **Backup & restore for the memory tiers + engine state** (epic #1059 / #1062): the crown-jewel accumulated
+  memory (Qdrant vectors, Neo4j graph, Valkey warm) + engine state (vault artifacts, ACE playbooks, the audit
+  ledger) had **zero** backup automation — data loss was permanent. `scripts/backup.sh` dumps each running
+  memory-tier volume (via a throwaway helper container, so it works without quiescing the DB) + the
+  `./ironclad-workdir` bind mount to a timestamped archive, then applies retention (keep newest N,
+  unit-tested); `scripts/restore.sh` puts it back (`--yes`-gated, DESTRUCTIVE); `docs/backup-restore.md` is
+  the runbook (incl. cron scheduling until the in-product scheduler #1064). Second sub-issue of the Operate &
+  Maintain epic.
+- **Runtime self-telemetry — `GET /metrics` + SLO/anomaly** (epic #1059 / #1060): the orchestrator keeps a
+  bounded, thread-safe rolling record of per-generation latency, token cost, and errors (`engine/
+  telemetry.py`), and a token-gated `GET /metrics` returns the all-time + recent-window aggregate (turns,
+  error rate, latency p50/p95, prompt/completion/total tokens) plus an **SLO verdict** (config-tunable
+  `metrics.slo_error_rate` / `slo_p95_latency_s` / `window_s`) and a **recent-vs-baseline anomaly** signal —
+  so a degradation in an unattended deployment is observable/scrapable without a human at the console.
+  stdlib-only, fail-soft (recording never breaks a turn). First sub-issue of the Operate & Maintain epic.
+- **Per-action audit ledger** (epic #1043 / #1084): the orchestrator's mutating tool actions (`write_file` /
+  `write_last_reply` / `edit_file` / `execute_command` / `create_issue`) can now be recorded into a
+  **tamper-evident, hash-chained** audit trail (`engine/audit_ledger.py` — a core-owned ledger reusing the
+  dev-process ledger's proven `sha256(seq|prev_hash|payload)` chain; `verify_chain` detects any edit / reorder
+  / middle-deletion). Records are **content-free** (actor + action + target + ok, never the file body or
+  command output) and **default-off** (opt-in `audit.enabled` / `GX10_AUDIT_ENABLED` — no records when off,
+  byte-identical). The minimal first step of the audit-log epic (#1067); fail-soft. The last capability-audit
+  quick-win — completes epic #1072.
+- **Escalation notifications — a HUMAN_ESCALATION reaches an off-duty human** (epic #1043 / #1083): a
+  HUMAN_ESCALATION (the per-task attempt budget spent) now fires a new `escalation` Hook-Bus event, and a
+  default-off notifier POSTs it to an operator-configured webhook (a Slack incoming webhook or any JSON
+  endpoint) so it no longer only prints to a console a human must watch. The endpoint is a **deploy secret**
+  (`GX10_NOTIFY_WEBHOOK` / `notify.webhook` — never a URL literal in core); with no URL configured no consumer
+  is registered (byte-identical). stdlib-only, fail-soft; seeds the Operate epic's alerting. The tenth
+  capability-audit quick-win.
+- **`/ace snapshot|versions|rollback|unlearn` — operator safety net for the learned playbook** (epic #1043 /
+  #1082): the ACE playbook adapts silently, but the M-002 versioning + Q-001 selective-forget primitives
+  (`ack.ace.robust`) were unreachable. The `PlaybookStore` now persists a bounded per-scope version history
+  (next to the scope playbook) and exposes `snapshot` (record a rollback point), `versions`, `rollback
+  [<version>]` (restore the previous or a named snapshot — snapshotting the current state first so a rollback
+  is itself reversible), and `unlearn <id…>` (selectively forget bullets); wired to the `/ace` verbs,
+  fail-soft. The ninth capability-audit quick-win.
+- **Log & run-artifact retention** (epic #1043 / #1079): the reference compose stack now caps every
+  long-lived service's json-file logs (`max-size: 10m` × `max-file: 3`, via a shared `x-logging` anchor) so an
+  always-on deployment can't fill the disk with unbounded container logs; and a new `scripts/prune_runs.py`
+  purges run artifacts older than `--keep-days` (default 30) from the workdir's `runs/` directories (dry-run
+  by default, `--apply` to delete) — a deploy schedules it (cron/timer today; the in-product scheduler is
+  #1064). The seventh capability-audit quick-win.
+- **Supply-chain: dependabot + a CI dependency-audit** (epic #1043 / #1078): the published repo now ships
+  `.github/dependabot.yml` (weekly update PRs for the Python package, the bundled `clients/ink` client, and
+  the GitHub Actions) and a `dependency-audit` CI job that runs `pip-audit` (Python) + `npm audit` (ink) to
+  surface known CVEs. **Advisory** (continue-on-error, not a required check) so a newly-disclosed transitive
+  CVE surfaces in the log without blocking unrelated PRs; dependabot proposes the fixes. The sixth
+  capability-audit quick-win.
+- **`feature-spec` / PRD authoring prompt** (epic #1043 / #1077): a new `kind: prompt` built-in in the core
+  prompt library that drafts a concise product feature spec / PRD (problem · users & use cases · goals /
+  non-goals · prioritised MUST/SHOULD/COULD requirements · acceptance criteria · risks & open questions) from
+  a `feature` description — closing the ideation/planning gap of a product-facing artifact. EN + DE; passes
+  `ack.gate`; no engine change (one MD file). The fifth capability-audit quick-win.
+- **`remember` — deliberate durable memory write** (epic #1043 / #1076): a `remember(text)` tool lets the
+  model deliberately persist a fact / decision / gotcha into the project's long-term memory (fire-and-forget
+  via `MemoryManager.add_bulk`, scope-aware to the active project) so it survives the session and is retrieved
+  later via `query_memory` / RAG — the write counterpart to the read-only `query_memory` / `deep_query_memory`.
+  Offered only when a memory store is configured; fail-soft. The fourth capability-audit quick-win.
+- **`edit_file` — targeted string edit** (epic #1043 / #1075): `edit_file(path, old_string, new_string,
+  replace_all?)` replaces an EXACT string in a file instead of rewriting the whole thing with `write_file`
+  (cheaper + safer for a small change). `old_string` must match exactly and be unique (add surrounding
+  context) unless `replace_all`; an absent or ambiguous match is refused (file unchanged); atomic write with
+  the retry-on-lock helper. The third capability-audit quick-win.
+- **`fetch_url` — read a specific web page verbatim** (epic #1043 / #1074): a bounded `fetch_url(url)` tool
+  fetches an http(s) page (RFCs, standards, API specs, docs) via stdlib `urllib` — `web_search` FINDS pages,
+  `fetch_url` READS one. Trust-gated (offered only when outbound is allowed; blocked under `sealed` unless
+  `security.web_in_sealed`), **SSRF-guarded** (http/https only; refuses loopback/private/link-local hosts so
+  an autonomous agent can't pivot to internal services, incl. cloud metadata `169.254.169.254`), and
+  double-bounded (a hard byte cap + the ingestion choke-point char cap). The second capability-audit
+  quick-win.
+- **The orchestrator can file its own tracker issues — gated `create_issue` tool** (epic #1043 / #1073): a
+  new model-callable `create_issue(title, body_file, labels?, milestone?)` files an issue in the project's
+  code forge (GitHub, via the `gh` CLI) — so the orchestrator no longer dead-ends at "I have no GitHub tool"
+  and writes an un-submittable body file. **Default OFF** (opt-in `forge.enabled` / `GX10_FORGE_ENABLED` — an
+  autonomous agent writing to a forge is a deliberate operator choice; the tool is not registered when off,
+  byte-identical), **secret-free** (ambient `gh` auth, no token on the wire, no repo literal in core; optional
+  `forge.repo`), and **escape-free** (the body comes from a FILE the model already wrote via `write_last_reply`,
+  never a giant JSON arg). The first quick-win from the whole-lifecycle capability audit.
+- **Escape-free authoring — `write_last_reply` + `write_file` append** (epic #1043 / #1048, L1): a small
+  model can't reliably emit a large file body as a JSON-escaped `write_file` `content` string (it mis-escapes
+  → the tool JSON is malformed → the write is dropped). Two escape-free paths now exist: a new model-callable
+  **`write_last_reply(path)`** persists the model's PREVIOUS reply text (produced as ordinary streamed output
+  — no JSON escaping), and **`write_file` gains `mode='append'`** to build a large file in chunks. A warn-only
+  integrity guard flags a write whose emitting generation was cut off by the token limit
+  (`finish_reason=length`, now captured in the completion metrics) — the file may be truncated, continue with
+  append. Never blocks.
+- **One ingestion choke-point cap — no single tool result overflows the window** (epic #1043 / #1046, L1):
+  every INGESTION tool result (`read_file`, `list_directory`, `search_files`, `execute_command`) is now
+  capped to the LIVE per-turn budget at ONE run-loop choke point — not just `read_file` (which capped
+  itself) but the previously-uncapped `search_files` / `list_directory` / `execute_command` AND the
+  local-tool bridge return (which bypassed read_file's cap). Structured / already-budgeted payloads
+  (`web_search`, `parallel_reason`, MPR, memory) are never touched. `read_file`'s omission marker now steers
+  to `search_files` (a capped tool) instead of the uncapped `execute_command`/`findstr`. So an agentic turn
+  that fans out many large reads stays bounded per result — the first of the epic #1043 context/quality
+  quick-wins.
+- **A malformed tool-call no longer kills the turn — Validate→Reask self-heals** (epic #366): the
+  `arguments` stored on an assistant `tool_call` in the history are now sanitised to valid JSON
+  (`_valid_tool_args_json`) before they enter the transcript. vLLM `json.loads()` the stored tool-call
+  arguments when rendering the NEXT request, so a model's un-parseable arguments string (a small model
+  emitting a huge escaped `content` for `write_file` gets it wrong) previously hard-400'd the reask itself
+  (`Expecting ',' delimiter`) and defeated the tool-boundary Validate→Reask — the turn died before the
+  model could re-emit. The parse error is still fed back as the tool result (the model re-emits), but the
+  request always renders, so the loop actually recovers. **Defense-in-depth:** the sanitiser also runs over
+  the WHOLE history at the single send choke-point (`_sanitize_tool_call_history` in `_make_completion`), so
+  a malformed tool-call that entered from a **loaded session** (`session.json` persists the raw arguments)
+  or a resume can't 400 the FIRST request after a restart — the operator hit exactly this: a truncated
+  `write_file` call reloaded from a prior session produced a 0-generation 400 on the next run.
+- **Adaptive output reserve — a marginal-overflow turn no longer dies** (epic #366): the pre-flight context
+  guard now treats the output-token reserve (`generation.max_tokens`, default 8192) as a **ceiling, not a
+  fixed floor**. When the full reserve would push the prompt past the model window, the engine reserves
+  **less** output — down to `context.min_output_tokens` / `GX10_MIN_OUTPUT_TOKENS` (default 1024) — so the
+  turn proceeds **losslessly** (all context kept, just a shorter answer) instead of raising a
+  `ContextOverflowError`. Only when even a minimal answer will not fit does it emergency whole-round trim,
+  then truncate an irreducible oversized turn (#994-S16), then — last — raise. Fixes routine multi-file
+  turns overflowing a 32k window by a handful of tokens (a large prompt + the fixed 8192 reserve landing
+  just over the wall) on a 32k-window model such as `qwen3.6-35b`. The clamp keeps a
+  `context.overflow_safety_tokens` / `GX10_OVERFLOW_SAFETY` headroom (default 1536) below the window so it
+  never targets the wall to the token — the engine's estimate undercounts vLLM's exact rendered prompt
+  (chat-template framing + tools/tool-call serialization), and a zero-margin send would still hit a raw
+  vLLM 400. And when whole-round eviction cannot fit the transcript, the recovery now **iteratively**
+  truncates the largest turns' content (not a single message): an agentic loop is ONE user turn with many
+  accumulated tool reads and no round boundary to evict, so a single truncation left it over the wall — the
+  loop now degrades to head+tail excerpts and keeps running instead of raising.
+
 ## [0.0.23]
 - **Budget-aware read cap + emergency-trim recovery** (epic #994 / #1028): an agent can no longer overflow
   the model window with a single tool result. `read_file` now caps to the live per-turn window budget

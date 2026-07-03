@@ -31,7 +31,21 @@ _SCHEMA = {
 }
 
 
-# ── _validate_tool_args (pure) ───────────────────────────────
+# ── _valid_tool_args_json — history must stay renderable (no vLLM 400 on reask) ──
+def test_valid_tool_args_json_keeps_valid_and_repairs_malformed():
+    import json
+    good = '{"path": "epic.md", "content": "line1\\nline2"}'
+    assert gx10._valid_tool_args_json(good) == good          # valid JSON preserved verbatim
+    # a malformed arguments string (a small model's huge unescaped write_file content) → safe placeholder,
+    # so vLLM's tool-call rendering json.loads() on the NEXT request cannot 400 and defeat Validate→Reask.
+    for bad in ['{"path": "a", "content": "oops',           # unterminated string
+                '{"path": "a" "content": "b"}',             # missing comma (the operator's 400)
+                '{bad json', 'not json at all', '{"a":}', None, ""]:
+        out = gx10._valid_tool_args_json(bad)
+        assert out == "{}"
+        json.loads(out)                                      # the stored arguments always render
+
+
 def test_required_missing():
     assert "missing required" in gx10._validate_tool_args({"limit": 1}, _SCHEMA)
 

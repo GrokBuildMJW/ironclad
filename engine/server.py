@@ -26,6 +26,7 @@ Endpoints (all JSON; trust model = the configured security.profile — see secur
   GET  /coders        → which coding agents are bound (registry + boot probe) + the fan-out lane
   GET  /doctor        → runtime ACK/registry self-check (read-only)
   GET  /catalogue     → loaded prompt/skill registry snapshot (for client autocomplete)
+  GET  /metrics       → runtime telemetry (latency/error-rate/token-cost) + SLO/anomaly (#1060)
   POST /chat          → ``{"message": str}`` → run one orchestrator turn, return captured output
   POST /chat/stream   → streamed turn; passes local code-tool calls back over the wire as
                         ``\x00TR\x00`` frames (+ ``\x00HB\x00`` heartbeats) for the client tool-bridge
@@ -33,6 +34,7 @@ Endpoints (all JSON; trust model = the configured security.profile — see secur
   POST /feedback      → ``{"task_id","agent","content"}`` → drop the feedback file the reconciler advances on
   POST /coders        → ``{"agent": <id>|"auto"|null}`` → pin/clear the runtime code-agent (#454)
   POST /cancel        → set the engine cancel event; the running turn aborts at its next iteration
+  POST /alert         → inbound alert receiver → page via the configured webhook (#1061, token-gated)
   POST /fanout        → ``{"prompts":[...], "system"?, "max_tokens"?, "temperature"?, "think"?}`` → run
                         independent reasoning prompts CONCURRENTLY against the local model; input order.
                         Stateless — does not take the agent lock.
@@ -667,6 +669,13 @@ class _Handler(BaseHTTPRequestHandler):
                 if not self._guard():
                     return
                 self._send(200, gx10._catalogue_snapshot())
+            elif self.path == "/metrics":
+                # #1060: runtime telemetry — rolling latency / error-rate / token-cost aggregate + the SLO
+                # verdict + a recent-vs-baseline anomaly signal, so an unattended deployment is observable.
+                # Guarded like /doctor (operator-scoped; a monitor scrapes it with the token).
+                if not self._guard():
+                    return
+                self._send(200, gx10._metrics_report())
             else:
                 self._send(404, {"ok": False, "error": f"no route {self.path}"})
         except Exception as e:  # noqa: BLE001
@@ -805,6 +814,13 @@ class _Handler(BaseHTTPRequestHandler):
                 # turn thread polls it. The next turn clears it on start.
                 gx10._CANCEL_EVENT.set()
                 self._send(200, {"ok": True, "cancelled": True})
+            elif self.path == "/alert":
+                # #1061: inbound alert receiver — an external monitor POSTs {severity, message, source, kind}
+                # → paged via the configured webhook (#1083), correlated with the running deploy version.
+                # Token-gated (operator-scoped, like /doctor).
+                if not self._guard():
+                    return
+                self._send(200, gx10._receive_alert(self._read_json()))
             elif self.path == "/feedback":
                 gx10.bind_active()          # S5b: this request thread → the active project's ctx
                 data = self._read_json()
@@ -885,6 +901,16 @@ class _Handler(BaseHTTPRequestHandler):
 # --------------------------------------------------------------------------- #
 # Entry point.
 # --------------------------------------------------------------------------- #
+def _alert_scanner_loop(stop: "threading.Event", interval: float) -> None:
+    """#1061: every *interval* seconds (until *stop* is set), evaluate the telemetry SLO/anomaly (#1060) and
+    page any alert to the webhook. Daemon; fail-soft — a scan error never kills the loop."""
+    while not stop.wait(interval):
+        try:
+            gx10._alert_scan()
+        except Exception:   # noqa: BLE001 — a scan failure must never kill the alerting loop
+            pass
+
+
 def serve(host: str = "0.0.0.0", port: int = 8100,
           config_path: Optional[str] = None) -> None:
     # UTF-8 stdout + color decision. Headless server stdout is not a TTY → color is
@@ -917,6 +943,11 @@ def serve(host: str = "0.0.0.0", port: int = 8100,
     # the registry drives the autoplan pause when the channel is sealed.
     qt = threading.Thread(target=_queue_consumer, args=(agent, stop, sessions), daemon=True)
     qt.start()
+    # #1061: alerting self-scan — periodically page the telemetry SLO/anomaly to the webhook. Gated on
+    # alert.enabled AND a configured webhook (both default OFF → no thread started, byte-identical). Fail-soft.
+    if getattr(gx10, "ALERT_ENABLED", False) and getattr(gx10, "NOTIFY_WEBHOOK", ""):
+        _interval = float((cfg.get("alert") or {}).get("interval_s", 300) or 300)
+        threading.Thread(target=_alert_scanner_loop, args=(stop, _interval), daemon=True).start()
 
     _Handler.agent = agent
     _Handler.cfg = cfg
@@ -1011,8 +1042,8 @@ def serve(host: str = "0.0.0.0", port: int = 8100,
     except Exception as e:  # noqa: BLE001 — diagnostics must never block startup
         print(f"  Doctor : self-check skipped ({e!r})", flush=True)
     print(f"  Listen : http://{host}:{port}  "
-          f"(GET /health /tasks /pending /coders /doctor · POST /chat /chat/stream /coders /cancel "
-          f"/feedback /fanout /session/open|heartbeat|close)",
+          f"(GET /health /tasks /pending /coders /doctor /metrics · POST /chat /chat/stream /coders /cancel "
+          f"/alert /feedback /fanout /session/open|heartbeat|close)",
           flush=True)
     try:
         httpd.serve_forever()

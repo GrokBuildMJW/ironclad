@@ -64,6 +64,7 @@ _CATEGORY_SECTION = {
     "general":             "strategies_and_hard_rules",
 }
 _VALID_SECTIONS = set(DEFAULT_SECTIONS)
+_HISTORY_MAX = 20                       # #1082: bound the per-scope rollback history (newest kept)
 _WORD_RE = re.compile(r"[a-z0-9]+")
 
 
@@ -117,20 +118,28 @@ class PlaybookStore:
         self._max = _safe_cap(max_bullets, 200)
         self._config = config or AdaptConfig(max_bullets=self._max)
         self._top_k = 8                                # #905: the context_for injection cap (`ace.top_k`); live-configurable
+        self._safe_promote = False                     # #1070: snapshot-before-adapt + eval-gate (default OFF)
+        self._eval_fn: "Optional[Callable[[Playbook], Any]]" = None   # #1070: injected quality scorer (higher=better)
         self._lock = threading.Lock()
 
     # ─── transport injection (the engine wires these after building the /embed + chat adapters) ───────
-    def set_transports(self, *, chat: Any = None, embed: Any = None, budget: Any = None) -> None:
+    def set_transports(self, *, chat: Any = None, embed: Any = None, budget: Any = None,
+                       eval_fn: Any = None) -> None:
         """Inject (or replace) the online-adaptation transports on the live store. ``None`` leaves a
-        transport unchanged (pass an explicit sentinel only via the kwargs you mean to set)."""
+        transport unchanged (pass an explicit sentinel only via the kwargs you mean to set). *eval_fn*
+        (#1070) is the injected quality scorer (a playbook → a numeric score, higher=better) the safe-promote
+        eval-gate uses; a deployment wires it (a held-out eval / a telemetry-derived signal)."""
         if chat is not None:
             self._chat = chat
         if embed is not None:
             self._embed = embed
         if budget is not None:
             self._budget = budget
+        if eval_fn is not None:
+            self._eval_fn = eval_fn
 
-    def configure(self, *, max_bullets: Any = None, max_per_scope: Any = None, top_k: Any = None) -> None:
+    def configure(self, *, max_bullets: Any = None, max_per_scope: Any = None, top_k: Any = None,
+                  safe_promote: Any = None) -> None:
         """Live cap change (so a runtime ``/config set`` takes effect on the registered store). Accepts
         ``max_per_scope`` as a back-compat alias for the EngineLessonStore key. ``top_k`` sets the
         ``context_for`` injection cap (`ace.top_k`, #905). Malformed values ⇒ kept."""
@@ -144,6 +153,8 @@ class PlaybookStore:
                 self._top_k = max(0, int(top_k))
             except (TypeError, ValueError):           # a malformed top_k is kept (no silent 0)
                 pass
+        if safe_promote is not None:
+            self._safe_promote = bool(safe_promote)    # #1070: snapshot-before-adapt + eval-gate toggle
 
     # ─── persistence (scope → one JSON file; opaque scope hashed to a safe name) ──────────────────────
     def _path(self, scope: str) -> Path:
@@ -177,6 +188,101 @@ class PlaybookStore:
                     tmp.unlink()
                 except OSError:
                     pass
+
+    # ─── #1082: operator-facing playbook safety — versioning (M-002) + selective forget (Q-001) ───────
+    # The learned playbook adapts silently; these give an operator a rollback net (snapshot/rollback) and a
+    # scalpel (unlearn a bad bullet) via `/ace`. The version log persists next to the scope playbook so a
+    # rollback point survives the session; every mutating verb snapshots first, so it is itself reversible.
+    def _history_path(self, scope: str) -> Path:
+        return self._path(scope).with_suffix(".history.json")
+
+    def _load_history(self, scope: str):
+        from ack.ace.robust import PlaybookHistory
+        try:
+            log = json.loads(self._history_path(scope).read_text(encoding="utf-8"))
+            return PlaybookHistory.from_log(log)
+        except Exception:   # noqa: BLE001 — missing / corrupt → empty history, never raises
+            return PlaybookHistory()
+
+    def _save_history(self, scope: str, hist) -> None:
+        tmp = None
+        try:
+            path = self._history_path(scope)
+            self._base.mkdir(parents=True, exist_ok=True)
+            log = hist.to_log()[-_HISTORY_MAX:]          # keep only the newest snapshots
+            tmp = path.parent / f"{path.name}.{os.getpid()}.tmp"
+            tmp.write_text(json.dumps(log), encoding="utf-8")
+            os.replace(tmp, path)
+        except Exception:   # noqa: BLE001 — advisory, never raises
+            if tmp is not None:
+                try:
+                    tmp.unlink()
+                except OSError:
+                    pass
+
+    def snapshot(self, scope: str) -> dict:
+        """Record the current scope playbook as a named rollback point. Returns ``{version, versions}`` or
+        ``{error}``. Idempotent (a snapshot of an unchanged tip returns the same id)."""
+        if not _scoped(scope):
+            return {"error": "no active scope"}
+        try:
+            with self._lock:
+                hist = self._load_history(scope)
+                vid = hist.snapshot(self._load(scope))
+                self._save_history(scope, hist)
+                return {"version": vid, "versions": len(hist.versions())}
+        except Exception as ex:   # noqa: BLE001
+            return {"error": repr(ex)}
+
+    def versions(self, scope: str) -> List[str]:
+        """The recorded snapshot version ids for *scope* (oldest→newest)."""
+        if not _scoped(scope):
+            return []
+        try:
+            return self._load_history(scope).versions()
+        except Exception:   # noqa: BLE001
+            return []
+
+    def rollback(self, scope: str, target: "Optional[str]" = None) -> dict:
+        """Restore the scope playbook to *target* (or the previous snapshot). Snapshots the CURRENT state
+        first so the rollback is itself reversible, then persists the restored playbook. Returns
+        ``{rolled_back_to, size}`` or ``{error}``."""
+        if not _scoped(scope):
+            return {"error": "no active scope"}
+        try:
+            with self._lock:
+                hist = self._load_history(scope)
+                hist.snapshot(self._load(scope))          # capture current → reversible
+                restored = hist.rollback(target)
+                if restored is None:
+                    self._save_history(scope, hist)
+                    return {"error": "no such version / nothing earlier to roll back to"}
+                self._save(scope, restored)
+                vid = hist.snapshot(restored)             # the restored state is the new tip
+                self._save_history(scope, hist)
+                return {"rolled_back_to": vid, "size": len(restored)}
+        except Exception as ex:   # noqa: BLE001
+            return {"error": repr(ex)}
+
+    def unlearn(self, scope: str, bullet_ids) -> dict:
+        """Selectively remove bullets by id from the scope playbook (snapshots first, so it is reversible).
+        Returns ``{removed, missing}`` or ``{error}``."""
+        if not _scoped(scope):
+            return {"error": "no active scope"}
+        try:
+            from ack.ace.robust import unlearn as _unlearn
+            with self._lock:
+                pb = self._load(scope)
+                hist = self._load_history(scope)
+                hist.snapshot(pb)                         # reversible
+                res = _unlearn(pb, bullet_ids)
+                if res.get("removed"):
+                    self._save(scope, pb)
+                    hist.snapshot(pb)
+                self._save_history(scope, hist)
+                return res
+        except Exception as ex:   # noqa: BLE001
+            return {"error": repr(ex)}
 
     # ─── internal: a cheap, hot-path-safe sync write (no LLM, lexical prune only) ─────────────────────
     def _add(self, scope: str, content: str, *, section: str, tags: "Sequence[str]" = ()) -> "Optional[str]":
@@ -292,9 +398,36 @@ class PlaybookStore:
         try:
             with self._lock:
                 pb = self._load(scope)
+                # #1070 learned-state safety (safe_promote ON): snapshot the PRE-adapt state as an
+                # operator/auto rollback point, and measure it if an eval scorer is wired — so a bad learned
+                # delta can be reverted instead of silently degrading behavior.
+                before_score = None
+                if self._safe_promote:
+                    hist = self._load_history(scope)
+                    hist.snapshot(pb)
+                    self._save_history(scope, hist)
+                    if self._eval_fn is not None:
+                        try:
+                            before_score = self._eval_fn(pb)
+                        except Exception:   # noqa: BLE001 — a scorer hiccup ⇒ no gate (keep the change)
+                            before_score = None
                 summary = adapt_once(trajectory, pb, chat=self._chat, embed=self._embed,
                                      budget=self._budget, config=self._config)
                 if not summary.get("skipped"):
+                    # #1070: eval-gate — on a MEASURED regression, DON'T persist the delta (auto-revert: the
+                    # on-disk playbook stays at the pre-adapt state). Fail-open: a broken measurement keeps it.
+                    if self._safe_promote and self._eval_fn is not None and before_score is not None:
+                        try:
+                            after_score = self._eval_fn(pb)
+                        except Exception:   # noqa: BLE001
+                            after_score = None
+                        if after_score is not None:
+                            from ack.ace.robust import regression_verdict
+                            v = regression_verdict(before_score, after_score)
+                            summary["scores"] = {"before": v["before"], "after": v["after"]}
+                            if v["revert"]:
+                                summary["reverted"] = True          # discard: never persist a regression
+                                return summary
                     self._save(scope, pb)
                 return summary
         except Exception:   # noqa: BLE001 — an adaptation hiccup must never kill the worker
