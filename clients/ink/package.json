@@ -33,7 +33,7 @@
     "licenses": "license-checker --production --onlyAllow 'MIT;Apache-2.0;BSD-2-Clause;BSD-3-Clause;ISC;0BSD;Unlicense;CC0-1.0' --excludePrivatePackages"
   },
   "dependencies": {
-    "marked": "^15.0.0",
+    "marked": "^18.0.5",
     "marked-terminal": "^7.3.0",
     "react": "^19.2.0",
     "react-reconciler": "^0.33.0",
