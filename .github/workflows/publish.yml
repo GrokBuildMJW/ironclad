@@ -25,7 +25,7 @@ jobs:
                                #   it back (a no-op on the public production repo; required for a private
                                #   Test-PyPI proof repo).
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           # export-sync re-assert (#348 S5 / S1-D): build the EXACT tagged export tree, never a moving
           # main — closes the push -> release-create window where main could advance to a different tree.
