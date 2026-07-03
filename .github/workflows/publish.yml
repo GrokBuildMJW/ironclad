@@ -32,7 +32,7 @@ jobs:
           # release:published always carries a tag (workflow_dispatch removed in S7a); the engine's
           # PRE-push staged-tree export-sync (scripts/ci/export_sync_check.py --staged) is the private leg.
           ref: ${{ github.event.release.tag_name }}
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
       - name: Release preflight (fail-closed before the irreversible PyPI upload)
