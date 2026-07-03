@@ -2,14 +2,11 @@
 
 All notable changes to Ironclad are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/); the project is **pre-release** (0.0.x).
-Released versions are listed below; upcoming work accumulates under *Unreleased*.
-
-> Docs are code: a change does not ship without a Changelog entry (the promote gate
-> enforces a non-empty *Unreleased* section).
-
-## [Unreleased]
+Released versions are listed below.
 
 ## [0.0.24]
+
+### Added
 - **Per-principal identity + RBAC + multi-tenant memory namespacing (foundation)** (epic #1065 / #1071):
   Ironclad's trust model was single-tenant (one token for the whole server, no per-principal identity/authz,
   no tenant isolation). A pure core authz foundation (`ack.authz`): a `Principal` (id/role/tenant), a
@@ -38,14 +35,6 @@ Released versions are listed below; upcoming work accumulates under *Unreleased*
   when injection is detected. Gated `security.injection_defense` / `GX10_INJECTION_DEFENSE` (default off,
   byte-identical). Defense-in-depth ([ADR-0012](docs/adr/0012-ingestion-injection-defense.md)) — **not** a
   complete solution; an LLM classifier, per-source trust levels, and output-side checks are explicit
-  remaining scope.
-- **Full-surface, immutable per-action audit log — who/what/when/why + tamper-resistance** (epic #1065 /
-  #1067): extends #1084 from the mutating subset to the FULL tool surface. `audit.scope: all` (vs the default
-  `mutating`) records EVERY tool call (reads, searches, memory queries, …); each record now carries
-  who/what/when/why (actor + action + content-free target + `reason` = the active project scope + ts). And
-  the agent's own write tools (`write_file`/`edit_file`) REFUSE any path under the audit directory
-  (`_is_audit_path`), so an autonomous agent can't tamper with its own trail — tamper-RESISTANCE on top of the
-  hash-chain's tamper-EVIDENCE. Default-off; append-only OS enforcement / an external WORM sink is explicit
   remaining scope.
 - **Learned-state safety — eval-gated ACE promotion + snapshot + auto-revert** (epic #1065 / #1070): ACE
   deltas were applied without a snapshot or an eval gate, so a bad learned delta could silently degrade
@@ -122,12 +111,12 @@ Released versions are listed below; upcoming work accumulates under *Unreleased*
   purges run artifacts older than `--keep-days` (default 30) from the workdir's `runs/` directories (dry-run
   by default, `--apply` to delete) — a deploy schedules it (cron/timer today; the in-product scheduler is
   #1064). The seventh capability-audit quick-win.
-- **Supply-chain: dependabot + a CI dependency-audit** (epic #1043 / #1078): the published repo now ships
-  `.github/dependabot.yml` (weekly update PRs for the Python package, the bundled `clients/ink` client, and
-  the GitHub Actions) and a `dependency-audit` CI job that runs `pip-audit` (Python) + `npm audit` (ink) to
-  surface known CVEs. **Advisory** (continue-on-error, not a required check) so a newly-disclosed transitive
-  CVE surfaces in the log without blocking unrelated PRs; dependabot proposes the fixes. The sixth
-  capability-audit quick-win.
+- **Supply-chain: dependabot + a CI dependency-audit** (epic #1043 / #1078): **dependabot runs on the source
+  repo** (bumping `core/pyproject.toml` / `clients/ink` / the workflows, so a fix flows through core/ → the
+  export — never a doomed edit of the generated public tree), and the published repo's `dependency-audit` CI
+  job runs `pip-audit` (Python) + `npm audit` (ink) to surface known CVEs on the shipped artifact. **Advisory**
+  (continue-on-error, not a required check) so a newly-disclosed transitive CVE surfaces in the log without
+  blocking unrelated PRs. The sixth capability-audit quick-win.
 - **`feature-spec` / PRD authoring prompt** (epic #1043 / #1077): a new `kind: prompt` built-in in the core
   prompt library that drafts a concise product feature spec / PRD (problem · users & use cases · goals /
   non-goals · prioritised MUST/SHOULD/COULD requirements · acceptance criteria · risks & open questions) from
@@ -166,6 +155,18 @@ Released versions are listed below; upcoming work accumulates under *Unreleased*
   integrity guard flags a write whose emitting generation was cut off by the token limit
   (`finish_reason=length`, now captured in the completion metrics) — the file may be truncated, continue with
   append. Never blocks.
+
+### Changed
+- **Full-surface, immutable per-action audit log — who/what/when/why + tamper-resistance** (epic #1065 /
+  #1067): extends #1084 from the mutating subset to the FULL tool surface. `audit.scope: all` (vs the default
+  `mutating`) records EVERY tool call (reads, searches, memory queries, …); each record now carries
+  who/what/when/why (actor + action + content-free target + `reason` = the active project scope + ts). And
+  the agent's own write tools (`write_file`/`edit_file`) REFUSE any path under the audit directory
+  (`_is_audit_path`), so an autonomous agent can't tamper with its own trail — tamper-RESISTANCE on top of the
+  hash-chain's tamper-EVIDENCE. Default-off; append-only OS enforcement / an external WORM sink is explicit
+  remaining scope.
+
+### Fixed
 - **One ingestion choke-point cap — no single tool result overflows the window** (epic #1043 / #1046, L1):
   every INGESTION tool result (`read_file`, `list_directory`, `search_files`, `execute_command`) is now
   capped to the LIVE per-turn budget at ONE run-loop choke point — not just `read_file` (which capped
