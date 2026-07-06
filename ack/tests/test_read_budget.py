@@ -75,6 +75,7 @@ def test_live_read_budget_shrinks_with_transcript(monkeypatch):
 class _FakeGX10:
     _emergency_trim = gx10.GX10._emergency_trim
     _trim_oversized_messages = gx10.GX10._trim_oversized_messages
+    _archive_trimmed_slice = gx10.GX10._archive_trimmed_slice   # #1050: rung-2 archives the discarded slice
     _TRUNCATE_FLOOR_CHARS = gx10.GX10._TRUNCATE_FLOOR_CHARS
 
     def __init__(self, messages):

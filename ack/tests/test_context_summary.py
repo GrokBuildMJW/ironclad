@@ -393,3 +393,58 @@ def test_roll_summary_no_warm_is_fine(monkeypatch, tmp_path):
     g.messages = [{"role": "system", "content": "SYS"}] + _rounds(8)
     g._trim_context()
     assert len(_markers(g.messages)) == 1
+
+
+# ── #1049 (L3): query-aware summary fidelity ─────────────────────────────────
+def test_summary_biases_toward_current_turn(monkeypatch, tmp_path):
+    # With a user turn in scope, the summarizer instruction gains a query-aware BIAS clause naming the
+    # current task (bias, not filter — recency eviction stays unchanged; this only steers the summary).
+    monkeypatch.setattr(gx10, "MAX_CTX_CHARS", 1000)
+    monkeypatch.setattr(gx10, "TRIM_TARGET_CHARS", 400)
+    monkeypatch.setattr(gx10, "SUMMARIZE_EVICTED", True)
+    monkeypatch.setattr(gx10, "_MEMORY", _FakeMem())
+    g = _mk_agent(monkeypatch, tmp_path)
+    fc = _FakeClient()
+    g.client = fc
+    g._current_user_turn = "deploy the SPARKPLUG-XYZ service to the spark"
+    g.messages = [{"role": "system", "content": "SYS"}] + _rounds(8)
+
+    g._trim_context()
+
+    instr = fc.chat.completions.calls[0]["messages"][0]["content"]   # the summarizer's system instruction
+    assert "CURRENT task" in instr
+    assert "SPARKPLUG-XYZ" in instr
+
+
+def test_summary_generic_when_no_turn_is_byte_identical(monkeypatch, tmp_path):
+    # No turn in scope (fresh agent → "" default): the instruction is the generic one, no query-aware
+    # clause — byte-identical to pre-#1049 behaviour.
+    monkeypatch.setattr(gx10, "MAX_CTX_CHARS", 1000)
+    monkeypatch.setattr(gx10, "TRIM_TARGET_CHARS", 400)
+    monkeypatch.setattr(gx10, "SUMMARIZE_EVICTED", True)
+    monkeypatch.setattr(gx10, "_MEMORY", _FakeMem())
+    g = _mk_agent(monkeypatch, tmp_path)
+    fc = _FakeClient()
+    g.client = fc
+    assert g._current_user_turn == ""          # __init__ default
+    g.messages = [{"role": "system", "content": "SYS"}] + _rounds(8)
+
+    g._trim_context()
+
+    instr = fc.chat.completions.calls[0]["messages"][0]["content"]
+    assert "CURRENT task" not in instr
+
+
+def test_run_stores_current_user_turn_at_entry(monkeypatch, tmp_path):
+    # run() captures the turn at entry, BEFORE any summarize can fire. Stop right after the assignment
+    # (make the first downstream call raise) and assert the field was updated from its stale value.
+    g = _mk_agent(monkeypatch, tmp_path)
+    g._current_user_turn = "STALE"
+
+    def _boom(_q):
+        raise RuntimeError("stop after the entry assignment")
+
+    monkeypatch.setattr(g, "_retrieve_context", _boom)
+    with pytest.raises(RuntimeError):
+        g.run("fresh topic ABC-123")
+    assert g._current_user_turn == "fresh topic ABC-123"

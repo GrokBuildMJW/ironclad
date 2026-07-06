@@ -40,6 +40,62 @@ test('read_file caps >24000 chars head 16000 + marker + tail 8000', async () => 
   await fs.rm(d, {recursive: true, force: true});
 });
 
+// #1047: ranged / pattern read_file (mirrors gx10.py `_read_file_ranged`) ──────
+test('read_file start/end returns only that 1-based inclusive line range', async () => {
+  const d = await tmp();
+  const p = path.join(d, 'n.txt');
+  const content = Array.from({length: 50}, (_, i) => `L${i + 1}`).join('\n');
+  await runTool('write_file', {path: p, content});
+  assert.equal(await runTool('read_file', {path: p, start: 5, end: 7}), '[Ironclad: lines 5-7 of 50]\nL5\nL6\nL7');
+  await fs.rm(d, {recursive: true, force: true});
+});
+
+test('read_file bad range falls back to the normal read (no crash)', async () => {
+  const d = await tmp();
+  const p = path.join(d, 'n.txt');
+  await runTool('write_file', {path: p, content: Array.from({length: 20}, (_, i) => `L${i + 1}`).join('\n')});
+  const out = await runTool('read_file', {path: p, start: 999}); // past EOF → fall back
+  assert.ok(out.startsWith('L1') && !out.includes('[Ironclad: lines'));
+  await fs.rm(d, {recursive: true, force: true});
+});
+
+test('read_file pattern reads a window of lines around the first match', async () => {
+  const d = await tmp();
+  const p = path.join(d, 'n.txt');
+  await runTool('write_file', {path: p, content: Array.from({length: 50}, (_, i) => `L${i + 1}`).join('\n')});
+  const out = await runTool('read_file', {path: p, pattern: '^L25$'});
+  assert.ok(out.startsWith('[Ironclad: lines 5-45 of 50]'), 'a ±20-line window around the match');
+  assert.ok(out.includes('L25'));
+  await fs.rm(d, {recursive: true, force: true});
+});
+
+test('read_file no pattern match falls back to the normal read', async () => {
+  const d = await tmp();
+  const p = path.join(d, 'n.txt');
+  await runTool('write_file', {path: p, content: 'L1\nL2\nL3'});
+  assert.equal(await runTool('read_file', {path: p, pattern: 'ZZZ-NOPE'}), 'L1\nL2\nL3');
+  await fs.rm(d, {recursive: true, force: true});
+});
+
+test('read_file max_chars caps the returned slice', async () => {
+  const d = await tmp();
+  const p = path.join(d, 'n.txt');
+  await runTool('write_file', {path: p, content: 'X'.repeat(1000) + '\n' + 'Y'.repeat(1000)});
+  const out = await runTool('read_file', {path: p, start: 1, end: 2, max_chars: 200});
+  assert.ok(out.includes('omitted from the slice — capped at 200'));
+  await fs.rm(d, {recursive: true, force: true});
+});
+
+test('read_file cap marker re-steers to search_files (not findstr)', async () => {
+  const d = await tmp();
+  const p = path.join(d, 'big.txt');
+  await runTool('write_file', {path: p, content: 'a'.repeat(25000)});
+  const out = await runTool('read_file', {path: p});
+  assert.ok(out.includes('use search_files to locate the relevant lines, then read only those.'));
+  assert.ok(!out.includes('findstr'));
+  await fs.rm(d, {recursive: true, force: true});
+});
+
 test('write_file content.length is the char count (counts JS string length)', async () => {
   const d = await tmp();
   const p = path.join(d, 'u.txt');

@@ -140,6 +140,30 @@ def _print_banner(srv: "Server", h: Dict[str, Any], codedir: Path, max_agents: i
     print(_c("    /help · commands   ·   exit · quit   ·   Strg+C · cancel turn", "gray"))
 
 
+# epic #1043 / #1052: the CLI-runner lane spawns a coder that reads UNTRUSTED content (web results, and —
+# with read_offload — local files). It must never inherit the server's secrets, and the ambient push
+# credential must be unreachable on the default git/gh path — else a prompt-injection becomes an exfil.
+# Harden the child env at this ONE choke point (covers web_search, parallel_reason, and future
+# read_offload). Built once + cached (the process env is stable); fail-CLOSED to a plain secret scrub if
+# the credential redirect can't be written. See engine/agent_env.py for the invariants (HOME kept, no
+# CLAUDE_CONFIG_DIR).
+_HARDENED_CHILD_ENV: Optional[Dict[str, str]] = None
+
+
+def _hardened_child_env() -> Dict[str, str]:
+    global _HARDENED_CHILD_ENV
+    if _HARDENED_CHILD_ENV is None:
+        from agent_env import agent_env_scratch, harden_agent_env, scrub_agent_env
+        base = dict(os.environ)
+        try:
+            hardened = harden_agent_env(base, agent_env_scratch())
+        except Exception:  # noqa: BLE001 — fail CLOSED: still remove secrets even if the redirect fails
+            hardened = scrub_agent_env(base)
+        hardened["PYTHONIOENCODING"] = "utf-8"
+        _HARDENED_CHILD_ENV = hardened
+    return _HARDENED_CHILD_ENV
+
+
 def default_cli_runner(spec, prompt: str, *, effort: str, max_tokens: Optional[int] = None,
                        timeout: Optional[float] = None) -> Dict[str, Any]:
     """CLI substrate for the provider dispatcher (MPR P0 §5.2) — CLIENT-lane.
@@ -161,7 +185,7 @@ def default_cli_runner(spec, prompt: str, *, effort: str, max_tokens: Optional[i
     t0 = time.monotonic()
     try:
         proc = subprocess.run(
-            argv, env={**os.environ, "PYTHONIOENCODING": "utf-8"},
+            argv, env=_hardened_child_env(),
             stdin=subprocess.DEVNULL, text=True, capture_output=True, timeout=timeout,
         )
         return {

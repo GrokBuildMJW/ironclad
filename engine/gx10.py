@@ -218,6 +218,17 @@ THINKING_RESERVE = 4000
 SUMMARIZE_EVICTED  = True        # B1 switch (default ON, 06-18 decision); off via context.summarize_evicted=false / GX10_CONTEXT_SUMMARY=0
 SUMMARY_MAX_TOKENS = 512         # capped output of the eviction summary
 _SUMMARY_MARKER    = "## Conversation so far (rolling summary)"   # stable block marker (find-and-update instead of duplicating)
+# #1050 (L3): the emergency rung ALWAYS cold-archives the slice it discards (source="fragment_trim"), and an
+# optional summarize-not-truncate replaces the raw drop with a bounded summary — DEFAULT OFF (raw head+tail
+# truncation stays byte-identical), guarded by a hard timeout + a skip when a generation this turn errored.
+EMERGENCY_SUMMARIZE           = False   # off via context.emergency_summarize=false / GX10_EMERGENCY_SUMMARIZE=0
+EMERGENCY_SUMMARIZE_TIMEOUT_S = 8.0     # hard wall-clock cap on the recovery-path summarize (daemon-thread, win32-safe)
+# #1051 (L3): the proactive cumulative-ingestion accountant + the shared per-turn summarize rate-limit.
+PROACTIVE_ROLL         = False   # default OFF (byte-identical). ON → proactively roll the oldest tool rounds via a
+                                 #   query-aware summary once cumulative ingestion crosses the soft mark
+INGEST_SOFT_FRAC       = 0.7     # soft mark as a fraction of the model window that triggers a proactive roll
+MAX_SUMMARIES_PER_TURN = 0       # shared per-turn cap across ALL summarize triggers (roll/emergency/proactive);
+                                 #   0 ⇒ unlimited (byte-identical to today); >0 ⇒ degrade to a plain drop past the cap
 # B2 — auto-retrieval assembly: per user turn ONE vector-only search (graph=false) on the
 # user message, dedup against the window, a token-budgeted context block BEFORE the user message
 # (at the tail → prefix cache stays). Warm cache (B0) in front (cache-aside). Flag-gated, fail-soft;
@@ -2147,10 +2158,20 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "read_file",
-            "description": "Read the full content of a file. Use for handovers, task JSONs, feedback, CLAUDE.md.",
+            "description": ("Read a file — prefer a TARGETED read. For a large or unknown file, use "
+                            "search_files first to locate the relevant lines, then read only that range: pass "
+                            "start/end (1-based inclusive line numbers) or a regex `pattern` (reads a window "
+                            "around the first match). Omitting the range reads the file (head+tail-capped if "
+                            "large). Good for handovers, task JSONs, feedback, CLAUDE.md."),
             "parameters": {
                 "type": "object",
-                "properties": {"path": {"type": "string"}},
+                "properties": {
+                    "path": {"type": "string"},
+                    "start": {"type": "integer", "description": "1-based first line to read (inclusive)"},
+                    "end": {"type": "integer", "description": "1-based last line to read (inclusive)"},
+                    "max_chars": {"type": "integer", "description": "cap the returned slice to this many chars"},
+                    "pattern": {"type": "string", "description": "regex: read a window of lines around the first match"}
+                },
                 "required": ["path"]
             }
         }
@@ -4587,6 +4608,50 @@ def _derive_ctx_budget(max_model_len: int, max_tokens: int, rag_tokens: int,
     return high, int(high * 0.6)
 
 
+def _read_file_ranged(text: str, *, start=None, end=None, max_chars=None, pattern=None) -> Optional[str]:
+    """#1047: return a TARGETED slice of a file's text — a regex `pattern` (a window of lines around the
+    first match) OR a 1-based inclusive line range `start`/`end`, capped by `max_chars` (else the live
+    read cap). Returns None on a bad/empty range or an unmatched/invalid pattern so the caller falls back
+    to the existing head+tail cap. Never raises. Mirrored in the ink client (clients/ink runTool.ts) so a
+    local-topology read applies the same slice."""
+    try:
+        # No keepends + a "\n" join, so the line model (count, indices, regex `$`) matches the ink client's
+        # (JS `$` anchors only at line end without a trailing newline, and its keepends split would add a
+        # phantom trailing empty line) — the returned slice normalises endings to "\n", which is fine for an
+        # excerpt the model reads.
+        lines = text.splitlines()
+        n = len(lines)
+        if n == 0:
+            return None
+        if pattern:
+            rx = re.compile(pattern)
+            hit = next((i for i, ln in enumerate(lines) if rx.search(ln)), None)
+            if hit is None:
+                return None                              # no match → fall back to the head+tail cap
+            ctx = 20                                     # a window of lines around the first match
+            lo, hi = max(0, hit - ctx), min(n, hit + ctx + 1)
+        elif start is not None or end is not None:
+            s = int(start) if start is not None else 1
+            e = int(end) if end is not None else n
+            if s < 1 or s > n or e < s:
+                return None                              # bad range → fall back
+            lo, hi = s - 1, min(n, e)
+        else:
+            return None                                  # no ranged args → the caller uses the normal path
+        body = "\n".join(lines[lo:hi])
+        cap = int(max_chars) if max_chars else _read_char_cap()
+        if cap > 0 and len(body) > cap:
+            head_n = cap * 2 // 3
+            tail_n = cap - head_n
+            omitted = len(body) - head_n - tail_n
+            body = (body[:head_n]
+                    + f"\n\n... [Ironclad: {omitted} chars omitted from the slice — capped at {cap}] ...\n\n"
+                    + body[-tail_n:])
+        return f"[Ironclad: lines {lo + 1}-{hi} of {n}]\n{body}"
+    except Exception:  # noqa: BLE001 — any bad arg → the caller falls back to the head+tail cap
+        return None
+
+
 def run_tool(name: str, args: Dict[str, Any]) -> str:
     try:
         # #459 (§4, review A S2): the shell guardrail fires SERVER-SIDE here, BEFORE the local-tool bridge
@@ -4624,6 +4689,13 @@ def run_tool(name: str, args: Dict[str, Any]) -> str:
                 return f"ERROR: Not found: {args['path']}"
             # errors="replace": a non-UTF-8 file is read lossily, never crashes the read.
             text = p.read_text(encoding="utf-8", errors="replace")
+            # #1047: a targeted ranged/pattern read returns only the relevant slice; a bad range/pattern
+            # returns None → fall through to the existing head+tail cap below.
+            if any(args.get(k) is not None for k in ("start", "end", "max_chars", "pattern")):
+                ranged = _read_file_ranged(text, start=args.get("start"), end=args.get("end"),
+                                           max_chars=args.get("max_chars"), pattern=args.get("pattern"))
+                if ranged is not None:
+                    return ranged
             # PERF-05 + #994-S16: don't load a large file uncapped into the context; the cap is the live
             # per-turn window budget (so one read can't overflow), falling back to the fixed ceiling.
             cap = _read_char_cap()
@@ -5056,6 +5128,17 @@ class GX10:
         self.onboarding    = ONBOARDING_MODE if onboarding is None else bool(onboarding)
         self.messages: List[Dict] = []
         self.last_response = ""
+        # #1049 (L3): the current user turn, captured at run() entry. Read by _summarize to BIAS the
+        # rolling summary toward task-relevant state on eviction (bias, not filter). "" ⇒ the generic
+        # instruction (byte-identical to today) — so a summarize outside a run() never changes behaviour.
+        self._current_user_turn = ""
+        # #1050 (L3): set when a generation attempt THIS user turn errored → the emergency-rung summarize is
+        # skipped (don't hit an already-sick endpoint on the recovery path). Reset at run() entry.
+        self._turn_gen_errored = False
+        # #1051 (L3): per-turn summarize counters — the shared rate-limit + telemetry across the steady-state
+        # roll, the emergency rung, and the proactive accountant. Reset at run() entry.
+        self._summaries_this_turn = 0
+        self._summary_tokens_this_turn = 0
         self._turn_think = True   # auto decision per turn (safe default)
         # OPT-3: cumulative performance counters over the session
         self._perf = {"gens": 0, "prompt": 0, "completion": 0, "wall": 0.0, "last": ""}
@@ -5213,6 +5296,7 @@ class GX10:
         shrink, so the assistant.tool_calls ↔ tool-response pairing is untouched. Returns the final estimate
         (still > budget only when the system partition + framing alone overflow — then the caller raises)."""
         floor = self._TRUNCATE_FLOOR_CHARS
+        summarized = False   # #1050: at most ONE recovery-path summarize per invocation (bounds the cost)
         for _ in range(len(self.messages) + 8):          # bounded: at most one pass per message (+ slack)
             est = _count_prompt_tokens(self.messages)
             over = est - budget
@@ -5231,11 +5315,56 @@ class GX10:
             keep = clen - cut_chars
             head_n = keep * 2 // 3
             tail_n = keep - head_n
-            self.messages[i]["content"] = (
-                content[:head_n]
-                + f"\n\n... [Ironclad: {clen - keep} chars truncated to fit the context window] ...\n\n"
-                + (content[-tail_n:] if tail_n > 0 else ""))
+            discarded = content[head_n:clen - tail_n] if tail_n > 0 else content[head_n:]
+            # #1050: ALWAYS cold-archive the discarded slice so rung-2 recovery stops losing data silently
+            # (B2 RAG re-injects it query-aware next turn) — fail-soft, fire-and-forget, no model call.
+            self._archive_trimmed_slice(discarded)
+            # #1050: optional summarize-not-truncate (DEFAULT OFF) — replace the raw drop with a bounded
+            # summary. At most ONE model call per invocation, under a hard timeout, skipped when a generation
+            # this turn already errored, and ALWAYS falling through to the raw marker on timeout/exception.
+            middle = f"\n\n... [Ironclad: {clen - keep} chars truncated to fit the context window] ...\n\n"
+            if (EMERGENCY_SUMMARIZE and not summarized and not self._turn_gen_errored
+                    and self._summary_budget_ok() and discarded.strip()):   # #1051: shared per-turn cap
+                summarized = True   # mark the one attempt USED before the call → no retry against a sick endpoint
+                summ = self._summarize_slice_timed(discarded)
+                if summ:
+                    self._note_summary(summ)   # #1051: count toward the shared per-turn cap
+                    middle = f"\n\n... [Ironclad: {clen - keep} chars summarized to fit] {summ} ...\n\n"
+            self.messages[i]["content"] = content[:head_n] + middle + (content[-tail_n:] if tail_n > 0 else "")
         return _count_prompt_tokens(self.messages)
+
+    def _archive_trimmed_slice(self, text: str) -> None:
+        """#1050: lossless cold-archive of a slice discarded by fragment truncation — so the rung-2
+        recovery stops silently dropping data (B2 RAG re-injects it query-aware next turn). Fail-soft,
+        fire-and-forget, NO model call; mirrors _emergency_trim's whole-round archive."""
+        if not text or _MEMORY is None:
+            return
+        try:
+            if _MEMORY.is_available():
+                _MEMORY.add_bulk(text, {"source": "fragment_trim"})
+        except Exception:  # noqa: BLE001 — the archive is best effort
+            pass
+
+    def _summarize_slice_timed(self, text: str) -> Optional[str]:
+        """#1050: run _summarize on a to-be-truncated slice under a HARD wall-clock timeout, on a DAEMON
+        thread (signal.alarm is unusable on win32 and off the main thread; a daemon thread never blocks
+        process exit). Returns the summary, or None on timeout/exception → the caller falls through to raw
+        head+tail truncation. Never raises; never blocks longer than EMERGENCY_SUMMARIZE_TIMEOUT_S."""
+        box: Dict[str, Any] = {}
+
+        def _work() -> None:
+            try:
+                box["v"] = self._summarize("", text)
+            except Exception:  # noqa: BLE001 — a summarizer error → the caller falls through to raw truncation
+                box["v"] = None
+
+        t = threading.Thread(target=_work, daemon=True)
+        t.start()
+        t.join(timeout=EMERGENCY_SUMMARIZE_TIMEOUT_S)
+        if t.is_alive():
+            return None    # timed out — abandon the daemon thread, fall through to raw truncation
+        val = box.get("v")
+        return (val or "").strip() or None
 
     def _live_read_budget(self) -> int:
         """#994-S16: the safe char cap for a tool result THIS turn — the model window minus the reserves it
@@ -5291,6 +5420,7 @@ class GX10:
                 if attempt == 0 and not _CANCEL_EVENT.is_set():
                     time.sleep(RETRY_BACKOFF)
                     continue
+                self._turn_gen_errored = True   # #1050: a generation this turn errored → skip the recovery-path summarize
                 raise last_err
 
     @staticmethod
@@ -5567,6 +5697,20 @@ class GX10:
             "made, facts established, file paths, task ids, open threads — anything needed to "
             "continue the work. Be terse and factual. Output only the summary text."
         )
+        # #1049 (L3): query-aware fidelity — bias, NOT filter. The generic instruction above already
+        # preserves all established state; when a user turn is in scope we additionally ask the summarizer
+        # to PREFER task-relevant facts/paths/ids/threads when the summary must be tight. This biases the
+        # rolling summary only; it does not make eviction relevance-ranked (recency eviction is unchanged;
+        # relevance recall stays with B2 RAG). Empty turn ⇒ the instruction is byte-identical to today.
+        # The focus is bounded so a large paste can't bloat the summarizer's own prompt.
+        _turn = (getattr(self, "_current_user_turn", "") or "").strip()
+        if _turn:
+            _focus = _turn if len(_turn) <= 400 else _turn[:400] + "…"
+            instr += (
+                " The user's CURRENT task is: \"" + _focus + "\". When the summary must be tight, PREFER "
+                "keeping facts, paths, ids and open threads relevant to that task over unrelated ones — "
+                "this biases retention; it does not license dropping state you could otherwise keep."
+            )
         prev_body = ""
         if prev_summary.strip():
             # remove the marker line before re-feeding (only the content matters)
@@ -5596,6 +5740,47 @@ class GX10:
         )
         return (resp.choices[0].message.content or "").strip()
 
+    def _summary_budget_ok(self) -> bool:
+        """#1051: the shared per-turn summarize rate-limit consulted by ALL three summarize triggers (the
+        steady-state roll, the emergency rung, the proactive accountant) so they can't compound into
+        multiple full model round-trips in one turn. MAX_SUMMARIES_PER_TURN <= 0 ⇒ unlimited (byte-identical
+        to today — the gate always passes)."""
+        return MAX_SUMMARIES_PER_TURN <= 0 or self._summaries_this_turn < MAX_SUMMARIES_PER_TURN
+
+    def _note_summary(self, summary_text: str) -> None:
+        """#1051: telemetry for the shared rate-limit — count one summarize + a cheap CHAR-based estimate of
+        the tokens it produced (no tokenizer round-trip, so the default path adds no network call)."""
+        self._summaries_this_turn += 1
+        self._summary_tokens_this_turn += int(len(summary_text or "") / max(1.0, float(CHARS_PER_TOKEN)))
+
+    def _proactive_roll_if_needed(self) -> None:
+        """#1051 (L3): the proactive cumulative-ingestion accountant. DEFAULT OFF (byte-identical — a single
+        flag check, no token count, no eviction). ON → once the transcript crosses INGEST_SOFT_FRAC of the
+        model window, proactively shed the oldest WHOLE tool rounds via a query-aware roll-summary (high
+        floor) instead of waiting for the reactive low-floor truncation. Bounded by the shared per-turn
+        summarize cap (past it _roll_summary degrades to a plain archived drop) and self-debouncing (it sheds
+        back under the soft mark). Fail-soft; an irreducible single turn is left to the reactive ladder."""
+        if not PROACTIVE_ROLL:
+            return
+        soft = int(MAX_MODEL_LEN * INGEST_SOFT_FRAC)
+        system = [m for m in self.messages if m.get("role") == "system"]
+        others = [m for m in self.messages if m.get("role") != "system"]
+        if _count_prompt_tokens(system + others) < soft:
+            return
+        evicted: List[Dict] = []
+        while len(others) > 1 and _count_prompt_tokens(system + others) >= soft:
+            cut = 1
+            while cut < len(others) and others[cut].get("role") != "user":
+                cut += 1
+            if cut >= len(others):
+                break                       # only the last user turn remains → leave it to the reactive ladder
+            evicted.extend(others[:cut])
+            del others[:cut]
+        if not evicted:
+            return
+        self._roll_summary(system, evicted)   # query-aware summary (budget-gated) + lossless cold archive
+        self.messages = system + others       # system may have grown a summary block in place
+
     def _roll_summary(self, system: List[Dict], evicted: List[Dict]) -> None:
         """Roll the evicted rounds into the summary block (directly below the system prompt) and
         archive the raw text losslessly to cold. Fail-soft: any error leaves `system`
@@ -5610,6 +5795,8 @@ class GX10:
                 pass
         # 2) In-window rolling summary (synchronous, capped model call, fail-soft).
         prev = self._find_summary(system)
+        if not self._summary_budget_ok():   # #1051: shared per-turn cap hit → plain archived drop (no summary)
+            return
         try:
             new_summary = self._summarize(prev["content"] if prev else "", raw)
         except Exception as e:  # noqa: BLE001 — a failed summary must not tip the turn
@@ -5617,6 +5804,7 @@ class GX10:
             return
         if not new_summary.strip():
             return
+        self._note_summary(new_summary)     # #1051: count this summarize toward the shared per-turn cap
         content = _SUMMARY_MARKER + "\n" + new_summary.strip()
         if prev is not None:
             prev["content"] = content          # find-and-update (no duplicate)
@@ -5875,6 +6063,13 @@ class GX10:
     # ── Agent loop ────────────────────────────────────────────
     def run(self, user_input: str):
         _CANCEL_EVENT.clear()
+        # #1049 (L3): remember this turn so a mid-turn eviction can bias the rolling summary toward the
+        # current task (read in _summarize via the instance; fail-soft to the generic instruction when
+        # empty). Set at entry, before any work that could trigger a summarize.
+        self._current_user_turn = user_input or ""
+        self._turn_gen_errored = False   # #1050 (L3): reset the per-turn generation-error flag (guards the emergency summarize)
+        self._summaries_this_turn = 0            # #1051 (L3): reset the shared per-turn summarize counters
+        self._summary_tokens_this_turn = 0
         # B2: per-turn retrieval BEFORE the append (query = user message, dedup against the existing
         # window). FLAG OFF → "" → the user message is appended verbatim (byte-identical).
         rag = self._retrieve_context(user_input)
@@ -6066,6 +6261,9 @@ class GX10:
                     "tool_call_id": tcid,
                     "content":      result_t
                 })
+                # #1051 (L3): proactive cumulative-ingestion accountant — proactively shed the oldest tool
+                # rounds via a query-aware summary once ingestion crosses the soft mark (default OFF ⇒ no-op).
+                self._proactive_roll_if_needed()
                 # #602 2.0/#690: publish the tool-result boundary (ctx carries the tool name).
                 _emit_hook("post_toolresult", {"tool": name, "args": args, "result": result_t,
                                                "agent": self})
@@ -8338,6 +8536,10 @@ def _code_defaults() -> Dict[str, Any]:
             "list_dir_hard_cap":  LIST_DIR_HARD_CAP,
             "summarize_evicted":  SUMMARIZE_EVICTED,   # B1: default ON (06-18); off → byte-identical trim
             "summary_max_tokens": SUMMARY_MAX_TOKENS,
+            "emergency_summarize": EMERGENCY_SUMMARIZE,   # #1050 L3: default OFF; ON → summarize-not-truncate on the emergency rung
+            "proactive_roll":     PROACTIVE_ROLL,      # #1051 L3: default OFF; ON → proactive query-aware roll at the soft mark
+            "ingest_soft_frac":   INGEST_SOFT_FRAC,    # #1051 L3: soft-mark fraction of the model window
+            "max_summaries_per_turn": MAX_SUMMARIES_PER_TURN,   # #1051 L3: shared per-turn summarize cap (0 ⇒ unlimited)
             "rag_enabled":        RAG_ENABLED,         # B2: default ON (06-18); off → user message verbatim
             "rag_top_k":          RAG_TOP_K,
             "rag_max_tokens":     RAG_MAX_TOKENS,
@@ -8503,6 +8705,10 @@ def _apply_env(cfg: Dict[str, Any]) -> Dict[str, Any]:
     setif("GX10_PROVIDERS_MAX_AGENTS",   "providers", "max_agents", int)      # server CLI-pool cap
     setif("GX10_PROVIDERS_CLI_TIMEOUT_S","providers", "cli_timeout_s", int)   # CLI spawn timeout
     setif("GX10_CONTEXT_SUMMARY",    "context", "summarize_evicted",  _truthy)   # B1 switch
+    setif("GX10_EMERGENCY_SUMMARIZE", "context", "emergency_summarize", _truthy)   # #1050 L3 (default OFF)
+    setif("GX10_PROACTIVE_ROLL",      "context", "proactive_roll",      _truthy)   # #1051 L3 (default OFF)
+    setif("GX10_INGEST_SOFT_FRAC",    "context", "ingest_soft_frac",    float)     # #1051 L3
+    setif("GX10_MAX_SUMMARIES_PER_TURN", "context", "max_summaries_per_turn", int) # #1051 L3 (0 ⇒ unlimited)
     setif("GX10_SUMMARY_MAX_TOKENS", "context", "summary_max_tokens", int)
     setif("GX10_CONTEXT_RAG",        "context", "rag_enabled",        _truthy)   # B2 switch
     setif("GX10_RAG_TOP_K",          "context", "rag_top_k",          int)
@@ -8543,7 +8749,8 @@ def _apply_config(cfg: Dict[str, Any]):
     global AUTOPILOT_DEFAULT_EFFORT, AUTOPILOT_LOGS_DIR, AUTOPILOT_MAX_CONCURRENT, AUTOPILOT_STREAM, AUTOPILOT_TERMINATE_ON_ADVANCE, AUTOPILOT_AUTOPLAN, AUTOPILOT_MAX_TASKS, AUTOPILOT_LOG_TERMINAL
     global TEMPERATURE, MAX_TOKENS, RETRY_BACKOFF, LANGUAGE
     global MAX_ITERATIONS, MAX_CTX_CHARS, TRIM_TARGET_CHARS, MAX_FILE_CHARS, LIST_DIR_HARD_CAP
-    global SUMMARIZE_EVICTED, SUMMARY_MAX_TOKENS, RAG_ENABLED, RAG_TOP_K, RAG_MAX_TOKENS
+    global SUMMARIZE_EVICTED, SUMMARY_MAX_TOKENS, RAG_ENABLED, RAG_TOP_K, RAG_MAX_TOKENS, EMERGENCY_SUMMARIZE
+    global PROACTIVE_ROLL, INGEST_SOFT_FRAC, MAX_SUMMARIES_PER_TURN
     global MAX_MODEL_LEN, TOKEN_BUDGET, CHARS_PER_TOKEN, THINKING_RESERVE, MEMORY_BRIEF_TOKENS, MIN_OUTPUT_TOKENS, OVERFLOW_SAFETY_TOKENS
     global WORKER_MEMORY, WORKER_WRITE, WORKER_WRITE_MODE, WARM_SESSION_ID
     global _PLANNING_KW, _ROUTINE_KW, WORKSPACE_DIRS, _IDLE_ACTIVE
@@ -8607,6 +8814,10 @@ def _apply_config(cfg: Dict[str, Any]):
     LIST_DIR_HARD_CAP = int(ctx["list_dir_hard_cap"])
     SUMMARIZE_EVICTED  = bool(ctx.get("summarize_evicted", True))    # B1: default ON (06-18)
     SUMMARY_MAX_TOKENS = int(ctx.get("summary_max_tokens", SUMMARY_MAX_TOKENS))
+    EMERGENCY_SUMMARIZE = bool(ctx.get("emergency_summarize", False))   # #1050 L3: default OFF
+    PROACTIVE_ROLL         = bool(ctx.get("proactive_roll", False))           # #1051 L3: default OFF
+    INGEST_SOFT_FRAC       = float(ctx.get("ingest_soft_frac", INGEST_SOFT_FRAC))
+    MAX_SUMMARIES_PER_TURN = int(ctx.get("max_summaries_per_turn", MAX_SUMMARIES_PER_TURN))
     RAG_ENABLED        = bool(ctx.get("rag_enabled", True))          # B2: default ON (06-18)
     RAG_TOP_K          = int(ctx.get("rag_top_k", RAG_TOP_K))
     RAG_MAX_TOKENS     = int(ctx.get("rag_max_tokens", RAG_MAX_TOKENS))

@@ -45,6 +45,8 @@ while [ $# -gt 0 ]; do
     --vllm-image)        VLLM_IMAGE="$2"; shift 2;;
     --port)              VLLM_PORT="$2"; shift 2;;
     --gpu-mem-util)      GPU_MEM_UTIL="$2"; shift 2;;
+    --max-model-len)     MAX_MODEL_LEN="$2"; shift 2;;
+    --max-num-seqs)      MAX_SEQS="$2"; shift 2;;
     --with-orchestrator) WITH_ORCH=1; shift;;
     --docker)            ORCH_DOCKER=1; shift;;
     --orchestrator-port) ORCH_PORT="$2"; shift 2;;
@@ -58,6 +60,11 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"   # scripts/ → re
 
 log() { echo "  [bootstrap] $*"; }
 fail() { echo "  [bootstrap] FAIL: $*" >&2; exit 1; }
+
+# Echo the effective served-window knobs (from flags / IRONCLAD_* env) BEFORE the idempotency check, so a
+# deploy can confirm the passthrough delivered them even when the model server is already up (no relaunch).
+# The engine auto-adopts the served window at boot (#377), so raising it here is picked up with no code change.
+log "effective vLLM launch: max-model-len=$MAX_MODEL_LEN gpu-mem-util=$GPU_MEM_UTIL max-num-seqs=$MAX_SEQS"
 
 # ── preflight ────────────────────────────────────────────────────────────────
 command -v docker >/dev/null || fail "docker not found"

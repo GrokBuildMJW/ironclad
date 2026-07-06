@@ -129,6 +129,71 @@ function execCommand(command: string, timeoutS: number): Promise<string> {
   });
 }
 
+/** ≙ Python str.splitlines() (no keepends) for the common separators: split on \r\n / \r / \n and drop the
+ *  single phantom trailing '' a trailing separator produces, so the line count matches gx10.py. (Exotic
+ *  \v/\f/\x1c separators Python also splits on are an accepted parity limit.) */
+function splitLinesLikePython(text: string): string[] {
+  if (text === '') return [];
+  const lines = text.split(/\r\n|\r|\n/);
+  if (lines.length > 0 && lines[lines.length - 1] === '') lines.pop();
+  return lines;
+}
+
+/** #1047: a TARGETED slice of a file's text — a regex `pattern` (a window of lines around the first
+ *  match) OR a 1-based inclusive line range start/end, capped by max_chars (else MAX_FILE_CHARS).
+ *  Returns null on a bad/empty range or an unmatched/invalid pattern so the caller falls back to the
+ *  head+tail cap. Never throws. Mirrors gx10.py `_read_file_ranged` — the return strings are byte-identical
+ *  (the model is prompt-tuned to them). The line model is Python str.splitlines() (see splitLinesLikePython)
+ *  so counts, indices and the regex `$` anchor match; the returned slice normalises line endings to `\n`. */
+function rangedRead(text: string, args: Args): string | null {
+  const start = args['start'], end = args['end'], maxChars = args['max_chars'], pattern = args['pattern'];
+  if (start === undefined && end === undefined && maxChars === undefined && pattern === undefined) return null;
+  try {
+    const lines = splitLinesLikePython(text);
+    const n = lines.length;
+    if (n === 0) return null;
+    let lo: number;
+    let hi: number;
+    if (pattern !== undefined && pattern !== null && String(pattern) !== '') {
+      const rx = new RegExp(String(pattern));
+      let hit = -1;
+      for (let i = 0; i < n; i++) {
+        if (rx.test(lines[i] ?? '')) {
+          hit = i;
+          break;
+        }
+      }
+      if (hit < 0) return null; // no match → fall back to the head+tail cap
+      const ctx = 20; // a window of lines around the first match
+      lo = Math.max(0, hit - ctx);
+      hi = Math.min(n, hit + ctx + 1);
+    } else if (start !== undefined || end !== undefined) {
+      const s = start !== undefined ? Math.trunc(Number(start)) : 1;
+      const e = end !== undefined ? Math.trunc(Number(end)) : n;
+      if (!Number.isFinite(s) || !Number.isFinite(e) || s < 1 || s > n || e < s) return null; // bad range
+      lo = s - 1;
+      hi = Math.min(n, e);
+    } else {
+      return null;
+    }
+    let body = lines.slice(lo, hi).join('\n');
+    const cp = Array.from(body); // code points ≙ Python len()/str slicing
+    const cap = maxChars !== undefined && Number(maxChars) > 0 ? Math.trunc(Number(maxChars)) : MAX_FILE_CHARS;
+    if (cap > 0 && cp.length > cap) {
+      const headN = Math.floor((cap * 2) / 3);
+      const tailN = cap - headN;
+      const omitted = cp.length - headN - tailN;
+      body =
+        cp.slice(0, headN).join('') +
+        `\n\n... [Ironclad: ${omitted} chars omitted from the slice — capped at ${cap}] ...\n\n` +
+        cp.slice(cp.length - tailN).join('');
+    }
+    return `[Ironclad: lines ${lo + 1}-${hi} of ${n}]\n${body}`;
+  } catch {
+    return null;
+  }
+}
+
 // ── dispatch ─────────────────────────────────────────────────────────────────
 export async function runTool(name: string, args: Args): Promise<string> {
   try {
@@ -143,6 +208,10 @@ export async function runTool(name: string, args: Args): Promise<string> {
           throw e;
         }
         const text = buf.toString('utf-8');
+        // #1047: a targeted ranged/pattern read returns only the relevant slice; a bad range/pattern
+        // falls through to the head+tail cap below (≙ gx10.py `_read_file_ranged`).
+        const ranged = rangedRead(text, args);
+        if (ranged !== null) return ranged;
         // cap on Unicode CODE POINTS (≙ Python len()/str slicing), not UTF-16 code units.
         const cp = Array.from(text);
         if (cp.length > MAX_FILE_CHARS) {
@@ -152,8 +221,8 @@ export async function runTool(name: string, args: Args): Promise<string> {
           return (
             cp.slice(0, headN).join('') +
             `\n\n... [Ironclad: ${omitted} chars omitted — file ${cp.length} ` +
-            `chars, capped at ${MAX_FILE_CHARS}. For targeted excerpts use ` +
-            `execute_command, e.g. findstr/Select-String.] ...\n\n` +
+            `chars, capped at ${MAX_FILE_CHARS}. For targeted excerpts, use search_files to ` +
+            `locate the relevant lines, then read only those.] ...\n\n` + // #1047 re-steer (was findstr/Select-String; ≙ gx10.py #1046)
             cp.slice(cp.length - tailN).join('')
           );
         }

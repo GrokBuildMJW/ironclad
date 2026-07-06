@@ -9,10 +9,10 @@
 
 | | |
 |---|---|
-| Automated tests (offline, no model) | **2617 passed** |
+| Automated tests (offline, no model) | **2651 passed** |
 | Live smoke tests (skipped without a model) | **9** |
-| **Total Python** | **2626** |
-| TypeScript client tests (`node:test`) | **367 passed** (371 total, 4 skipped) |
+| **Total Python** | **2660** |
+| TypeScript client tests (`node:test`) | **373 passed** (377 total, 4 skipped) |
 | Full agentic loop, end to end, with a **real** code-agent | **verified** |
 | Issues found during the campaign | **1 functional gap + 5 review findings — all found and fixed** (see below) |
 
@@ -24,7 +24,7 @@ default** and only runs when pointed at a real server.
 
 ```bash
 # 1) offline suite — deterministic, no model needed
-pytest -q                                   # from core/  → 2617 passed, 9 skipped
+pytest -q                                   # from core/  → 2651 passed, 9 skipped
 
 # 2) live smoke — against your own running orchestrator
 GX10_LIVE_URL=http://<your-host>:8100 pytest -k live -q     # 9 passed
@@ -34,7 +34,7 @@ GX10_LIVE_URL=http://<your-host>:8100 pytest -k live -q     # 9 passed
 ## Coverage by area
 
 The breakdown below groups the suite by capability area and sums to
-the **2626** total (2617 offline + 9 live). It is a high-level view of internal QA
+the **2660** total (2651 offline + 9 live). It is a high-level view of internal QA
 coverage; the granular test names and the maintainers' internal tracker are
 intentionally not enumerated here.
 
@@ -71,10 +71,10 @@ intentionally not enumerated here.
 | **ACE MPR-for-architecture e2e proof (M5-5)** — the M5 capstone (epic #855 / #886, MPR-A-6): a boundary-clean END-TO-END test of the whole gated fork propose-loop through the ONE core seam — a `ForkSignal` → M5-2 fires the gated, off-path, pre-informed MPR panel → M5-3 records + renders the matrix as a recommendation → the operator resolves → M5-4 records a fork-decision bullet → a SECOND comparable fork's MPR query is pre-informed by it. Proven for BOTH dev-processes (public generic + internal DEV-3) through the same ledger schema/seam; the **gate-off no-op** (no MPR, no proposal, no learning, no pre-informing — byte-identical); and the full **fail-soft matrix** (tampered ledger, MPR no-op/ERROR, MPR raises, malformed signal → the ask always surfaces, no crash, the loop never blocks). Covered by `test_ace_forkproof.py` (4) | 4 |
 | **Closed-loop e2e** (#602 C2 done-gate) — the reflection loop proven LIVE end-to-end on the dev-task pipeline: a staged handover is scored (Verifier) → fed to the Quality breaker + trips → a run failure is classified (FailureClass) → the Strategy Revisor escalates on a spent budget; the C2 reflection seams off are a no-op while the ACE loop-intelligence core is always-on and owns `post_feedback` (#863); plus the 8b `eval` per-type verifier selection (#602 / #809) | 3 |
 | **Function-calling robustness** — tool-argument validation and model-agnostic call recovery | 24 |
-| **Server / client split & security** — HTTP surface, trust profiles, sessions, sealing, the config tree + runtime config, command router, doctor, catalogue endpoint, the server-side tool bridge, the coders / health observability blocks, and the client<->commands.py command-parity guard. **#921 (desktop fachtest):** the captured `/chat` response strips the interactive status chrome (`[GX10]` / `[Qwen (planning)]`) so the API returns the answer, not pane markers | 122 |
+| **Server / client split & security** — HTTP surface, trust profiles, sessions, sealing, the config tree + runtime config, command router, doctor, catalogue endpoint, the server-side tool bridge, the coders / health observability blocks, and the client<->commands.py command-parity guard, plus the injected CLI-runner secret-env hardener (`engine/agent_env.py`, #1052 — scrubs every secret NAME from the spawned coder's env + redirects the git/gh credential-discovery paths; `HOME`/`~/.claude` preserved). **#921 (desktop fachtest):** the captured `/chat` response strips the interactive status chrome (`[GX10]` / `[Qwen (planning)]`) so the API returns the answer, not pane markers | 128 |
 | **Provider-router / dispatch** — backend registry, routing policy, artifact routing, spill / fallback, setup-type resolution, reviewer anti-affinity, first-class web-search routing, and the **handover effort auto-tiering by task class** (#500: security/architecture → xhigh, routine → high; explicit `effort:` wins; fail-open on an unmapped/unloadable class) | 102 |
 | **Web search & current-info routing** — the web-search tool gating + handler, the current-info intent classifier (English + German), the strict input contract + domain normalizer, the standalone adapter seam + a native HTTP adapter, the model-facing Sources formatter, the web_search prompt + tool-description, the sealed trust gate, the config + secret surface, the search-progress renderer, the 16-test spec consolidation, the tool-as-shell guard, and a fail-closed shell guardrail | 147 |
-| **Memory & context** — Mem0 client, chunking, RAG, the rolling summary, bounded summarizer input, deep query, vault reconcile, the warm tier, the token-budgeted handover brief, and the pre-flight overflow guard with its adaptive output reserve + safety headroom + iterative oversized-turn truncation (#366), the single ingestion choke-point cap (#1046), and the deliberate `remember` write tool (#1076) | 115 |
+| **Memory & context** — Mem0 client, chunking, RAG, the rolling summary (query-aware, #1049), bounded summarizer input, deep query, vault reconcile, the warm tier, the token-budgeted handover brief, and the pre-flight overflow guard with its adaptive output reserve + safety headroom + iterative oversized-turn truncation (#366), the single ingestion choke-point cap (#1046), the emergency-rung truncated-slice archive + optional summarize-not-truncate (#1050), the proactive ingestion accountant + shared per-turn summarize cap (#1051), ranged/pattern read_file (#1047), the #366 file-heavy E2E repro keystone (epic #1043 C2), and the deliberate `remember` write tool (#1076) | 143 |
 | **Lesson store / provider API** — the curated, versioned `ack.lessons` delegation seam (AD-10, #601 S14-3): a `runtime_checkable LessonProvider` (get_lessons / report_lesson / brief) + set/get_provider; fail-soft no-op when no provider is wired (reads `[]`, writes no-op, a provider error never breaks a turn); a scope-priority `brief()` merge (provider-or-composed, dedup + limit); and the **fail-closed redaction-gated `promote()`** (AD-9 — a project-private lesson is promoted to a broader scope ONLY through an approving redactor). The #602-unblocking surface; lesson semantics are the provider's | 20 |
 | **Lesson seam wiring** — the engine integration of `ack.lessons` (AD-10, #601 S14-4): the handover read-site appends an advisory, scope-keyed lesson brief alongside the Memory brief, and the task-completion write-site reports the feedback as a scoped lesson (tagged with the task id) — both lazy-imported, both scoped to the active project/track `mem_scope`, and both byte-identical no-ops with no provider wired (the read returns nothing, the write does not even touch the feedback file), plus the **`post_feedback` Hook-Bus re-home** of the write site (#602 2.3/#804): the task-completion lesson write is driven by `gx10._lessons_consumer_hook` through the real `_advance_pipeline` wrapper (registered on **provider presence**, outside the vault lock), reporting on a fresh completion only (no double-report on an already-done re-advance), byte-identical no-op with no provider, fail-soft on a raising provider | 10 |
 | **Scope-aware forget + scope tagging** — the substrate delete path (AD-10 / #601 S14-5): cold writes self-describe their origin `scope` in metadata (only when a project scope is bound — byte-identical for the base partition); `MemoryManager.forget(scope)` deletes a partition via the Mem0 `/delete_all` route (synchronous, fail-soft, fail-closed on an empty scope); the warm tier's `forget_scope(scope)` deletes the **exact**-scope session + retrieval-cache keys without cascading into deeper track scopes (fail-closed on an empty / glob-bearing scope); `ack.lessons.forget(scope)` is an optional, fail-soft provider verb; and `gx10._forget_scope` fans out across all three layers, fail-closed on an empty scope | 21 |

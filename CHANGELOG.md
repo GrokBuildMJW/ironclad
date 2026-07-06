@@ -4,6 +4,58 @@ All notable changes to Ironclad are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/); the project is **pre-release** (0.0.x).
 Released versions are listed below.
 
+## [0.0.25]
+### Added
+- **Query-aware rolling summary (L3)** (epic #1043 / #1049): on context eviction the hierarchical rolling
+  summary now biases retention toward the current user task — the turn is captured at `run()` entry and
+  folded into the summarizer instruction as a *bias, not a filter* (recency eviction and relevance recall
+  via RAG are unchanged; this only steers what the summary keeps when space is tight). Fail-soft: with no
+  turn in scope the generic instruction is used, byte-identical to before, and the injected focus is bounded
+  so a large paste can't bloat the summarizer's own prompt. No new flag. First code rung of the
+  context-&-quality defense-in-depth epic (#1043).
+- **In-core secret-env hardener on the CLI-runner lane** (epic #1043 / #1052): `default_cli_runner` spawned
+  the coder subprocess (`web_search`, `parallel_reason`, and the future `read_offload`) with the server's
+  full environment. A new `engine/agent_env.py` now scrubs every secret NAME from the child env and redirects
+  the git/gh credential-discovery paths into an empty scratch store at that one choke-point, so a
+  prompt-injection in untrusted ingested content can't exfiltrate an inherited token or push via the ambient
+  credential — while `HOME`/`~/.claude` (the coder's own OAuth) is preserved and `CLAUDE_CONFIG_DIR` is never
+  set (#994/#996). Fail-closed to a plain secret scrub if the redirect can't be written. Also closes the
+  pre-existing `web_search` env exposure; a hard precondition for the gated `read_offload` (#1053).
+- **Emergency-rung archive + optional summarize-not-truncate (L3)** (epic #1043 / #1050): the last-resort
+  recovery that truncates the largest turns' content to head+tail excerpts previously dropped the middle
+  slice silently. It now **always cold-archives** the discarded slice (`add_bulk(source="fragment_trim")`)
+  so B2 RAG can re-inject it query-aware next turn. An optional, **default-off** `context.emergency_summarize`
+  (`GX10_EMERGENCY_SUMMARIZE`) replaces the raw drop with a bounded summary, wrapped in a hard wall-clock
+  timeout (daemon-thread, win32-safe), skipped when a generation this turn already errored, and **always**
+  falling through to raw truncation on timeout/exception (at most one model call per invocation). The
+  default-off path is byte-identical to before.
+- **Proactive ingestion accountant + shared summarize rate-limit (L3)** (epic #1043 / #1051): completes the
+  L3 backstop. A **default-off** `context.proactive_roll` (`GX10_PROACTIVE_ROLL`) accountant runs at the
+  tool-result boundary and, once cumulative ingestion crosses `context.ingest_soft_frac` (~0.7) of the model
+  window, proactively sheds the oldest whole tool rounds via a query-aware roll-summary (high floor) instead
+  of waiting for the reactive low-floor truncation. A `context.max_summaries_per_turn`
+  (`GX10_MAX_SUMMARIES_PER_TURN`, **0 = unlimited**) shared per-turn cap now bounds the total summarizes
+  across ALL three triggers (steady-state roll, emergency rung, proactive) so they can't compound into
+  multiple full model round-trips in one turn; past the cap a roll degrades to a plain archived drop.
+  Per-turn counters (summaries + estimated tokens) track the cost. The default path is byte-identical.
+- **Ranged / pattern `read_file` (L1)** (epic #1043 / #1047): `read_file` gains `start`/`end` (1-based
+  inclusive line numbers), an optional regex `pattern` (reads a window of lines around the first match), and
+  `max_chars` — so the model reads only the relevant slice of a large file instead of the whole thing, and
+  the schema/description steer search-first (use `search_files` to locate the lines, then read that range). A
+  bad range or an unmatched/invalid pattern falls back to the existing head+tail cap (never crashes). The
+  slice logic is mirrored in the TypeScript client (`clients/ink` `runTool.ts`) so a local-topology read
+  applies the same slice, and the ink omission marker is re-steered from `findstr`/`Select-String` to
+  `search_files` (matching the server, #1046).
+- **L0 served-window deploy passthrough (64k)** (epic #1043 / #1044 / #1045): `scripts/spark-bootstrap.sh`
+  gains `--max-model-len` / `--max-num-seqs` flags (previously env-only) and logs the effective window before
+  its idempotency check, and the private deploy driver now forwards `IRONCLAD_MAX_MODEL_LEN` /
+  `IRONCLAD_GPU_MEM_UTIL` / `IRONCLAD_MAX_SEQS` to the remote (ssh does not forward env), so a deploy raises the
+  served vLLM window to 64k reproducibly without hand-editing the bootstrap default. The public core default
+  stays a conservative 32768 and the engine auto-adopts the served window at boot (#377). Live-verified on the
+  Spark: vLLM serves 65536 with the co-located Mem0 stack healthy (~43x KV headroom at 65,536 tokens/request,
+  ~37 GB free) at gpu-mem-util **0.6** — the evidence corrects the design's 0.85, which would starve Mem0 on
+  the shared 121 GB unified-memory box; unset `IRONCLAD_MAX_MODEL_LEN` reverts to 32768 cleanly.
+
 ## [0.0.24]
 
 ### Added
