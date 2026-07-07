@@ -4,7 +4,12 @@ function Say($m) { Write-Host "[doctor] $m" }
 
 $proj = (Get-Location).Path
 $cfgPath = Join-Path $proj ".ironclad\config.json"
-if (-not (Test-Path $cfgPath)) { Say "no .ironclad in '$proj' — run install\ironclad-install.ps1 in this project first."; exit 2 }
+if (-not (Test-Path $cfgPath)) {
+  # S9 (#1232): no local bind yet — fall back to the recorded runtime (read-only; the doctor never writes).
+  $runtime = Join-Path $HOME ".ironclad\runtime.json"
+  if (Test-Path $runtime) { Say "no .ironclad in '$proj' — reporting the installed runtime."; $cfgPath = $runtime }
+  else { Say "no .ironclad in '$proj' and no installed runtime — run install\ironclad-install.ps1 first."; exit 2 }
+}
 $cfg = Get-Content $cfgPath -Raw | ConvertFrom-Json
 $type = if ($cfg.type) { "$($cfg.type)".Trim().ToLower() } else { "desktop" }
 $port = if ($cfg.port) { [int]$cfg.port } else { 8100 }

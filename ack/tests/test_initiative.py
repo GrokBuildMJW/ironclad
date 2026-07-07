@@ -205,8 +205,9 @@ def test_cmd_list_marks_active():
     gx10._initiative_command("new One --type software")
     gx10._initiative_command("new Two")     # active
     out = gx10._initiative_command("list")
-    assert "* two" in out
-    assert "  one" in out and "* one" not in out
+    assert "- two [active]" in out                        # #1238: markdown-safe [active] tag, not a "* " bullet
+    assert "- one" in out and "one [active]" not in out
+    assert "* two" not in out and "(* = active)" not in out   # the old markdown-colliding marker is gone
 
 
 def test_cmd_list_empty():

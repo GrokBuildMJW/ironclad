@@ -44,7 +44,7 @@ def _local_row(i):
 
 def _offload_row(i):
     return {"ok": True, "content": f"Gutachten {i}", "error": None, "completion_tokens": 200, "latency": 0.2,
-            "provider_id": "claude-sonnet", "provider_kind": "cli", "model": "claude-sonnet-4-6",
+            "provider_id": "claude-sonnet", "provider_kind": "cli", "model": "claude-sonnet-5",
             "effort": "medium", "est_cost_usd": 0.015, "real_cost_usd": 0.02, "route_reason": "cost-fit",
             "spilled": False}
 
@@ -137,7 +137,7 @@ def test_manifest_provenance_from_offload_dispatch_result(tmp_path):
     m = _manifest(tmp_path, "pw-off")
     ps = m["perspectives"]
     assert ps and all(p["provider"] == "claude-sonnet" and p["substrate"] == "pc-cli" for p in ps)
-    assert all(p["model"] == "claude-sonnet-4-6" and p["route_reason"] == "cost-fit" for p in ps)
+    assert all(p["model"] == "claude-sonnet-5" and p["route_reason"] == "cost-fit" for p in ps)
     assert all(p["cost"]["amount"] == 0.02 and p["spilled"] is False for p in ps)
     # real egress recorded + counted; offloadable → allowed (no violation)
     assert m["provenance"]["egress"] and m["sovereignty_summary"]["offloaded_count"] == len(ps)

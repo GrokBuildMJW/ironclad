@@ -421,7 +421,7 @@ def test_pending_handover_honors_pin(tmp_path, monkeypatch):
     item = server._pending_handovers()[0]
     assert item["agent"] == "SONNET"                                  # the pin overrode the staged OPUS
     # #454 (review B): the pinned agent runs ITS OWN model — NOT the staged handover's `to:` frontmatter
-    assert item["model"] == "claude-sonnet-4-6"
+    assert item["model"] == "claude-sonnet-5"
     assert item["effort"] == "high"                                  # SONNET's spec effort, not xhigh
 
 

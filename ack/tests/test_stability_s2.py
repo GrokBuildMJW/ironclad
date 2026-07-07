@@ -43,7 +43,13 @@ def test_watchdog_trips_on_idle_stall_and_surfaces_stalled(monkeypatch, tmp_path
     seen = _capture_outcome(monkeypatch, g)
 
     def stalling_generate(think):
-        time.sleep(0.7)                                   # NO progress signal for > the idle bound → watchdog trips
+        # Deterministic stall (#1207): emit NO progress signal and block until the real idle watchdog
+        # actually observes the stall (g._watchdog_tripped) — never a fixed sleep racing the poll interval,
+        # which flaked on loaded CI runners (the ~0.4s margin was too tight; the watchdog thread did not
+        # always wake inside it). The generous deadline keeps a busy runner from hanging should it never fire.
+        deadline = time.monotonic() + 5.0
+        while not g._watchdog_tripped and time.monotonic() < deadline:
+            time.sleep(0.01)
         return ("done", [], False, None, {})
     monkeypatch.setattr(g, "_generate", stalling_generate)
 

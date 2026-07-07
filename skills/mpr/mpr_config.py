@@ -25,7 +25,7 @@ DEFAULT_POOL: Dict[str, dict] = {
                    "cost_per_1k_in_usd": 0.0, "cost_per_1k_out_usd": 0.0,
                    "effort_levels": ["low", "medium", "high"]},
     "claude-sonnet": {"kind": "code-cli", "policy_class": "offloadable", "agent": "SONNET",
-                      "model": "claude-sonnet-4-6", "cost_per_1k_in_usd": 0.003,
+                      "model": "claude-sonnet-5", "cost_per_1k_in_usd": 0.003,
                       "cost_per_1k_out_usd": 0.015, "effort_levels": ["low", "medium", "high"]},
     "claude-opus": {"kind": "code-cli", "policy_class": "offloadable", "agent": "OPUS",
                     "model": "claude-opus-4-8", "cost_per_1k_in_usd": 0.015,

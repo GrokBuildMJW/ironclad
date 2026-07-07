@@ -6,7 +6,18 @@ set -euo pipefail
 say() { printf '[ironclad] %s\n' "$*"; }
 PROJ="$(pwd)"
 CFG="$PROJ/.ironclad/config.json"
-[ -f "$CFG" ] || { say "no .ironclad in '$PROJ' — run install/ironclad-install.sh in this project first."; exit 2; }
+if [ ! -f "$CFG" ]; then
+  # S9 (#1232): a new project dir must NOT demand a re-install (the runtime is already installed). If a global
+  # runtime.json exists (written once by the installer), auto-bind THIS dir to it and carry on; only a genuine
+  # first-run (no runtime installed at all) still points at the installer.
+  RUNTIME="$HOME/.ironclad/runtime.json"
+  if [ -f "$RUNTIME" ]; then
+    say "no .ironclad in '$PROJ' — auto-binding to the installed runtime."
+    mkdir -p "$PROJ/.ironclad"; cp "$RUNTIME" "$CFG"; printf '*\n' > "$PROJ/.ironclad/.gitignore"
+  else
+    say "no .ironclad in '$PROJ' and no installed runtime — run install/ironclad-install.sh first."; exit 2
+  fi
+fi
 
 # read the (install-written) config — unit-separator (\x1f) so empty fields (e.g. clientCli) and paths
 # with spaces both survive (a Tab is IFS-whitespace → read would collapse empty fields and shift values).
@@ -52,18 +63,33 @@ try:
 except Exception: pass
 PY
 }
+workdir() { "$PY" - "$1" <<'PY' 2>/dev/null
+import sys, json, urllib.request
+try:
+    print(json.load(urllib.request.urlopen(sys.argv[1], timeout=3)).get("workdir",""))
+except Exception: pass
+PY
+}
 
 STAMP="unknown"; [ -f "$ENGINE_DIR/VERSION" ] && STAMP="$(tr -d '[:space:]' < "$ENGINE_DIR/VERSION")"
 STARTED_PID=""
 REUSE=0
 if [ -n "$(probe "$BASE/health")" ]; then
   RV="$(version "$BASE/health")"
-  if [ "$RV" = "$STAMP" ]; then
+  WD="$(workdir "$BASE/health")"
+  # #1252: reuse ONLY when it is THIS project's engine — a wrong-workdir engine on the shared port would
+  # silently serve the wrong project's vault/registry. Resolve THIS folder EXACTLY as the engine does
+  # (pathlib.Path.resolve → what /health's workdir reports after its own resolve+chdir) so a symlink or case
+  # difference never spuriously restarts; an empty/unresolvable workdir stays a mismatch (fail-closed to
+  # restart, never a wrong attach).
+  PROJ_REAL="$("$PY" -c "import sys,pathlib;print(pathlib.Path(sys.argv[1]).resolve())" "$PROJ" 2>/dev/null || printf '%s' "$PROJ")"
+  if [ "$RV" = "$STAMP" ] && [ -n "$WD" ] && [ "$WD" = "$PROJ_REAL" ]; then
     say "engine already running on $BASE (version $STAMP) — reusing."
     REUSE=1
   else
-    # #47: a stale engine keeps serving the old code; stop it (by listening port) and start fresh.
-    say "engine on $BASE is version '$RV', installed is '$STAMP' — restarting."
+    # #47 / #1252: a stale-version OR wrong-project engine must not be reused; stop it (by listening port) and start fresh.
+    if [ "$RV" != "$STAMP" ]; then say "engine on $BASE is version '$RV', installed is '$STAMP' — restarting."
+    else say "engine on $BASE is bound to a different project ('$WD') — restarting for '$PROJ'."; fi
     if command -v fuser >/dev/null 2>&1; then fuser -k "${PORT}/tcp" 2>/dev/null || true
     elif command -v lsof >/dev/null 2>&1; then kill $(lsof -t -i ":${PORT}" 2>/dev/null) 2>/dev/null || true; fi
     sleep 1

@@ -4,6 +4,303 @@ All notable changes to Ironclad are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/); the project is **pre-release** (0.0.x).
 Released versions are listed below.
 
+## [0.0.26]
+### Added
+- **Grok (xAI) documented as a headless code-agent CLI** (#1246): a `docs/code-agents.md` example for the
+  stdout-capture variant (drops `{feedback}`, `-m grok-build`, `--yolo`), complementing the Codex
+  `-o {feedback}` example. The engine's agent registry is already agent-agnostic, so onboarding a coder is a
+  configuration-only addition (the handover pool + the reasoning fan-out pool) — no engine change.
+- **Watcher/autopilot disentangle + task heartbeat + explicit blocked state** (#1229): three opt-in,
+  default-off mechanisms (byte-identical when off). `automation.decoupled` makes autopilot self-sufficient (the
+  reconciler runs if either concern is on; the feedback-advance side stays watcher-gated) and drops the
+  contradictory "watcher on required" double message. `heartbeat.stall_seconds` flags an in_progress task that
+  shows no progress signal (coder log / feedback mtime) for N seconds. A task-level BLOCKED annotation
+  (`mark_blocked`/`clear_blocked` — no 4th directory state) surfaces a refused (advance-gate) or stalled task
+  with a ⚠ marker on the board instead of a healthy-looking in_progress row.
+- **Basic no-blind-advance gate** (#1224): opt-in (`advance_gate.enabled`, default off → byte-identical), a
+  deterministic pre-`done` gate — an advance to done requires the feedback to declare `status: done`;
+  `blocked`/`clarification_needed`/no-status is refused ("no signal ≠ done", fail-closed). Reads the feedback
+  only when the gate is on. The full composed gate (coupling/CI/quality) is out of scope.
+- **Central task board — `/board` + BOARD.md** (#1228): a human-readable, LLM-free projection of the TaskStore
+  — every unit grouped pending/in_progress/done (`id` · type · title · labels · parent · created_at) — so the
+  operator sees the whole pipeline at a glance. `/board [slug]` renders it and writes `<unit>/BOARD.md`; the
+  file is kept current via the fail-soft soft-reconcile (no new hot-path failure) and is excluded from the
+  vault index/graph. Deterministic + timestamp-free (idempotent re-render).
+- **GitHub-issue-shaped unit data model** (#1223): a work unit now carries optional `labels` + `parent` (the
+  epic/sub-issue link) alongside its title/description/state, so a unit maps 1:1 onto a (sub-)issue. Additive +
+  optional (empty defaults → byte-identical when unused); the `model_json_schema()` SSOT propagates the fields
+  to the prompt, the constraint grammar, the validator, and the docs at once.
+- **Design→implementation approval gate — no blind coding** (#1227): the orchestrator can no longer jump from
+  an analysis straight to a coding handover. `record_design` persists the design as a `decisions/` doc
+  (`stage: design`, `approved: false`); the engine then **refuses an implementation `stage_handover`** until
+  the operator approves it via **`/approve`** (or `approved: true` in the design doc) — a fail-closed pre-code
+  gate (`force` does not bypass it) — opt-in via `design_gate.enabled` (default off; byte-identical when off, DEV-1 enables it). Design/analysis/documentation handovers are unaffected. The per-turn
+  steering-state block surfaces the gate state so the model knows why a handover would be refused.
+- **`launch_coder` — the orchestrator starts a staged handover on demand** (#1226): the model is the single
+  steering author, so it triggers the coding session itself instead of waiting for a daemon. `launch_coder`
+  resolves the newest pending task with a staged handover (or an explicit `task_id`), launches its agent via
+  the same machinery the reconciler uses, and flips the task to in_progress — WITHOUT enabling the autopilot
+  daemon (which stays off by default: no second steering authority). Fail-closed (nothing staged · already
+  running/done · no agent on this box → the coder runs on the client in the server topology · concurrency cap
+  reached), never double-launches, and never leaks a concurrency slot on a launch error.
+- **Per-turn authoritative steering-state injection** (#1225): the orchestrator now sees its own bound state —
+  active project · active unit · lifecycle stage · N pending/M in_progress tasks · watcher/autopilot flags —
+  folded onto each user turn from the SAME state the plumbing acts on, so it never GUESSES (the prior failure
+  mode: probing the filesystem, concluding "no active project" while one was active, then fabricating a path).
+  Kept as EXACTLY ONE current copy (stale copies dropped each turn) after the stable system prefix
+  (KV-cache-safe); `""` when nothing is bound → a plain-chat turn stays byte-identical. Never raises.
+- **`pr_status` — read a PR's CI/mergeability snapshot** (#1219): the merge-readiness gate as a first-class
+  read. `pr_status(number)` returns a deterministic per-check verdict (ALL PASSING / N FAILING / N PENDING)
+  plus `mergeable`/`mergeStateStatus`/`reviewDecision`, on both transports (`cli` = `gh pr checks` +
+  `gh pr view`, `native` = `GET /pulls/{n}` + the head commit's check-runs (paginated) + legacy commit statuses + a best-effort reviewDecision from `/reviews`). A **snapshot** — non-blocking,
+  never a `--watch`/poll (the engine runs one agent turn behind a single lock; re-poll across turns). It is a
+  read (in the ingestion char-cap + injection fence, not the audit ledger); a non-existent number returns an
+  authoritative `NOT_FOUND`. Note: `gh pr checks` exits non-zero as *data* (pending=8, fail=1) — the cli
+  adapter parses stdout first rather than treating the exit code as an error.
+- **`comment_on_issue` — append a comment to a tracker issue through the forge adapter** (#1217): the third
+  leg of create/read/**comment** on the forge seam. `comment_on_issue(number, body_file)` runs on both
+  transports (`cli` = `gh issue comment`, `native` = `POST /issues/{n}/comments`); escape-free (body from a
+  file), **narrow — comment-only** (never closes, reopens, or relabels — close is policy-sensitive and
+  excluded). A non-existent number returns an authoritative `NOT_FOUND` (repo-disambiguated on the native
+  path). Capability-detected + `sealed`-blocked + audited, like `create_issue`.
+- **`create_pr` — open a PR through the forge adapter** (#1215): the WRITE-sibling of `create_issue` on the
+  forge seam, so the orchestrator's Issue→Branch→**PR**→Merge loop no longer drops to the raw shell.
+  `create_pr(title, body_file, base?, head?, draft?)` runs on both transports (`cli` = `gh pr create`,
+  `native` = `POST /pulls`); escape-free (body from a file), **open-only** (it never merges — merge stays a
+  CI/review gate). Capability-detected + `sealed`-blocked like `create_issue`, and audited. The native path
+  requires an explicit `head` (no local git to infer it) and defaults `base` to the repo's default branch.
+- **Forge adapter seam — the forge tools are now `gh`-independent** (#1213): a vendor-neutral `forge.adapter`
+  seam (`cli` \| `native` \| `mock`), mirroring the `web_search` adapter. `cli` (default) is the ambient
+  `gh` CLI, **byte-identical** to before; `native` is a stdlib-`urllib` GitHub REST client so
+  `create_issue`/`view_issue` (and the follow-up PR/comment tools) work with **no `gh` CLI on the box** — the
+  capability is general in ironclad, not contingent on a `gh` binary. The native token is read
+  **name-indirectly** from the environment (`forge.token_env`, default `GX10_FORGE_TOKEN`; never a secret
+  literal in core), the repo comes from `forge.repo`, and requests are SSRF-guarded to `api.github.com`.
+  `_forge_available()` is now transport-aware (offered when `gh` is present **or** a native token+repo is
+  configured); still `forge.enabled`-gated and blocked under the `sealed` profile.
+- **`view_issue` — read a tracker issue, the first-class way to resolve a `#NNN` reference** (epic #1043):
+  the read counterpart to `create_issue`. `view_issue(number)` queries the code forge (GitHub via the `gh`
+  CLI) and returns the issue's number/state/title/labels/milestone/body/url; a non-existent number returns an
+  authoritative `NOT_FOUND` (the tracker **was** queried). This gives the orchestrator the correct path for
+  "check #NNN" instead of falling back to the generic shell and grepping git history — which only ever cites
+  issues a merged PR closed, so an open issue is invisible there, making "no commit found" a false
+  "issue does not exist". Capability-detected + trust-gated exactly like `create_issue` (offered together
+  when `gh` is present and the profile permits; blocked under `sealed`; `forge.enabled=false` forces both
+  off; body bounded so a huge issue can't blow the window). The default orchestrator system prompt now routes
+  a `#NNN` reference to `view_issue` and forbids concluding "issue does not exist" from a missing commit.
+- **Guard 1 — a turn can no longer silently stall the orchestrator** (epic #1130 / #1131): three fail-soft
+  bounds so a wedged/stalled turn can't hold the server agent lock forever with no output. (1) A per-request
+  LLM timeout on **every** OpenAI client (the agent client + the ACE reflector; the reasoning workers and MPR
+  reuse the agent's), so a hung completion fails soft instead of hanging for the SDK default (~600s) × retries
+  — `connection.request_timeout_s` / `GX10_LLM_TIMEOUT_S` (default 120s), `connection.max_retries`. (2) The
+  tool loop now honours cancellation between tool calls and answers **every** pending `tool_call` on abort, so
+  it never leaves an orphan `tool_calls` message (a hard vLLM 400). (3) A bounded agent-lock acquire in the
+  server: a second request behind a running/wedged turn gets a retryable **503 "busy"** instead of blocking
+  forever — `GX10_AGENT_LOCK_TIMEOUT_S` (default 45s).
+- **Guard 1 watchdog — a stalled turn is now aborted AND surfaced, never silent** (epic #1130 / #1132): a
+  per-turn IDLE watchdog resets on every progress signal (a generation chunk, a completed generation, a tool
+  result) — so a slow-but-progressing deep turn (e.g. an MPR panel) is never killed — and, if a turn makes no
+  progress for `context.turn_idle_timeout_s` / `GX10_TURN_IDLE_TIMEOUT_S` (default 240s), aborts it and renders
+  a distinct `stalled` turn-end marker ("⏱ TURN ABORTED — model stalled"). The operator is never left staring
+  at a silent, wedged turn. Disabled (`<=0`) is byte-identical.
+- **Coloured directory listings** (epic #1144 / #1196): the listing default is now
+  `ls -lA --color=always`, whose ANSI SGR colours the entry names like a native terminal `ls`. The engine
+  splits the two audiences at the run-loop choke point: the **model context** is ANSI-**stripped**
+  (`_strip_ansi`, scoped to `execute_command` so ingested file content is never altered — the model reads
+  clean text and the ingestion cap counts real characters, not escape bytes), while the **display** stream
+  keeps the raw colour. A coloured line is streamed **without** the default grey wrap, so its
+  `⎿`/continuation prefix stays plain at the start and the client's tool-block parser captures the line WITH
+  its inner SGR (raw-or-stripped match) for the renderer to paint. The renderer already sandboxes SGR (colour
+  only — non-SGR escapes are dropped, never reaching the real terminal), so a hostile filename can tint text
+  but cannot hijack the cursor. On a non-coreutils host (BSD/macOS `ls`, which rejects `--color=always`) the
+  listing is retried without the flag so its header/`Answer:` are never lost. This supersedes the earlier
+  muted-palette choice for tool output: native shell colours (ls / PowerShell) are now preserved in the fold.
+
+### Changed
+- **SONNET code-agent default upgraded to Claude Sonnet 5** (#1258): the built-in SONNET handover agent now
+  defaults to `claude-sonnet-5` (was `claude-sonnet-4-6`); OPUS (`claude-opus-4-8`) is unchanged. A deployment
+  can still override the model per agent in its config pool.
+- **CI runs a single Python version (3.14)** (#1231): the per-PR `test` job dropped the `3.10 + 3.12` matrix
+  for one `test (3.14)` leg, and the branch-protection required-checks SSOT follows (`test (3.10)`/`test (3.12)`
+  → `test (3.14)`). `requires-python` stays `>=3.10`, so install-compatibility is unchanged and broad — but the
+  3.10–3.13 floor is no longer exercised per-PR (a deliberate trade-off; move it to a periodic run if that
+  coverage is wanted again).
+
+### Fixed
+- **`ironclad` reuses a running engine only for the SAME project** (#1252): the launcher compared only the
+  engine version, so a running engine on the shared port (default 8100) bound to a DIFFERENT project's workdir
+  was silently reused — the client then talked to the wrong project's vault/registry. It now also compares the
+  engine's `/health` `workdir` against the current folder and restarts the engine on a mismatch (`.sh` + `.ps1`).
+- **`/project list` (and initiative/track lists) mark the active row consistently** (#1238): the active row
+  used a leading `* ` marker that the client's markdown renderer turned into a generic `- ` bullet, dropping the
+  active marker its own `(* = active)` legend advertised. The lists now use a markdown-safe `[active]` tag (the
+  same `[…]` convention as `[archived]`) on a clean `- ` bullet, so the active unit is visually distinguishable.
+- **The developed software is isolated in a code subdir** (#1237): with `paths.code_subdir` set (opt-in,
+  default off → byte-identical), model-driven execution (code-tools, `execute_command`, the launched coder —
+  all via `_exec_cwd`) runs under `<project>/<code_subdir>` (e.g. `src/`), so the product tree no longer lands
+  alongside the ironclad control-plane (`vault/`, `.ironclad/`, `tasks/`). The control-plane keeps resolving to
+  the project root.
+- **`ironclad` in a new project folder no longer demands a re-install** (#1232): the installer now records the
+  runtime once at `~/.ironclad/runtime.json`, and the launcher **auto-binds** a new folder to it (mints a local
+  `.ironclad/config.json`) instead of dead-ending with "run ironclad-install". Separates the one-time runtime
+  install from the per-directory project bind; a project's own `config.json` still wins. (`.sh` + `.ps1`)
+- **A launched coder no longer gets `--model <AGENT>`** (#1236): the handover frontmatter `to:` is the
+  recipient AGENT (e.g. `to: CODEX`), which the orchestrator writes there — it was read as a model override,
+  so a non-Claude agent launched with `--model CODEX` and crashed ("the 'CODEX' model is not supported"). An
+  agent-name in `to:` is now ignored for the model (the agent's configured model wins); a genuine model string
+  in `to:` still overrides.
+- **`/update` works out of the box** (#1243): the desktop installer now stamps `srcDir` (the repo root) into
+  the project config, so `/update [pull]` (rebuild + reinstall the client from source) no longer fails with
+  "needs the source path — set GX10_SRC" on a fresh install.
+- **Listings default to `ls -lA` so the visible rows match the count** (epic #1144 / #1199): the default
+  listing was `ls -la`, which prints the `.`/`..` pseudo-entries as two extra `d` rows — a directory of 19
+  real subdirectories showed 21 `d` lines, so an operator counting rows read the (correct) `19 directories`
+  header as wrong. The default is now `ls -lA`: hidden entries are still shown, but `.`/`..` are not, so the
+  rows a user can count equal the deterministic header + `Answer:` sentence. Detection is unaffected (`-A`
+  is not recursive); an explicit `-R` still suppresses the header.
+- **The listing reply itself is now built in code — the model copies, it never composes** (epic #1144 /
+  #1202): the one-prose-sentence summary format was still only a prompt rule, and the model kept violating it
+  stochastically (blocks instead of a sentence) and even dropped names while enumerating (18 dir names under
+  a correctly copied count of 19). A simple shell listing now carries a machine **`AnswerData:` payload**
+  directly under the count header (ONE filesystem snapshot feeds both — no self-contradicting pair), and the
+  SERVER renders it into the final ready-made **`Answer:` sentence** — **command-gated inside `run_tool`
+  itself** (`_localize_listing_answer`), so a SINGLE structural site covers every topology AND every caller
+  (the model run-loop, `/tool`, `/ls`, the API): the machine `AnswerData:` line never leaks to a user, and a
+  NON-listing command whose output merely mimics the shape (e.g. `cat` of a crafted file) is never rewritten.
+  The sentence is `_listing_answer_sentence`: ALL names case-insensitively sorted, backtick-wrapped for
+  deterministic inline-code colouring, **sanitized against filename injection** (backticks + every
+  `str.splitlines()` line/paragraph separator — LF, NEL, LS, PS — render as `?`, so a hostile name can neither
+  forge a line nor break a code span in the verbatim-copied reply), en/de templates with English fallback,
+  and robust to malformed/type-confused data (the machine line is dropped, never a fabricated one). Listing
+  DETECTION is hardened too: recursion is caught case-insensitively (`gci -recurse`, not just `-R`) and a
+  PowerShell cmdlet with any value-taking named parameter (`-Exclude X`) yields no header (no guess).
+  Language, templates and sorting live ONLY server-side — the Ink tool bridge (`listingCount.ts`, whose
+  directory classifier now also FOLLOWS symlinks/junctions like the engine, from ONE readdir snapshot) ships
+  data, never prose, so every topology (desktop, spark, reuse, Python thin client) gets the one authoritative
+  reply language. Skipped above the configured `list_dir_hard_cap` (the large-folder rule governs). The
+  orchestrator prompt reduces the model's job to a verbatim copy of the `Answer:` line directly under the
+  header.
+- **The deterministic listing count now reaches BRIDGED setups too** (epic #1144 / #1195): the #1193
+  fs-computed `N directories, M files` header was engine-only — but with a client offering local execution
+  (`X-Local-Tools: 1`, the standard remote-server + local-code topology) `execute_command` runs in the
+  client's tool bridge, which bypassed the engine-side prepend entirely, so live listings started at
+  `total …` and the model fell back to self-counting (wrong, self-inconsistent counts, e.g. 21/9 for 20/10).
+  The Ink bridge now computes + prepends the same header itself (`listingCount.ts` ≙
+  `_listing_count_header_for_command`/`_directory_count_header`: same conservative detection — no header on
+  pipes, redirects, globs, `-R`/recursive, >1 path — same filesystem count, only on exit 0 with real output).
+  The client-wide symlink parity limit this entry originally carried (a symlink-to-directory counted as a
+  file in the client) is CLOSED since #1202: the client's directory classifier follows links like the engine.
+
+### Changed
+- **Listings ALWAYS run through the shell — `list_directory` is no longer offered to the model** (epic
+  #1144 / #1200): with the tool still offered, the tool choice was sampled per turn, so the transcript look
+  flipped between `$ ls -la` output and a `[D]/[F]` list for the same request (operator-verified across
+  fresh sessions). The `list_directory` schema is removed from the model's tool list and the orchestrator
+  prompt's listing rules are shell-only (large folders: a bounded `ls -lt … | head`, not `sort='time'` +
+  `limit`) — determinism lives in code, not in stacked prompt rules. The handler, the client-bridge case and
+  `LOCAL_TOOL_NAMES` stay: `/ls` (`manual_ls`) and API callers are unchanged.
+- **Listings default to bash `ls -la` with a deterministic count** (epic #1144 / #1193): a shell listing
+  (`ls` / `Get-ChildItem`, incl. `cd X && ls -la`) now carries the same exact `N directories, M files` header
+  as `list_directory` — computed from the FILESYSTEM (`_directory_count_header`), not by parsing the output —
+  so the model copies the number instead of counting the listing (LLMs miscount, e.g. 13/8 for 20/10).
+  Detection (`_listing_count_header_for_command`) is conservative: pipes, redirects, globs, `-R`/recursive, or
+  more than one path operand get NO header (no guess). The orchestrator defaults a listing to bash `ls -la`
+  and copies the header verbatim. (Coloured output follows.)
+- **Listings report the TOOL's deterministic count; restored history renders in full** (epic #1144 / #1187):
+  a listing result carries an exact `N directories, M files` header and the orchestrator copies THAT number
+  verbatim into a one-sentence prose summary naming every item — it never counts the list itself (LLMs
+  miscount) and never passes a `limit` that hides items. (The listing path itself has since moved to the
+  shell — #1193/#1200 above.) And a resumed session (no `/clear`) renders its
+  transcript through the SAME markdown + tool-fold path as fresh output, so restored file names / code are
+  coloured, not dim plain text.
+- **`list_directory` states a deterministic count** (epic #1144 / #1183): the tool result now leads with an
+  exact "N directories, M files" header of the full set (client + engine, byte-parity preserved), so the
+  orchestrator reports the count verbatim instead of miscounting the list — LLMs can't reliably count.
+  (Since #1200 the tool is no longer offered to the model; it stays live for `/ls` + API callers.)
+- **Engine `execute_command` runs the right shell on Windows** (epic #1144 / #1183): a local Windows engine
+  hard-forced PowerShell (the tool-bridge fix only helped when a command was bridged to the client). The engine
+  now routes per command too — a POSIX/bash command runs in Git Bash when installed, a PowerShell cmdlet in
+  PowerShell — and the runtime guidance tells the model both shells work, so it may use either flavour.
+- **Git Bash detection resolves `bash` on PATH** (epic #1144 / #1177): the per-command shell routing now also
+  finds Git Bash via `where bash` (skipping WSL's `System32\bash.exe`) and Scoop install paths, not just
+  Program Files — `GX10_BASH` still overrides.
+- **CLI drops the engine's transient tool-generation status** (epic #1144 / #1181): the engine's transient
+  "generating tool call" status line (`⋯ …`) leaked into and lingered in the committed transcript. The client
+  has its own working-line spinner, so the output router now drops any `⋯`-prefixed engine status line.
+- **Orchestrator answers simple results in prose, not a table** (epic #1144): a set of files / names / options
+  is now concise prose (e.g. "contains 19 directories (…) and 10 files (…)") or a short bulleted list, instead
+  of a wide single-cell table that overflowed the terminal — the operator never asked for a table (prompt
+  guidance). Reserve tables for genuinely multi-column data.
+- **CLI runs the right shell per command** (epic #1144 / #1177): the local tool-bridge hard-forced PowerShell
+  on Windows, so a bash command (`ls -la`) couldn't run and was mislabelled `Bash(...)`. It now routes per
+  command — PowerShell cmdlets (`Get-ChildItem`, `Select-String`, `$env:`) run in PowerShell, POSIX/agnostic
+  commands in Git Bash when installed (`GX10_BASH` overrides the detection) — so BOTH shells work, neither is
+  forced, and the tool-call header names the shell each command actually ran in.
+- **CLI text selection follows the scroll + drags past the edge** (epic #1144 / #1173): the selection is now
+  content-coordinate — scrolling (wheel / PageUp / PageDown) keeps the highlight on the selected text instead of
+  stranding it on fixed screen rows, and dragging past the top/bottom edge auto-scrolls so a selection can span
+  more than one screen; copy reads the FULL content, not just the viewport. Replaces the earlier
+  clear-on-scroll workaround.
+- **CLI tool calls are foldable, Claude-Code style** (epic #1144 / #1167): a tool call renders collapsed as an
+  action summary (`● Ran 1 shell command` / `● Read 70 lines`, present-progressive `Running…`/`Reading…` while
+  it runs) with a one-line detail (`⎿ $ <cmd>` / `⎿ <path>`); click it to expand the exact `Bash(<cmd>)` /
+  `Read(<path>)` header + the full result under a `⎿` corner, click again to collapse. The result is folded,
+  never truncated; fold state persists across re-renders. The expanded header names the client's ACTUAL shell
+  (`PowerShell(<cmd>)` on Windows), not a hardcoded `Bash`, since the local tool-bridge runs the platform shell.
+  A blank line inside a tool result (e.g. PowerShell output, whose first line is blank) no longer ends the
+  block early and leaks the rest into the transcript as raw, coloured text — the whole result stays folded.
+- **CLI polish from live testing** (epic #1144 follow-ups): the tool-call header is now muted grey (not
+  magenta/pink); the orchestrator prompt forbids indenting markdown (an indented block was rendered by the CLI
+  as a raw code block — literal `#`/`|`/`>` — instead of formatted markdown); and a text selection is dropped
+  on scroll instead of leaving the highlight stranded on fixed screen rows (selection is screen-coordinate).
+- **CLI tool calls read like Claude Code** (epic #1144 / #1146 + #1147): a tool call now shows a human header —
+  the command / target (`● Bash(ls -1)`, `● Read(path)`, `● Issue(title)`), NOT the internal
+  `execute_command(command='…')` chrome — and its FULL result indented under a `⎿` corner, instead of a
+  single-line 70-char preview that cut mid-word. Overlong output is capped with an explicit
+  `… (+N more lines)` marker — never a silent truncation.
+- **CLI input box is pinned to the viewport bottom** (epic #1144 / #1148): the input + footer no longer scroll
+  off when you scroll up through history. The renderer now paints the transcript scrolled and then STAMPS the
+  fixed chrome (working/thinking line + input + menu + footer) at the bottom rows (new `paintFixed` +
+  `Surface.clearRows`), so it stays
+  put while history scrolls behind it — the Claude-Code behaviour, on the same alt-screen + app-ScrollBox tech.
+  Plus a blank line above the input's top rule.
+- **CLI tables + emphasis now render (root-cause fix)** (epic #1144 / #1154): the engine's `_TableLineRenderer`
+  was collapsing every pipe table into pipe-less aligned columns and stripping `**` before the stream reached
+  the client — a pre-markdown-client leftover that made the Ink client (which renders markdown itself) show
+  tables as flat text and bold as plain text. It now re-emits pipe tables as PROPER GFM (pipes kept + the
+  `|---|` separator inserted) and passes bold/code through unchanged, so the client renders a box and shows
+  emphasis. This is why the operator's tables were "wordsalat" — the model's markdown never reached the client.
+- **CLI tolerates separator-less pipe tables** (epic #1144 / #1152): a smaller model often emits a
+  markdown table without the `|---|` separator row, which GFM would render as flat pipe-text; the renderer now
+  repairs it (inserts the separator) so it still renders as a box. Well-formed tables and non-table pipe text
+  are untouched. (The table renderer itself was verified correct via the render-to-buffer harness — the
+  original breakage was model fidelity, not rendering.)
+- **CLI markdown formatting parity with Claude Code** (epic #1144 / #1150): beyond the colour muting — lists
+  use `- ` bullets at a tight indent (top level at column 0, nested 2-space) instead of `* ` + deep indent; a
+  blockquote renders as a `▎ ` left bar on its **own** line (no longer glued onto a preceding list/paragraph
+  line); inline code and links are **indigo** (`#818cf8`), not grey. Verified against a live
+  Claude-Code reference render.
+- **Muted, Claude-Code-like CLI palette** (epic #1144 / #1145): the Ink client's markdown rendering drops
+  `marked-terminal`'s colourful default (green headings, yellow inline code, blue-underlined links, red table
+  headers) for restrained emphasis — **bold** headings (no literal `##` prefix), **dim** code, quiet links,
+  uncoloured tables. Less colour, same structure. Raw-ANSI style functions, no new dependency.
+- **`create_issue` is now capability-detected (default ON)** (epic #1043 / #1073): it was the only optional
+  tool behind a manual opt-in flag (`forge.enabled`, default off) while every other optional tool
+  (`web_search`, memory, skills, prompts) is capability-detected. It is now offered whenever the `gh` CLI is
+  present + authenticated — installing/authing `gh` IS the operator's deliberate opt-in — via a new
+  `_forge_available()` that mirrors `_web_search_available()`. The operator can still force it off
+  (`forge.enabled=false` / `GX10_FORGE_ENABLED=0`), and it is blocked under the `sealed` trust profile (no
+  autonomous outbound writes, like `web_search`/`fetch_url`). The tool surface is now uniformly
+  capability-detected — no redundant flag to flip.
+- **`create_issue` hardening — valid labels + native sub-issue linking** (epic #1043 / #1130 follow-up): (1)
+  the `labels` arg is now validated against the repo's ACTUAL labels — an unknown label is rejected with the
+  valid set + a did-you-mean so the model re-emits (validate→reask), instead of `gh` hard-failing the whole
+  create on the first invented label (and instead of silently dropping it); fail-soft (a label-lookup hiccup
+  skips validation, never blocks a create). (2) A new optional `parent` param links the new issue as a native
+  GitHub **sub-issue** of an epic via `gh issue edit --parent`, so the model links in-tool instead of via
+  ad-hoc `execute_command` gh calls; fail-soft (a link failure is reported alongside the created issue, not
+  raised).
+
 ## [0.0.25]
 ### Added
 - **Query-aware rolling summary (L3)** (epic #1043 / #1049): on context eviction the hierarchical rolling

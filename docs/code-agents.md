@@ -140,6 +140,20 @@ hashed/rotates, so resolve the newest at boot). The four-point contract is uncha
 the handover, works the repo, and writes the feedback file; `-o {feedback}` is the deterministic
 fallback if it doesn't.
 
+### Grok (xAI, stdout-capture)
+
+Grok (`grok -p`) plugs in the same way but **drops** `{feedback}` — it has no `-o` flag and prints its
+answer to **stdout**, so the result is captured from stdout (the fallback for a CLI that skips the feedback
+file). `--yolo` is the auto-exec (write) role; `--cwd .` anchors it at the launch directory:
+
+```bash
+export GX10_AGENT_CMD='{bin} -p {prompt} -m {model} --cwd . --yolo'
+```
+
+`{bin}` resolves to `grok` on `PATH`; `-m grok-build` selects the full coding agent (vs the faster
+`grok-composer-2.5-fast`). The four-point contract is unchanged — Grok reads the handover, works the repo,
+and writes the feedback file; stdout is the deterministic fallback if it doesn't.
+
 ### Any other headless coding CLI (the general recipe)
 
 ```bash

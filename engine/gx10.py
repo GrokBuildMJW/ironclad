@@ -219,6 +219,10 @@ THINKING_RESERVE = 4000
 SUMMARIZE_EVICTED  = True        # B1 switch (default ON, 06-18 decision); off via context.summarize_evicted=false / GX10_CONTEXT_SUMMARY=0
 SUMMARY_MAX_TOKENS = 512         # capped output of the eviction summary
 _SUMMARY_MARKER    = "## Conversation so far (rolling summary)"   # stable block marker (find-and-update instead of duplicating)
+# #1225 (S3): the per-turn AUTHORITATIVE steering-state block folded onto the user turn (like rag/steer) so
+# the orchestrator model never GUESSES its state (the observed bug: it probed `ls vault/` + a non-existent
+# sentinel → "no active project" + a fabricated vault path, while the engine held the real active project).
+_STEERING_MARKER   = "## Steering state (authoritative — this is what the engine is bound to)"
 # #1050 (L3): the emergency rung ALWAYS cold-archives the slice it discards (source="fragment_trim"), and an
 # optional summarize-not-truncate replaces the raw drop with a bounded summary — DEFAULT OFF (raw head+tail
 # truncation stays byte-identical), guarded by a hard timeout + a skip when a generation this turn errored.
@@ -264,7 +268,7 @@ def _read_char_cap() -> int:
 #: but `search_files`/`list_directory`/`execute_command` do NOT, and the local-tool bridge returns before
 #: read_file's cap — so ALL of them are capped here. Deliberately NOT web_search/parallel_reason/MPR/memory:
 #: those return already-budgeted or structured JSON payloads a blind head+tail cap would corrupt.
-_INGESTION_TOOLS = frozenset({"read_file", "list_directory", "search_files", "execute_command", "fetch_url"})
+_INGESTION_TOOLS = frozenset({"read_file", "list_directory", "search_files", "execute_command", "fetch_url", "view_issue", "pr_status"})
 _INGEST_MARKER_SLACK = 512   # a result read_file already capped (cap + its own marker) must pass through here
 
 
@@ -291,7 +295,7 @@ def _cap_ingested_result(name: str, result: str, cap_chars: int) -> str:
 
 # #1084: per-action audit — the mutating/outward tool surface whose actions are recorded (content-free) into
 # the tamper-evident audit ledger when `audit.enabled`. The minimal first step of the audit-log epic (#1067).
-_AUDIT_TOOLS = frozenset({"write_file", "write_last_reply", "edit_file", "execute_command", "create_issue"})
+_AUDIT_TOOLS = frozenset({"write_file", "write_last_reply", "edit_file", "execute_command", "create_issue", "create_pr", "comment_on_issue"})
 
 
 def _audit_detail(name: str, args: "Dict[str, Any]") -> str:
@@ -302,8 +306,10 @@ def _audit_detail(name: str, args: "Dict[str, Any]") -> str:
         return str(a.get("path", ""))
     if name == "execute_command":
         return str(a.get("command", ""))
-    if name == "create_issue":
+    if name in ("create_issue", "create_pr"):
         return str(a.get("title", ""))
+    if name == "comment_on_issue":
+        return str(a.get("number", ""))
     if name in ("search_files", "query_memory", "deep_query_memory", "web_search", "remember"):
         return str(a.get("query", a.get("pattern", a.get("text", ""))))
     if name == "list_directory":
@@ -466,6 +472,12 @@ SESSION_FILE     = "session.json"   # basename, resolved under STATE_ROOT (was "
 # Visible knowledge root (Obsidian-navigable): vault/<slug>/ per initiative. Engine machinery
 # is STATE_ROOT, KNOWLEDGE is VAULT_ROOT — strictly separated. Overridable via cfg["paths"]["vault_root"].
 VAULT_ROOT       = "vault"
+# S? (#1237): the software tree lives under this subdir of the project so the product sources are ISOLATED
+# from the ironclad control-plane (vault/, .ironclad/, tasks/). Governs MODEL-driven execution only (code-
+# tools, execute_command, the launched code-agent — via _exec_cwd); the control-plane keeps resolving to the
+# project root. Empty ⇒ off / byte-identical (execution at the project root). Overridable via
+# cfg["paths"]["code_subdir"] (DEV-1 sets "src").
+CODE_SUBDIR      = ""
 SPINNER_FRAMES   = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 UI_REFRESH_INTERVAL = 0.1        # prompt_toolkit Application refresh
 
@@ -498,6 +510,11 @@ LODESTAR_ENABLED = False
 # FORGE_REPO is optional (empty ⇒ the gh CLI's default repo for the cwd); never a repo literal baked into core.
 FORGE_ENABLED    = True
 FORGE_REPO       = ""
+# #1213 (epic #1212): the forge adapter seam — `cli` (default, the ambient `gh` CLI, byte-identical) |
+# `native` (a stdlib-urllib GitHub client, so the forge tools work with NO `gh` on the box, e.g. the Spark) |
+# `mock`. The native token is read name-indirectly from the env var NAMED here (never a secret literal in core).
+FORGE_ADAPTER    = "cli"
+FORGE_TOKEN_ENV  = "GX10_FORGE_TOKEN"
 # #1083: outbound escalation notification. A HUMAN_ESCALATION fires the `escalation` hook; when a webhook is
 # configured (deploy secret via GX10_NOTIFY_WEBHOOK / notify.webhook — NEVER a URL literal in core) the
 # notifier POSTs it to an off-duty human. Empty ⇒ no consumer registered (byte-identical default-off).
@@ -540,7 +557,7 @@ _AUTOPLAN_DONE           = 0       # session counter (touched only in the agent_
 AUTOPILOT_LOG_TERMINAL   = False        # on every autopilot start open a new terminal with Get-Content -Wait; default OFF
 # Kimi was replaced by Sonnet on 2026-06-15. "KIMI" remains only as a
 # legacy alias and is transparently normalized to SONNET everywhere
-# (Claude Code CLI + claude-sonnet-4-6). No Kimi CLI plumbing anymore.
+# (Claude Code CLI + claude-sonnet-5). No Kimi CLI plumbing anymore.
 WATCHER_FEEDBACK_DIR = "feedback"   # name of the feedback inbox under <initiative>/.work/ (B3); overridable via watcher.feedback_dir
 API_KEY_ENV      = "GX10_API_KEY"             # secrets only from env, never from a file
 
@@ -955,8 +972,13 @@ _LINKS_AUTO_END   = "<!-- ironclad:related:auto END -->"
 # next to INDEX.md. The HTML markers above stay FROZEN; LIFECYCLE.md adds its own managed-block markers.
 _LIFECYCLE_AUTO_START = "<!-- ironclad:lifecycle:auto START -->"
 _LIFECYCLE_AUTO_END   = "<!-- ironclad:lifecycle:auto END -->"
+# S6 (#1228 / R5): the central task board — a human-readable, LLM-free projection of the TaskStore (all units
+# grouped pending/in_progress/done), managed block next to INDEX/LIFECYCLE. Frozen markers.
+_BOARD_AUTO_START  = "<!-- ironclad:board:auto START -->"
+_BOARD_AUTO_END    = "<!-- ironclad:board:auto END -->"
 GRAPH_FILENAME     = "GRAPH.json"
 LIFECYCLE_FILENAME = "LIFECYCLE.md"
+BOARD_FILENAME     = "BOARD.md"
 # Doc categories (first path segment) that get a "Verwandt" (related) block — curated knowledge,
 # NOT the auto-generated MPR runs/ and not the meta.md.
 _LINK_CATEGORIES  = {"decisions", "proposals", "reviews", "(root)"}
@@ -1080,7 +1102,7 @@ def _vault_docs(vdir: Path) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
     for p in sorted(vdir.rglob("*.md")):
         rel = p.relative_to(vdir)
-        if p.name in ("INDEX.md", LIFECYCLE_FILENAME) or (rel.parts and rel.parts[0] == WORKFLOW_DIR):
+        if p.name in ("INDEX.md", LIFECYCLE_FILENAME, BOARD_FILENAME) or (rel.parts and rel.parts[0] == WORKFLOW_DIR):
             continue
         try:
             text = p.read_text(encoding="utf-8", errors="replace")
@@ -1095,6 +1117,7 @@ def _vault_docs(vdir: Path) -> List[Dict[str, Any]]:
             "tags": _parse_tags(fm.get("tags", "")),
             "category": rel.parts[0] if len(rel.parts) > 1 else "(root)",
             "stage": (fm.get("stage", "") or "").strip(),
+            "approved": (fm.get("approved", "") or "").strip(),       # S5 (#1227): design-gate approval flag
             "tree_sha": (fm.get("tree_sha", "") or "").strip(),       # S13: evidence-doc provenance
             "edges": _doc_edges(fm),
             "text": text,
@@ -1211,6 +1234,85 @@ def _lifecycle_block(graph: Dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _render_board(slug: "Optional[str]" = None) -> str:
+    """S6 (#1228 / R5): a human-readable, LLM-free task board — every unit grouped pending/in_progress/done,
+    the central steering view. Deterministic + timestamp-free (idempotent re-render). Reads the TaskStore for
+    *slug* (the active unit by default; a non-active slug via a slug-scoped store). Managed block, frozen
+    markers. Rows: ``id`` · type · title · labels · parent · created_at."""
+    slug = (slug or active_slug() or "").strip()
+    store = _store() if slug and slug == active_slug() else TaskStore(root=str(vault_root() / slug))
+    by_status = {st: sorted(store.list(st), key=lambda t: (t.get("created_at", ""), t.get("id", "")))
+                 for st in TaskStore.STATUSES}
+    counts = {st: len(by_status[st]) for st in TaskStore.STATUSES}
+    lines = [_BOARD_AUTO_START,
+             "_" + f"{sum(counts.values())} task(s) — "
+             + " · ".join(f"{st} {counts[st]}" for st in TaskStore.STATUSES) + "_", ""]
+    for st in TaskStore.STATUSES:
+        lines.append(f"## {st} ({counts[st]})")
+        for t in by_status[st]:
+            # Coerce EVERY field to str — a task JSON stored while the ACK contract was soft (ack.enabled off /
+            # unimportable) can carry non-string values (labels:[1,2], type:7); a bare str.join would then raise
+            # and silently kill /board. Defensive: str() each bit so a malformed unit renders instead of crashing.
+            labels = t.get("labels") or []
+            if isinstance(labels, str):
+                labels = [x.strip() for x in labels.split(",") if x.strip()]
+            elif not isinstance(labels, (list, tuple)):
+                labels = [str(labels)]
+            # S7 (#1229): a blocked/stalled in_progress task shows a ⚠ marker so the operator sees the stall on
+            # the board instead of a healthy-looking row. Conditional on the field → byte-identical when absent.
+            blocked_bit = ""
+            if t.get("blocked"):
+                blocked_bit = "⚠ " + str(t.get("blocked_kind") or "blocked").upper()
+                if str(t.get("blocked_reason") or "").strip():
+                    blocked_bit += f": {str(t.get('blocked_reason')).strip()}"
+            bits = " · ".join(b for b in (
+                str(t.get("type") or ""),
+                str(t.get("title") or ""),
+                (f"labels: {', '.join(str(x) for x in labels)}" if labels else ""),
+                (f"parent: {t['parent']}" if t.get("parent") else ""),
+                blocked_bit,
+                str(t.get("created_at") or ""),
+            ) if b)
+            tid = t.get("id", "?")
+            lines.append(f"- `{tid}` · {bits}" if bits else f"- `{tid}`")
+        lines.append("")
+    lines.append(_BOARD_AUTO_END)
+    return "\n".join(lines)
+
+
+def _write_board(slug: "Optional[str]" = None) -> None:
+    """Write/refresh ``<slug>/BOARD.md`` from :func:`_render_board` (idempotent — writes only on a real
+    change). Vault-locked, FAIL-SOFT: never raises, never blocks a caller (a board hiccup must not fail a
+    task op — the S6 backstop is folded into the existing soft-reconcile, adding no new hot-path failure)."""
+    try:
+        s = (slug or active_slug() or "").strip()
+        if not s:
+            return
+        vdir = vault_root() / s
+        if not (vdir / "meta.md").is_file():
+            return
+        with _vault_lock():
+            doc = vdir / BOARD_FILENAME
+            existing = doc.read_text(encoding="utf-8") if doc.is_file() else f"# {s} — task board\n\n"
+            new = _set_managed_block(existing, _BOARD_AUTO_START, _BOARD_AUTO_END, _render_board(s))
+            if new != existing:
+                doc.write_text(new, encoding="utf-8", newline="\n")
+    except Exception:   # noqa: BLE001 — the board is an aid; never let it break a write
+        pass
+
+
+def _board_command(arg: "Optional[str]" = None) -> str:
+    """S6 (#1228): render the active (or named) unit's task board to BOARD.md and return it for display.
+    Deterministic, model-free. Friendly message when there is no unit; fail-closed on an unknown slug."""
+    slug = (arg or active_slug() or "").strip()
+    if not slug:
+        return "No active unit — create or switch to one first (/project), then /board."
+    if not (vault_root() / slug / "meta.md").is_file():
+        return f"ERROR: no unit {slug!r}."
+    _write_board(slug)
+    return _render_board(slug)
+
+
 def reconcile_vault(slug: str, *, links: bool = True) -> str:
     """Maintains INDEX.md (always) + optionally the "Verwandt (auto)" (related) blocks (``links=True``) of an initiative.
     Deterministic, idempotent, LLM-free. ``links=False`` (auto-trigger) only keeps the index fresh and
@@ -1280,6 +1382,7 @@ def _reconcile_active_soft(*, links: bool = False) -> None:
             reconcile_vault(s, links=links)
     except Exception:   # noqa: BLE001 — reconcile must never make a write fail
         pass
+    _write_board()      # S6 (#1228): keep BOARD.md current on disk — own fail-soft guard, never disturbs the reconcile
 
 
 # ─── Evidence projection + lifecycle-completeness gate (S13a / AD-7) ──────────
@@ -1384,6 +1487,171 @@ def lifecycle_completeness(slug: str, *, required_stages: "List[str]", tree_sha:
         if not any(d.get("tree_sha") == tree_sha for d in docs):
             reasons.append(f"stage {stage!r} evidence not bound to delivery tree_sha {tree_sha[:12]}")
     return (not reasons), reasons
+
+
+# ─── S5 (#1227): fail-closed design→impl approval gate (no blind coding, R2/R3) ───────────────────
+# Opt-in, default OFF → byte-identical (the shared engine + all non-DEV-1 flows + the test suite are
+# unaffected), exactly like the verify/quality/strategy seams. DEV-1 turns it ON via `design_gate.enabled`
+# (config) / GX10_DESIGN_GATE to enforce no-blind-coding.
+DESIGN_GATE_ENABLED = False
+# S2 (#1224): the BASIC public no-blind-advance gate — opt-in (default OFF → byte-identical, like design_gate).
+# When on, an advance to `done` requires a feedback `status: done`; blocked/clarification_needed/no-status is
+# refused ("no signal ≠ done"). The FULL composed gate (coupling/CI/quality guards) stays PRIVATE (the addon).
+# DEV-1 turns it on via `advance_gate.enabled` (config).
+ADVANCE_GATE_ENABLED = False
+# S7 (#1229): disentangle /watcher (feedback-advance) from /autopilot (launch) — two orthogonal concerns over
+# ONE reconciler loop. Opt-in (default OFF → byte-identical: the loop is gated on _WATCHER_ENABLED only, launch
+# needs watcher on, and `autopilot on` warns that watcher is required). When ON: autopilot is self-sufficient
+# (the loop runs if EITHER is on; the feedback side stays _WATCHER-gated) and the contradictory double message
+# is suppressed. DEV-1 turns it on via `automation.decoupled`.
+AUTOMATION_DECOUPLED = False
+# S7 (#1229): task-scoped detect-progress heartbeat (distinct from the per-turn idle-watchdog #1132). Seconds
+# without a progress signal (coder-log / feedback / task-json mtime) before an in_progress task is flagged
+# stalled. 0.0 ⇒ off / byte-identical (mirrors TURN_IDLE_TIMEOUT_S). DEV-1 sets `heartbeat.stall_seconds`.
+HEARTBEAT_STALL_S = 0.0
+DESIGN_STAGE = "design"
+# Task types that PRODUCE CODE — a stage_handover of one of these is REFUSED until the active unit has an
+# APPROVED design. Design/analysis types (architecture, concept, research, documentation, verification,
+# smoke-test, cleanup) are the stage that PRODUCES the design → never gated. (Not `_task_class`, which lumps
+# docs into "coding".)
+_IMPLEMENTATION_TASK_TYPES = frozenset({
+    "implementation", "feature", "backend", "frontend", "fullstack", "integration",
+    "refactoring", "bugfix", "optimization", "security", "security-audit",
+    "deployment", "infrastructure",
+})
+
+
+def _fm_is_true(v: object) -> bool:
+    """Frontmatter values arrive as strings (via `_parse_frontmatter`). Coerce an approval flag."""
+    return str(v or "").strip().lower() in ("true", "yes", "1", "approved")
+
+
+def _unit_design_status(slug: "Optional[str]") -> "tuple[bool, bool, Optional[str]]":
+    """(has_design, approved, doc_rel) for *slug*, read from the unit's SINGLE canonical design doc
+    ``decisions/design.md`` (the gate's one source of truth — no per-title fan-out, so a newly-recorded
+    design cannot be waved through by a stale approved sibling). Cheap: ONE file read, no vault rescan.
+    Pure/fail-soft (no unit / no design / a read hiccup → ``(False, False, None)``)."""
+    if not slug:
+        return (False, False, None)
+    doc = vault_root() / slug / "decisions" / "design.md"
+    try:
+        if not doc.is_file():
+            return (False, False, None)
+        fm = _parse_frontmatter(doc.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001 — a design-status probe must never raise (it runs every turn)
+        return (False, False, None)
+    return (True, _fm_is_true(fm.get("approved")), doc.relative_to(vault_root()).as_posix())
+
+
+def _design_gate(task_type: str, slug: "Optional[str]") -> "Optional[str]":
+    """R2/R3 fail-closed PRE-code gate: an implementation handover is refused until the active unit has a
+    recorded + APPROVED design. Design/analysis/docs handovers are unaffected. Returns an ERROR string
+    (refusal) or ``None`` (allow). Pure/deterministic — no model call."""
+    if not DESIGN_GATE_ENABLED:       # opt-in (default OFF, config `design_gate.enabled`) → byte-identical when off
+        return None
+    if (task_type or "").strip().lower() not in _IMPLEMENTATION_TASK_TYPES:
+        return None
+    if not slug:
+        return ("ERROR: blind-coding refused (R2) — no active unit. Record + approve a design "
+                "(record_design → /approve) before an implementation handover.")
+    has_design, approved, rel = _unit_design_status(slug)
+    if not has_design:
+        return (f"ERROR: blind-coding refused (R2) — unit {slug!r} has no design on record. Call "
+                f"record_design to persist the design (idea/approach/architecture), get it approved "
+                f"(/approve), THEN stage the implementation handover.")
+    if not approved:
+        return (f"ERROR: design for unit {slug!r} is recorded ({rel}) but NOT approved. The operator must "
+                f"approve it — run /approve (or set `approved: true` in the design doc) — before an "
+                f"implementation handover.")
+    return None
+
+
+def record_design(title: str, body: str, *, slug: "Optional[str]" = None) -> str:
+    """S5 (#1227): persist a DESIGN doc for the active (or *slug*) unit — the pre-code lifecycle artifact the
+    design→impl gate reads. Writes ``<slug>/decisions/<name>-design.md`` with contract-guaranteed frontmatter
+    (``type: decision`` · ``stage: design`` · ``approved: false``), so the model cannot forget the fields the
+    gate needs, then reconciles the vault (cross-links, R4). A fresh recording resets approval to ``false`` (a
+    changed design must be re-approved). Fail-closed: no resolvable unit raises ``ValueError``. Returns the
+    doc path (posix)."""
+    target = (slug or active_slug() or "").strip()
+    if not target:
+        raise ValueError("no active unit for record_design")
+    title = (title or "").strip() or "Design"
+    body = str(body).replace("\r\n", "\n").replace("\r", "\n")
+    if not body.endswith("\n"):
+        body += "\n"
+    with _vault_lock():
+        vdir = vault_root() / target
+        if not (vdir / "meta.md").is_file():
+            raise ValueError(_msg("vault.no_initiative", slug=target, root=vault_root().as_posix()))
+        ddir = vdir / "decisions"
+        ddir.mkdir(parents=True, exist_ok=True)
+        doc = ddir / "design.md"        # single canonical design doc — re-recording replaces it (resets approval)
+        content = (
+            "---\n"
+            "type: decision\n"
+            f"stage: {DESIGN_STAGE}\n"
+            "approved: false\n"
+            f"title: {title}\n"
+            "---\n\n"
+            f"# {title}\n\n"
+            f"{body}"
+        )
+        doc.write_text(content, encoding="utf-8", newline="\n")
+        try:
+            reconcile_vault(target, links=False)
+        except Exception:  # noqa: BLE001 — projection must not fail on a reconcile hiccup
+            pass
+        return (doc.relative_to(vault_root())).as_posix()
+
+
+def _approve_design(slug: "Optional[str]" = None) -> str:
+    """S5 (#1227): stamp ``approved: true`` into the active (or *slug*) unit's ``stage: design`` doc — the
+    operator's influence/approval point that unblocks implementation handovers. File-based (R1). Returns a
+    human message. Fail-closed: no unit / no design doc → a clear ERROR, nothing changed."""
+    target = (slug or active_slug() or "").strip()
+    if not target:
+        return "ERROR: no active unit — nothing to approve."
+    with _vault_lock():
+        vdir = vault_root() / target
+        if not (vdir / "meta.md").is_file():
+            return f"ERROR: no unit {target!r}."
+        doc = vdir / "decisions" / "design.md"
+        if not doc.is_file():
+            return (f"ERROR: unit {target!r} has no design to approve — record one first "
+                    f"(record_design). Nothing changed.")
+        rel = doc.relative_to(vault_root()).as_posix()
+        text = doc.read_text(encoding="utf-8")
+        if _fm_is_true(_parse_frontmatter(text).get("approved")):
+            return f"Design for {target!r} is already approved ({rel})."
+        new = _set_frontmatter_flag(text, "approved", "true")
+        if new == text:
+            return f"ERROR: could not stamp approval on the design doc for {target!r} ({rel})."
+        doc.write_text(new, encoding="utf-8", newline="\n")
+        try:
+            reconcile_vault(target, links=False)
+        except Exception:  # noqa: BLE001
+            pass
+    return f"OK: approved the design for {target!r} ({rel}) — implementation handovers are now unblocked."
+
+
+def _set_frontmatter_flag(text: str, key: str, value: str) -> str:
+    """Set/insert a scalar ``key: value`` inside the leading ``---`` frontmatter block. If the key exists it
+    is replaced; else it is appended just before the closing ``---``. Returns the doc with no frontmatter
+    unchanged (defensive)."""
+    m = re.match(r"^(---\s*\n)(.*?)(\n---\s*(?:\n|$))", text, re.DOTALL)
+    if not m:
+        return text
+    head, block, tail = m.group(1), m.group(2), m.group(3)
+    lines = block.split("\n")
+    kre = re.compile(rf"^(\s*){re.escape(key)}\s*:.*$")
+    for i, ln in enumerate(lines):
+        if kre.match(ln):
+            lines[i] = f"{key}: {value}"
+            break
+    else:
+        lines.append(f"{key}: {value}")
+    return head + "\n".join(lines) + tail + text[m.end():]
 
 
 def _project_vault_base() -> Path:
@@ -1597,13 +1865,25 @@ def _exec_cwd() -> "Optional[str]":
     its own tree.
 
     NB: when a local-tool bridge is active the code-tools run on the CLIENT's tree (``run_tool`` returns
-    early), so this governs only SERVER-side execution — exactly where the project root must be honoured."""
+    early), so this governs only SERVER-side execution — exactly where the project root must be honoured.
+
+    S? (#1237): when ``CODE_SUBDIR`` is configured (``paths.code_subdir``, opt-in, default empty), execution
+    runs under ``<root>/<CODE_SUBDIR>`` (created on demand) so the software tree is isolated from the control-
+    plane (vault/, .ironclad/ keep resolving to the project root via ``_project_root``). Empty ⇒ the pre-
+    isolation behaviour, byte-identical."""
     pc = _pc.current() if _pc is not None else None
-    if pc is None or not pc.root:
-        return None
-    if _BOOT_WORKDIR is not None and Path(pc.root) == _BOOT_WORKDIR:
-        return None                              # the default project == the boot workdir → today's behaviour
-    return pc.root
+    root: "Optional[str]" = None
+    if pc is not None and pc.root and not (_BOOT_WORKDIR is not None and Path(pc.root) == _BOOT_WORKDIR):
+        root = pc.root                           # a genuinely non-default project (default == boot workdir → None)
+    if CODE_SUBDIR:
+        base = Path(root) if root is not None else (_BOOT_WORKDIR or Path.cwd())
+        sub = base / CODE_SUBDIR
+        try:
+            sub.mkdir(parents=True, exist_ok=True)
+            return str(sub)
+        except Exception:   # noqa: BLE001 — mkdir failed (e.g. a plain file sits at <root>/<subdir>): fall
+            return root     # back to the project root rather than hand a caller a non-directory cwd (Popen)
+    return root
 
 
 def _resolve_exec_path(path: str) -> Path:
@@ -1999,6 +2279,9 @@ _TOOL_LABELS = {
     "search_files":     ("Search", "query"),
     "list_directory":   ("List",   "path"),
     "create_issue":     ("Issue",  "title"),
+    "create_pr":        ("PR",     "title"),
+    "comment_on_issue": ("Comment", "number"),
+    "pr_status":        ("PR-checks", "number"),
     "web_search":       ("Search", "query"),
 }
 
@@ -2464,6 +2747,48 @@ TOOLS = [
                 "required": ["agent", "handover_md"]
             }
         }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "launch_coder",
+            "description": ("Start the coding agent for the CURRENT staged handover NOW (the one you just "
+                            "created via stage_handover). Resolves the newest pending task that has a "
+                            "handover, launches its agent, and flips the task to in_progress. Use this right "
+                            "after stage_handover when the session must start now — you are the one steering "
+                            "author, so you trigger it (autopilot stays off by default). Fail-closed: a clear "
+                            "message if nothing is staged, a coder is already running, or no agent is "
+                            "configured on this box. Never double-launches."),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "task_id": {"type": "string",
+                                "description": "optional — a specific task to launch; default = the current "
+                                               "(newest) pending handover"}
+                }
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "record_design",
+            "description": ("Persist the DESIGN for the active unit BEFORE any implementation. Call this "
+                            "after your analysis: `title` = the design's title, `body` = the design (goal, "
+                            "the chosen approach/technology + WHY, architecture, the facets to cover). It "
+                            "writes a decisions/ doc the engine's design-gate reads, then you STOP — an "
+                            "implementation stage_handover is REFUSED until the operator approves the design "
+                            "(/approve). This is the no-blind-coding contract (R2)."),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string", "description": "the design's title"},
+                    "body": {"type": "string",
+                             "description": "the design content — approach/technology + why, architecture, facets"}
+                },
+                "required": ["title", "body"]
+            }
+        }
     }
 ]
 
@@ -2645,6 +2970,113 @@ CREATE_ISSUE_TOOL = {
                 "parent":    {"type": "string", "description": "optional parent epic issue number — links this issue as a native sub-issue"},
             },
             "required": ["title", "body_file"],
+        },
+    },
+}
+
+# #1208: the READ counterpart to create_issue — the first-class path for resolving a `#NNN` reference.
+# The agent flailed on "check #1207" because it had NO issue-read tool: it fell back to the generic shell and
+# grepped git history (which only ever cites issues a merged PR CLOSED, so an OPEN issue is invisible there),
+# then falsely concluded "does not exist". view_issue queries the tracker directly. Capability-detected +
+# trust-gated exactly like create_issue (offered together via _forge_available), so the forge surface stays
+# uniform. Offered in _effective_tools ONLY when available → byte-identical when off.
+VIEW_ISSUE_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "view_issue",
+        "description": (
+            "Read a tracker issue from the project's code forge (GitHub, via the `gh` CLI) by its NUMBER. This "
+            "is the CORRECT way to check/resolve a `#NNN` reference (e.g. the operator says 'check #1207') — "
+            "NEVER search git history or branches for it (commit messages only cite issues a merged PR closed, "
+            "so an open issue is invisible there). Returns the issue's number, state, title, labels, milestone, "
+            "url and body. A non-existent number returns an authoritative 'NOT_FOUND' (the tracker WAS queried) "
+            "— never conclude an issue does not exist from the absence of a commit."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "number": {"type": "string", "description": "the issue number (with or without a leading '#')"},
+            },
+            "required": ["number"],
+        },
+    },
+}
+
+# #1215 (epic #1212): open a PR through the forge adapter — the WRITE-sibling of create_issue for the
+# Issue→Branch→PR→Merge dev loop. Escape-free (body from a FILE), capability-detected + sealed-gated like
+# create_issue, and OPEN-ONLY (it never merges — merge stays a CI/review gate). Offered only when available.
+CREATE_PR_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "create_pr",
+        "description": (
+            "Open a pull request in the project's code forge (GitHub). The body comes from a FILE "
+            "(escape-free): FIRST write the PR body with write_last_reply / write_file, THEN pass its path as "
+            "body_file. Include 'Closes #<N>' in the body to link the issue. Optional `base` (target branch; "
+            "default the repo's default branch), `head` (source branch; the cli path infers the current branch, "
+            "the native path REQUIRES it), and `draft`. Returns the PR URL. Does NOT merge — merge stays a "
+            "CI/review gate."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "title":     {"type": "string"},
+                "body_file": {"type": "string", "description": "path to a file holding the PR body (escape-free)"},
+                "base":      {"type": "string", "description": "optional target branch (default: repo default)"},
+                "head":      {"type": "string", "description": "optional source branch (cli infers it; native requires it)"},
+                "draft":     {"type": "string", "description": "optional 'true' to open as a draft PR"},
+            },
+            "required": ["title", "body_file"],
+        },
+    },
+}
+
+# #1217 (epic #1212): append a comment to an existing tracker issue through the forge adapter — the third leg
+# of create/read/comment. NARROW (comment only, never close/relabel — close is policy-sensitive). Escape-free
+# (body from a FILE), capability-detected + sealed-gated like create_issue. Offered only when available.
+COMMENT_ISSUE_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "comment_on_issue",
+        "description": (
+            "Append a comment to an existing tracker issue in the project's code forge (GitHub) by NUMBER. The "
+            "body comes from a FILE (escape-free): FIRST write the comment with write_last_reply / write_file, "
+            "THEN pass its path as body_file — NEVER shell out to `gh issue comment`. Returns the posted "
+            "comment URL; a non-existent number returns an authoritative 'NOT_FOUND'. Comment-ONLY — it does "
+            "NOT close, reopen, or relabel the issue."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "number":    {"type": "string", "description": "the issue number (with or without a leading '#')"},
+                "body_file": {"type": "string", "description": "path to a file holding the comment body (escape-free)"},
+            },
+            "required": ["number", "body_file"],
+        },
+    },
+}
+
+# #1219 (epic #1212): read a PR's CI/mergeability SNAPSHOT — the merge-readiness gate of the dev loop. A
+# NON-BLOCKING read (never waits/watches — the engine runs one agent turn behind a single lock; re-poll
+# across turns). Capability-detected + sealed-gated. Offered only when available.
+PR_STATUS_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "pr_status",
+        "description": (
+            "Read the CI + mergeability status of a pull request in the project's code forge (GitHub) by "
+            "NUMBER — the correct way to judge if a PR is mergeable. Returns a deterministic per-check summary "
+            "(name -> pass/fail/pending) plus an overall verdict (ALL PASSING / N FAILING / N PENDING) and the "
+            "mergeable / mergeStateStatus / reviewDecision. A SNAPSHOT of the current state, NOT a wait — "
+            "re-call on a LATER turn to poll; NEVER scrape a shell table for merge-readiness. A non-existent "
+            "number returns an authoritative 'NOT_FOUND'."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "number": {"type": "string", "description": "the PR number (with or without a leading '#')"},
+            },
+            "required": ["number"],
         },
     },
 }
@@ -2897,7 +3329,7 @@ def _all_tool_names(include_plugins: bool = True) -> frozenset:
             if n:
                 names.add(n)
     for sn in ("MEMORY_TOOL", "DEEP_MEMORY_TOOL", "MEMORY_WRITE_TOOL", "PARALLEL_TOOL", "WEBSEARCH_TOOL",
-               "CREATE_ISSUE_TOOL", "FETCH_URL_TOOL", "USE_SKILL_TOOL", "USE_PROMPT_TOOL"):
+               "CREATE_ISSUE_TOOL", "VIEW_ISSUE_TOOL", "CREATE_PR_TOOL", "COMMENT_ISSUE_TOOL", "PR_STATUS_TOOL", "FETCH_URL_TOOL", "USE_SKILL_TOOL", "USE_PROMPT_TOOL"):
         t = g.get(sn)
         n = ((t or {}).get("function") or {}).get("name") if isinstance(t, dict) else None
         if n:
@@ -2907,14 +3339,29 @@ def _all_tool_names(include_plugins: bool = True) -> frozenset:
     return frozenset(names)
 
 
-def _forge_available() -> bool:
-    """Central capability check for create_issue (#1073) — offered when its capability is PRESENT (the `gh`
-    CLI on PATH) and the trust profile permits an outbound write, mirroring _web_search_available() so the
-    whole tool surface is uniformly CAPABILITY-DETECTED rather than behind a manual opt-in flag. Default ON;
-    the operator can force it off with forge.enabled=false; blocked under the sealed profile (no autonomous
-    outbound writes, like web_search / fetch_url). Never raises."""
+def _forge_transport():
+    """Select the active forge adapter from the vendor-neutral `forge.adapter` config (#1213/epic #1212):
+    `cli` (default — the ambient `gh` CLI, byte-identical to before) | `native` (a stdlib-`urllib` GitHub
+    client that works with NO `gh` on the box — the Spark `server` topology — keyed by a name-indirected
+    token + `forge.repo`) | `mock`. Reads the LIVE globals so a reconfigure/monkeypatch takes effect per
+    call. Never raises."""
     try:
-        return FORGE_ENABLED and shutil.which("gh") is not None and not _is_sealed_profile()
+        from forge_adapters import build_forge_adapter
+        token = os.environ.get(FORGE_TOKEN_ENV, "") if FORGE_ADAPTER == "native" else ""
+        return build_forge_adapter(adapter=FORGE_ADAPTER, repo=FORGE_REPO, token=token)
+    except Exception:  # noqa: BLE001 — a builder hiccup must never break the turn
+        from forge_adapters import UnavailableForgeAdapter
+        return UnavailableForgeAdapter("error", "forge adapter unavailable")
+
+
+def _forge_available() -> bool:
+    """Central capability check for the forge tools (create_issue/view_issue, #1073/#1208) — offered when a
+    forge TRANSPORT is usable: the `gh` CLI on PATH for the default `cli` adapter, OR a native token+repo for
+    the `native` adapter (#1213/#1212 — so the tools are general IN ironclad, not gh-on-the-box). Gated by
+    forge.enabled; blocked under the sealed profile (no autonomous outbound writes, like web_search). Mirrors
+    _web_search_available() (uniformly capability-detected). Never raises."""
+    try:
+        return FORGE_ENABLED and not _is_sealed_profile() and _forge_transport().available()
     except Exception:  # noqa: BLE001 — a flaky capability probe must never break the turn
         return False
 
@@ -2922,17 +3369,12 @@ def _forge_available() -> bool:
 def _forge_labels() -> Optional[set]:
     """create_issue label vocabulary (#1130 follow-up): the repo's ACTUAL labels, for validate→reask on the
     `labels` arg — the model must use existing labels, not invent them. Returns None on any error (fail-soft:
-    validation is then skipped, never blocking a create over a label-lookup hiccup). Same repo context as create."""
-    cmd = ["gh", "label", "list", "--limit", "300", "--json", "name", "-q", ".[].name"]
-    if FORGE_REPO:
-        cmd += ["--repo", FORGE_REPO]
+    validation is then skipped, never blocking a create over a label-lookup hiccup). Routed through the active
+    forge adapter (#1213), so it works on both the `cli` and `native` paths."""
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30)
+        return _forge_transport().list_labels()
     except Exception:  # noqa: BLE001
         return None
-    if r.returncode != 0:
-        return None
-    return {ln.strip() for ln in (r.stdout or "").splitlines() if ln.strip()}
 
 
 def _effective_tools() -> List[Dict[str, Any]]:
@@ -2944,7 +3386,8 @@ def _effective_tools() -> List[Dict[str, Any]]:
     # #459 / epic #505: offer web_search only when a usable search adapter is configured (else every
     # call would return "unavailable"). Adapter-aware (cli / brave / mock) — not dispatcher-only.
     web = [WEBSEARCH_TOOL] if _web_search_available() else []
-    iss = [CREATE_ISSUE_TOOL] if _forge_available() else []   # #1073: capability-detected (gh present, not sealed)
+    iss = ([CREATE_ISSUE_TOOL, VIEW_ISSUE_TOOL, CREATE_PR_TOOL, COMMENT_ISSUE_TOOL, PR_STATUS_TOOL]
+           if _forge_available() else [])   # #1073/#1208/#1215/#1217/#1219: capability-detected forge surface
     fet = [FETCH_URL_TOOL] if _web_search_trust_ok() else []   # #1074: outbound fetch, blocked under sealed
     plug = [t["schema"] for t in _PLUGIN_TOOLS.values()]
     skl = [USE_SKILL_TOOL] if _PLAYBOOKS else []
@@ -3023,6 +3466,28 @@ def _advance_pipeline(task_id: str, agent: str, next_task_id: Optional[str] = No
     return result
 
 
+def _advance_gate(fb_text: str) -> "Optional[str]":
+    """S2 (#1224): the BASIC no-blind-advance gate. Opt-in (default OFF → byte-identical). An advance to done
+    is allowed only when the feedback declares ``status: done``; ``blocked``/``clarification_needed`` is
+    refused, and a missing/unrecognized status is refused too ("no signal ≠ done", fail-closed). Deterministic,
+    no model call — the FULL composed gate (coupling/CI/quality) stays private. Returns an ERROR string
+    (refuse) or ``None`` (allow)."""
+    if not ADVANCE_GATE_ENABLED:
+        return None
+    fm = _parse_frontmatter(fb_text or "")
+    # Tolerant: case-insensitive KEY (the parser preserves key case, so `Status:` must still match) + FIRST
+    # token of the value (so `status: done (all tests green)` still reads as done). Refuse-on-uncertain stays.
+    raw = next((v for k, v in fm.items() if k.strip().lower() == "status"), "").strip().lower()
+    status = raw.split()[0] if raw else ""
+    if status == "done":
+        return None
+    if status in ("blocked", "clarification_needed"):
+        return (f"ERROR: not advancing — the feedback status is {status!r}, not done. Resolve it first; the "
+                f"task stays in_progress (no blind advance).")
+    return ("ERROR: not advancing — the feedback carries no recognized completion status (expected "
+            "`status: done`). 'No signal ≠ done', fail-closed — the task stays in_progress.")
+
+
 def _advance_pipeline_impl(task_id: str, agent: str, next_task_id: Optional[str] = None) -> str:
     """Advances the 'done' pipeline for ONE task deterministically.
     Status transitions go through the TaskStore (directory = truth),
@@ -3065,6 +3530,23 @@ def _advance_pipeline_impl(task_id: str, agent: str, next_task_id: Optional[str]
                     f"and {fb_arch.as_posix()} "
                     f"— the task is NOT considered complete. Pipeline not advanced.")
     log.append(f"feedback found: {fb}")
+    if ADVANCE_GATE_ENABLED:   # S2 (#1224): basic no-blind-advance gate — only read/parse feedback when ON (byte-identical off)
+        try:
+            _fbtext = fb.read_text(encoding="utf-8")
+        except Exception:   # noqa: BLE001 — a read failure is "no signal" → fail-closed
+            _fbtext = ""
+        _gate_err = _advance_gate(_fbtext)
+        if _gate_err:
+            # S7 (#1229): the refused task stays in_progress — mark it BLOCKED so the operator sees the stall on
+            # the board/steering instead of a healthy-looking in_progress (transition() clears it on advance).
+            _st = (next((v for k, v in _parse_frontmatter(_fbtext or "").items()
+                         if k.strip().lower() == "status"), "").strip().lower().split() or [""])[0]
+            try:
+                store.mark_blocked(task_id, reason=_gate_err.replace("ERROR: ", "")[:200],
+                                   kind=_st if _st in ("blocked", "clarification_needed") else "blocked")
+            except Exception:   # noqa: BLE001 — a marking hiccup must not change the refusal outcome
+                pass
+            return _gate_err
 
     try:
         # 1. archive the current active.md handover (before the switch)
@@ -3281,6 +3763,12 @@ def _stage_handover_impl(task_id: Optional[str], agent: str, handover_md: str,
             if ack_err:
                 return ("ERROR: task_json violates the ACK contract (nothing created):\n"
                         + ack_err + "\n→ fix the fields and call stage_handover again.")
+            # S5 (#1227): fail-closed design→impl gate — refuse an IMPLEMENTATION handover until the active
+            # unit has a recorded + APPROVED design (no blind coding, R2). Runs BEFORE store.create, so a
+            # refusal mutates nothing. `force` does NOT bypass it (the approval file is the intended override).
+            gate_err = _design_gate(task_type, active_slug())
+            if gate_err:
+                return gate_err
             # Store: dedup + ID + created_at + schema, writes the pending JSON
             try:
                 task = store.create(fields, force=bool(force))
@@ -3350,9 +3838,17 @@ def _stage_handover_impl(task_id: Optional[str], agent: str, handover_md: str,
             _atomic_write(ho, ho_md)
             log.append(f"handover written: {ho} ({len(ho_md)} chars)")
         else:
-            # Pure handover without task JSON — requires a valid task_id.
+            # Pure handover without task JSON — requires a valid, EXISTING task_id.
             if not task_id or not _TASK_ID_RE.match(task_id):
                 return f"ERROR: without task_json a valid task_id is required (was: {task_id!r})"
+            existing = store.get(task_id)
+            if existing is None:
+                return f"ERROR: no such task {task_id!r} — create it with task_json first (nothing written)."
+            # S5 (#1227): re-handing an IMPLEMENTATION task still needs an approved design — a blank
+            # re-handover of an impl-typed task cannot slip past the design gate.
+            gate_err = _design_gate(str(existing.get("type", "")), active_slug())
+            if gate_err:
+                return gate_err
             tid = task_id
             ho = handovers_dir() / f"{tid}_{agent}.md"
             _atomic_write(ho, handover_md)
@@ -3597,6 +4093,10 @@ class TaskStore:
                 data = {"id": task_id}
             data["id"]     = task_id
             data["status"] = to_status
+            # S7 (#1229): a task that advances is no longer blocked — drop any blocked annotation. No-op (byte-
+            # identical) for a task that never carried one.
+            for _bk in ("blocked", "blocked_reason", "blocked_kind", "blocked_at"):
+                data.pop(_bk, None)
             self._dir(to_status).mkdir(parents=True, exist_ok=True)
             _atomic_write(self._path(task_id, to_status),
                           json.dumps(data, ensure_ascii=False, indent=2))
@@ -3604,6 +4104,43 @@ class TaskStore:
                 p.unlink()
             self.project_active()
             return data
+
+    def mark_blocked(self, task_id: str, reason: str = "", kind: str = "blocked") -> None:
+        """S7 (#1229): annotate a task blocked/stalled IN PLACE (no folder move) so the 3 directory states
+        (STATUSES) stay untouched, but the board/steering can show a stuck task instead of a healthy-looking
+        in_progress. Additive JSON keys → a task that never gets marked is byte-identical."""
+        with self._lock:
+            p, s = self._find(task_id)
+            if not p:
+                return
+            try:
+                data = json.loads(p.read_text(encoding="utf-8"))
+            except Exception:   # noqa: BLE001 — a bad task file is not worth crashing a reconcile tick
+                return
+            if not isinstance(data, dict):
+                return
+            data["id"] = task_id
+            data["blocked"] = True
+            data["blocked_reason"] = (reason or "").strip()
+            data["blocked_kind"] = kind
+            data["blocked_at"] = self._now_iso()
+            _atomic_write(self._path(task_id, s), json.dumps(data, ensure_ascii=False, indent=2))
+
+    def clear_blocked(self, task_id: str) -> None:
+        """S7 (#1229): drop the blocked annotation (progress resumed). No-op if the task is not marked."""
+        with self._lock:
+            p, s = self._find(task_id)
+            if not p:
+                return
+            try:
+                data = json.loads(p.read_text(encoding="utf-8"))
+            except Exception:   # noqa: BLE001
+                return
+            if not isinstance(data, dict) or not data.get("blocked"):
+                return
+            for _bk in ("blocked", "blocked_reason", "blocked_kind", "blocked_at"):
+                data.pop(_bk, None)
+            _atomic_write(self._path(task_id, s), json.dumps(data, ensure_ascii=False, indent=2))
 
     def project_active(self):
         """active.md = handover of the newest NON-done task (in_progress before
@@ -3986,6 +4523,61 @@ def _websearch_steer(user_input: str) -> str:
         return ("[note: this looks like a request for CURRENT / real-time information — use the "
                 "`web_search` tool for it, not `execute_command`.]")
     return ""
+
+
+def _steering_state_block() -> str:
+    """#1225 (S3): the per-turn AUTHORITATIVE steering state — active project · unit · lifecycle stage ·
+    N pending/M in_progress · watcher/autopilot — read from the SAME globals the plumbing acts on. The caller
+    keeps EXACTLY ONE current copy (dropping stale ones), placed after the stable system prefix (KV-cache-safe),
+    so the model never has to GUESS its state (the #1225 bug). Returns "" when nothing is bound (no project
+    AND no unit) → a plain-chat/unisolated turn stays byte-identical. Compact, secret-free; effectively
+    read-only (may lazily init the shared task-store singleton); NEVER raises (like registry_health)."""
+    try:
+        health  = registry_health()                       # {status, active_project, home} — never raises
+        project = health.get("active_project")
+        unit    = active_slug()                            # one small file read, fail-soft → None
+        if not project and not unit:
+            return ""                                      # nothing bound → byte-identical plain-chat turn
+        stage = ""
+        if unit:
+            try:                                           # cheap cached projection — never re-scan the vault
+                gp = vault_root() / unit / GRAPH_FILENAME
+                if gp.is_file():
+                    stage = (json.loads(gp.read_text(encoding="utf-8"))
+                             .get("lifecycle", {}).get("current") or "")
+            except Exception:  # noqa: BLE001 — advisory; omit the stage on any hiccup
+                stage = ""
+        try:
+            store = _store()                               # the same singleton the plumbing uses
+            n_pending = len(store.list("pending"))          # best-effort snapshot ([] when no unit; per-file errors swallowed)
+            n_prog    = len(store.list("in_progress"))
+        except Exception:  # noqa: BLE001
+            n_pending = n_prog = 0
+        lines = [
+            _STEERING_MARKER,
+            f"- active project: {project or '(none)'}"
+            + ("  [engine running un-isolated]" if health.get("status") == "unisolated" else ""),
+            f"- active unit (initiative): {unit or '(none — no vault/<slug> unit is active)'}",
+        ]
+        if stage:
+            lines.append(f"- lifecycle stage: {stage}")
+        if unit and DESIGN_GATE_ENABLED:  # S5 (#1227): surface the design gate — only when it is enforced
+            _hd, _ap, _rel = _unit_design_status(unit)
+            if not _hd:
+                lines.append("- design gate: no design on record — implementation handovers are BLOCKED "
+                             "(record_design first, then /approve).")
+            elif not _ap:
+                lines.append(f"- design gate: design recorded ({_rel}) but NOT approved — implementation "
+                             f"handovers BLOCKED until /approve.")
+            else:
+                lines.append("- design gate: design approved — implementation handovers allowed.")
+        lines.append(f"- tasks: {n_pending} pending · {n_prog} in_progress")
+        lines.append(f"- watcher: {'on' if _WATCHER_ENABLED else 'off'} · "
+                     f"autopilot: {'on' if AUTOPILOT_ENABLED else 'off'}")
+        lines.append("Trust these fields over any filesystem probe; do NOT invent a vault path.")
+        return "\n".join(lines)
+    except Exception:  # noqa: BLE001 — a per-turn hint must never break a turn
+        return ""
 
 # Fail-closed deny-list for execute_command (§4 / operator 2026-06-25): a shell command that fetches the
 # web / a remote host (that is what web_search is for, and a PowerShell web fetch draws a progress bar into
@@ -5069,21 +5661,25 @@ def _run_tool_dispatch(name: str, args: Dict[str, Any]) -> str:
             return f"OK: edited {args['path']} ({hits if args.get('replace_all') else 1} replacement(s))"
 
         elif name == "create_issue":
-            # #1073: file a forge issue via the ambient gh CLI. Capability-detected (offered + accepted when
-            # `gh` is present and the profile permits an outbound write), secret-free (gh auth), escape-free
-            # (body from a file). Same check as the registration gate (_forge_available), with a precise reason.
+            # #1073/#1213: file a forge issue through the active forge ADAPTER (cli=gh | native=urllib | mock),
+            # so it works with OR without a `gh` CLI on the box (the Spark `server` topology). Capability-
+            # detected (offered + accepted when a forge transport is usable and the profile permits an outbound
+            # write), secret-free, escape-free (body from a file). Same gate as the offer (_forge_available).
             if not _forge_available():
                 if not FORGE_ENABLED:
                     return "ERROR: create_issue is force-disabled by the operator (config forge.enabled=false)."
                 if _is_sealed_profile():
                     return "ERROR: create_issue is blocked under the sealed trust profile (no autonomous outbound writes)."
+                if FORGE_ADAPTER == "native":
+                    return (f"ERROR: create_issue (native forge) needs a token in ${FORGE_TOKEN_ENV} and "
+                            f"forge.repo (owner/repo).")
                 return "ERROR: create_issue needs the GitHub CLI ('gh') on PATH + authenticated (gh auth login)."
             bf = _resolve_exec_path(args["body_file"])
             if not bf.exists():
                 return (f"ERROR: body_file not found: {args['body_file']} — write the issue body to a FILE "
                         f"first (write_last_reply / write_file), then pass its path.")
             # A) label validate→reask: the model must use EXISTING repo labels, not invent them. An unknown
-            # label is rejected with the valid set (+ did-you-mean) so the model re-emits — instead of gh
+            # label is rejected with the valid set (+ did-you-mean) so the model re-emits — instead of the forge
             # hard-failing the whole create on the first bad label, and instead of silently dropping it.
             # Fail-soft: if the label list can't be fetched, validation is skipped (never block on a hiccup).
             req_labels = [l.strip() for l in str(args.get("labels", "") or "").split(",") if l.strip()]
@@ -5100,39 +5696,152 @@ def _run_tool_dispatch(name: str, args: Dict[str, Any]) -> str:
                         return ("ERROR: unknown label(s): " + "; ".join(parts) + ". Use existing labels ONLY "
                                 "(do not invent labels). Valid labels: " + ", ".join(sorted(valid)) +
                                 ". Re-call create_issue with valid labels (or omit `labels`).")
-            cmd = ["gh", "issue", "create", "--title", str(args.get("title", "")), "--body-file", str(bf)]
-            if FORGE_REPO:
-                cmd += ["--repo", FORGE_REPO]
-            for _lb in req_labels:
-                cmd += ["--label", _lb]
-            if args.get("milestone"):
-                cmd += ["--milestone", str(args["milestone"])]
-            try:
-                r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8",
-                                   errors="replace", timeout=60)
-            except Exception as ex:   # noqa: BLE001 — a forge/network hiccup is a tool error, not a crash
-                return f"ERROR: create_issue could not run gh: {ex!r}"
-            if r.returncode != 0:
-                return f"ERROR: gh issue create failed: {((r.stderr or r.stdout) or '').strip()[:400]}"
-            new_url = r.stdout.strip()
-            # B) parent linking: if a parent epic was given, link the new issue as a NATIVE sub-issue (gh
-            # supports `--parent`) — so the model links in-tool, not via ad-hoc execute_command gh calls.
-            # Fail-soft: the issue already exists, so a link failure is reported alongside it, not raised.
+            _forge = _forge_transport()
+            cst, cres = _forge.create_issue(str(args.get("title", "")), bf, req_labels,
+                                            str(args["milestone"]) if args.get("milestone") else None)
+            if cst != "ok":
+                return f"ERROR: {cres}"
+            new_url = (cres or {}).get("url", "")
+            # B) parent linking: link the new issue as a NATIVE sub-issue — so the model links in-tool, not via
+            # ad-hoc execute_command. Fail-soft: the issue already exists, so a link failure is reported
+            # alongside it, not raised.
             parent = str(args.get("parent", "") or "").strip().lstrip("#")
             if parent and new_url:
-                lcmd = ["gh", "issue", "edit", new_url, "--parent", parent]
-                if FORGE_REPO:
-                    lcmd += ["--repo", FORGE_REPO]
-                try:
-                    lr = subprocess.run(lcmd, capture_output=True, text=True, encoding="utf-8",
-                                        errors="replace", timeout=60)
-                except Exception as ex:   # noqa: BLE001
-                    return f"OK: created issue {new_url}, but linking to parent #{parent} raised: {ex!r}"
-                if lr.returncode != 0:
+                lst, lres = _forge.link_sub_issue(parent, cres)
+                if lst != "ok":
                     return (f"OK: created issue {new_url}, but linking to parent #{parent} failed: "
-                            f"{((lr.stderr or lr.stdout) or '').strip()[:200]}")
+                            f"{str(lres)[:200]}")
                 return f"OK: created issue {new_url} and linked it as a sub-issue of #{parent}"
             return f"OK: created issue {new_url}"
+
+        elif name == "view_issue":
+            # #1208/#1213: read a tracker issue through the active forge ADAPTER (cli=gh | native=urllib) — the
+            # first-class path for resolving a `#NNN` reference (never git-history grepping). A non-existent
+            # issue returns an authoritative NOT_FOUND (the tracker WAS queried), so the model never falls back
+            # to inferring non-existence from a missing commit.
+            if not _forge_available():
+                if not FORGE_ENABLED:
+                    return "ERROR: view_issue is force-disabled by the operator (config forge.enabled=false)."
+                if _is_sealed_profile():
+                    return "ERROR: view_issue is blocked under the sealed trust profile (no autonomous outbound calls)."
+                if FORGE_ADAPTER == "native":
+                    return (f"ERROR: view_issue (native forge) needs a token in ${FORGE_TOKEN_ENV} and "
+                            f"forge.repo (owner/repo).")
+                return "ERROR: view_issue needs the GitHub CLI ('gh') on PATH + authenticated (gh auth login)."
+            num = str(args.get("number", "")).strip().lstrip("#")
+            if not num.isdigit():
+                return f"ERROR: view_issue needs a numeric issue number (got {args.get('number')!r})."
+            vst, vres = _forge_transport().view_issue(int(num))
+            if vst == "not_found":
+                where = f" in {FORGE_REPO}" if FORGE_REPO else ""
+                return f"NOT_FOUND: issue #{num} does not exist{where} (the tracker was queried — authoritative)."
+            if vst != "ok":
+                return f"ERROR: {vres}"
+            data = vres if isinstance(vres, dict) else {}
+            labels = ", ".join(l.get("name", "") for l in (data.get("labels") or [])) or "-"
+            milestone = (data.get("milestone") or {}).get("title") or "-"
+            body = (data.get("body") or "").strip()
+            if len(body) > 4000:   # bound a huge body so it can't blow the window (belt-and-suspenders)
+                body = body[:4000].rstrip() + "\n… [body truncated]"
+            return (f"#{data.get('number')} [{data.get('state')}] {data.get('title')}\n"
+                    f"labels: {labels} · milestone: {milestone}\n"
+                    f"url: {data.get('url')}\n\n{body}")
+
+        elif name == "create_pr":
+            # #1215: open a PR through the active forge adapter (cli=gh | native=urllib). OPEN-ONLY — it never
+            # merges (merge stays a CI/review gate). Escape-free (body from a file), capability-detected +
+            # sealed-gated exactly like create_issue.
+            if not _forge_available():
+                if not FORGE_ENABLED:
+                    return "ERROR: create_pr is force-disabled by the operator (config forge.enabled=false)."
+                if _is_sealed_profile():
+                    return "ERROR: create_pr is blocked under the sealed trust profile (no autonomous outbound writes)."
+                if FORGE_ADAPTER == "native":
+                    return (f"ERROR: create_pr (native forge) needs a token in ${FORGE_TOKEN_ENV} and "
+                            f"forge.repo (owner/repo).")
+                return "ERROR: create_pr needs the GitHub CLI ('gh') on PATH + authenticated (gh auth login)."
+            bfp = str(args.get("body_file", "") or "").strip()
+            if not bfp:   # empty/omitted must not silently resolve to the cwd dir (Path('.').exists() is True)
+                return ("ERROR: create_pr needs body_file — write the PR body to a FILE first "
+                        "(write_last_reply / write_file), then pass its path.")
+            bf = _resolve_exec_path(bfp)
+            if not bf.exists():
+                return (f"ERROR: body_file not found: {args.get('body_file')} — write the PR body to a FILE "
+                        f"first (write_last_reply / write_file), then pass its path.")
+            draft = str(args.get("draft", "") or "").strip().lower() in ("1", "true", "yes")
+            pst, pres = _forge_transport().create_pr(
+                str(args.get("title", "")), bf,
+                str(args.get("base", "") or "") or None, str(args.get("head", "") or "") or None, draft)
+            if pst != "ok":
+                return f"ERROR: {pres}"
+            return f"OK: opened PR {pres}"
+
+        elif name == "comment_on_issue":
+            # #1217: append a comment to an issue through the active forge adapter (cli=gh | native=urllib).
+            # NARROW — comment only (never close/relabel). Escape-free, capability-detected + sealed-gated.
+            if not _forge_available():
+                if not FORGE_ENABLED:
+                    return "ERROR: comment_on_issue is force-disabled by the operator (config forge.enabled=false)."
+                if _is_sealed_profile():
+                    return "ERROR: comment_on_issue is blocked under the sealed trust profile (no autonomous outbound writes)."
+                if FORGE_ADAPTER == "native":
+                    return (f"ERROR: comment_on_issue (native forge) needs a token in ${FORGE_TOKEN_ENV} and "
+                            f"forge.repo (owner/repo).")
+                return "ERROR: comment_on_issue needs the GitHub CLI ('gh') on PATH + authenticated (gh auth login)."
+            num = str(args.get("number", "")).strip().lstrip("#")
+            if not num.isdigit():
+                return f"ERROR: comment_on_issue needs a numeric issue number (got {args.get('number')!r})."
+            bfp = str(args.get("body_file", "") or "").strip()
+            if not bfp:
+                return ("ERROR: comment_on_issue needs body_file — write the comment to a FILE first "
+                        "(write_last_reply / write_file), then pass its path.")
+            bf = _resolve_exec_path(bfp)
+            if not bf.exists():
+                return (f"ERROR: body_file not found: {args.get('body_file')} — write the comment to a FILE "
+                        f"first (write_last_reply / write_file), then pass its path.")
+            cst, cres = _forge_transport().comment_on_issue(int(num), bf)
+            if cst == "not_found":
+                where = f" in {FORGE_REPO}" if FORGE_REPO else ""
+                return f"NOT_FOUND: issue #{num} does not exist{where} (the tracker was queried — authoritative)."
+            if cst != "ok":
+                return f"ERROR: {cres}"
+            return f"OK: commented on #{num}: {cres}"
+
+        elif name == "pr_status":
+            # #1219: read a PR's CI/mergeability SNAPSHOT through the active forge adapter. NON-BLOCKING — one
+            # snapshot, never a watch/poll (the engine runs one agent turn behind a single lock).
+            if not _forge_available():
+                if not FORGE_ENABLED:
+                    return "ERROR: pr_status is force-disabled by the operator (config forge.enabled=false)."
+                if _is_sealed_profile():
+                    return "ERROR: pr_status is blocked under the sealed trust profile (no autonomous outbound calls)."
+                if FORGE_ADAPTER == "native":
+                    return (f"ERROR: pr_status (native forge) needs a token in ${FORGE_TOKEN_ENV} and "
+                            f"forge.repo (owner/repo).")
+                return "ERROR: pr_status needs the GitHub CLI ('gh') on PATH + authenticated (gh auth login)."
+            num = str(args.get("number", "")).strip().lstrip("#")
+            if not num.isdigit():
+                return f"ERROR: pr_status needs a numeric PR number (got {args.get('number')!r})."
+            sst, sres = _forge_transport().pr_status(int(num))
+            if sst == "not_found":
+                where = f" in {FORGE_REPO}" if FORGE_REPO else ""
+                return f"NOT_FOUND: PR #{num} does not exist{where} (the forge was queried — authoritative)."
+            if sst != "ok":
+                return f"ERROR: {sres}"
+            data = sres if isinstance(sres, dict) else {}
+            checks = data.get("checks") or []
+            n_fail = sum(1 for c in checks if str((c or {}).get("bucket", "")).lower() in ("fail", "cancel"))
+            n_pend = sum(1 for c in checks if str((c or {}).get("bucket", "")).lower() == "pending")
+            verdict = ("no checks reported" if not checks
+                       else f"{n_fail} FAILING" if n_fail
+                       else f"{n_pend} PENDING" if n_pend
+                       else "ALL PASSING")
+            merge_line = (f"mergeable: {data.get('mergeable') or '?'} · "
+                          f"state: {data.get('mergeStateStatus') or data.get('state') or '?'} · "
+                          f"review: {data.get('reviewDecision') or '-'}")
+            lines = [f"{str((c or {}).get('bucket', '?')).upper():9} {(c or {}).get('name', '')}" for c in checks]
+            return (f"PR #{num} — {verdict} ({len(checks)} checks):\n{merge_line}"
+                    + ("\n" + "\n".join(lines) if lines else ""))
 
         elif name == "fetch_url":
             # #1074: verbatim, size-capped http(s) fetch. Trust-gated (sealed) + SSRF-guarded + byte-capped;
@@ -5366,6 +6075,17 @@ def _run_tool_dispatch(name: str, args: Dict[str, Any]) -> str:
                 return "ERROR: title required"
             existing = _store().find_duplicate(title, args.get("description", ""))
             return f"EXISTS: {existing}" if existing else "NONE"
+
+        elif name == "launch_coder":
+            return _trigger_coder(args.get("task_id") or None)
+
+        elif name == "record_design":
+            try:
+                rel = record_design(args.get("title", ""), args.get("body", ""))
+            except ValueError as e:
+                return f"ERROR: {e}"
+            return (f"OK: design recorded at {rel} (stage: design, approved: false). STOP — get it approved "
+                    f"(/approve) before an implementation handover; the engine refuses one until then.")
 
         elif name == "query_memory":
             if _MEMORY is None or not _MEMORY.is_available():
@@ -6485,6 +7205,16 @@ class GX10:
         # #602 S602-6: an opt-in pre-turn hint of known working approaches (process-lessons); "" by default
         # → the prefix is byte-identical (transient + non-accumulating, like rag/steer).
         prefix = "\n\n".join(p for p in (rag, steer, _process_hint()) if p)
+        # #1225 (S3): the AUTHORITATIVE steering-state block is kept as EXACTLY ONE current message — drop any
+        # stale copy from earlier turns, then append the fresh one right before this user turn. So a project/
+        # unit switch can never leave an obsolete "authoritative" block in history. "" when nothing is bound →
+        # no message added → byte-identical.
+        self.messages = [m for m in self.messages
+                         if not (isinstance(m.get("content"), str)
+                                 and m["content"].startswith(_STEERING_MARKER))]
+        steer_state = _steering_state_block()
+        if steer_state:
+            self.messages.append({"role": "user", "content": steer_state})
         self.messages.append({"role": "user",
                               "content": (prefix + "\n\n" + user_input) if prefix else user_input})
         # #602 2.0/#690: publish the turn-start boundary (observer-only; byte-identical with no subscriber).
@@ -7054,10 +7784,12 @@ def _initiative_command(arg_str: str) -> str:
             if not vs:
                 return _msg("init.cmd_none")
             cur = active_slug()
-            lines = ["[initiative]  (* = active)"]
+            # #1238: the row marker must survive the client's markdown renderer — a leading "* " became a
+            # generic "- " bullet, dropping the active marker. Use the existing "[…]" tag convention instead.
+            lines = ["[initiative]  ([active] = current)"]
             for v in vs:
-                mark = "*" if v.slug == cur else " "
-                lines.append(f"  {mark} {v.slug}  ·  type {v.type} · status {v.status} · {v.created}")
+                tag = " [active]" if v.slug == cur else ""
+                lines.append(f"- {v.slug}{tag}  ·  type {v.type} · status {v.status} · {v.created}")
             return "\n".join(lines)
         if sub == "active":
             v = initiative_active()
@@ -7479,8 +8211,8 @@ def _project_track_command(args: "List[str]") -> str:
     if sub == "list":
         tracks = list(getattr(cur, "tracks", ["main"]) or ["main"])
         act = getattr(cur, "active_track", "main") or "main"
-        lines = ["[project] tracks  (* = active):"]
-        lines += [f"  {'*' if t == act else ' '} {t}" for t in tracks]
+        lines = ["[project] tracks  ([active] = current):"]     # #1238: markdown-safe marker ([…] tag, not "* ")
+        lines += [f"- {t}{' [active]' if t == act else ''}" for t in tracks]
         return "\n".join(lines)
     if sub in ("new", "use"):
         if len(args) < 2:
@@ -7755,13 +8487,15 @@ def _project_command(arg_str: str, agent: "Optional[GX10]" = None) -> str:
                 return "[project] none registered — /project new <name>"
             cur = _ACTIVE_PROJECT.id if _ACTIVE_PROJECT is not None else None
             n_arch = sum(1 for p in projs if getattr(p, "archived", False))
-            head = "[project]  (* = active" + (", [archived] hidden — /project list --all" if (n_arch and not show_all) else "") + ")"
+            # #1238: markdown-safe marker — a leading "* " row became a generic "- " bullet in the client's
+            # markdown renderer, dropping the active marker. Use the existing "[…]" tag convention instead.
+            head = "[project]  ([active] = current" + (", [archived] hidden — /project list --all" if (n_arch and not show_all) else "") + ")"
             lines = [head]
             for p in shown:
-                mark = "*" if p.id == cur else " "
+                active_tag = " [active]" if p.id == cur else ""
                 root = str(_BOOT_WORKDIR) if (p.id == default_id and _BOOT_WORKDIR is not None) else p.root
-                tag = " [archived]" if getattr(p, "archived", False) else ""
-                lines.append(f"  {mark} {p.id}{tag}  ·  {root}  ·  mem_ns {(p.mem_ns or '-')[:8]}")
+                arch_tag = " [archived]" if getattr(p, "archived", False) else ""
+                lines.append(f"- {p.id}{active_tag}{arch_tag}  ·  {root}  ·  mem_ns {(p.mem_ns or '-')[:8]}")
             return "\n".join(lines)
         if sub in ("new", "add"):
             rest = arg_str.split(None, 1)[1] if len(parts) > 1 else ""
@@ -8132,7 +8866,8 @@ def _dispatch(agent: GX10, user_input: str):
             if _EFFECTIVE_CFG: _EFFECTIVE_CFG["autopilot"]["enabled"] = True
             msg = (f"[AUTOPILOT] ON (max_concurrent={AUTOPILOT_MAX_CONCURRENT}); "
                    f"takes effect on the next tick (~{RECONCILER_INTERVAL:.0f}s).")
-            if not _WATCHER_ENABLED:
+            if not _WATCHER_ENABLED and not AUTOMATION_DECOUPLED:
+                # S7 (#1229): only true in coupled mode — decoupled autopilot is self-sufficient.
                 msg += "  ⚠ reconciler is OFF — 'watcher on' is required, else nothing happens."
             _ui_print(col(msg, C.GREEN))
         elif arg == "off":
@@ -8222,6 +8957,13 @@ def _dispatch(agent: GX10, user_input: str):
         _ui_print(col(_initiative_command(user_input[len("initiative"):].strip()), C.CYAN))
     elif cmd == "switch" or cmd.startswith("switch "):
         _ui_print(col(_switch_command(agent, user_input[len("switch"):].strip()), C.CYAN))
+    elif cmd == "approve" or cmd.startswith("approve "):
+        # S5 (#1227): the operator's approval point — stamp `approved: true` on the active (or named) unit's
+        # design doc, unblocking implementation handovers (no blind coding). Deterministic, model-free.
+        _ui_print(col(_approve_design(user_input[len("approve"):].strip() or None), C.CYAN))
+    elif cmd == "board" or cmd.startswith("board "):
+        # S6 (#1228 / R5): render the task board (all units pending/in_progress/done) to BOARD.md + show it.
+        _ui_print(col(_board_command(user_input[len("board"):].strip() or None), C.CYAN))
     elif cmd == "lifecycle" or cmd.startswith("lifecycle "):
         # S13b / AD-7: the engine DELIVER-leg lifecycle-completeness gate (reads the transition ledger as
         # data → projects stage-tagged evidence → verifies completeness). Deterministic, model-free.
@@ -8387,9 +9129,15 @@ def _do_launch(task_id: str, agent: str):
     # a pinned (different) agent runs with ITS OWN model/effort, not the staged agent's.
     if agent == _agent_from_handover(ho.name):
         model, effort = _parse_handover_meta(ho)
+        # #1236: the handover's `to:` is the RECIPIENT AGENT (e.g. "to: CODEX"), which the orchestrator writes
+        # there — it is NOT a model override. An agent-name in `to:` must never become `--model CODEX` (a
+        # non-Claude CLI rejects it: "the 'CODEX' model is not supported"). Drop it so spec.model wins; only a
+        # genuine model string in `to:` still overrides.
+        if model and _code_agent_registry().has(model.strip().upper()):
+            model = None
     else:
         model, effort = None, None
-    model  = model or spec.model                          # registry model (frontmatter `to:` overrides)
+    model  = model or spec.model                          # registry model (a genuine `to:` model still overrides)
     # #500: when the handover carries no explicit `effort:`, auto-tier it by the task's class (security/
     # architecture → xhigh, routine → high) instead of the flat default; an explicit `effort:` still wins,
     # and a task that can't be loaded / an unmapped class falls through unchanged (fail-open).
@@ -8519,6 +9267,62 @@ def _do_launch(task_id: str, agent: str):
     threading.Thread(target=_wait, daemon=True).start()
 
 
+def _trigger_coder(task_id: "Optional[str]" = None) -> str:
+    """#1226 (S4): the model-invokable trigger verb. The orchestrator — the SINGLE steering author — launches
+    the coding agent for a staged handover ON DEMAND, bypassing the autopilot daemon (which stays off by
+    default; ADR-0002 D7 / #312 S4: no second steering authority). Resolves the current staged unit, launches
+    it via the SAME machinery the reconciler uses (`_do_launch`, NOT gated on AUTOPILOT_ENABLED), and flips it
+    to in_progress. Fail-closed with a clear message; never double-launches; respects the concurrency cap."""
+    store = _store()
+    # 1. resolve the target task (explicit id, else the newest pending task that has a staged handover)
+    if task_id:
+        target = store.get(task_id)
+        if target is None:
+            return f"ERROR: no such task {task_id!r}."
+    else:
+        pend = sorted(store.list("pending"), key=lambda t: (t.get("created_at", ""), t.get("id", "")))
+        target = next((t for t in reversed(pend) if _find_handover(t.get("id", ""))), None)
+        if target is None:
+            return ("No staged handover to launch — nothing pending has a handover. Stage one via "
+                    "stage_handover first.")
+    tid = target.get("id", "")
+    # 2. double-launch guard — in_progress (running) OR done (a stale handover that advance failed to unlink)
+    if target.get("status") in ("in_progress", "done"):
+        return f"{tid} is already {target.get('status')} — not relaunched."
+    ho = _find_handover(tid)
+    if not ho:
+        return f"ERROR: {tid} has no staged handover file — stage_handover first."
+    # 3. resolve the effective agent (pin/failover), fail-closed. An empty registry = the server topology
+    #    (providers disabled): the coder runs on the CLIENT there, not on this box.
+    agent = _effective_code_agent(_agent_from_handover(ho.name), task_class=_task_class(target))
+    if not _code_agent_registry().has(agent):
+        names = _agent_names()
+        if not names:
+            return (f"Nothing to launch here — no coding agent runs on this box (server topology: the coder "
+                    f"runs on the client, which polls pending handovers). {tid} stays staged.")
+        return f"ERROR: unknown/unconfigured agent for {tid} (configured: {', '.join(names)})."
+    # 4. concurrency cap — the same bound the reconciler honours. The check-then-reserve is not locked as one
+    #    atom, but it does not race: tool dispatch runs under _AGENT_LOCK (one turn at a time) and the
+    #    orchestrator is the SINGLE steering author, so two launch_coder calls never overlap; the autopilot
+    #    daemon (the only other launcher) stays off by default.
+    if AUTOPILOT_MAX_CONCURRENT and _autopilot_active() >= AUTOPILOT_MAX_CONCURRENT:
+        return (f"BUSY: {_autopilot_active()} coder(s) already running (max_concurrent="
+                f"{AUTOPILOT_MAX_CONCURRENT}) — {tid} not launched, retry after one finishes.")
+    # 5. reserve a slot + launch via the SAME machinery (NOT AUTOPILOT_ENABLED-gated). `_do_launch` flips the
+    #    task to in_progress + spawns detached, and frees the slot itself on any error (its documented contract).
+    _autopilot_reserve()
+    try:
+        _do_launch(tid, agent)
+    except Exception as e:  # noqa: BLE001 — _do_launch frees the slot on its OWN handled errors, but an
+        _autopilot_release()  # unguarded raise (a bad logdir, or a non-KeyError transition error) would leak it.
+        return f"ERROR: launch of {tid} failed to start ({e.__class__.__name__}) — slot released."
+    after = store.get(tid)
+    if after and after.get("status") == "in_progress":
+        return (f"OK: launched {agent} for {tid} — the coding session is running; its feedback will "
+                f"auto-advance the pipeline.")
+    return f"ERROR: launch of {tid} did not start (see the log)."
+
+
 # ─── Feedback reconciler (polling instead of event triggers) ───────
 # Reads the TRUE state every tick: for each in_progress task a
 # complete feedback file is sought and the completion is triggered DETERMINISTICALLY (without
@@ -8529,6 +9333,32 @@ def _do_launch(task_id: str, agent: str):
 # `_CLAUDE_OPUS-feedback.md` → "CLAUDE_OPUS" via `\w+`). Letters-only makes both sides yield the same
 # trailing token, so an agent_id round-trips identically through BOTH regexes (charter §C0R-1).
 _FB_RE = re.compile(r"_([A-Za-z]+)-feedback\.md$")
+
+def _task_progress_mtime(store: "TaskStore", tid: str) -> "Optional[float]":
+    """S7 (#1229): the newest 'work is happening' signal for an in_progress task — the max mtime of the coder
+    log and any feedback file. Deliberately EXCLUDES the task-json mtime: mark_blocked/clear_blocked rewrite it,
+    so counting it would make marking a task look like progress and flap the stall on and off. None when neither
+    a log nor a feedback exists (a manual task with no observable signal is never false-flagged as stalled)."""
+    mtimes: List[float] = []
+    d = feedback_dir(soft=True)                     # any (partial) feedback of this task
+    if d and d.exists():
+        for f in d.glob(f"{tid}_*-feedback.md"):
+            try:
+                mtimes.append(f.stat().st_mtime)
+            except OSError:
+                pass
+    try:                                            # a launched coder's live log (autopilot / launch_coder)
+        logs = state_root() / AUTOPILOT_LOGS_DIR
+        if logs.exists():
+            for lg in logs.glob(f"{tid}_*.log"):
+                try:
+                    mtimes.append(lg.stat().st_mtime)
+                except OSError:
+                    pass
+    except Exception:   # noqa: BLE001 — a log-dir hiccup must not break a reconcile tick
+        pass
+    return max(mtimes) if mtimes else None
+
 
 def _reconcile_once(store: "TaskStore", enqueue, seen_mtime: Dict[str, float],
                     enqueued: set, launch_enqueue=None, launched: Optional[set] = None):
@@ -8565,6 +9395,43 @@ def _reconcile_once(store: "TaskStore", enqueue, seen_mtime: Dict[str, float],
             _autopilot_reserve()              # reserve a slot (worker starts, monitor frees)
             launch_enqueue(tid, agent)
 
+    # S7 (#1229): when decoupled and only autopilot is on, this is a launch-only tick — the feedback-advance
+    # side belongs to the watcher concern. Byte-identical when coupled (the loop only runs with watcher on).
+    # ── S7 (#1229) heartbeat side: flag an in_progress task with no progress signal (coder log / feedback
+    #    mtime) for HEARTBEAT_STALL_S seconds. 0 ⇒ off / byte-identical. Runs whenever the loop ticks —
+    #    INDEPENDENT of the watcher/feedback concern (a wedged autopilot coder must be caught in decoupled,
+    #    watcher-off mode too), so it sits BEFORE the decoupled feedback-side skip. Dedup + un-stall via the
+    #    persistent `enqueued` set (a `__stall_<tid>` key), mirroring the orphan-warning dedup.
+    if HEARTBEAT_STALL_S > 0:
+        now = time.time()
+        for task in store.list("in_progress"):
+            tid = task.get("id") or ""
+            if not tid:
+                continue
+            newest = _task_progress_mtime(store, tid)
+            stall_key = f"__stall_{tid}"
+            # never clobber a DIFFERENT block reason (e.g. an advance-gate refusal) with 'stalled'
+            blocked_other = bool(task.get("blocked")) and task.get("blocked_kind") != "stalled"
+            if newest is not None and (now - newest) > HEARTBEAT_STALL_S:
+                if stall_key not in enqueued and not blocked_other:
+                    enqueued.add(stall_key)
+                    secs = int(now - newest)
+                    _ui_print(col(f"  ⚠ [WATCHER] task {tid} stalled — no progress for {secs}s", C.YELLOW))
+                    try:
+                        store.mark_blocked(tid, reason=f"no progress for {secs}s", kind="stalled")
+                    except Exception:   # noqa: BLE001 — a marking hiccup must not break the tick
+                        pass
+            elif stall_key in enqueued:
+                enqueued.discard(stall_key)           # progress resumed → un-stall
+                try:
+                    if task.get("blocked_kind") == "stalled":
+                        store.clear_blocked(tid)
+                except Exception:   # noqa: BLE001
+                    pass
+    # S7 (#1229): when decoupled and only autopilot is on, this is a launch-only tick — the feedback-advance
+    # side belongs to the watcher concern. Byte-identical when coupled (the loop only runs with watcher on).
+    if AUTOMATION_DECOUPLED and not _WATCHER_ENABLED:
+        return
     # ── Feedback side: pending OR in_progress + feedback OF THE ASSIGNED
     #    agent → advance. IMPORTANT: also scan `pending` — a task processed
     #    manually (outside autopilot) stays in `pending`
@@ -8637,7 +9504,9 @@ def _reconciler_loop(stop_event: threading.Event, interval: float):
         _INPUT_QUEUE.put(f"{_LAUNCH_CMD}{tid}\x00{agent}")
 
     while not stop_event.wait(interval):
-        if not _WATCHER_ENABLED:
+        # S7 (#1229): OFF → coupled (the loop runs iff watcher on). ON → autopilot is self-sufficient (the loop
+        # runs if EITHER concern is on; the feedback side stays _WATCHER-gated inside _reconcile_once).
+        if not (_WATCHER_ENABLED or (AUTOMATION_DECOUPLED and AUTOPILOT_ENABLED)):
             continue
         bind_active()           # S5b: this daemon thread → the active project (re-read each tick; follows a switch)
         try:
@@ -8729,8 +9598,10 @@ def _code_defaults() -> Dict[str, Any]:
             "max_output_chars": 100_000,                # cap on the model-facing tool result (S5)
         },
         "forge": {                                      # #1073: code-host issue filing (default OFF)
-            "enabled": FORGE_ENABLED,                   # default ON — capability-detected (gh present); false = force-off
-            "repo":    FORGE_REPO,                       # optional owner/repo; empty ⇒ gh's cwd default
+            "enabled":   FORGE_ENABLED,                 # default ON — capability-detected; false = force-off
+            "repo":      FORGE_REPO,                     # optional owner/repo; empty ⇒ gh's cwd default (required for native)
+            "adapter":   FORGE_ADAPTER,                  # #1213: cli (gh) | native (stdlib urllib) | mock
+            "token_env": FORGE_TOKEN_ENV,               # #1213: env var NAME holding the native GitHub token (never a literal)
         },
         "notify": {                                     # #1083: escalation → webhook (default OFF)
             "webhook": NOTIFY_WEBHOOK,                   # deploy secret via GX10_NOTIFY_WEBHOOK; empty ⇒ off
@@ -8902,7 +9773,7 @@ def _code_defaults() -> Dict[str, Any]:
                  "cmd_template": "{bin} --model {model} --effort {effort} --permission-mode {permission} --print {prompt}",
                  "effort": "xhigh", "permission_mode": "acceptEdits"},
                 {"provider_id": "claude-sonnet", "kind": "cli", "agent_id": "SONNET",
-                 "display": "Claude Sonnet 4.6", "model": "claude-sonnet-4-6", "bin": "claude",
+                 "display": "Claude Sonnet 5", "model": "claude-sonnet-5", "bin": "claude",
                  "cmd_template": "{bin} --model {model} --effort {effort} --permission-mode {permission} --print {prompt}",
                  "effort": "high", "permission_mode": "acceptEdits"},
             ],
@@ -9145,6 +10016,8 @@ def _apply_env(cfg: Dict[str, Any]) -> Dict[str, Any]:
     setif("GX10_SEARCH_ENABLED",          "search", "enabled", _truthy)
     setif("GX10_FORGE_ENABLED",           "forge",  "enabled", _truthy)   # #1073: opt-in issue filing
     setif("GX10_FORGE_REPO",              "forge",  "repo")
+    setif("GX10_FORGE_ADAPTER",           "forge",  "adapter")            # #1213: cli | native | mock
+    setif("GX10_FORGE_TOKEN_ENV",         "forge",  "token_env")          # #1213: NAME of the native-token env var
     setif("GX10_NOTIFY_WEBHOOK",          "notify", "webhook")            # #1083: escalation webhook (deploy secret)
     setif("GX10_AUDIT_ENABLED",           "audit",  "enabled", _truthy)   # #1084: opt-in per-action audit ledger
     setif("GX10_AUDIT_SCOPE",             "audit",  "scope")              # #1067: mutating | all
@@ -9201,8 +10074,8 @@ def _apply_config(cfg: Dict[str, Any]):
     """Writes the merged config back into the module globals, so the
     existing references (run_tool, macros, _trim_context, _classify_thinking,
     watcher, UI …) keep running unchanged."""
-    global DEFAULT_BASE_URL, DEFAULT_MODEL, API_KEY_ENV, STATE_ROOT, VAULT_ROOT, SESSION_FILE, CODE_ROOT
-    global PLATFORM_MODE, PLATFORM, TASKS_DEDUP_THRESHOLD, ONBOARDING_MODE, TASK_PREFIX, _TASK_ID_RE, ACK_ENABLED, LODESTAR_ENABLED, FORGE_ENABLED, FORGE_REPO, NOTIFY_WEBHOOK, AUDIT_ENABLED, AUDIT_SCOPE, INJECTION_DEFENSE, SANDBOX, MULTI_TENANT, ALERT_ENABLED, LLM_REQUEST_TIMEOUT_S, LLM_MAX_RETRIES
+    global DEFAULT_BASE_URL, DEFAULT_MODEL, API_KEY_ENV, STATE_ROOT, VAULT_ROOT, SESSION_FILE, CODE_ROOT, CODE_SUBDIR
+    global PLATFORM_MODE, PLATFORM, TASKS_DEDUP_THRESHOLD, ONBOARDING_MODE, TASK_PREFIX, _TASK_ID_RE, ACK_ENABLED, LODESTAR_ENABLED, FORGE_ENABLED, FORGE_REPO, FORGE_ADAPTER, FORGE_TOKEN_ENV, NOTIFY_WEBHOOK, AUDIT_ENABLED, AUDIT_SCOPE, INJECTION_DEFENSE, SANDBOX, MULTI_TENANT, ALERT_ENABLED, LLM_REQUEST_TIMEOUT_S, LLM_MAX_RETRIES
     global AUTOPILOT_ENABLED, AUTOPILOT_CLAUDE_BIN, AUTOPILOT_EXTRA_ARGS
     global AUTOPILOT_DEFAULT_EFFORT, AUTOPILOT_LOGS_DIR, AUTOPILOT_MAX_CONCURRENT, AUTOPILOT_STREAM, AUTOPILOT_TERMINATE_ON_ADVANCE, AUTOPILOT_AUTOPLAN, AUTOPILOT_MAX_TASKS, AUTOPILOT_LOG_TERMINAL
     global TEMPERATURE, MAX_TOKENS, RETRY_BACKOFF, LANGUAGE
@@ -9227,6 +10100,13 @@ def _apply_config(cfg: Dict[str, Any]):
     LLM_MAX_RETRIES       = int(conn.get("max_retries", LLM_MAX_RETRIES))                 # #1131
     STATE_ROOT       = paths.get("state_root", STATE_ROOT)
     VAULT_ROOT       = paths.get("vault_root", VAULT_ROOT)
+    # S? (#1237): isolate the software tree (absent → off). CONTAINMENT — a code_subdir must be a RELATIVE path
+    # inside the project; reject an absolute path, a drive (``D:``) or any ``..`` traversal, else it would
+    # redirect every model/coder file op outside the tree (fall back to off = the project root).
+    _cs = (paths.get("code_subdir", "") or "").strip().replace("\\", "/").strip("/")
+    if _cs and (":" in _cs or ".." in _cs.split("/")):
+        _cs = ""
+    CODE_SUBDIR      = _cs
     SESSION_FILE     = paths["session_file"]
     CODE_ROOT        = paths.get("code_root", CODE_ROOT)
 
@@ -9239,6 +10119,8 @@ def _apply_config(cfg: Dict[str, Any]):
     ACK_ENABLED           = bool(cfg.get("ack", {}).get("enabled", ACK_ENABLED))
     FORGE_ENABLED         = bool(cfg.get("forge", {}).get("enabled", FORGE_ENABLED))   # #1073 default OFF
     FORGE_REPO            = str(cfg.get("forge", {}).get("repo", FORGE_REPO) or "")
+    FORGE_ADAPTER         = str(cfg.get("forge", {}).get("adapter", FORGE_ADAPTER) or "cli").strip().lower()  # #1213
+    FORGE_TOKEN_ENV       = str(cfg.get("forge", {}).get("token_env", FORGE_TOKEN_ENV) or "GX10_FORGE_TOKEN")  # #1213
     NOTIFY_WEBHOOK        = str(cfg.get("notify", {}).get("webhook", NOTIFY_WEBHOOK) or "")   # #1083
     AUDIT_ENABLED         = bool(cfg.get("audit", {}).get("enabled", AUDIT_ENABLED))   # #1084 default OFF
     AUDIT_SCOPE           = str(cfg.get("audit", {}).get("scope", AUDIT_SCOPE) or "mutating").lower()   # #1067
@@ -9370,6 +10252,50 @@ def _apply_config(cfg: Dict[str, Any]):
     _apply_verifier(cfg)           # epic #602 SUB-4/2.1: register/clear the opt-in pre_handover Verifier
     _apply_quality_consumer(cfg)   # epic #602 SUB-9/2.7: register/clear the post_handover quality consumer
     _apply_strategy(cfg)           # epic #602 SUB-3/2.4: capture strategy.enabled for the failure recorder
+    _apply_design_gate(cfg)        # S5 (#1227): capture design_gate.enabled (opt-in; DEV-1 enforces no blind coding)
+    _apply_advance_gate(cfg)       # S2 (#1224): capture advance_gate.enabled (opt-in; DEV-1 no blind advance)
+    _apply_automation(cfg)         # S7 (#1229): capture automation.decoupled (watcher/autopilot disentangle)
+    _apply_heartbeat(cfg)          # S7 (#1229): capture heartbeat.stall_seconds (task-scoped progress heartbeat)
+
+
+def _apply_design_gate(cfg: Dict[str, Any]) -> None:
+    """S5 (#1227): capture ``design_gate.enabled`` for the pre-code design→impl gate. Default OFF →
+    byte-identical (the shared engine + every non-DEV-1 flow are unaffected); DEV-1 turns it on. Fail-soft."""
+    global DESIGN_GATE_ENABLED
+    try:
+        DESIGN_GATE_ENABLED = bool(_cfg_get(cfg, "design_gate.enabled"))
+    except Exception:   # noqa: BLE001 — advisory wiring: default to off
+        DESIGN_GATE_ENABLED = False
+
+
+def _apply_advance_gate(cfg: Dict[str, Any]) -> None:
+    """S2 (#1224): capture ``advance_gate.enabled`` for the basic no-blind-advance gate. Default OFF →
+    byte-identical (the shared engine + every non-DEV-1 flow are unaffected); DEV-1 turns it on. Fail-soft."""
+    global ADVANCE_GATE_ENABLED
+    try:
+        ADVANCE_GATE_ENABLED = bool(_cfg_get(cfg, "advance_gate.enabled"))
+    except Exception:   # noqa: BLE001 — advisory wiring: default to off
+        ADVANCE_GATE_ENABLED = False
+
+
+def _apply_automation(cfg: Dict[str, Any]) -> None:
+    """S7 (#1229): capture ``automation.decoupled`` (watcher/autopilot disentangle). Default OFF → byte-
+    identical coupled loop; DEV-1 turns it on. Fail-soft."""
+    global AUTOMATION_DECOUPLED
+    try:
+        AUTOMATION_DECOUPLED = bool(_cfg_get(cfg, "automation.decoupled"))
+    except Exception:   # noqa: BLE001 — advisory wiring: default to off
+        AUTOMATION_DECOUPLED = False
+
+
+def _apply_heartbeat(cfg: Dict[str, Any]) -> None:
+    """S7 (#1229): capture ``heartbeat.stall_seconds`` (task-scoped detect-progress heartbeat). Default 0.0 =
+    off → byte-identical; DEV-1 sets it > 0. Fail-soft."""
+    global HEARTBEAT_STALL_S
+    try:
+        HEARTBEAT_STALL_S = float(_cfg_get(cfg, "heartbeat.stall_seconds") or 0.0)
+    except Exception:   # noqa: BLE001 — advisory wiring: default to off
+        HEARTBEAT_STALL_S = 0.0
 
 
 def _apply_lessons_provider(cfg: Dict[str, Any]) -> None:

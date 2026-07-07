@@ -60,7 +60,7 @@ TASK_ID_PATTERN = r"^[A-Z][A-Z0-9]*-\d+$"
 #: the live set). Vessels extend this freely.
 KNOWN_ASSIGNEES: tuple[str, ...] = (
     "claude-opus-4-8",
-    "claude-sonnet-4-6",
+    "claude-sonnet-5",
 )
 
 
@@ -141,6 +141,16 @@ class TaskSpec(BaseModel):
         default_factory=list,
         description="Task-IDs this task depends on (each a valid Task-ID).",
     )
+    # S1 (#1223): the GitHub-issue-shaped fields — a unit carries the label set + the epic/parent link so it
+    # maps 1:1 onto a (sub-)issue. Additive + optional (empty defaults → byte-identical when unused).
+    labels: list[str] = Field(
+        default_factory=list,
+        description="Free-form labels on the unit (the 1:1 GitHub-issue label set).",
+    )
+    parent: Optional[str] = Field(
+        default=None,
+        description="The parent/epic this unit belongs to (the 1:1 GitHub epic/sub-issue link); a unit-id or issue ref.",
+    )
     acceptance_criteria: Optional[list[str]] = Field(
         default=None,
         description="Concrete, checkable acceptance criteria (no empty entries).",
@@ -183,6 +193,18 @@ class TaskSpec(BaseModel):
             if not re.match(TASK_ID_PATTERN, d or ""):
                 raise ValueError(f"dependency {d!r} is not a valid Task-ID")
         return deps
+
+    @field_validator("parent")
+    @classmethod
+    def _valid_parent(cls, p: "Optional[str]") -> "Optional[str]":
+        # S1 (#1223): the parent/epic link must be a real unit-id (like `dependencies`) so it maps cleanly onto
+        # a (sub-)issue — an empty/None parent is "no epic"; anything else must be a valid Task-ID.
+        if p is None or not p.strip():
+            return None
+        p = p.strip()
+        if not re.match(TASK_ID_PATTERN, p):
+            raise ValueError(f"parent {p!r} is not a valid unit/Task-ID (e.g. KGC-3)")
+        return p
 
     @field_validator("acceptance_criteria")
     @classmethod

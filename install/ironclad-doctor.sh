@@ -5,7 +5,12 @@ set -euo pipefail
 say() { printf '[doctor] %s\n' "$*"; }
 PROJ="$(pwd)"
 CFG="$PROJ/.ironclad/config.json"
-[ -f "$CFG" ] || { say "no .ironclad in '$PROJ' — run install/ironclad-install.sh in this project first."; exit 2; }
+if [ ! -f "$CFG" ]; then
+  # S9 (#1232): no local bind yet — fall back to the recorded runtime (read-only; the doctor never writes).
+  RUNTIME="$HOME/.ironclad/runtime.json"
+  if [ -f "$RUNTIME" ]; then say "no .ironclad in '$PROJ' — reporting the installed runtime."; CFG="$RUNTIME"
+  else say "no .ironclad in '$PROJ' and no installed runtime — run install/ironclad-install.sh first."; exit 2; fi
+fi
 
 # unit-separator (\x1f) so empty fields + spaced paths survive (Tab is IFS-whitespace → read collapses them)
 IFS=$'\x1f' read -r ROOT VENV ENGINE_DIR CLIENT_CLI BASE_URL MEMORY_URL MODEL PORT LANGUAGE TYPE SERVER_URL < <(python3 - "$CFG" <<'PY'

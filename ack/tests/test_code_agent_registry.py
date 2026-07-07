@@ -47,7 +47,7 @@ def _cfg_with_extra_agent() -> dict:
         {"provider_id": "claude-opus", "kind": "cli", "agent_id": "OPUS",
          "model": "claude-opus-4-8", "bin": "claude", "cmd_template": "{bin} --print {prompt}"},
         {"provider_id": "claude-sonnet", "kind": "cli", "agent_id": "SONNET",
-         "model": "claude-sonnet-4-6", "bin": "claude", "cmd_template": "{bin} --print {prompt}"},
+         "model": "claude-sonnet-5", "bin": "claude", "cmd_template": "{bin} --print {prompt}"},
         {"provider_id": "toolx", "kind": "cli", "agent_id": "TOOLX", "model": "toolx-1",
          "bin": "toolx", "cmd_template": "{bin} run -o {feedback} {prompt}"},
     ]}}
@@ -59,7 +59,7 @@ def test_default_registry_has_opus_and_sonnet():
     assert reg.names() == ["OPUS", "SONNET"]            # declaration order, public defaults
     opus = reg.resolve("OPUS")
     assert opus.model == "claude-opus-4-8" and opus.bin == "claude"
-    assert reg.resolve("sonnet").model == "claude-sonnet-4-6"   # case-insensitive lookup
+    assert reg.resolve("sonnet").model == "claude-sonnet-5"   # case-insensitive lookup
 
 
 def test_config_pool_adds_a_third_agent():
@@ -258,6 +258,21 @@ def test_do_launch_templated_agent_renders_feedback_path(tmp_path, monkeypatch):
     assert "-o" in argv
     cap = argv[argv.index("-o") + 1]
     assert cap and cap.endswith(f"{tid}_TOOLX-feedback.md")
+
+
+def test_do_launch_agent_name_in_to_is_not_the_model(tmp_path, monkeypatch):
+    # #1236: an agent-name in the handover `to:` (e.g. `to: OPUS`, which the orchestrator writes as the
+    # RECIPIENT) must NOT become `--model OPUS` — it is not a model override; spec.model wins. Repro of the
+    # CODEX crash ("the 'CODEX' model is not supported"), kept agent-agnostic via the Claude `--print` shape.
+    argv, _ = _capture_launch_argv(monkeypatch, tmp_path, "OPUS", frontmatter="---\nto: OPUS\n---\nho")
+    assert argv[argv.index("--model") + 1] == "claude-opus-4-8"   # spec.model, NOT the agent name "OPUS"
+
+
+def test_do_launch_genuine_model_override_in_to_still_wins(tmp_path, monkeypatch):
+    # #1236 must NOT over-correct: a real model string in `to:` still overrides spec.model.
+    argv, _ = _capture_launch_argv(monkeypatch, tmp_path, "SONNET",
+                                   frontmatter="---\nto: claude-opus-4-8\n---\nho")
+    assert argv[argv.index("--model") + 1] == "claude-opus-4-8"   # the frontmatter model override is honoured
 
 
 # ── Server resolves the FULL spec into the /pending item; client renders it ─────────────────────

@@ -131,6 +131,13 @@ JSON
 printf '*\n' > "$PROJECT/.ironclad/.gitignore"
 say "bound project: $PROJECT/.ironclad/config.json"
 
+# S9 (#1232): also record the runtime globally (once) so `ironclad` in ANY new project dir can auto-bind to
+# this install instead of demanding a re-install. runtime.json is the install-level config; a project's own
+# .ironclad/config.json (if present) still wins.
+mkdir -p "$HOME/.ironclad"
+cp "$PROJECT/.ironclad/config.json" "$HOME/.ironclad/runtime.json"
+say "recorded runtime: $HOME/.ironclad/runtime.json (new project dirs auto-bind to it)"
+
 # --- wire the `ironclad` shell command ----------------------------------------------------------
 LAUNCHER="$SCRIPT_DIR/ironclad.sh"
 DOCTOR="$SCRIPT_DIR/ironclad-doctor.sh"

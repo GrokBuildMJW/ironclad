@@ -34,7 +34,7 @@ jobs:
           ref: ${{ github.event.release.tag_name }}
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: "3.14"
       - name: Release preflight (fail-closed before the irreversible PyPI upload)
         # The three views must agree before publishing: the release tag, pyproject.version, and a
         # non-empty CHANGELOG section for that version. A duplicate version is backstopped by the

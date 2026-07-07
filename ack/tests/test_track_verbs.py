@@ -90,7 +90,7 @@ def gx10_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
 def test_track_list_shows_active(gx10_env: pr.Registry) -> None:
     result = gx10._project_command("track list")
     assert "main" in result
-    assert "*" in result
+    assert "[active]" in result       # #1238: markdown-safe [active] tag (was a "* " marker)
 
 
 def test_track_new_creates_and_switches(gx10_env: pr.Registry) -> None:

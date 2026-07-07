@@ -5,7 +5,20 @@ function Say($m) { Write-Host "[ironclad] $m" }
 
 $proj = (Get-Location).Path
 $cfgPath = Join-Path $proj ".ironclad\config.json"
-if (-not (Test-Path $cfgPath)) { Say "no .ironclad in '$proj' — run install\ironclad-install.ps1 in this project first."; exit 2 }
+if (-not (Test-Path $cfgPath)) {
+  # S9 (#1232): a new project dir must NOT demand a re-install (the runtime is already installed). If a global
+  # runtime.json exists (written once by the installer), auto-bind THIS dir to it — mint a per-dir config.json —
+  # and carry on. Only a genuine first-run (no runtime installed at all) still points at the installer.
+  $runtime = Join-Path $HOME ".ironclad\runtime.json"
+  if (Test-Path $runtime) {
+    Say "no .ironclad in '$proj' — auto-binding to the installed runtime."
+    New-Item -ItemType Directory -Force (Split-Path $cfgPath) | Out-Null
+    Copy-Item $runtime $cfgPath -Force
+    Set-Content (Join-Path $proj ".ironclad\.gitignore") "*" -Encoding ascii
+  } else {
+    Say "no .ironclad in '$proj' and no installed runtime — run install\ironclad-install.ps1 first."; exit 2
+  }
+}
 $cfg = Get-Content $cfgPath -Raw | ConvertFrom-Json
 $type = if ($cfg.type) { "$($cfg.type)".Trim().ToLower() } else { "desktop" }
 
@@ -27,15 +40,26 @@ if (-not (Test-Path $venvPy)) { Say "venv python missing ($venvPy) — re-run in
 
 function Probe($url)   { try { (Invoke-WebRequest -Uri $url -TimeoutSec 3 -UseBasicParsing).StatusCode -eq 200 } catch { $false } }
 function Version($url) { try { (Invoke-RestMethod -Uri $url -TimeoutSec 3).orchestrator_version } catch { $null } }
+function Workdir($url) { try { (Invoke-RestMethod -Uri $url -TimeoutSec 3).workdir } catch { $null } }
+# #1252: resolve THIS folder EXACTLY as the engine does (pathlib.Path.resolve → what /health's `workdir`
+# reports after its own resolve+chdir), so a directory junction/symlink or a case difference never spuriously
+# restarts a healthy engine. Fall back to the raw path if the resolve call fails.
+$projReal = try { (& $venvPy -c "import sys,pathlib;print(pathlib.Path(sys.argv[1]).resolve())" "$proj" 2>$null | Out-String).Trim() } catch { "" }
+if (-not $projReal) { $projReal = $proj }
 
 $stamp = (Get-Content "$engineDir\VERSION" -Raw -ErrorAction SilentlyContinue); if ($stamp) { $stamp = $stamp.Trim() } else { $stamp = "unknown" }
 $started = $null; $reuse = $false
 if (Probe "$base/health") {
   $rv = Version "$base/health"
-  if ($rv -eq $stamp) { Say "engine already running on $base (version $stamp) — reusing."; $reuse = $true }
+  $wd = Workdir "$base/health"
+  # #1252: reuse ONLY when it is THIS project's engine. An engine on the shared port bound to a DIFFERENT
+  # workdir would silently serve the wrong project's vault/registry, so treat a workdir mismatch like a stale
+  # version and restart for this project.
+  if ($rv -eq $stamp -and $wd -and ("$wd".TrimEnd('\','/') -ieq $projReal.TrimEnd('\','/'))) { Say "engine already running on $base (version $stamp) — reusing."; $reuse = $true }
   else {
-    # #47: a stale engine keeps serving the old code; stop it (by listening port) and start fresh.
-    Say "engine on $base is version '$rv', installed is '$stamp' — restarting."
+    # #47 / #1252: a stale-version OR wrong-project engine must not be reused; stop it (by listening port) and start fresh.
+    if ($rv -ne $stamp) { Say "engine on $base is version '$rv', installed is '$stamp' — restarting." }
+    else { Say "engine on $base is bound to a different project ('$wd') — restarting for '$proj'." }
     try {
       Get-NetTCPConnection -State Listen -LocalPort $port -ErrorAction SilentlyContinue |
         Select-Object -ExpandProperty OwningProcess -Unique |

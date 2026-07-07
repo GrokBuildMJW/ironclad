@@ -66,6 +66,8 @@ export const COMMANDS: readonly Command[] = [
   {name: 'initiative', scope: 'server', usage: 'new <name> --type mpr|software | list | use <slug> | active | reconcile', desc: 'manage the initiative-centric vault (a deprecated alias for /project)'},
   {name: 'project', scope: 'server', usage: 'list [--all] | new <name> [--type mpr|software] [--path <dir>] | active | track new|use|list | delete <id> [--purge] | archive|unarchive <id>', desc: 'manage isolated projects (the guided setup command; /initiative is a deprecated alias)'},
   {name: 'switch', scope: 'server', usage: '<project_id>', desc: 'rebind the engine to a project (own paths + memory partition)'},
+  {name: 'approve', scope: 'server', usage: '[slug]', desc: "approve the active unit's design so implementation handovers are unblocked (S5, no blind coding)"},
+  {name: 'board', scope: 'server', usage: '[slug]', desc: 'render the task board (pending/in_progress/done) to BOARD.md and show it'},
   {name: 'generate', scope: 'server', usage: '[--kind case|prompt] --domain <d> --case <c> --description <text> [--prefix x] [--dry-run]', desc: 'scaffold a paved-road capability into the active project library'},
   // #952: complete the server-verb subset so it covers command_spec (guarded by check_ink_command_parity.py).
   // Missing these three permanently blinded the did-you-mean net to the epic's own worst-offender verbs.

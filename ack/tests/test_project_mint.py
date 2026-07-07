@@ -132,6 +132,16 @@ def test_mint_creates_registry_project_at_cwd_slug(mint_env):
     assert "now on alpha" in out          # activation went through the real switch
 
 
+def test_project_list_active_marker_is_markdown_safe(mint_env):
+    # #1238: the active project must carry the [active] tag the legend advertises. A leading "* " marker
+    # collided with the client's markdown renderer (became a generic "- " bullet, dropping the marker).
+    gx10._project_command("new alpha", FakeGx())          # alpha becomes active
+    out = gx10._project_command("list", FakeGx())
+    assert "([active] = current" in out                    # legend uses the [active] tag …
+    assert "- alpha [active]" in out                       # … and the active row carries it
+    assert "* alpha" not in out and "(* = active)" not in out   # the markdown-colliding "* " marker is gone
+
+
 def test_mint_seeds_software_unit(mint_env):
     # #984: /project new always seeds a software unit (no --type needed).
     wd = mint_env

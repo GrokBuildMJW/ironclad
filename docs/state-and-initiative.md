@@ -50,7 +50,7 @@ initiative (fail-closed). Pure conversational turns (no artifacts) need none.
 
 ```text
 /project new <name>                         create + activate (writes meta.md + the software skeleton)
-/initiative list                            all initiatives (* = active)
+/initiative list                            all initiatives ([active] = current)
 /initiative use <slug>                      switch the active initiative
 /initiative active                          show the active initiative
 /initiative reconcile [slug]                rebuild INDEX.md + [[links]] (see below)

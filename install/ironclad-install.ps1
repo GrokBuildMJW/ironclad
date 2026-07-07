@@ -79,11 +79,18 @@ if ($InkDir -and (Get-Command node -ErrorAction SilentlyContinue)) {
 
 # --- project config ---
 $dot = "$Project\.ironclad"; New-Item -ItemType Directory -Force $dot | Out-Null
-$cfg = [ordered]@{ type="desktop"; root=$Root; venv=$Venv; engineDir=$EngineDir; clientCli=$ClientCli;
+$cfg = [ordered]@{ type="desktop"; root=$Root; srcDir=$Root; venv=$Venv; engineDir=$EngineDir; clientCli=$ClientCli;
                    baseUrl=$BaseUrl; memoryUrl=$MemoryUrl; warmUrl=$WarmUrl; model=$Model; port=$Port; language=$Language }
 $cfg | ConvertTo-Json | Set-Content "$dot\config.json" -Encoding utf8
 Set-Content "$dot\.gitignore" "*" -Encoding ascii
 Say "bound project: $dot\config.json"
+
+# S9 (#1232): also record the runtime globally (once) so `ironclad` in ANY new project dir can auto-bind to
+# this install instead of demanding a re-install. runtime.json is the install-level config; a project's own
+# .ironclad\config.json (if present) still wins.
+$runtimeDir = Join-Path $HOME ".ironclad"; New-Item -ItemType Directory -Force $runtimeDir | Out-Null
+$cfg | ConvertTo-Json | Set-Content "$runtimeDir\runtime.json" -Encoding utf8
+Say "recorded runtime: $runtimeDir\runtime.json (new project dirs auto-bind to it)"
 
 # --- wire the `ironclad` command into the PowerShell profile ---
 $prof = $PROFILE; $pdir = Split-Path $prof

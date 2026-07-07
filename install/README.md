@@ -32,12 +32,20 @@ ironclad           # ensure the local engine is up, then open the client (curren
 ironclad-doctor    # read-only status: engine version + endpoint reachability
 ```
 
+Run `ironclad` from **any** project folder. The first run in a new folder **auto-binds** to the installed
+runtime — it mints a local `.ironclad/config.json` from the global `~/.ironclad/runtime.json` the installer
+records once. Install once; you do **not** re-run the installer per project (a project's own `.ironclad/config.json`
+still wins, so a per-project override remains possible). One engine runs **per port** (default 8100): switching
+to another folder **restarts** the engine for that project (the launcher reuses a running engine only when it
+is bound to the current project's workdir), so sequential use just works; to run two projects **at once**, set
+a distinct `port` in each project's `config.json`.
+
 ## What each script does
 
 | Script | Role |
 |---|---|
-| `ironclad-install.{sh,ps1}` | One-shot: prereq check → venv + `pip install -e .[engine,memory]` (the `memory` extra adds the warm-cache client so the warm tier works once `GX10_WARM_URL` is set) → build the ink client (if Node present) → write `<project>/.ironclad/config.json` → wire the `ironclad` command into your shell profile. |
-| `ironclad.{sh,ps1}` | Launcher (`ironclad`): ensure the engine is healthy (version-aware restart), then run the client against `http://127.0.0.1:<port>`. |
+| `ironclad-install.{sh,ps1}` | One-shot: prereq check → venv + `pip install -e .[engine,memory]` (the `memory` extra adds the warm-cache client so the warm tier works once `GX10_WARM_URL` is set) → build the ink client (if Node present) → write `<project>/.ironclad/config.json` **and record the runtime once at `~/.ironclad/runtime.json`** → wire the `ironclad` command into your shell profile. |
+| `ironclad.{sh,ps1}` | Launcher (`ironclad`): in a new folder, **auto-bind** to the recorded runtime (no re-install); ensure the engine is healthy (version- **and** project-aware restart — a running engine is reused only when its `/health` workdir is the current project), then run the client against `http://127.0.0.1:<port>`. |
 | `ironclad-doctor.{sh,ps1}` | Read-only status of the install and its endpoints. |
 
 ## Configuration

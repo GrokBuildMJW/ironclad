@@ -11,7 +11,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        python-version: ["3.10", "3.12"]
+        python-version: ["3.14"]   # S8 (#1231): ONE per-PR leg. `requires-python` stays >=3.10 (broad install-compat); the 3.10-3.13 floor is not per-PR-tested.
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -48,7 +48,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: "3.14"
       - name: pip-audit (Python deps)
         continue-on-error: true
         run: |
