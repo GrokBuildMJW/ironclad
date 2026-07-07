@@ -26,6 +26,8 @@ import {WorkingLine} from './WorkingLine.js';
 import {InputBox} from './InputBox.js';
 import {CommandMenu} from './CommandMenu.js';
 import {menuKey, completionText} from './menuModel.js';
+import {splitToolBlocks} from './toolBlocks.js';
+import {ToolCall} from './ToolCall.js';
 import {runPassthroughTool} from '../tools/bridge.js';
 import {runTool} from '../tools/runTool.js';
 import {runUpdate} from '../tools/update.js';
@@ -37,6 +39,30 @@ import {ACCENT, DIM, ERROR, TEXT, VERBS} from './theme.js';
 interface Item {
   id: number;
   node: ReactNode;
+}
+
+/** Render a committed turn body — markdown segments + foldable tool calls. Shared by the live commit AND the
+ *  session restore (#1187), so restored history looks identical to fresh output (colours + folds), not the
+ *  old dim plain text. */
+function renderTurnBody(body: string, wrap: number): React.ReactElement {
+  const nodes: ReactNode[] = [];
+  for (const s of splitToolBlocks(body)) {
+    if (s.type === 'tool') {
+      nodes.push(<ToolCall label={s.label} result={s.result} />);
+    } else {
+      const md = renderMarkdown(s.text, wrap);
+      if (md) nodes.push(<Text>{md}</Text>);
+    }
+  }
+  return (
+    <Box flexDirection="column" paddingLeft={2} marginTop={1}>
+      {nodes.map((n, i) => (
+        <Box key={i} marginTop={i === 0 ? 0 : 1}>
+          {n}
+        </Box>
+      ))}
+    </Box>
+  );
 }
 
 export function App({
@@ -118,7 +144,8 @@ export function App({
       transcriptRef.current = [...prev.transcript];
       const {turns, lines} = transcriptStats(prev.transcript);
       commit(<Text color={DIM}>{`  ↻ restored ${turns} turn(s) (${lines} lines)`}</Text>);
-      prev.transcript.forEach((line) => commit(<Text color={DIM}>{line}</Text>));
+      // #1187: render restored turns through the SAME path as fresh output (colours + folds), not dim plain.
+      prev.transcript.forEach((tbody) => commit(renderTurnBody(tbody, Math.max(20, width - 4))));
       return true;
     }
     return false;
@@ -241,12 +268,8 @@ export function App({
     setLiveAnswer(''); // drop the live preview; the exact whole-document render is committed below
     const body = answerBody(router);
     if (body) {
-      const md = renderMarkdown(body, Math.max(20, width - 4));
-      commit(
-        <Box paddingLeft={2} marginTop={1}>
-          <Text>{md}</Text>
-        </Box>,
-      );
+      // #1167/#1187: markdown + foldable tool calls via the shared helper (also used on restore).
+      commit(renderTurnBody(body, Math.max(20, width - 4)));
       if (conversational) transcriptRef.current.push(body); // §3b(a)/MEM-11: only real turns
     }
     if (conversational) persist(); // §3b(a): snapshot transcript + session handle (fail-soft, no token)
@@ -526,24 +549,32 @@ export function App({
 
   return (
     <Box flexDirection="column" flexGrow={1}>
+      {/* #1148: the SCROLLABLE region — transcript + the live streaming tail. mount scrolls this. */}
       <Box flexDirection="column" flexGrow={1}>
         <Static items={items}>{(item) => <Box key={item.id}>{item.node}</Box>}</Static>
+        {liveAnswer ? (
+          <Box paddingLeft={2} marginTop={1}>
+            <Text>{liveAnswer}</Text>
+          </Box>
+        ) : null}
       </Box>
-      {liveAnswer ? (
-        <Box paddingLeft={2} marginTop={1}>
-          <Text>{liveAnswer}</Text>
+      {/* #1148: the FIXED chrome — the working/thinking line + input + menu + footer + brand. mount stamps
+          this at the viewport bottom (paintFixed) so it stays pinned while the transcript above scrolls
+          behind it. MUST be the LAST element child of this root Box (mount identifies it by that). The live
+          STREAMING answer scrolls with the transcript (above); the WORKING line stays pinned near the input,
+          like Claude Code. */}
+      <Box flexDirection="column">
+        {thinking ? <WorkingLine verb={verbRef.current} frame={frame} seconds={secs} tokens={tokens} /> : null}
+        <InputBox buffer={buffer} caret={!thinking} />
+        {menuOpen ? <CommandMenu items={menuItems} sel={menuSel} /> : null}
+        <Footer st={status} />
+        <Box flexDirection="row">
+          <Spacer />
+          {/* subtle bottom-right brand mark — single accent blue (no rainbow) */}
+          <Text bold color={ACCENT}>
+            Developed in the UAE
+          </Text>
         </Box>
-      ) : null}
-      {thinking ? <WorkingLine verb={verbRef.current} frame={frame} seconds={secs} tokens={tokens} /> : null}
-      <InputBox buffer={buffer} caret={!thinking} />
-      {menuOpen ? <CommandMenu items={menuItems} sel={menuSel} /> : null}
-      <Footer st={status} />
-      <Box flexDirection="row">
-        <Spacer />
-        {/* subtle bottom-right brand mark — single accent blue (no rainbow) */}
-        <Text bold color={ACCENT}>
-          Developed in the UAE
-        </Text>
       </Box>
     </Box>
   );

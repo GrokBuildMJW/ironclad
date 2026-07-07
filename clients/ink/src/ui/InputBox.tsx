@@ -24,6 +24,7 @@ export function InputBox({
   return (
     <Box
       flexDirection="column"
+      marginTop={1}
       borderStyle="single"
       borderColor={SUBTLE}
       borderLeft={false}

@@ -116,3 +116,14 @@ test('clear removes the selection', () => {
   assert.equal(sel.hasSelection, false);
   assert.equal(sel.range, null);
 });
+
+test('#1173 overlay maps a CONTENT-row range onto the screen via viewOffset', () => {
+  const s = grid(['aaaa', 'bbbb']); // 2 screen rows
+  const pal = new Palette();
+  const sel = new Selection();
+  sel.begin(0, 5); // content row 5 (off-screen without scrolling)
+  sel.extend(3, 5);
+  sel.overlay(s, pal, undefined, 5); // viewOffset 5 → content row 5 == screen row 0
+  assert.equal(pal.get(s.getStyle(0, 0)).inverse, true, 'content row 5 highlighted at screen row 0');
+  assert.equal(pal.get(s.getStyle(0, 1)).inverse, undefined, 'screen row 1 (content 6) untouched');
+});

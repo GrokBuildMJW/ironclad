@@ -99,3 +99,70 @@ test('MEM-20: StreamMarkdown renders both code lines across a blank line in the 
   // the fenced block is one cached/non-tail block (intro complete, code block is the tail)
   assert.equal(sm.cachedBlocks, 1, 'intro cached; the whole fence is the single open tail');
 });
+
+// #1145 (epic #1144): muted, Claude-Code-like palette — restrained emphasis, not the colourful default.
+test('#1145 headings are bold, not green, and drop the ## prefix', () => {
+  const out = renderMarkdown('## Heading', 80);
+  assert.ok(!out.includes('\x1b[32m'), 'no green heading colour');
+  assert.ok(out.includes('\x1b[1m'), 'heading is bold');
+  assert.ok(!strip(out).includes('#'), 'the literal ## prefix is dropped');
+  assert.match(strip(out), /Heading/);
+});
+
+test('#1156 inline code is indigo, not yellow', () => {
+  const out = renderMarkdown('some `code` here', 80);
+  assert.ok(!out.includes('\x1b[33m'), 'no yellow code colour');
+  assert.ok(out.includes('\x1b[38;2;129;140;248m'), 'inline code is indigo');
+  assert.match(strip(out), /code/);
+});
+
+test('#1156 links are indigo, not bright blue', () => {
+  const out = renderMarkdown('see [docs](https://example.com)', 80);
+  assert.ok(!out.includes('\x1b[34m'), 'no bright blue link colour');
+  assert.ok(out.includes('\x1b[38;2;129;140;248m'), 'link is indigo');
+  assert.match(strip(out), /docs/);
+});
+
+test('#1145 table headers are not red', () => {
+  const out = renderMarkdown('| A | B |\n|---|---|\n| 1 | 2 |', 80);
+  assert.ok(!out.includes('\x1b[31m'), 'no red table header colour');
+  assert.match(strip(out), /A/);
+});
+
+// #1146 (epic #1144): markdown structure parity with Claude Code — dash lists + own-line blockquote bar.
+test('#1146 lists use dash bullets at tight indent (top level at column 0)', () => {
+  const out = strip(renderMarkdown('- one\n- two\n  - nested', 80));
+  const items = out.split('\n').filter((l) => /one|two|nested/.test(l));
+  assert.match(items[0] ?? '', /^- one/, 'top-level dash at column 0');
+  assert.match(items[2] ?? '', /^ {2}- nested/, 'nested dash at a 2-space indent');
+  assert.ok(!out.includes('* '), 'no asterisk bullets');
+});
+
+test('#1146 a blockquote after a list is its own line with a left bar', () => {
+  const out = strip(renderMarkdown('1. Deploy\n> Hinweis', 80));
+  const lines = out.split('\n').map((l) => l.trim()).filter(Boolean);
+  const dep = lines.find((l) => l.includes('Deploy')) ?? '';
+  assert.ok(!dep.includes('Hinweis'), 'blockquote is NOT glued to the list line');
+  assert.ok(
+    lines.some((l) => l.startsWith('▎') && l.includes('Hinweis')),
+    'blockquote rendered as a ▎ left bar on its own line',
+  );
+});
+
+// #1152 (epic #1144): tolerate a smaller model's pipe-table that omits the `|---|` separator row.
+test('#1152 a pipe-table missing its separator still renders as a box', () => {
+  const out = strip(renderMarkdown('| A | B |\n| 1 | 2 |\n| 3 | 4 |', 80));
+  assert.ok(out.includes('┌') && out.includes('│'), 'rendered as a box table');
+  assert.match(out, /A/);
+  assert.match(out, /2/);
+});
+
+test('#1152 a well-formed table is untouched (single box, no double separator)', () => {
+  const out = strip(renderMarkdown('| A | B |\n|---|---|\n| 1 | 2 |', 80));
+  assert.equal((out.match(/┌/g) ?? []).length, 1, 'exactly one table top border');
+});
+
+test('#1152 non-table pipe text is not turned into a table', () => {
+  const out = strip(renderMarkdown('use the `a | b` idiom in the shell', 80));
+  assert.ok(!out.includes('┌'), 'inline pipe text is not a table');
+});

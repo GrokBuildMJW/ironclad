@@ -410,3 +410,28 @@ export function paint(
   paintNode(root, 0, -Math.round(yOffset), surface, palette, noSelect, false, undefined, softWrap, cursor);
   return noSelect;
 }
+
+/**
+ * #1148: paint a single laid-out subtree so its top-left lands at absolute (absLeft, absTop), WITHOUT
+ * clearing the surface — used to STAMP an app-pinned region (the input + footer) over the already-painted
+ * scrolled transcript, so it stays fixed at the viewport bottom while history scrolls behind it. The caller
+ * clears the target rows first (`surface.clearRows`) and marks them no-select in the returned mask.
+ */
+export function paintFixed(
+  node: VNode,
+  surface: Surface,
+  palette: Palette,
+  absLeft: number,
+  absTop: number,
+  noSelect: Uint8Array,
+  softWrap?: Uint8Array,
+  cursor?: CursorOut,
+): void {
+  const yn = node.yoga as {getComputedLeft(): number; getComputedTop(): number} | null;
+  if (!yn) return;
+  // paintNode(node, ax, ay) draws at (ax + node.left, ay + node.top); solve for the fake parent origin that
+  // lands the node's own top-left at (absLeft, absTop).
+  const parentAx = absLeft - Math.round(yn.getComputedLeft());
+  const parentAy = absTop - Math.round(yn.getComputedTop());
+  paintNode(node, parentAx, parentAy, surface, palette, noSelect, false, undefined, softWrap, cursor);
+}

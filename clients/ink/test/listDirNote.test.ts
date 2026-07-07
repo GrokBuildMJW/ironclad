@@ -17,7 +17,7 @@ test('limit branch: suffix "(limit=N)" and the GX10v3 note appears (limit-then-c
   const d = await tmpWith(5);
   const out = await runTool('list_directory', {path: d, limit: 2});
   const lines = out.split('\n');
-  assert.equal(lines.length, 3, '2 entries + 1 note line');
+  assert.equal(lines.length, 4, '#1183 count header + 2 entries + 1 note line');
   assert.match(out, /\.\.\. \[GX10v3: showing 2 of 5 entries \(limit=2\)\]$/);
   await fs.rm(d, {recursive: true, force: true});
 });
@@ -26,7 +26,7 @@ test('hard-cap branch: >200 entries → "(hard cap 200 — use sort=\'time\'+lim
   const d = await tmpWith(205);
   const out = await runTool('list_directory', {path: d});
   const lines = out.split('\n');
-  assert.equal(lines.length, 201, '200 entries + 1 note line');
+  assert.equal(lines.length, 202, '#1183 count header + 200 entries + 1 note line');
   assert.match(out, /\.\.\. \[GX10v3: showing 200 of 205 entries \(hard cap 200 — use sort='time'\+limit\)\]$/);
   await fs.rm(d, {recursive: true, force: true});
 });
@@ -35,7 +35,8 @@ test('no trim → no note (shown == total)', async () => {
   const d = await tmpWith(3);
   const out = await runTool('list_directory', {path: d});
   assert.doesNotMatch(out, /GX10v3/);
-  assert.equal(out.split('\n').length, 3);
+  assert.match(out, /^0 directories, 3 files\n/, '#1183 deterministic count header of the full set');
+  assert.equal(out.split('\n').length, 4);
   await fs.rm(d, {recursive: true, force: true});
 });
 

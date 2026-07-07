@@ -121,7 +121,7 @@ APIs/layout/config may change. Tagged releases ship on **PyPI** (`ironclad-ai`) 
 development snapshot. The internal DEV → Prod → Public **promote pipeline** that hardens our
 releases is in development (today a manual gated path).
 
-Verified by **2660 Python tests** (2651 offline + 9 live) plus **373 TypeScript client
+Verified by **2704 Python tests** (2695 offline + 9 live) plus **419 TypeScript client
 tests**, and a **full end-to-end run with a real code-agent**. Read these before relying on
 anything:
 

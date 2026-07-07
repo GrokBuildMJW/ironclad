@@ -30,6 +30,7 @@ import sys
 import json
 import inspect
 import time
+import shlex
 import shutil
 import subprocess
 import threading
@@ -445,6 +446,17 @@ def _receive_alert(payload: "Any") -> "Dict[str, Any]":
 LIST_DIR_HARD_CAP = 200          # HV-B: hard cap in list_directory
 TEMPERATURE      = 0.3
 RETRY_BACKOFF    = 1.5           # OPT-4: wait time (s) before 1× retry on an API error
+# Guard 1 (#1131/epic #1130): per-request LLM bound. Without it a hung completion (a stalled stream, a wedged
+# nested MPR/worker call) holds the turn — and the server agent lock — for the OpenAI SDK default (~600s) ×
+# retries = a silent multi-minute stall. Applied at EVERY OpenAI() construction (the agent client + the ACE
+# reflector; workers/MPR reuse the agent client). Tunable via connection.request_timeout_s / GX10_LLM_TIMEOUT_S.
+LLM_REQUEST_TIMEOUT_S = 120.0    # seconds per LLM request (connect+read); a slow LAN 35B first-token stays well under
+LLM_MAX_RETRIES       = 1        # SDK client retries; kept low so it can't compound _make_completion's own retry
+# Guard 1 / S2 (#1132/epic #1130): per-turn IDLE watchdog. If a turn makes NO progress (no generation chunk, no
+# completed generation, no tool result) for this long it is aborted AND SURFACED ("⏱ TURN ABORTED — model
+# stalled"), never a silent indefinite hold of the agent lock. A backstop ABOVE the per-request LLM timeout,
+# reset on every progress signal so a slow-but-progressing deep turn (e.g. an MPR panel) is never killed. 0 ⇒ off.
+TURN_IDLE_TIMEOUT_S   = 240.0    # seconds of NO progress before a turn is declared stalled (GX10_TURN_IDLE_TIMEOUT_S)
 # Engine machinery lives hidden under STATE_ROOT (initiative-independent): session.json, the
 # local warm cache (memory/), config.json/active (ITYPE). Relative to WORKDIR (after chdir = CWD),
 # overridable via cfg["paths"]["state_root"] (default ".ironclad") — absolute too. Boundary
@@ -479,10 +491,12 @@ TASK_PREFIX = "KGC"
 # buildable types). Both config-driven (ack.enabled / lodestar.enabled).
 ACK_ENABLED      = True
 LODESTAR_ENABLED = False
-# #1073: forge (code-host) issue-filing. OFF by default — an autonomous agent writing to GitHub is a
-# deliberate operator opt-in (forge.enabled / GX10_FORGE_ENABLED). FORGE_REPO is optional (empty ⇒ the gh
-# CLI's default repo for the cwd); never a repo literal baked into core. Uses the ambient gh auth (secret-free).
-FORGE_ENABLED    = False
+# #1073: forge (code-host) issue-filing. CAPABILITY-DETECTED (default ON) — offered whenever the `gh` CLI is
+# present + authenticated, mirroring web_search/memory/etc. (installing + authing gh IS the operator's
+# deliberate opt-in; a redundant manual flag is not). The operator can still force it OFF (forge.enabled=false),
+# and it is blocked under the sealed profile (no autonomous outbound writes) — see _forge_available().
+# FORGE_REPO is optional (empty ⇒ the gh CLI's default repo for the cwd); never a repo literal baked into core.
+FORGE_ENABLED    = True
 FORGE_REPO       = ""
 # #1083: outbound escalation notification. A HUMAN_ESCALATION fires the `escalation` hook; when a webhook is
 # configured (deploy secret via GX10_NOTIFY_WEBHOOK / notify.webhook — NEVER a URL literal in core) the
@@ -1918,11 +1932,11 @@ class _ThinkFilter:
 
 # ─── Table-aware line output (code-rendered tables) ──
 class _TableLineRenderer:
-    """Takes text line by line. Markdown/pipe tables are buffered
-    and emitted with exactly aligned columns; everything else passes
-    through unchanged (line by line). The `|---|` separator row and `**`/`` ` ``
-    are removed. Costs NO extra tokens — the alignment
-    happens locally during rendering."""
+    """Takes text line by line, buffering pipe-table rows so a separator-less table (the model is told to omit
+    the `|---|` row) is re-emitted as a PROPER GFM table (pipes + the separator inserted) for the
+    markdown-rendering client to render as a box; every other line passes through UNCHANGED so bold/code/etc.
+    reach the client. #1154 (epic #1144): was collapsing tables to pipe-less aligned columns + stripping `**`,
+    a pre-markdown-client leftover the Ink client (marked-terminal) then showed as flat text."""
 
     def __init__(self, emit_line):
         self.emit_line = emit_line     # callable(str): emits ONE finished line
@@ -1940,11 +1954,6 @@ class _TableLineRenderer:
         core = s.replace("|", "").replace(":", "").replace("-", "").replace(" ", "")
         return s.startswith("|") and "-" in s and core == ""
 
-    @staticmethod
-    def _cells(line: str):
-        s = line.strip().strip("|")
-        return [c.strip().replace("**", "").replace("`", "") for c in s.split("|")]
-
     def feed(self, text: str):
         self.buf += text
         while "\n" in self.buf:
@@ -1957,21 +1966,19 @@ class _TableLineRenderer:
                 self.table.append(line)
             return
         self._flush_table()
-        self.emit_line(line.replace("**", ""))   # remove literal markdown bold markers
+        self.emit_line(line)   # #1154: pass markdown through unchanged — the client renders bold/code/tables
 
     def _flush_table(self):
         if not self.table:
             return
-        rows = [self._cells(r) for r in self.table]
-        ncol = max(len(r) for r in rows)
-        widths = [0] * ncol
-        for r in rows:
-            for i, c in enumerate(r):
-                if len(c) > widths[i]:
-                    widths[i] = len(c)
-        for r in rows:
-            cells = [(r[i] if i < len(r) else "").ljust(widths[i]) for i in range(ncol)]
-            self.emit_line("  " + "  ".join(cells).rstrip())
+        # #1154: re-emit the buffered rows as a PROPER GFM table (pipes kept + a `|---|` separator inserted,
+        # since the model is told to omit it) so the markdown-rendering client renders a box.
+        header = self.table[0]
+        ncol = header.strip().strip("|").count("|") + 1
+        self.emit_line(header)
+        self.emit_line("|" + " --- |" * ncol)
+        for r in self.table[1:]:
+            self.emit_line(r)
         self.table = []
 
     def flush(self):
@@ -1979,6 +1986,48 @@ class _TableLineRenderer:
             self._line(self.buf)
             self.buf = ""
         self._flush_table()
+
+
+# ─── Tool-call display (#1146/#1147: Claude-Code-style header + full result under a ⎿ corner) ──
+# name → (human label, the arg key whose value is the subject). The internal tool name
+# (`execute_command`, …) never reaches the user; the command/target does.
+_TOOL_LABELS = {
+    "execute_command":  ("Bash",   "command"),
+    "read_file":        ("Read",   "path"),
+    "write_file":       ("Write",  "path"),
+    "write_last_reply": ("Write",  "path"),
+    "search_files":     ("Search", "query"),
+    "list_directory":   ("List",   "path"),
+    "create_issue":     ("Issue",  "title"),
+    "web_search":       ("Search", "query"),
+}
+
+
+def _tool_display(name: str, args: dict) -> str:
+    """A human, Claude-Code-style header for a tool call — the command / target, NOT the internal tool name
+    (`execute_command(command='…')`). Falls back to ``name(<first meaningful arg>)`` then bare ``name``."""
+    label, key = _TOOL_LABELS.get(name, (name, None))
+    if key is None:
+        for k in ("path", "query", "title", "task_id", "name", "url"):
+            if k in (args or {}):
+                key = k
+                break
+    val = ""
+    if key and args:
+        val = str(args.get(key, "")).replace("\n", " ").strip()
+        if len(val) > 120:
+            val = val[:120] + "…"
+    return f"{label}({val})" if key else label
+
+
+def _tool_result_lines(result_t: str, max_lines: int = 60) -> list:
+    """The FULL tool result indented under a ``⎿`` corner (no 70-char cut). Output longer than *max_lines* is
+    capped with an EXPLICIT ``… (+N more lines)`` — never a silent mid-line truncation."""
+    lines = (result_t or "").splitlines() or [""]
+    out = [("  ⎿ " if i == 0 else "     ") + ln for i, ln in enumerate(lines[:max_lines])]
+    if len(lines) > max_lines:
+        out.append(f"     … (+{len(lines) - max_lines} more lines)")
+    return out
 
 
 # ─── Global UI state ────────────────────────────────────────
@@ -2032,6 +2081,29 @@ def _ui_print(*args, sep: str = " ", end: str = "\n", flush: bool = False):
         print(*args, sep=sep, end=end, flush=flush)
 
 _ANSI_LEN_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+#: #1196: ANSI escapes to strip from a tool result before it enters the model context / the ingestion cap
+#: — the model must read clean text (escape bytes are noise and skew the char count), while the DISPLAY
+#: stream keeps the colour. Covers CSI (SGR colour `…m`, cursor/erase), OSC (`…]…BEL/ST`, e.g. title-set),
+#: and a bare two-byte Fe escape, so a crafted `ls`/shell output can't smuggle a non-CSI escape past the
+#: strip into the model view.
+_ANSI_ESCAPE_RE = re.compile(
+    r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)"   # OSC …  BEL | ST
+    r"|\x1b\[[0-9;?]*[ -/]*[@-~]"          # CSI …
+    r"|\x1b[@-Z\\-_]"                      # a bare 2-byte Fe escape
+)
+
+
+def _strip_ansi(s: str) -> str:
+    """Remove ANSI escapes (CSI colour/control + OSC + bare Fe) from *s* — for the model-facing copy of a
+    tool result. The DISPLAY keeps the raw bytes (the renderer sandboxes them)."""
+    return _ANSI_ESCAPE_RE.sub("", s) if s else s
+
+
+def _has_ansi(s: str) -> bool:
+    """True iff *s* carries an ANSI escape (e.g. `ls --color` output) — the display streams it as-is."""
+    return "\x1b[" in s
+
 
 def _visual_rows(line: str, width: int) -> int:
     """How many screen rows a (possibly wrapping) line occupies —
@@ -2242,26 +2314,10 @@ TOOLS = [
             }
         }
     },
-    {
-        "type": "function",
-        "function": {
-            "name": "list_directory",
-            "description": (
-                "List files and subdirectories. For large folders like "
-                "tasks/done ALWAYS pass sort='time' and a small limit to "
-                "get only the newest entries — never dump the whole folder."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "path":  {"type": "string", "default": "."},
-                    "sort":  {"type": "string", "enum": ["name", "time"], "default": "name"},
-                    "limit": {"type": "integer", "description": "max number of entries (newest first when sort='time')"}
-                },
-                "required": []
-            }
-        }
-    },
+    # #1200: list_directory is deliberately NOT offered to the model — a listing must always run
+    # through the shell (execute_command: bash `ls` / PowerShell), so the transcript look never
+    # flips between `$ ls -la` output and a `[D]/[F]` list per sampled tool choice. The handler,
+    # the bridge case and LOCAL_TOOL_NAMES keep the tool alive for `/ls` (manual_ls) + API callers.
     {
         "type": "function",
         "function": {
@@ -2574,16 +2630,19 @@ CREATE_ISSUE_TOOL = {
         "description": (
             "Create a tracker issue in the project's code forge (GitHub, via the `gh` CLI). The body comes "
             "from a FILE (escape-free): FIRST write the issue body with write_last_reply / write_file, THEN "
-            "pass its path as body_file (do NOT inline a large body). Optional labels (comma-separated) + "
-            "milestone. Returns the created issue URL."
+            "pass its path as body_file (do NOT inline a large body). Optional comma-separated `labels` — these "
+            "must ALREADY EXIST in the repo (an unknown label is rejected with the valid set; do not invent "
+            "labels). Optional `milestone` (existing title) and `parent` (an epic issue number — links this "
+            "issue as a native sub-issue of that epic). Returns the created issue URL."
         ),
         "parameters": {
             "type": "object",
             "properties": {
                 "title":     {"type": "string"},
                 "body_file": {"type": "string", "description": "path to a file holding the issue body (escape-free)"},
-                "labels":    {"type": "string", "description": "optional comma-separated labels"},
+                "labels":    {"type": "string", "description": "optional comma-separated labels — must be labels that already exist in the repo"},
                 "milestone": {"type": "string", "description": "optional milestone title"},
+                "parent":    {"type": "string", "description": "optional parent epic issue number — links this issue as a native sub-issue"},
             },
             "required": ["title", "body_file"],
         },
@@ -2848,6 +2907,34 @@ def _all_tool_names(include_plugins: bool = True) -> frozenset:
     return frozenset(names)
 
 
+def _forge_available() -> bool:
+    """Central capability check for create_issue (#1073) — offered when its capability is PRESENT (the `gh`
+    CLI on PATH) and the trust profile permits an outbound write, mirroring _web_search_available() so the
+    whole tool surface is uniformly CAPABILITY-DETECTED rather than behind a manual opt-in flag. Default ON;
+    the operator can force it off with forge.enabled=false; blocked under the sealed profile (no autonomous
+    outbound writes, like web_search / fetch_url). Never raises."""
+    try:
+        return FORGE_ENABLED and shutil.which("gh") is not None and not _is_sealed_profile()
+    except Exception:  # noqa: BLE001 — a flaky capability probe must never break the turn
+        return False
+
+
+def _forge_labels() -> Optional[set]:
+    """create_issue label vocabulary (#1130 follow-up): the repo's ACTUAL labels, for validate→reask on the
+    `labels` arg — the model must use existing labels, not invent them. Returns None on any error (fail-soft:
+    validation is then skipped, never blocking a create over a label-lookup hiccup). Same repo context as create."""
+    cmd = ["gh", "label", "list", "--limit", "300", "--json", "name", "-q", ".[].name"]
+    if FORGE_REPO:
+        cmd += ["--repo", FORGE_REPO]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30)
+    except Exception:  # noqa: BLE001
+        return None
+    if r.returncode != 0:
+        return None
+    return {ln.strip() for ln in (r.stdout or "").splitlines() if ln.strip()}
+
+
 def _effective_tools() -> List[Dict[str, Any]]:
     """Tool list depending on the mode — onboarding tools only when active."""
     # Offer the tool only when memory is CONFIGURED (not just the module present) —
@@ -2857,7 +2944,7 @@ def _effective_tools() -> List[Dict[str, Any]]:
     # #459 / epic #505: offer web_search only when a usable search adapter is configured (else every
     # call would return "unavailable"). Adapter-aware (cli / brave / mock) — not dispatcher-only.
     web = [WEBSEARCH_TOOL] if _web_search_available() else []
-    iss = [CREATE_ISSUE_TOOL] if FORGE_ENABLED else []   # #1073: gated (default off) forge issue-filing
+    iss = [CREATE_ISSUE_TOOL] if _forge_available() else []   # #1073: capability-detected (gh present, not sealed)
     fet = [FETCH_URL_TOOL] if _web_search_trust_ok() else []   # #1074: outbound fetch, blocked under sealed
     plug = [t["schema"] for t in _PLUGIN_TOOLS.values()]
     skl = [USE_SKILL_TOOL] if _PLAYBOOKS else []
@@ -3563,6 +3650,217 @@ def _resolve_platform(mode: Optional[str]) -> str:
     return "windows" if os.name == "nt" else "linux"
 
 
+# #1183: per-command shell on Windows — a PowerShell cmdlet runs in PowerShell, a POSIX/bash command in Git
+# Bash when it's installed; so BOTH shells work, neither is forced. Mirrors clients/ink/src/tools/shell.ts.
+_PS_CMDLET_RE = re.compile(
+    r"(?:^|[\s|;&(])(?:Get|Set|New|Remove|Select|Where|ForEach|Write|Add|Copy|Move|Rename|Test|Invoke|"
+    r"Start|Stop|Out|Format|Sort|Measure|Import|Export|ConvertTo|ConvertFrom|Join|Split|Compare|Group|"
+    r"Resolve|Clear|Push|Pop)-[A-Z]\w+"
+)
+_PS_SYNTAX_RE = re.compile(
+    r"\$env:|\$PSItem|\$_(?:\.|\s|\)|$)|-Recurse\b|-Filter\b|-ErrorAction\b|\|\s*(?:Where|Select|ForEach|Sort|Measure)-",
+    re.IGNORECASE,
+)
+
+
+def _detect_shell(command: str) -> str:
+    """Which shell a command is written for: 'powershell' for PS cmdlets/syntax, else 'bash'."""
+    c = command or ""
+    return "powershell" if (_PS_CMDLET_RE.search(c) or _PS_SYNTAX_RE.search(c)) else "bash"
+
+
+_GIT_BASH: "Optional[str]" = None
+_GIT_BASH_RESOLVED = False
+
+
+def _git_bash() -> "Optional[str]":
+    """The Git Bash executable to prefer on Windows (``GX10_BASH`` override / Program Files / Scoop / PATH),
+    or None → PowerShell. Cached. Skips WSL's ``System32\\bash.exe`` (runs in the WSL filesystem)."""
+    global _GIT_BASH, _GIT_BASH_RESOLVED
+    if _GIT_BASH_RESOLVED:
+        return _GIT_BASH
+    _GIT_BASH_RESOLVED = True
+    if os.name != "nt":
+        _GIT_BASH = None
+        return None
+    home = os.environ.get("USERPROFILE", "")
+    candidates = [
+        os.environ.get("GX10_BASH"),
+        r"C:\Program Files\Git\bin\bash.exe",
+        r"C:\Program Files\Git\usr\bin\bash.exe",
+        r"C:\Program Files (x86)\Git\bin\bash.exe",
+    ]
+    if home:
+        candidates += [
+            os.path.join(home, r"scoop\apps\git\current\bin\bash.exe"),
+            os.path.join(home, r"scoop\apps\git\current\usr\bin\bash.exe"),
+            os.path.join(home, r"scoop\shims\bash.exe"),
+        ]
+    for c in candidates:
+        if c and os.path.isfile(c):
+            _GIT_BASH = c
+            return c
+    w = shutil.which("bash")
+    if w and "system32" not in w.lower():
+        _GIT_BASH = w
+        return w
+    _GIT_BASH = None
+    return None
+
+
+# ─── Deterministic listing count (#1193) — a shell listing carries the same authoritative count as
+# list_directory, computed from the FILESYSTEM (not by parsing output), so the model copies the number
+# instead of counting the listing (LLMs miscount). ──
+def _fmt_count(n_dirs: int, n_files: int) -> str:
+    """`N directories, M files` with correct singular/plural."""
+    return f"{n_dirs} director{'y' if n_dirs == 1 else 'ies'}, {n_files} file{'' if n_files == 1 else 's'}"
+
+
+def _directory_entry_names(path) -> "Optional[tuple]":
+    """The (dir_names, file_names) of a directory (same hidden-entry policy as list_directory) —
+    None if the path is not a readable directory. ONE O(n) pass, one snapshot."""
+    try:
+        p = Path(path)
+        if not p.is_dir():
+            return None
+        items = list(p.iterdir())
+    except OSError:
+        return None
+    dirs, files = [], []
+    for i in items:
+        (dirs if i.is_dir() else files).append(i.name)
+    return dirs, files
+
+
+def _directory_count_header(path) -> "Optional[str]":
+    """Deterministic `N directories, M files` for a directory — None if not a readable directory."""
+    names = _directory_entry_names(path)
+    return None if names is None else _fmt_count(len(names[0]), len(names[1]))
+
+
+def _safe_listing_name(n: str) -> str:
+    """A name rendered into the copied-verbatim Answer sentence: a backtick would corrupt the inline-code
+    spans, and any line/paragraph separator could FORGE extra lines in the reply the model copies —
+    prompt injection via filename. Each such char renders as '?' (visibly altered, never executed). The
+    class matches Python str.splitlines() line boundaries (C0 controls + DEL + NEL U+0085 + LS/PS
+    U+2028/U+2029) plus the backtick, so no name can introduce a second line or a stray code span."""
+    return re.sub("[`\x00-\x1f\x7f\x85\u2028\u2029]", "?", n)
+
+
+def _listing_answer_sentence(dir_names, file_names, lang: str) -> str:
+    """#1202: the COMPLETE, final listing reply, built from the filesystem in the reply language (en/de;
+    anything else falls back to English). The model copies this sentence verbatim instead of composing a
+    summary — composition drops names and breaks the one-sentence format, copying is reliable. Every name
+    is sanitized and backtick-wrapped so the markdown clients render it as coloured inline code —
+    deterministically, not only when the model happens to add the backticks itself."""
+    d = sorted(dir_names, key=str.lower)
+    f = sorted(file_names, key=str.lower)
+
+    def _part(names, one, many):
+        label = f"{len(names)} {one if len(names) == 1 else many}"
+        return f"{label} ({', '.join(f'`{_safe_listing_name(n)}`' for n in names)})" if names else label
+
+    if (lang or "en").lower().startswith("de"):
+        return (f"Das Verzeichnis enthält {_part(d, 'Verzeichnis', 'Verzeichnisse')} "
+                f"und {_part(f, 'Datei', 'Dateien')}.")
+    return (f"The directory contains {_part(d, 'directory', 'directories')} "
+            f"and {_part(f, 'file', 'files')}.")
+
+
+_LISTING_VERBS = {"ls", "dir", "get-childitem", "gci"}
+
+
+def _listing_count_header_for_command(command: str) -> "Optional[str]":
+    """The deterministic count header for a SIMPLE listing command — see _listing_target_for_command."""
+    target = _listing_target_for_command(command)
+    return None if target is None else _directory_count_header(target)
+
+
+_LISTING_HEADER_RE = re.compile(r"\d+ director(?:y|ies), \d+ files?")
+
+
+def _localize_listing_answer(text: str, command: str = "") -> str:
+    """#1202: render the machine ``AnswerData: {json}`` line a listing result carries into the final,
+    localized ``Answer:`` sentence — SERVER-side, so ONE authoritative ``LANGUAGE`` governs every topology
+    (bridged clients ship data, never templates or languages). **Command-gated**: only the result of a
+    genuine listing command is transformed, so arbitrary output (e.g. ``cat file`` whose first lines
+    coincidentally or maliciously match the shape) is NEVER rewritten. Additionally anchored to line 2
+    directly under a line-1 count header. Malformed data drops the machine line (never leaves it, and
+    never fabricates)."""
+    if _listing_target_for_command(command) is None:
+        return text
+    lines = (text or "").split("\n", 2)
+    if len(lines) < 2 or not lines[1].startswith("AnswerData: ") or not _LISTING_HEADER_RE.fullmatch(lines[0]):
+        return text
+    rest = lines[2:]   # the raw command body (line 3+), preserved verbatim
+    try:
+        data = json.loads(lines[1][len("AnswerData: "):])
+        dirs, files = data["dirs"], data["files"]
+        if not isinstance(dirs, list) or not isinstance(files, list):   # no str/scalar → char-splitting
+            raise ValueError("dirs/files must be lists")
+        dirs = [str(n) for n in dirs]
+        files = [str(n) for n in files]
+    except Exception:   # noqa: BLE001 — malformed data must never break a tool result: drop the machine line
+        return "\n".join([lines[0]] + rest)
+    if len(dirs) + len(files) > LIST_DIR_HARD_CAP:
+        # the CONFIGURED cap governs at the render site too (a bridged client only knows the default
+        # transport bound) — over the cap the large-folder prompt rule applies, no Answer line
+        return "\n".join([lines[0]] + rest)
+    return "\n".join([lines[0], f"Answer: {_listing_answer_sentence(dirs, files, LANGUAGE)}"] + rest)
+
+
+def _listing_target_for_command(command: str) -> "Optional[str]":
+    """If *command* is a SIMPLE directory listing (`ls`/`dir`/`Get-ChildItem`, optionally one leading
+    `cd <path> &&`), return its resolved target directory path. None (no guess) for anything ambiguous:
+    pipes, redirects, subshells, globs, `-R`/recursive, or more than one path operand."""
+    cmd = (command or "").strip()
+    if not cmd or "||" in cmd or any(t in cmd for t in ("|", ">", "<", "$(", "`", ";", "\n")):
+        return None
+    parts = cmd.split("&&")
+    if len(parts) > 2:
+        return None
+    base = _exec_cwd() or os.getcwd()
+    if len(parts) == 2:
+        try:
+            cd_tok = shlex.split(parts[0].strip(), posix=True)
+        except ValueError:
+            return None
+        if len(cd_tok) != 2 or cd_tok[0] != "cd":
+            return None
+        base = cd_tok[1] if os.path.isabs(cd_tok[1]) else os.path.join(base, cd_tok[1])
+    list_part = parts[-1].strip()
+    if "&" in list_part:  # a stray background '&'
+        return None
+    try:
+        tok = shlex.split(list_part, posix=True)
+    except ValueError:
+        return None
+    if not tok or tok[0].lower() not in _LISTING_VERBS:
+        return None
+    # PowerShell cmdlets are case-INSENSITIVE and take VALUE-bearing named params (-Filter *.txt,
+    # -Exclude x) whose value would be misread as the path operand; we can't tell a switch from a
+    # value-taker without the cmdlet model, so a PS-style listing with ANY named parameter is
+    # ambiguous → no header (no guess). `ls`/`dir` (POSIX/coreutils) keep clustered short flags.
+    ps_style = tok[0].lower() in ("get-childitem", "gci")
+    for t in tok[1:]:
+        if not t.startswith("-"):
+            continue
+        low = t.lower()
+        if low in ("--recursive", "-recurse", "-r") or (not t.startswith("--") and "R" in t):
+            return None  # recursive (any case) — the header would no longer describe ONE directory
+        if ps_style:
+            return None  # a named parameter on a PS cmdlet takes a value → ambiguous target
+    operands = [t for t in tok[1:] if not t.startswith("-")]
+    if len(operands) > 1:
+        return None
+    target = operands[0] if operands else "."
+    if any(ch in target for ch in "*?[]{}<>|;$`"):
+        return None
+    if not os.path.isabs(target):
+        target = os.path.join(base, target)
+    return target
+
+
 _LANG_NAMES = {
     "en": "English", "de": "German", "fr": "French", "es": "Spanish",
     "it": "Italian", "pt": "Portuguese", "nl": "Dutch", "pl": "Polish",
@@ -3607,6 +3905,15 @@ def _language_guidance(lang: str) -> str:
 def _platform_guidance(platform: str) -> str:
     """Dynamically injected runtime note — keeps the prompt file neutral."""
     if platform == "windows":
+        if _git_bash():
+            # #1183: Git Bash present → execute_command routes each command to the shell it's written for,
+            # so BOTH work — the model may use either flavour.
+            return (
+                "## Runtime environment\n"
+                "Operating system: **Windows** with **Git Bash** available. `execute_command` runs each "
+                "command in the shell it is written for — use POSIX/bash (`ls`, `cat`, `grep`, `find`) OR "
+                "PowerShell cmdlets (`Get-ChildItem`, `Select-String`); both work."
+            )
         return (
             "## Runtime environment\n"
             "Operating system: **Windows**. For `execute_command` use PowerShell syntax "
@@ -4653,6 +4960,17 @@ def _read_file_ranged(text: str, *, start=None, end=None, max_chars=None, patter
 
 
 def run_tool(name: str, args: Dict[str, Any]) -> str:
+    """#1202: the SINGLE structural site that renders a listing's machine ``AnswerData`` into the localized
+    ``Answer:`` sentence. It wraps the tool dispatch and is **command-gated**, so EVERY caller (the model
+    run loop, ``/tool``, ``/ls``, the API) and EVERY topology (native + bridged client) gets the localized
+    reply, the machine line NEVER leaks to a user, and a non-listing command's output is never rewritten."""
+    result = _run_tool_dispatch(name, args)
+    if name == "execute_command":
+        result = _localize_listing_answer(result, (args or {}).get("command", ""))
+    return result
+
+
+def _run_tool_dispatch(name: str, args: Dict[str, Any]) -> str:
     try:
         # #459 (§4, review A S2): the shell guardrail fires SERVER-SIDE here, BEFORE the local-tool bridge
         # dispatches execute_command to a client — otherwise a thin/Ink client would run the blocked
@@ -4751,24 +5069,42 @@ def run_tool(name: str, args: Dict[str, Any]) -> str:
             return f"OK: edited {args['path']} ({hits if args.get('replace_all') else 1} replacement(s))"
 
         elif name == "create_issue":
-            # #1073: file a forge issue via the ambient gh CLI. Double-gated (registered only when
-            # FORGE_ENABLED, and refused here too), secret-free (gh auth), escape-free (body from a file).
-            if not FORGE_ENABLED:
-                return ("ERROR: create_issue is disabled — the operator must enable the forge "
-                        "(config forge.enabled / GX10_FORGE_ENABLED).")
-            if not shutil.which("gh"):
+            # #1073: file a forge issue via the ambient gh CLI. Capability-detected (offered + accepted when
+            # `gh` is present and the profile permits an outbound write), secret-free (gh auth), escape-free
+            # (body from a file). Same check as the registration gate (_forge_available), with a precise reason.
+            if not _forge_available():
+                if not FORGE_ENABLED:
+                    return "ERROR: create_issue is force-disabled by the operator (config forge.enabled=false)."
+                if _is_sealed_profile():
+                    return "ERROR: create_issue is blocked under the sealed trust profile (no autonomous outbound writes)."
                 return "ERROR: create_issue needs the GitHub CLI ('gh') on PATH + authenticated (gh auth login)."
             bf = _resolve_exec_path(args["body_file"])
             if not bf.exists():
                 return (f"ERROR: body_file not found: {args['body_file']} — write the issue body to a FILE "
                         f"first (write_last_reply / write_file), then pass its path.")
+            # A) label validate→reask: the model must use EXISTING repo labels, not invent them. An unknown
+            # label is rejected with the valid set (+ did-you-mean) so the model re-emits — instead of gh
+            # hard-failing the whole create on the first bad label, and instead of silently dropping it.
+            # Fail-soft: if the label list can't be fetched, validation is skipped (never block on a hiccup).
+            req_labels = [l.strip() for l in str(args.get("labels", "") or "").split(",") if l.strip()]
+            if req_labels:
+                valid = _forge_labels()
+                if valid is not None:
+                    unknown = [l for l in req_labels if l not in valid]
+                    if unknown:
+                        import difflib
+                        parts = []
+                        for u in unknown:
+                            near = difflib.get_close_matches(u, valid, n=3, cutoff=0.5)
+                            parts.append(f"'{u}'" + (f" (did you mean: {', '.join(near)}?)" if near else ""))
+                        return ("ERROR: unknown label(s): " + "; ".join(parts) + ". Use existing labels ONLY "
+                                "(do not invent labels). Valid labels: " + ", ".join(sorted(valid)) +
+                                ". Re-call create_issue with valid labels (or omit `labels`).")
             cmd = ["gh", "issue", "create", "--title", str(args.get("title", "")), "--body-file", str(bf)]
             if FORGE_REPO:
                 cmd += ["--repo", FORGE_REPO]
-            for _lb in str(args.get("labels", "") or "").split(","):
-                _lb = _lb.strip()
-                if _lb:
-                    cmd += ["--label", _lb]
+            for _lb in req_labels:
+                cmd += ["--label", _lb]
             if args.get("milestone"):
                 cmd += ["--milestone", str(args["milestone"])]
             try:
@@ -4778,7 +5114,25 @@ def run_tool(name: str, args: Dict[str, Any]) -> str:
                 return f"ERROR: create_issue could not run gh: {ex!r}"
             if r.returncode != 0:
                 return f"ERROR: gh issue create failed: {((r.stderr or r.stdout) or '').strip()[:400]}"
-            return f"OK: created issue {r.stdout.strip()}"
+            new_url = r.stdout.strip()
+            # B) parent linking: if a parent epic was given, link the new issue as a NATIVE sub-issue (gh
+            # supports `--parent`) — so the model links in-tool, not via ad-hoc execute_command gh calls.
+            # Fail-soft: the issue already exists, so a link failure is reported alongside it, not raised.
+            parent = str(args.get("parent", "") or "").strip().lstrip("#")
+            if parent and new_url:
+                lcmd = ["gh", "issue", "edit", new_url, "--parent", parent]
+                if FORGE_REPO:
+                    lcmd += ["--repo", FORGE_REPO]
+                try:
+                    lr = subprocess.run(lcmd, capture_output=True, text=True, encoding="utf-8",
+                                        errors="replace", timeout=60)
+                except Exception as ex:   # noqa: BLE001
+                    return f"OK: created issue {new_url}, but linking to parent #{parent} raised: {ex!r}"
+                if lr.returncode != 0:
+                    return (f"OK: created issue {new_url}, but linking to parent #{parent} failed: "
+                            f"{((lr.stderr or lr.stdout) or '').strip()[:200]}")
+                return f"OK: created issue {new_url} and linked it as a sub-issue of #{parent}"
+            return f"OK: created issue {new_url}"
 
         elif name == "fetch_url":
             # #1074: verbatim, size-capped http(s) fetch. Trust-gated (sealed) + SSRF-guarded + byte-capped;
@@ -4808,6 +5162,7 @@ def run_tool(name: str, args: Dict[str, Any]) -> str:
                 return f"ERROR: Not found: {args.get('path', '.')}"
             items = list(p.iterdir())
             total = len(items)
+            n_dirs_total = sum(1 for i in items if i.is_dir())  # #1183: count the FULL set before cap/limit
             if args.get("sort") == "time":
                 items.sort(key=lambda x: x.stat().st_mtime, reverse=True)
             else:
@@ -4828,7 +5183,12 @@ def run_tool(name: str, args: Dict[str, Any]) -> str:
                 capped = True
 
             lines = [f"{'[D]' if i.is_dir() else '[F]'} {i.name}" for i in items]
-            out = "\n".join(lines) if lines else "(empty)"
+            # #1183: a deterministic count header of the FULL set — LLMs miscount a list, so state the exact
+            # numbers and let the model report them verbatim instead of re-counting.
+            n_dirs = n_dirs_total
+            n_files = total - n_dirs
+            count = _fmt_count(n_dirs, n_files)
+            out = f"{count}\n" + "\n".join(lines) if lines else "(empty)"
             shown = len(lines)
             if shown < total:
                 out += (f"\n... [GX10v3: showing {shown} of {total} entries"
@@ -4848,16 +5208,25 @@ def run_tool(name: str, args: Dict[str, Any]) -> str:
             # encoding/errors explicit: decode command output as UTF-8 lossily, so a
             # non-locale byte (cp1252 on Windows) never raises decoding the result.
             if PLATFORM == "windows":
-                # #459: harden the PowerShell invocation — silence WriteProgress so a progress bar can
-                # never draw into the renderer-owned conhost (a 2nd layer behind the deny-list above).
-                hardened = "$ProgressPreference='SilentlyContinue'; " + command
-                argv = ["powershell", "-NoProfile", "-NonInteractive",
-                        "-Command", hardened]
-                r = subprocess.run(
-                    argv, stdin=subprocess.DEVNULL,
-                    capture_output=True, text=True, encoding="utf-8", errors="replace",
-                    timeout=timeout, cwd=_exec_cwd()       # S9c: run in the active project's root (None → process workdir)
-                )
+                _bash = _git_bash()
+                if _bash and _detect_shell(command) == "bash":
+                    # #1183: a POSIX/bash command runs in Git Bash (both shells work, neither is forced).
+                    r = subprocess.run(
+                        [_bash, "-lc", command], stdin=subprocess.DEVNULL,
+                        capture_output=True, text=True, encoding="utf-8", errors="replace",
+                        timeout=timeout, cwd=_exec_cwd()   # S9c: run in the active project's root
+                    )
+                else:
+                    # #459: harden the PowerShell invocation — silence WriteProgress so a progress bar can
+                    # never draw into the renderer-owned conhost (a 2nd layer behind the deny-list above).
+                    hardened = "$ProgressPreference='SilentlyContinue'; " + command
+                    argv = ["powershell", "-NoProfile", "-NonInteractive",
+                            "-Command", hardened]
+                    r = subprocess.run(
+                        argv, stdin=subprocess.DEVNULL,
+                        capture_output=True, text=True, encoding="utf-8", errors="replace",
+                        timeout=timeout, cwd=_exec_cwd()   # S9c: run in the active project's root (None → process workdir)
+                    )
             else:
                 run_cmd = command
                 if SANDBOX not in ("", "off", "none"):     # #1069: OS-isolate the command when a backend is present
@@ -4871,7 +5240,40 @@ def run_tool(name: str, args: Dict[str, Any]) -> str:
                     capture_output=True, text=True, encoding="utf-8", errors="replace",
                     timeout=timeout, cwd=_exec_cwd()       # S9c: run in the active project's root (None → process workdir)
                 )
+                # #1196: BSD/macOS `ls` rejects the GNU-only `--color=always` (exit != 0), which would drop
+                # the fs-computed header/Answer (gated on exit 0). Retry the LISTING without the colour flag
+                # so it still works on a non-coreutils host. (Windows uses Git Bash = coreutils, no retry.)
+                if (r.returncode != 0 and "--color=always" in command
+                        and _listing_target_for_command(command) is not None):
+                    _fb = re.sub(r"\s*--color=always\b", "", command)
+                    _fb_cmd = _fb
+                    if SANDBOX not in ("", "off", "none"):
+                        try:
+                            import sandbox as _sbx
+                            _fb_cmd, _ = _sbx.sandbox_command(_fb, SANDBOX)
+                        except Exception:   # noqa: BLE001
+                            _fb_cmd = _fb
+                    r = subprocess.run(
+                        _fb_cmd, shell=True, stdin=subprocess.DEVNULL,
+                        capture_output=True, text=True, encoding="utf-8", errors="replace",
+                        timeout=timeout, cwd=_exec_cwd())
             out = (r.stdout + r.stderr).strip()
+            if r.returncode == 0 and out:   # #1193: prepend a deterministic listing count (from the fs)
+                target = _listing_target_for_command(command)
+                names = _directory_entry_names(target) if target is not None else None
+                if names is not None:
+                    # ONE snapshot feeds header AND answer data (no self-contradicting TOCTOU pair).
+                    # #1202: the machine AnswerData line becomes the localized ready-made `Answer:`
+                    # sentence SERVER-side (_localize_listing_answer at the run-loop choke point) —
+                    # the model copies it verbatim instead of composing a summary. Above the hard cap
+                    # only the header ships (the large-folder prompt rule governs there).
+                    header = _fmt_count(len(names[0]), len(names[1]))
+                    data = ""
+                    if len(names[0]) + len(names[1]) <= LIST_DIR_HARD_CAP:
+                        payload = json.dumps({"dirs": names[0], "files": names[1]},
+                                             ensure_ascii=False, separators=(",", ":"))
+                        data = f"AnswerData: {payload}\n"
+                    out = f"{header}\n{data}{out}"
             return out or f"(exit {r.returncode}, no output)"
 
         elif name == "move_file":
@@ -5119,7 +5521,8 @@ class GX10:
                  stream: bool = True, max_tokens: int = MAX_TOKENS,
                  thinking_mode: str = "auto", platform: Optional[str] = None,
                  onboarding: Optional[bool] = None):
-        self.client        = OpenAI(base_url=base_url, api_key=api_key)
+        self.client        = OpenAI(base_url=base_url, api_key=api_key,
+                                    timeout=LLM_REQUEST_TIMEOUT_S, max_retries=LLM_MAX_RETRIES)   # #1131: fail-soft bound
         self.model         = model
         self.stream        = stream
         self.max_tokens    = max_tokens
@@ -5937,6 +6340,7 @@ class GX10:
                 delta = chunk_q.get(timeout=0.1)
             except _q.Empty:
                 continue
+            self._last_progress = time.time()   # S2 (#1132): a streamed chunk is progress — reset the idle watchdog
 
             if t_first[0] is None:
                 t_first[0] = time.time()
@@ -6049,6 +6453,7 @@ class GX10:
             "error": ("✗ ERROR",         C.RED),
             "max":   (f"⏱ MAX-ITER ({_loop_profile().max_iterations})", C.YELLOW),   # #602 SUB-8a: the profile bound (== MAX_ITERATIONS by default)
             "crash": ("✗ ERROR (internal)", C.RED),
+            "stalled": ("⏱ TURN ABORTED (model stalled — no progress)", C.YELLOW),   # S2 (#1132): never a silent hang
         }
         label, color = marks.get(kind, marks["done"])
         detail = outcome.get("detail") or ""
@@ -6092,6 +6497,23 @@ class GX10:
         # Turn outcome — ALWAYS printed as a status line in finally.
         outcome: Dict[str, Any] = {"kind": "max"}
 
+        # S2 (#1132): per-turn IDLE watchdog. Reset on every progress signal (a generation chunk, a completed
+        # generation, a tool result); if nothing progresses for TURN_IDLE_TIMEOUT_S the turn is aborted and
+        # surfaced as 'stalled' — never a silent indefinite hold of the agent lock. Off (<=0) ⇒ byte-identical.
+        self._last_progress = time.time()
+        self._watchdog_tripped = False
+        _wd_stop = threading.Event()
+        _wd_thread: Optional[threading.Thread] = None
+        if TURN_IDLE_TIMEOUT_S and TURN_IDLE_TIMEOUT_S > 0:
+            def _watchdog():
+                while not _wd_stop.wait(min(5.0, TURN_IDLE_TIMEOUT_S / 4.0)):
+                    if time.time() - self._last_progress > TURN_IDLE_TIMEOUT_S:
+                        self._watchdog_tripped = True
+                        _CANCEL_EVENT.set()   # break every poll site → the turn ends (abort → relabelled 'stalled')
+                        break
+            _wd_thread = threading.Thread(target=_watchdog, daemon=True)
+            _wd_thread.start()
+
         try:
           # #602 SUB-8a: the chat loop's iteration bound comes from the default loop profile — which is the
           # global MAX_ITERATIONS unless an operator configured loop_profiles (byte-identical by default).
@@ -6111,6 +6533,7 @@ class GX10:
             spinner.start()
             content, tool_calls, cancelled, err, metrics = self._generate(think)
             spinner.stop()
+            self._last_progress = time.time()   # S2 (#1132): a completed generation is progress (covers non-stream)
 
             if not cancelled:   # #1060: telemetry — record every real generation (success + error), skip aborts
                 try:
@@ -6185,6 +6608,16 @@ class GX10:
 
             _ui_print()
             for i, t in enumerate(tool_calls):
+                # Guard 1 (#1131): honour cancellation BETWEEN tool calls — but never leave the assistant
+                # tool_calls message with missing tool rows (an orphan → a hard vLLM 400 on the next send). So
+                # on cancel, emit a 'cancelled' result for THIS + every remaining call, then end the turn cleanly.
+                if _CANCEL_EVENT.is_set():
+                    for j in range(i, len(tool_calls)):
+                        self.messages.append({"role": "tool",
+                                              "tool_call_id": (tool_calls[j]["id"] or f"call_{iteration}_{j}"),
+                                              "content": "ERROR: cancelled"})
+                    outcome = {"kind": "abort"}
+                    return
                 name = t["name"] or ""
                 tcid = t["id"] or f"call_{iteration}_{i}"
                 # Validate→Reask at the tool boundary: malformed JSON or a schema
@@ -6192,26 +6625,20 @@ class GX10:
                 # instead of silently degrading to empty args.
                 args, arg_err = _parse_tool_args(name, t["arguments"])
                 if arg_err:
-                    _ui_print(col(f"  → {name}", C.MAGENTA) +
-                              col(f"  ✗ {arg_err[:80]}", C.RED))
+                    _ui_print(col(f"  ● {name}", C.GRAY))
+                    _ui_print(col(f"  ⎿ ✗ {arg_err}", C.RED))
                     self.messages.append({
                         "role": "tool", "tool_call_id": tcid,
                         "content": f"ERROR: {arg_err}",
                     })
                     continue
 
-                args_disp = ", ".join(
-                    f"{k}={repr(str(v))[:50]}" for k, v in args.items()
-                )
-                _ui_print(
-                    col(f"  → {name}", C.MAGENTA) +
-                    col(f"({args_disp})", C.GRAY),
-                    end="  "
-                )
+                _ui_print(col(f"  ● {_tool_display(name, args)}", C.GRAY))
 
                 cap = self._live_read_budget()                        # #994-S16/#1046: LIVE per-turn budget
                 _rb = _READ_BUDGET_CV.set(cap)                        # read_file reads it for its own cap
                 try:
+                    raw_result = None   # #1196: pre-strip raw result for the display (set for ingestion tools)
                     if name == "write_last_reply":
                         # #1048 (L1-write): escape-free authoring — persist the model's PREVIOUS reply text
                         # (already produced as ordinary output) instead of a huge JSON-escaped write_file
@@ -6226,7 +6653,20 @@ class GX10:
                                                                "content": body,
                                                                "mode": args.get("mode", "write")})
                     else:
+                        # #1202: run_tool itself renders a listing's AnswerData into the localized Answer
+                        # (command-gated, all topologies) — so the machine line is already resolved here,
+                        # BEFORE the cap/fence below, for every caller.
                         result_t = run_tool(name, args)
+                        # #1196: keep the RAW (possibly ANSI-coloured, e.g. `ls --color`) result for the
+                        # DISPLAY, and STRIP escapes for the model context + cap/fence below — the model reads
+                        # clean text (escape bytes are noise and skew the char count), the user sees colour.
+                        # SCOPED to execute_command (where our coloured listing default comes from): a
+                        # read_file/search_files/fetch_url result that legitimately CONTAINS escape bytes
+                        # (a terminal capture, ANSI-art, a colour-coded log) reaches the model verbatim, as
+                        # before — we never silently alter ingested file content.
+                        raw_result = result_t
+                        if name == "execute_command":
+                            result_t = _strip_ansi(result_t)
                         # #1046 (L1-choke): cap EVERY ingestion tool's result at this one choke point — not
                         # just read_file (which caps itself) but search_files/list_directory/execute_command
                         # AND the local-bridge return (which bypasses read_file's cap). Idempotent + scoped;
@@ -6250,17 +6690,24 @@ class GX10:
                     _maybe_audit(name, args, result_t)   # #1084: tamper-evident per-action audit (default-off)
                 finally:
                     _READ_BUDGET_CV.reset(_rb)
-                preview  = result_t.replace("\n", " ")[:70]
-                _ui_print(col(
-                    f"✓ {preview}",
-                    C.GREEN if not result_t.startswith("ERROR") else C.RED
-                ))
+                _ok = not result_t.startswith("ERROR")
+                # #1196: DISPLAY the raw (coloured) result for ingestion tools (e.g. `ls --color`), else the
+                # final result_t (carries write-warnings etc.). A line that carries its OWN colour streams
+                # as-is (native ls colours — the prefix stays plain so the client still parses the block); a
+                # plain line gets the default GRAY/RED tool-result styling. The MODEL sees result_t (stripped).
+                _disp = raw_result if (raw_result is not None and name == "execute_command") else result_t
+                for _ln in _tool_result_lines(_disp):
+                    if _ok and _has_ansi(_ln):
+                        _ui_print(_ln)
+                    else:
+                        _ui_print(col(_ln, C.GRAY if _ok else C.RED))
 
                 self.messages.append({
                     "role":         "tool",
                     "tool_call_id": tcid,
                     "content":      result_t
                 })
+                self._last_progress = time.time()   # S2 (#1132): a tool result is progress — reset the idle watchdog
                 # #1051 (L3): proactive cumulative-ingestion accountant — proactively shed the oldest tool
                 # rounds via a query-aware summary once ingestion crosses the soft mark (default OFF ⇒ no-op).
                 self._proactive_roll_if_needed()
@@ -6273,6 +6720,11 @@ class GX10:
             # and the turn still gets a completion marker.
             outcome = {"kind": "crash", "detail": repr(e)}
         finally:
+            _wd_stop.set()                          # S2 (#1132): stop the idle watchdog
+            if _wd_thread is not None:
+                _wd_thread.join(timeout=1.0)
+            if self._watchdog_tripped:              # relabel abort→stalled so the surfaced marker names the cause
+                outcome = {"kind": "stalled", "detail": f"no progress for {TURN_IDLE_TIMEOUT_S:.0f}s"}
             _status["thinking"] = False   # toolbar back to idle (even on crash)
             self._print_turn_end(turn, outcome)
 
@@ -8263,6 +8715,8 @@ def _code_defaults() -> Dict[str, Any]:
             "base_url":    DEFAULT_BASE_URL,
             "model":       DEFAULT_MODEL,
             "api_key_env": API_KEY_ENV,
+            "request_timeout_s": LLM_REQUEST_TIMEOUT_S,   # #1131: per-request LLM bound (fail-soft)
+            "max_retries":       LLM_MAX_RETRIES,         # #1131
         },
         # epic #505 S3: minimal web-search seam selector. The FULL surface — env vars, the
         # frozen/runtime split, max_searches / max_output_chars / default_permission / domains and
@@ -8275,7 +8729,7 @@ def _code_defaults() -> Dict[str, Any]:
             "max_output_chars": 100_000,                # cap on the model-facing tool result (S5)
         },
         "forge": {                                      # #1073: code-host issue filing (default OFF)
-            "enabled": FORGE_ENABLED,                   # opt-in: register the create_issue tool
+            "enabled": FORGE_ENABLED,                   # default ON — capability-detected (gh present); false = force-off
             "repo":    FORGE_REPO,                       # optional owner/repo; empty ⇒ gh's cwd default
         },
         "notify": {                                     # #1083: escalation → webhook (default OFF)
@@ -8531,6 +8985,7 @@ def _code_defaults() -> Dict[str, Any]:
             "thinking_reserve":   THINKING_RESERVE, # #366 D5: output headroom reserved when think=True
             "min_output_tokens":  MIN_OUTPUT_TOKENS, # #366: floor the adaptive output reserve can shrink to
             "overflow_safety_tokens": OVERFLOW_SAFETY_TOKENS, # #366: headroom below the wall (estimate slop)
+            "turn_idle_timeout_s": TURN_IDLE_TIMEOUT_S,  # #1132: idle-watchdog bound (no-progress → stalled)
             "memory_brief_tokens": MEMORY_BRIEF_TOKENS,  # #458 D1: token budget of the handover memory brief
             "max_file_chars":     MAX_FILE_CHARS,
             "list_dir_hard_cap":  LIST_DIR_HARD_CAP,
@@ -8667,6 +9122,8 @@ def _apply_env(cfg: Dict[str, Any]) -> Dict[str, Any]:
                 print(col(f"  [WARN] env {name}={v!r} ignored (invalid)", C.YELLOW))
     setif("GX10_BASE_URL",   "connection", "base_url")
     setif("GX10_MODEL",      "connection", "model")
+    setif("GX10_LLM_TIMEOUT_S",   "connection", "request_timeout_s", float)   # #1131: per-request LLM bound
+    setif("GX10_LLM_MAX_RETRIES", "connection", "max_retries",       int)     # #1131
     setif("GX10_WORKDIR",    "paths",      "workdir")
     setif("GX10_PROMPT",     "paths",      "system_prompt")
     setif("GX10_MAX_TOKENS", "generation", "max_tokens", int)
@@ -8730,6 +9187,7 @@ def _apply_env(cfg: Dict[str, Any]) -> Dict[str, Any]:
     setif("GX10_THINKING_RESERVE",   "context", "thinking_reserve",   int)     # #366 D5: thinking output reserve
     setif("GX10_MIN_OUTPUT_TOKENS",  "context", "min_output_tokens",  int)     # #366: adaptive output-reserve floor
     setif("GX10_OVERFLOW_SAFETY",    "context", "overflow_safety_tokens", int) # #366: estimate-slop headroom below the wall
+    setif("GX10_TURN_IDLE_TIMEOUT_S","context", "turn_idle_timeout_s", float)   # #1132: idle-watchdog bound
     setif("GX10_AUTOPILOT",  "autopilot",  "enabled", _truthy)
     setif("GX10_AUTOPILOT_STREAM",    "autopilot", "stream",          _truthy)
     setif("GX10_AUTOPILOT_TERMINATE", "autopilot", "terminate_on_advance", _truthy)
@@ -8744,14 +9202,14 @@ def _apply_config(cfg: Dict[str, Any]):
     existing references (run_tool, macros, _trim_context, _classify_thinking,
     watcher, UI …) keep running unchanged."""
     global DEFAULT_BASE_URL, DEFAULT_MODEL, API_KEY_ENV, STATE_ROOT, VAULT_ROOT, SESSION_FILE, CODE_ROOT
-    global PLATFORM_MODE, PLATFORM, TASKS_DEDUP_THRESHOLD, ONBOARDING_MODE, TASK_PREFIX, _TASK_ID_RE, ACK_ENABLED, LODESTAR_ENABLED, FORGE_ENABLED, FORGE_REPO, NOTIFY_WEBHOOK, AUDIT_ENABLED, AUDIT_SCOPE, INJECTION_DEFENSE, SANDBOX, MULTI_TENANT, ALERT_ENABLED
+    global PLATFORM_MODE, PLATFORM, TASKS_DEDUP_THRESHOLD, ONBOARDING_MODE, TASK_PREFIX, _TASK_ID_RE, ACK_ENABLED, LODESTAR_ENABLED, FORGE_ENABLED, FORGE_REPO, NOTIFY_WEBHOOK, AUDIT_ENABLED, AUDIT_SCOPE, INJECTION_DEFENSE, SANDBOX, MULTI_TENANT, ALERT_ENABLED, LLM_REQUEST_TIMEOUT_S, LLM_MAX_RETRIES
     global AUTOPILOT_ENABLED, AUTOPILOT_CLAUDE_BIN, AUTOPILOT_EXTRA_ARGS
     global AUTOPILOT_DEFAULT_EFFORT, AUTOPILOT_LOGS_DIR, AUTOPILOT_MAX_CONCURRENT, AUTOPILOT_STREAM, AUTOPILOT_TERMINATE_ON_ADVANCE, AUTOPILOT_AUTOPLAN, AUTOPILOT_MAX_TASKS, AUTOPILOT_LOG_TERMINAL
     global TEMPERATURE, MAX_TOKENS, RETRY_BACKOFF, LANGUAGE
     global MAX_ITERATIONS, MAX_CTX_CHARS, TRIM_TARGET_CHARS, MAX_FILE_CHARS, LIST_DIR_HARD_CAP
     global SUMMARIZE_EVICTED, SUMMARY_MAX_TOKENS, RAG_ENABLED, RAG_TOP_K, RAG_MAX_TOKENS, EMERGENCY_SUMMARIZE
     global PROACTIVE_ROLL, INGEST_SOFT_FRAC, MAX_SUMMARIES_PER_TURN
-    global MAX_MODEL_LEN, TOKEN_BUDGET, CHARS_PER_TOKEN, THINKING_RESERVE, MEMORY_BRIEF_TOKENS, MIN_OUTPUT_TOKENS, OVERFLOW_SAFETY_TOKENS
+    global MAX_MODEL_LEN, TOKEN_BUDGET, CHARS_PER_TOKEN, THINKING_RESERVE, MEMORY_BRIEF_TOKENS, MIN_OUTPUT_TOKENS, OVERFLOW_SAFETY_TOKENS, TURN_IDLE_TIMEOUT_S
     global WORKER_MEMORY, WORKER_WRITE, WORKER_WRITE_MODE, WARM_SESSION_ID
     global _PLANNING_KW, _ROUTINE_KW, WORKSPACE_DIRS, _IDLE_ACTIVE
     global WATCHER_FEEDBACK_DIR, _WATCHER_ENABLED, RECONCILER_INTERVAL
@@ -8765,6 +9223,8 @@ def _apply_config(cfg: Dict[str, Any]):
     DEFAULT_BASE_URL = conn["base_url"]
     DEFAULT_MODEL    = conn["model"]
     API_KEY_ENV      = conn.get("api_key_env", API_KEY_ENV)
+    LLM_REQUEST_TIMEOUT_S = float(conn.get("request_timeout_s", LLM_REQUEST_TIMEOUT_S))   # #1131: per-request LLM bound
+    LLM_MAX_RETRIES       = int(conn.get("max_retries", LLM_MAX_RETRIES))                 # #1131
     STATE_ROOT       = paths.get("state_root", STATE_ROOT)
     VAULT_ROOT       = paths.get("vault_root", VAULT_ROOT)
     SESSION_FILE     = paths["session_file"]
@@ -8830,6 +9290,7 @@ def _apply_config(cfg: Dict[str, Any]):
     THINKING_RESERVE   = int(ctx.get("thinking_reserve", THINKING_RESERVE))   # #366 D5
     MIN_OUTPUT_TOKENS  = max(1, int(ctx.get("min_output_tokens", MIN_OUTPUT_TOKENS)))   # #366 adaptive-reserve floor
     OVERFLOW_SAFETY_TOKENS = max(0, int(ctx.get("overflow_safety_tokens", OVERFLOW_SAFETY_TOKENS)))   # #366 estimate-slop headroom
+    TURN_IDLE_TIMEOUT_S = float(ctx.get("turn_idle_timeout_s", TURN_IDLE_TIMEOUT_S))   # #1132: idle-watchdog bound
     MEMORY_BRIEF_TOKENS = int(ctx.get("memory_brief_tokens", MEMORY_BRIEF_TOKENS))   # #458 D1 handover brief budget
     if TOKEN_BUDGET and not (os.environ.get("GX10_MAX_CTX_CHARS") or os.environ.get("GX10_TRIM_TARGET_CHARS")):
         # MEM-9: derive the char watermark from the window (output/RAG/summary reserve). BUDGET-3 (#503):
@@ -9138,7 +9599,8 @@ def _ace_chat_adapter():
         cfg = _EFFECTIVE_CFG if _EFFECTIVE_CFG is not None else _code_defaults()
         conn = (cfg.get("connection") or {})
         client = OpenAI(base_url=(conn.get("base_url") or DEFAULT_BASE_URL),
-                        api_key=(os.environ.get(conn.get("api_key_env", "GX10_API_KEY")) or "not-needed"))
+                        api_key=(os.environ.get(conn.get("api_key_env", "GX10_API_KEY")) or "not-needed"),
+                        timeout=LLM_REQUEST_TIMEOUT_S, max_retries=LLM_MAX_RETRIES)   # #1131: fail-soft bound
         resp = client.chat.completions.create(
             model=(conn.get("model") or DEFAULT_MODEL),
             messages=[{"role": "user", "content": prompt}],

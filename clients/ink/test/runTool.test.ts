@@ -138,7 +138,7 @@ test('list_directory sorts dirs first then name, [D]/[F] labels', async () => {
   await runTool('write_file', {path: path.join(d, 'alpha.txt'), content: '1'});
   await runTool('create_directory', {path: path.join(d, 'mid')});
   const out = await runTool('list_directory', {path: d});
-  assert.equal(out, '[D] mid\n[F] alpha.txt\n[F] zeta.txt');
+  assert.equal(out, '1 directory, 2 files\n[D] mid\n[F] alpha.txt\n[F] zeta.txt'); // #1183 count header
   await fs.rm(d, {recursive: true, force: true});
 });
 

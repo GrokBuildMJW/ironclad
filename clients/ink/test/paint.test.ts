@@ -4,7 +4,7 @@ import {createVNode, createTextNode, appendChild, type VNode} from '../src/rende
 import {createConfig, attachYoga, calculate, freeYoga} from '../src/render/layout.js';
 import {Surface} from '../src/render/surface.js';
 import {Palette} from '../src/render/palette.js';
-import {paint} from '../src/render/paint.js';
+import {paint, paintFixed} from '../src/render/paint.js';
 import {Selection} from '../src/render/selection.js';
 
 /** Lay out a vnode tree at the given width (height auto unless given). */
@@ -341,5 +341,35 @@ test('does not paint a display:none subtree', () => {
   assert.equal(row(s, 0, 0, 7), 'visible');
   // nothing from the hidden subtree anywhere
   for (let y = 0; y < 3; y++) assert.ok(!row(s, y).includes('gone'), `row ${y} has no hidden text`);
+  freeYoga(root);
+});
+
+// #1148: the input+footer stay PINNED at the viewport bottom while the transcript scrolls behind them —
+// exactly the mount stamp (paint scrolled, then clearRows + paintFixed the footer at the bottom).
+test('#1148 paintFixed pins the footer subtree at the viewport bottom regardless of scroll', () => {
+  const root = createVNode('ink-root');
+  const app = createVNode('ink-box', {flexDirection: 'column', flexGrow: 1});
+  const scroll = createVNode('ink-box', {flexDirection: 'column', flexGrow: 1});
+  for (let i = 0; i < 20; i++) appendChild(scroll, text({}, `line${i}`)); // taller than the viewport
+  const footer = createVNode('ink-box', {flexDirection: 'column'});
+  appendChild(footer, text({}, 'INPUT'));
+  appendChild(app, scroll);
+  appendChild(app, footer); // footer is the LAST element child (mount identifies it by that)
+  appendChild(root, app);
+
+  const H = 8; // viewport height
+  layout(root, 20); // natural height → the tree is ~21 rows, taller than H
+  const s = new Surface(20, H);
+  // scrolled to the TOP (yOffset 0): the footer's laid-out row (~20) is far below the 8-row surface
+  paint(root, s, new Palette(), 0);
+  assert.ok(!row(s, H - 1).includes('INPUT'), 'without the stamp the footer is off-screen when scrolled up');
+
+  // the mount stamp: reserve the bottom footer rows + paint the footer there, fixed
+  const fh = Math.round((footer.yoga as {getComputedHeight(): number}).getComputedHeight());
+  s.clearRows(H - fh, H);
+  paintFixed(footer, s, new Palette(), 0, H - fh, new Uint8Array(20 * H));
+
+  assert.match(row(s, H - 1), /INPUT/, 'the input is pinned on the bottom row');
+  assert.match(row(s, 0), /line0/, 'the transcript still shows at the top (scrolled up), behind the pin');
   freeYoga(root);
 });

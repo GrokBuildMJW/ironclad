@@ -20,6 +20,8 @@
 import {promises as fs} from 'node:fs';
 import path from 'node:path';
 import {spawn} from 'node:child_process';
+import {detectShell, gitBash} from './shell.js';
+import {classifyEntries, directoryEntryNames, fmtCount, listingTargetForCommand} from './listingCount.js';
 import {rglob} from './glob.js';
 
 const MAX_FILE_CHARS = 24000; // gx10.py:102
@@ -100,31 +102,43 @@ export function shellGuard(command: string): string | null {
   return null;
 }
 
-function execCommand(command: string, timeoutS: number): Promise<string> {
+// code null → spawn error / timeout / signal-kill (text carries the ERROR string or raw output);
+// the caller needs the exit code to gate the #1193 listing-count prepend on real success.
+type ExecResult = {text: string; code: number | null};
+
+function execCommand(command: string, timeoutS: number): Promise<ExecResult> {
   return new Promise((resolve) => {
-    const child =
-      process.platform === 'win32'
-        ? spawn('powershell', winPowershellArgs(command), {stdio: ['ignore', 'pipe', 'pipe']})
-        : spawn(command, {shell: true, stdio: ['ignore', 'pipe', 'pipe']});
+    let child;
+    if (process.platform === 'win32') {
+      // #1177: route per command so BOTH shells work — a bash command runs in Git Bash (when installed),
+      // a PowerShell cmdlet in PowerShell; neither is forced. Falls back to PowerShell without Git Bash.
+      const bash = gitBash();
+      child =
+        bash && detectShell(command) === 'bash'
+          ? spawn(bash, ['-lc', command], {stdio: ['ignore', 'pipe', 'pipe']})
+          : spawn('powershell', winPowershellArgs(command), {stdio: ['ignore', 'pipe', 'pipe']});
+    } else {
+      child = spawn(command, {shell: true, stdio: ['ignore', 'pipe', 'pipe']});
+    }
     const out: Buffer[] = [];
     const err: Buffer[] = [];
     let done = false;
-    const finish = (s: string): void => {
+    const finish = (r: ExecResult): void => {
       if (done) return;
       done = true;
       clearTimeout(timer);
-      resolve(s);
+      resolve(r);
     };
     const timer = setTimeout(() => {
       child.kill();
-      finish(`ERROR: Timeout after ${timeoutS}s`);
+      finish({text: `ERROR: Timeout after ${timeoutS}s`, code: null});
     }, timeoutS * 1000);
     child.stdout?.on('data', (d: Buffer) => out.push(d));
     child.stderr?.on('data', (d: Buffer) => err.push(d));
-    child.on('error', (e) => finish(`ERROR: ${e.message}`));
+    child.on('error', (e) => finish({text: `ERROR: ${e.message}`, code: null}));
     child.on('close', (code) => {
       const combined = (Buffer.concat(out).toString('utf-8') + Buffer.concat(err).toString('utf-8')).trim();
-      finish(combined || `(exit ${code ?? 0}, no output)`);
+      finish({text: combined, code});
     });
   });
 }
@@ -249,20 +263,26 @@ export async function runTool(name: string, args: Args): Promise<string> {
           throw e;
         }
         const total = entries.length;
-        let items = entries;
+        // #1202: ONE readdir snapshot feeds the count, the [D]/[F] markers AND the sort — no TOCTOU pair
+        // (a second readdir could desync the count from the listed items, even negative). Classify the
+        // ALREADY-READ dirents with the shared symlink-FOLLOWING helper (≙ Python Path.is_dir()), so a
+        // symlink-to-dir is a directory here exactly as in the engine and the listing-header path.
+        const classified = await classifyEntries(raw, entries);
+        const dirSet = new Set(classified.dirs);
+        let items = entries.map((e) => ({e, isDir: dirSet.has(e.name)}));
         if (args['sort'] === 'time') {
           const withM = await Promise.all(
-            items.map(async (e) => ({e, m: (await fs.stat(path.join(raw, e.name))).mtimeMs})),
+            items.map(async (it) => ({...it, m: (await fs.stat(path.join(raw, it.e.name))).mtimeMs})),
           );
           withM.sort((a, b) => b.m - a.m); // desc; ties keep original order (stable)
-          items = withM.map((x) => x.e);
+          items = withM.map(({e, isDir}) => ({e, isDir}));
         } else {
           items = [...items].sort((a, b) => {
-            const af = a.isFile() ? 1 : 0;
-            const bf = b.isFile() ? 1 : 0; // dirs (0) before files (1)
+            const af = a.isDir ? 0 : 1; // dirs (0) before files (1)
+            const bf = b.isDir ? 0 : 1;
             if (af !== bf) return af - bf;
-            const an = a.name.toLowerCase();
-            const bn = b.name.toLowerCase();
+            const an = a.e.name.toLowerCase();
+            const bn = b.e.name.toLowerCase();
             return an < bn ? -1 : an > bn ? 1 : 0;
           });
         }
@@ -273,8 +293,13 @@ export async function runTool(name: string, args: Args): Promise<string> {
           items = items.slice(0, LIST_DIR_HARD_CAP);
           capped = true;
         }
-        const lines = items.map((i) => `${i.isDirectory() ? '[D]' : '[F]'} ${i.name}`);
-        let out = lines.length ? lines.join('\n') : '(empty)';
+        const lines = items.map((it) => `${it.isDir ? '[D]' : '[F]'} ${it.e.name}`);
+        // #1183: a deterministic count header of the FULL set — LLMs miscount a list (the orchestrator, and
+        // me); state the exact numbers so the model reports them verbatim instead of re-counting.
+        const nDirs = dirSet.size; // from the SAME snapshot as total → 0 ≤ nDirs ≤ total always
+        const count = fmtCount(nDirs, total - nDirs); // ≙ gx10._fmt_count, shared with the listing header
+
+        let out = lines.length ? `${count}\n${lines.join('\n')}` : '(empty)';
         const shown = lines.length;
         if (shown < total) {
           const suffix = capped
@@ -303,7 +328,38 @@ export async function runTool(name: string, args: Args): Promise<string> {
           if (t === null) throw new Error(`invalid timeout: ${JSON.stringify(args['timeout'])}`);
           timeoutS = t;
         }
-        return await execCommand(command, timeoutS);
+        let r = await execCommand(command, timeoutS);
+        // #1196 ≙ gx10.py: BSD/macOS `ls` rejects the GNU-only `--color=always` (exit != 0), which would
+        // drop the fs-computed header/Answer (gated on exit 0). Retry the LISTING without the colour flag.
+        if (r.code !== 0 && command.includes('--color=always') && listingTargetForCommand(command) !== null) {
+          r = await execCommand(command.replace(/\s*--color=always\b/g, ''), timeoutS);
+        }
+        let out = r.text;
+        // #1193/#1195 ≙ gx10.py: a successful simple listing is prepended with the deterministic
+        // fs-computed count — the engine-side prepend never runs for a BRIDGED execute_command, so the
+        // bridge does it itself. Only on exit 0 with real output (an ERROR/timeout/empty result gets none).
+        if (r.code === 0 && out) {
+          const target = listingTargetForCommand(command);
+          const names = target === null ? null : await directoryEntryNames(target);
+          if (names !== null) {
+            // ONE snapshot feeds header AND answer data (no self-contradicting TOCTOU pair).
+            // #1202: the machine AnswerData line is rendered into the localized ready-made `Answer:`
+            // sentence SERVER-side (one authoritative language/template/sort) — this bridge ships
+            // DATA, never prose. Compact JSON ≙ the engine's json.dumps(separators=(",", ":")).
+            const header = fmtCount(names.dirs.length, names.files.length);
+            // 200 is the client TRANSPORT bound (don't ship huge name lists over the bridge). It equals
+            // the engine's DEFAULT cap; a deployment that raises list_dir_hard_cap ABOVE 200 keeps the
+            // ready-made Answer for engine-native listings between 200 and the configured cap but not for
+            // bridged ones — those fall back to the header + model prose. A known, documented topology
+            // limit under a non-default cap (the count header is unaffected).
+            const data =
+              names.dirs.length + names.files.length <= LIST_DIR_HARD_CAP
+                ? `AnswerData: ${JSON.stringify({dirs: names.dirs, files: names.files})}\n`
+                : '';
+            out = `${header}\n${data}${out}`;
+          }
+        }
+        return out || `(exit ${r.code ?? 0}, no output)`;
       }
 
       case 'move_file': {

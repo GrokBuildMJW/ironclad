@@ -83,6 +83,11 @@ _CAPTURE = threading.local()
 #: thread-safe). A /chat turn and a reconciler-driven advance take turns.
 _AGENT_LOCK = threading.Lock()
 
+#: Guard 1 (#1131/epic #1130): bound how long a request waits for the agent lock. Even with the per-request
+#: LLM timeout + the turn watchdog, a second /chat must NEVER block forever behind a running/wedged turn —
+#: after this it gets a 503 "busy" (retryable) instead of an indefinite hang. Env: GX10_AGENT_LOCK_TIMEOUT_S.
+_AGENT_LOCK_TIMEOUT_S = float(os.environ.get("GX10_AGENT_LOCK_TIMEOUT_S") or 45.0)
+
 
 def _capture_sink(text: str) -> None:
     """``gx10._UI_SINK`` hook. Output produced inside a request that registered an
@@ -721,10 +726,15 @@ class _Handler(BaseHTTPRequestHandler):
                 if info and not data.get("confirm"):
                     self._send(200, {"ok": True, "needs_confirm": info})   # do NOT execute; client confirms
                     return
-                with _Captured() as cap:
-                    with _AGENT_LOCK:
+                if not _AGENT_LOCK.acquire(timeout=_AGENT_LOCK_TIMEOUT_S):   # #1131: never block forever behind a wedge
+                    self._send(503, {"ok": False, "error": "busy — another turn is still running; try again shortly"})
+                    return
+                try:
+                    with _Captured() as cap:
                         gx10.bind_active()      # S5b: this request thread → the active project's ctx
                         gx10._dispatch(self.agent, message)
+                finally:
+                    _AGENT_LOCK.release()
                 self._send(200, {"ok": True, "output": _strip_chat_chrome(cap.text)})
             elif self.path == "/chat/stream":
                 data = self._read_json()
@@ -787,16 +797,21 @@ class _Handler(BaseHTTPRequestHandler):
                 hb_thread.start()
                 try:
                     with _Streamed(_write):
-                        with _AGENT_LOCK:
-                            gx10.bind_active()  # S5b: this request thread → the active project's ctx
-                            if bridge is not None:
-                                _ACTIVE_BRIDGE["b"] = bridge
-                                gx10._LOCAL_TOOL_BRIDGE = bridge
+                        if not _AGENT_LOCK.acquire(timeout=_AGENT_LOCK_TIMEOUT_S):   # #1131: bounded wait, then bail
+                            _write("\n[busy — another turn is still running; try again shortly]\n")
+                        else:
                             try:
-                                gx10._dispatch(self.agent, message)
+                                gx10.bind_active()  # S5b: this request thread → the active project's ctx
+                                if bridge is not None:
+                                    _ACTIVE_BRIDGE["b"] = bridge
+                                    gx10._LOCAL_TOOL_BRIDGE = bridge
+                                try:
+                                    gx10._dispatch(self.agent, message)
+                                finally:
+                                    gx10._LOCAL_TOOL_BRIDGE = None
+                                    _ACTIVE_BRIDGE["b"] = None
                             finally:
-                                gx10._LOCAL_TOOL_BRIDGE = None
-                                _ACTIVE_BRIDGE["b"] = None
+                                _AGENT_LOCK.release()
                 finally:
                     _hb_stop.set()
                     hb_thread.join(timeout=1.0)

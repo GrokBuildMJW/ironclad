@@ -14,6 +14,14 @@ test('route — [perf] goes to status (perf + tokens), not the answer', () => {
   assert.equal(r.answer.length, 0);
 });
 
+test('route — #1181 the engine "⋯ …" transient status is dropped, never committed', () => {
+  const r = createRouter();
+  r.route('  ⋯ Qwen erzeugt Tool-Aufruf …');
+  assert.equal(r.answer.length, 0, 'the "⋯" status line does not reach the transcript');
+  r.route('real answer');
+  assert.equal(answerBody(r), 'real answer');
+});
+
 test('route — #453 [agent] goes to the agent status, not the answer', () => {
   const r = createRouter();
   assert.equal(r.agent, ''); // a fresh per-turn router has no stale coder (no carry-over between turns)

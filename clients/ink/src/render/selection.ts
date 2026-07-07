@@ -87,14 +87,15 @@ export class Selection {
   }
 
   /** Toggle the inverse attribute on selected cells (the visible highlight); skips NoSelect chrome. */
-  overlay(surface: Surface, palette: Palette, noSelect?: Uint8Array): void {
+  overlay(surface: Surface, palette: Palette, noSelect?: Uint8Array, viewOffset = 0): void {
     const r = this.range;
     if (!r) return;
     const w = surface.width;
-    for (let y = r.start.y; y <= r.end.y; y++) {
+    for (let cy = r.start.y; cy <= r.end.y; cy++) {
+      const y = cy - viewOffset; // #1173: the range is in CONTENT rows; map onto the screen surface
       if (y < 0 || y >= surface.height) continue;
-      let xs = Math.max(0, y === r.start.y ? r.start.x : 0);
-      let xe = Math.min(w - 1, y === r.end.y ? r.end.x : w - 1);
+      let xs = Math.max(0, cy === r.start.y ? r.start.x : 0);
+      let xe = Math.min(w - 1, cy === r.end.y ? r.end.x : w - 1);
       // snap to whole wide glyphs: the lead carries the drawn glyph + its attributes
       if (xs > 0 && ((surface.flags[y * w + xs] ?? 0) & WIDE_CONT)) xs--;
       if (xe < w - 1 && ((surface.flags[y * w + xe] ?? 0) & WIDE)) xe++;

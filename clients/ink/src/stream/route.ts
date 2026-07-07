@@ -69,6 +69,9 @@ export function createRouter(): Router {
       return;
     }
     if (st.includes('===') && (st.includes('DONE') || st.includes('✓'))) return;
+    // #1181: engine transient status ("⋯ Qwen erzeugt Tool-Aufruf …") — the client has its own working line;
+    // never let it leak into (and linger in) the committed transcript.
+    if (st.startsWith('⋯')) return;
     // MPR sentinels on their own line (trim() also catches the model's indented/glued `<<<END>>>`).
     if (st === REPORT_OPEN || st === REPORT_CLOSE) return;
     if (

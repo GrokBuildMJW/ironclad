@@ -140,6 +140,25 @@ export class Surface {
     return x;
   }
 
+  /** Clear rows [y0, y1) to blank (space, default style) + mark them damaged — reserves an app-pinned
+   *  region (e.g. the input + footer) so scrolled content painted there can be overwritten. */
+  clearRows(y0: number, y1: number): void {
+    const a = Math.max(0, y0 | 0);
+    const b = Math.min(this.height, y1 | 0);
+    for (let y = a; y < b; y++) {
+      for (let x = 0; x < this.width; x++) {
+        const i = this.idx(x, y);
+        this.code[i] = 32;
+        this.style[i] = 0;
+        this.flags[i] = 0;
+      }
+      if (this.width > 0) {
+        this.grow(0, y);
+        this.grow(this.width - 1, y);
+      }
+    }
+  }
+
   /** Reallocate to new dimensions (a resize is a conceptually new frame → full damage). */
   resize(width: number, height: number): void {
     const w = Math.max(0, width | 0);

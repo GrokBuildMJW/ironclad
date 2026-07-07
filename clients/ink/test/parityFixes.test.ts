@@ -64,7 +64,7 @@ test('list_directory limit=true → 1 item (int(True)=1) with (limit=1) note', a
   for (const n of ['a', 'b', 'c']) await fs.writeFile(path.join(d, `${n}.txt`), '1');
   const out = await runTool('list_directory', {path: d, limit: true});
   assert.match(out, /\(limit=1\)\]$/);
-  assert.equal(out.split('\n').length, 2, '1 entry + note');
+  assert.equal(out.split('\n').length, 3, '#1183 count header + 1 entry + note');
   await fs.rm(d, {recursive: true, force: true});
 });
 
