@@ -150,6 +150,16 @@ def test_mint_seeds_software_unit(mint_env):
     assert list((wd / "beta").rglob("meta.md"))   # the seeded vault unit under the new project root
 
 
+def test_mint_seeds_canonical_main_slug_not_project_name(mint_env):
+    # #1276 (facet 2): the seeded unit uses a CANONICAL `main` slug, not the project name — so the design doc
+    # lands at `<project>/vault/main/…`, not the redundant `<project>/vault/<project>/…` double name.
+    wd = mint_env
+    out = gx10._project_command("new zeta", FakeGx())
+    assert "seeded software unit 'main'" in out
+    assert (wd / "zeta" / "vault" / "main" / "meta.md").is_file()   # canonical slug
+    assert not (wd / "zeta" / "vault" / "zeta").exists()            # NOT the project-name double-nesting
+
+
 def test_mint_with_path_roots_there(mint_env):
     wd = mint_env
     target = wd / "custom"

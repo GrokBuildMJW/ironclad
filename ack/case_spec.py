@@ -87,6 +87,10 @@ class TaskType(str, Enum):
     RESEARCH = "research"
     CLEANUP = "cleanup"
     SMOKE_TEST = "smoke-test"
+    # #1296: the tracker-level parent record of a design decomposition (1:1 GitHub epic). Never
+    # buildable/launchable itself — children link to it via ``parent``; the engine closes it
+    # deterministically when the last child is done.
+    EPIC = "epic"
 
 
 class Priority(str, Enum):

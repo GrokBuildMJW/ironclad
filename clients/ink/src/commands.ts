@@ -28,6 +28,7 @@ export interface Command {
   subcommands?: string[]; // #937: from /catalogue (#936) — powers argument autocomplete
   flags?: FlagInfo[]; //     #937: from /catalogue (#936) — flag names + choices for argument autocomplete
   arg?: boolean; //          #937: this completion inserts an argument token, not a `/verb` (see completionText)
+  hidden?: boolean; //       #1264: a deprecated verb — still dispatchable if typed, but never advertised in autocomplete
 }
 
 /** The command registry. `!<cmd>` (local shell, MEM-15) is separate — not a slash command. */
@@ -38,7 +39,7 @@ export const COMMANDS: readonly Command[] = [
   {name: 'pending', scope: 'local', desc: 'staged handovers for local code-agents'},
   {name: 'coders', scope: 'local', usage: '[use <id>|auto]', desc: 'which coding agents are bound/active (+ pin one at runtime)'},
   {name: 'work', scope: 'local', desc: 'run all open handovers ONCE locally (in parallel)'},
-  {name: 'auto', scope: 'local', usage: 'on|off', desc: 'background poller for handovers'},
+  {name: 'auto', scope: 'local', usage: 'on [N]|off', desc: 'full automation on/off — engine loop (watcher+autopilot+continuation) + local coder poller'},
   {name: 'health', scope: 'local', desc: 'server status'},
   {name: 'doctor', scope: 'local', desc: 'read-only preflight report (GET /doctor)'},
   {name: 'tool', scope: 'server', usage: '<name> <args|text>', desc: 'run a tool directly/deterministic, e.g. tool mpr_research <frage>'},
@@ -63,7 +64,7 @@ export const COMMANDS: readonly Command[] = [
   {name: 'autopilot', scope: 'server', usage: 'on|off', desc: 'autopilot'},
   {name: 'autoplan', scope: 'server', usage: 'on|off [N]', desc: 'auto-plan the next tasks'},
   {name: 'log-terminal', scope: 'server', usage: 'on|off', desc: 'live autopilot log window'},
-  {name: 'initiative', scope: 'server', usage: 'new <name> --type mpr|software | list | use <slug> | active | reconcile', desc: 'manage the initiative-centric vault (a deprecated alias for /project)'},
+  {name: 'initiative', scope: 'server', usage: 'new <name> --type mpr|software | list | use <slug> | active | reconcile', desc: 'manage the initiative-centric vault (a deprecated alias for /project)', hidden: true},
   {name: 'project', scope: 'server', usage: 'list [--all] | new <name> [--type mpr|software] [--path <dir>] | active | track new|use|list | delete <id> [--purge] | archive|unarchive <id>', desc: 'manage isolated projects (the guided setup command; /initiative is a deprecated alias)'},
   {name: 'switch', scope: 'server', usage: '<project_id>', desc: 'rebind the engine to a project (own paths + memory partition)'},
   {name: 'approve', scope: 'server', usage: '[slug]', desc: "approve the active unit's design so implementation handovers are unblocked (S5, no blind coding)"},
@@ -90,7 +91,8 @@ export function completions(prefix: string, extra: readonly Command[] = []): rea
   const p = prefix.trim().toLowerCase();
   const builtin = new Set(COMMANDS.map((c) => c.name));
   const dyn = extra.filter((c) => !builtin.has(c.name));
-  return [...COMMANDS, ...dyn].filter((c) => c.name.startsWith(p));
+  // #1264: a hidden (deprecated) built-in stays dispatchable if typed, but is never advertised here.
+  return [...COMMANDS.filter((c) => !c.hidden), ...dyn].filter((c) => c.name.startsWith(p));
 }
 
 /** #937: argument autocomplete — once past the verb, complete its subcommands / flag names / flag-choices
@@ -184,7 +186,7 @@ export const ALIASES: Readonly<Record<string, string>> = {
   lg: 'lifecycle gate', cfg: 'config', keys: 'config keys',
   cfgget: 'config get', cfgset: 'config set', pj: 'project', gen: 'generate',
 };
-const UNSAFE: ReadonlySet<string> = new Set(['project', 'autoplan', 'ace', 'generate', 'tool']);
+const UNSAFE: ReadonlySet<string> = new Set(['project', 'auto', 'autoplan', 'ace', 'generate', 'tool']);
 
 function _editDistance(a: string, b: string): number {
   if (a === b) return 0;

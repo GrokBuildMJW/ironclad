@@ -67,6 +67,15 @@ export type ChatStreamReply =
   | {needs_confirm?: {command: string; tier: string; reason: string}; needs_guide?: NeedsGuide}
   | undefined;
 
+/** #935/#1281: `--yes`/`--confirm` is the operator's confirmation for a destructive command — a standalone
+ *  token in ANY position (not only trailing; `--yes --purge` slipped past the old `$`-anchored regex).
+ *  Returns the message without the flag + whether it was present. */
+export function stripConfirm(message: string): {msg: string; confirm: boolean} {
+  const toks = message.split(/\s+/).filter((t) => t.length > 0);
+  const kept = toks.filter((t) => t !== '--yes' && t !== '--confirm');
+  return kept.length !== toks.length ? {msg: kept.join(' '), confirm: true} : {msg: message, confirm: false};
+}
+
 export async function chatStream(
   srv: Server,
   message: string,
@@ -80,11 +89,8 @@ export async function chatStream(
   };
   // #935: uniform confirm affordance — a trailing `--yes`/`--confirm` on a destructive command IS the
   // confirmation (stripped here, sent as confirm=true). Keeps the flow input-free.
-  let confirm = false;
-  const msg = message.replace(/\s+--(?:yes|confirm)\s*$/i, () => {
-    confirm = true;
-    return '';
-  });
+  // #935/#1281: `--yes`/`--confirm` (in ANY position) is the destructive-command confirmation.
+  const {msg, confirm} = stripConfirm(message);
   // Combine the caller's cancel signal (Esc / Ctrl+C) with the request timeout, so aborting a turn
   // tears down the fetch + reader IMMEDIATELY instead of waiting on the server to stop generating.
   const timeout = AbortSignal.timeout(srv.timeoutMs);

@@ -45,7 +45,7 @@ test('MEM-16: registry derives LOCAL_COMMANDS + powers completions', () => {
   // completions filter by prefix (no leading slash)
   const res = completions('res').map((c) => c.name);
   assert.deepEqual(res, ['reset', 'resume']);
-  assert.equal(completions('').length, COMMANDS.length); // empty → all
+  assert.equal(completions('').length, COMMANDS.filter((c) => !c.hidden).length); // empty → all visible (#1264: hidden excluded)
   assert.ok(completions('stat').some((c) => c.name === 'status' && c.scope === 'server'));
   assert.equal(completions('zzz').length, 0); // no match
 });

@@ -370,15 +370,15 @@ def _queue_consumer(agent: gx10.GX10, stop: threading.Event,
                         res = f"ERROR: {e!r}"
                 print(f"[ADVANCE] {tid} ({agent_adv}): {res.splitlines()[0] if res else res}",
                       flush=True)
-                # Autoplan (decoupled from autopilot — launching is the client's job): on
-                # empty pipeline, enqueue the next planning turn. Only fires when
-                # `/autoplan on` is set and a backlog is configured —
+                # Continuation (#1296; decoupled from autopilot — launching is the client's job):
+                # after an advance, enqueue the next turn (next open unit → capability backlog →
+                # idle). Only fires when continuation is armed (`/auto on` / `/autoplan on`) —
                 # AND the channel is not sealed (no client present to execute).
                 sealed = sessions.is_sealed() if sessions is not None else False
                 if res and res.startswith("OK") and not sealed:
-                    gx10._autoplan_tick(tid, lambda p: gx10._INPUT_QUEUE.put(p))
+                    gx10._continuation_tick(tid, lambda p: gx10._INPUT_QUEUE.put(p))
                 elif sealed:
-                    print("[AUTOPLAN] paused — channel sealed (no live session)", flush=True)
+                    print("[CONTINUATION] paused — channel sealed (no live session)", flush=True)
             continue
         # Plain prompt (e.g. autoplan) → normal turn.
         with _AGENT_LOCK:
@@ -397,6 +397,7 @@ def _pending_handovers() -> list[Dict[str, Any]]:
     The client pulls these, runs ``claude --print`` locally, posts feedback back."""
     store = gx10._store()
     reg = gx10._code_agent_registry()          # #449: config-driven code-agent registry
+    probe = _probe_cached()                    # #1279: boot-probe RESOLVED bin path per agent (as /coders uses)
     out: list[Dict[str, Any]] = []
     for task in store.list("pending"):
         tid = task.get("id") or ""
@@ -416,6 +417,13 @@ def _pending_handovers() -> list[Dict[str, Any]]:
         # agent's model, masking which agent really ran + breaking the per-agent model contract).
         if agent == staged:
             model, effort = gx10._parse_handover_meta(ho)
+            # #1279 (completes #1236 on the /pending path — the guard existed only in _do_launch): the
+            # handover's `to:` is the RECIPIENT AGENT (e.g. "to: CODEX"), which `_parse_handover_meta` returns
+            # as `model`. An agent id must NEVER be shipped as the model — the client would render `-m CODEX`
+            # and a non-Claude coder CLI rejects it (exit 1, no code produced). Drop it so spec.model wins; a
+            # genuine model string in `to:` still overrides.
+            if model and reg.has(model.strip().upper()):
+                model = None
         else:
             model, effort = None, None
         try:
@@ -434,7 +442,10 @@ def _pending_handovers() -> list[Dict[str, Any]]:
             # let the client fall back byte-identically to its Claude defaults (CLAUDE_BIN/AGENT_CMD).
             "model": model or spec.model,
             "effort": effort or spec.effort,
-            "bin": spec.bin,
+            # #1279: ship the boot-probe RESOLVED bin path (the exact codex.exe /coders shows), NOT the logical
+            # `spec.bin` ("codex") — else the client spawns a bare `codex` and node's PATH may pick the wrong
+            # install (an npm shim / a Store desktop app) that rejects `exec -m` (unknown option, no code).
+            "bin": probe.get(agent) or spec.bin,
             "cmd_template": spec.cmd_template,
             "permission": spec.permission_mode,
             # #480: the read-only Memory MCP, gated server-side on the sealed profile + a configured memory

@@ -277,6 +277,28 @@ export async function runHandover(
   return {fb: null, meta};
 }
 
+/** #1300: drop the per-task agent scratch (handover drop + feedback + capture) after a SUCCESSFUL
+ *  upload — the server-side `.work/archive/` history is the durable record; the client copies are
+ *  transport materialization and would otherwise accumulate per task. Fail-soft: a cleanup hiccup
+ *  never un-does a successful run. A FAILED run keeps its scratch for diagnosis + retry. */
+async function cleanupAgentScratch(codedir: string, item: Item): Promise<void> {
+  const tid = str(item['id']);
+  const agent = str(item['agent'], 'OPUS').toUpperCase();
+  const hoName = str(item['handover_file']) || `${tid}_${agent}.md`;
+  const base = path.join(codedir, '.ironclad', 'agent');
+  for (const p of [
+    path.join(base, 'handovers', hoName),
+    path.join(base, 'feedback', `${tid}_${agent}-feedback.md`),
+    path.join(base, 'feedback', `${tid}_${agent}-output.md`),
+  ]) {
+    try {
+      await fs.rm(p, {force: true});
+    } catch {
+      /* fail-soft — never let cleanup mask a successful upload */
+    }
+  }
+}
+
 /** ≙ _process_one: run the handover, upload feedback; un-claim on any failure for retry. */
 export async function processOne(
   srv: Server,
@@ -304,6 +326,7 @@ export async function processOne(
     const cls = typeof clsRaw === 'string' ? clsRaw : null;
     if (cls === 'ok-feedback' || (cls === null && fb)) {
       log(`  ✓ feedback uploaded: ${tid} → ${str((res as Json)['feedback_file'])}`);
+      await cleanupAgentScratch(codedir, item); // #1300: the scratch is done its job
       return true;
     }
     if (cls === 'agent-unavailable') {

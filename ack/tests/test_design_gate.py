@@ -153,3 +153,53 @@ def test_design_gate_unit(monkeypatch, tmp_path):
     assert gx10._design_gate("documentation", slug) is None                  # non-impl ungated
     assert gx10._design_gate("implementation", slug).startswith("ERROR")     # no design
     assert gx10._design_gate("implementation", None).startswith("ERROR")     # no unit
+
+
+# ── #1267: no duplicate H1 in the recorded design doc ───────────────────────────────────────────────
+def _h1_count(md: str) -> int:
+    return sum(1 for ln in md.splitlines() if ln.startswith("# "))
+
+
+def _design_body(rel: str) -> str:
+    # #1276: record_design now returns a project-root-relative (navigable) path → resolve it from the project
+    # root (the test's chdir'd workdir), not vault_root (which would double the `vault/` prefix).
+    base = gx10._project_root() or Path.cwd()
+    text = (base / rel).read_text(encoding="utf-8")
+    return text.split("---", 2)[2]                            # drop the leading frontmatter block
+
+
+def test_record_design_no_duplicate_h1(monkeypatch, tmp_path):
+    # #1267: when the body already opens with its own H1, record_design must NOT inject a second `# {title}`.
+    _setup(monkeypatch, tmp_path)
+    rel = gx10.record_design("FileSearch — Design", "# FileSearch CLI\n\nBody text.")
+    body = _design_body(rel)
+    assert _h1_count(body) == 1                               # exactly one top-level heading, not two
+    assert "# FileSearch CLI" in body                         # the model's own heading is preserved
+
+
+def test_record_design_injects_title_h1_when_body_has_none(monkeypatch, tmp_path):
+    # #1267: a body without its own heading still gets the title as an H1 (unchanged for that case).
+    _setup(monkeypatch, tmp_path)
+    rel = gx10.record_design("MyTitle", "just prose, no heading")
+    body = _design_body(rel)
+    assert _h1_count(body) == 1 and "# MyTitle" in body
+
+
+def test_record_design_returns_navigable_project_root_relative_path(monkeypatch, tmp_path):
+    # #1276: the reported path is in the OPERATOR's frame — project-root-relative (leads with `vault/`), so it
+    # resolves from where their shell runs, unlike the vault-root-relative value the gate uses internally.
+    _setup(monkeypatch, tmp_path)
+    rel = gx10.record_design("Approach", "use Rust")
+    assert rel.startswith("vault/") and rel.endswith("decisions/design.md")
+    base = gx10._project_root() or Path.cwd()
+    assert (base / rel).is_file()                            # the reported path actually resolves on disk
+
+
+# ── #1269: /approve confirms AND recommends the next step ────────────────────────────────────────────
+def test_approve_message_includes_next_step(monkeypatch, tmp_path):
+    _setup(monkeypatch, tmp_path)
+    gx10.record_design("Approach", "use Rust")
+    msg = gx10._approve_design()
+    assert msg.startswith("OK")                              # still a success confirmation
+    assert "Next:" in msg and "plan_units" in msg            # guided next-step present, not a dead end
+    assert "/auto" in msg                                    # #1296: the drain/guided switch is named

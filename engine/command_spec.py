@@ -98,6 +98,11 @@ COMMAND_SPECS: Tuple[CommandSpec, ...] = (
                 flags=(FlagSpec("<path>", required=True),)),
     CommandSpec("ls", READ_ONLY, "List a directory (default: the project workdir).",
                 flags=(FlagSpec("[dir]",),)),
+    CommandSpec("auto", COSTLY,
+                "Automation meta-switch: on = FULL automation (watcher + autopilot + continuation, "
+                "every unit = a paid coder run), off = guided mode (engine recommends, operator drives).",
+                flags=(FlagSpec("on [N] | off", "N caps the task count; on with no N runs unbounded",
+                                choices=("on", "off")),)),
     CommandSpec("watcher", MUTATING, "Toggle the reconciler auto-advance.", flags=_ON_OFF),
     CommandSpec("autopilot", MUTATING, "Toggle autopilot (auto-launch of agents).", flags=_ON_OFF),
     CommandSpec("autoplan", COSTLY, "Toggle autoplan — a model-driven planning loop (spends tokens).",
@@ -237,17 +242,26 @@ def render_usage(c: CommandSpec) -> str:
     return _usage_hint(c)
 
 
+def is_deprecated(c: CommandSpec) -> bool:
+    """A verb is *deprecated* iff its ``summary`` says so (one convention, single source). A deprecated verb
+    stays fully dispatchable for back-compat, but is NOT advertised — neither in the model-facing
+    :func:`context_summary` nor in the client-facing :func:`catalogue_entries` (so it disappears from
+    ``/catalogue`` + slash-autocomplete). #1264."""
+    return c.summary.lower().startswith("deprecated")
+
+
 def catalogue_entries() -> "list[dict]":
     """The server-verb spec serialized for ``GET /catalogue`` + client generation (#931/#936):
     ``[{name, tier, usage, summary, subcommands, flags:[{name, required, choices, summary}]}]``. Pure — the
     ink server-command completions are generated FROM this (with the client's static list as the cold-start
     fallback), and the structured ``flags``/``subcommands`` back the client's guided-input + autocomplete
-    (#936/#937)."""
+    (#936/#937). **Deprecated verbs are excluded** (#1264): they stay dispatchable but must not be
+    advertised in autocomplete."""
     return [{"name": c.verb, "tier": c.tier, "usage": render_usage(c), "summary": c.summary,
              "subcommands": list(c.subcommands),
              "flags": [{"name": f.name, "required": f.required, "choices": list(f.choices),
                         "summary": f.summary} for f in c.flags]}
-            for c in COMMAND_SPECS]
+            for c in COMMAND_SPECS if not is_deprecated(c)]
 
 
 def guided_usage(verb: str) -> str:
@@ -272,8 +286,8 @@ def context_summary() -> str:
     nothing)."""
     if not COMMAND_SPECS:
         return ""
-    canonical = [c for c in COMMAND_SPECS if not c.summary.lower().startswith("deprecated")]
-    deprecated = [c for c in COMMAND_SPECS if c.summary.lower().startswith("deprecated")]
+    canonical = [c for c in COMMAND_SPECS if not is_deprecated(c)]
+    deprecated = [c for c in COMMAND_SPECS if is_deprecated(c)]
     lines = ["Slash-command surface (use these canonical command names EXACTLY — never invent, guess, or",
              "recommend a command that is not listed here):"]
     lines += [f"  /{c.verb} — {c.summary}" for c in canonical]

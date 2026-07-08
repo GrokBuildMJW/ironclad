@@ -641,6 +641,25 @@ def vault_root() -> Path:
     return p
 
 
+def _display_doc_path(rel: str) -> str:
+    """#1276: render a vault-root-relative doc path in the OPERATOR's frame — project-root-relative
+    (e.g. ``vault/<slug>/decisions/design.md``), so it resolves from where the operator's shell runs. The
+    internal vault-root-relative value stays for the design gate's own resolution; only what the operator
+    SEES is reframed. Falls back to the input on any failure (a display reframe must never break a caller)."""
+    try:
+        vr = vault_root()
+        root = _project_root()
+        if root is not None and vr.is_absolute():
+            prefix = vr.relative_to(root)          # e.g. `vault` (or `vault/.tracks/<track>`)
+        elif not vr.is_absolute():
+            prefix = vr                            # default project: vault_root is already workdir-relative
+        else:
+            return rel
+        return (prefix / rel).as_posix()
+    except Exception:  # noqa: BLE001
+        return rel
+
+
 _vault_lock_tl = threading.local()
 
 
@@ -964,8 +983,12 @@ def archive_feedback_dir(soft: bool = False) -> Optional[Path]:
 # builds an AUTO-maintained INDEX.md (grouped by category/date, Obsidian [[links]]) plus —
 # optionally — an idempotent "Verwandt (auto)" (related) block in the curated docs (shared tags /
 # title reference in the text). Deterministic, no model call. Like the MEMORY.md pattern.
-_INDEX_AUTO_START = "<!-- ironclad:index:auto START — generiert von reconcile_vault, nicht von Hand ändern -->"  # noqa: E501 — deliberately FROZEN marker (test_frozen_markers_unchanged): existing vault INDEX.md files match it verbatim; do NOT translate — the english-only guard allowlists it as a frozen migration exception
+_INDEX_AUTO_START = "<!-- ironclad:index:auto START -->"   # #1265: English + description-less, consistent with the board/lifecycle/related markers
 _INDEX_AUTO_END   = "<!-- ironclad:index:auto END -->"
+# #1265: an INDEX.md written before #1265 carries the legacy (German, descriptive) START marker. reconcile_vault
+# normalizes ANY prior `ironclad:index:auto START …` marker to the current one BEFORE the managed-block rewrite,
+# so an existing vault's block is rewritten IN PLACE (never duplicated); it also matches the new marker → idempotent.
+_INDEX_LEGACY_START_RE = re.compile(r"<!-- ironclad:index:auto START.*?-->")
 _LINKS_AUTO_START = "<!-- ironclad:related:auto START -->"
 _LINKS_AUTO_END   = "<!-- ironclad:related:auto END -->"
 # S12c: a machine-readable typed-edge graph (GRAPH.json) + a human LIFECYCLE.md view, both generated
@@ -1244,6 +1267,18 @@ def _render_board(slug: "Optional[str]" = None) -> str:
     by_status = {st: sorted(store.list(st), key=lambda t: (t.get("created_at", ""), t.get("id", "")))
                  for st in TaskStore.STATUSES}
     counts = {st: len(by_status[st]) for st in TaskStore.STATUSES}
+    # #1296: per-epic unit progress ("3/7 units done") — computed once over all rows so every
+    # epic row can show how far its decomposition is.
+    _all_rows = [t for rows in by_status.values() for t in rows]
+    _epic_prog: Dict[str, str] = {}
+    for t in _all_rows:
+        if str(t.get("type") or "").lower() != "epic":
+            continue
+        eid = str(t.get("id") or "")
+        kids = [k for k in _all_rows if str(k.get("parent") or "") == eid]
+        if kids:
+            n_done = sum(1 for k in kids if k.get("status") == "done")
+            _epic_prog[eid] = f"units: {n_done}/{len(kids)} done"
     lines = [_BOARD_AUTO_START,
              "_" + f"{sum(counts.values())} task(s) — "
              + " · ".join(f"{st} {counts[st]}" for st in TaskStore.STATUSES) + "_", ""]
@@ -1270,6 +1305,7 @@ def _render_board(slug: "Optional[str]" = None) -> str:
                 str(t.get("title") or ""),
                 (f"labels: {', '.join(str(x) for x in labels)}" if labels else ""),
                 (f"parent: {t['parent']}" if t.get("parent") else ""),
+                _epic_prog.get(str(t.get("id") or ""), ""),   # #1296: epic rows show unit progress
                 blocked_bit,
                 str(t.get("created_at") or ""),
             ) if b)
@@ -1331,6 +1367,7 @@ def reconcile_vault(slug: str, *, links: bool = True) -> str:
         except Exception:
             seed_title = slug
         existing = index_path.read_text(encoding="utf-8") if index_path.exists() else f"# {seed_title} — INDEX\n"
+        existing = _INDEX_LEGACY_START_RE.sub(_INDEX_AUTO_START, existing)   # #1265: migrate any legacy START marker in place
         new_index = _set_managed_block(existing, _INDEX_AUTO_START, _INDEX_AUTO_END, _index_block(slug, docs))
         if new_index != existing:
             index_path.write_text(new_index, encoding="utf-8", newline="\n")
@@ -1560,7 +1597,7 @@ def _design_gate(task_type: str, slug: "Optional[str]") -> "Optional[str]":
                 f"record_design to persist the design (idea/approach/architecture), get it approved "
                 f"(/approve), THEN stage the implementation handover.")
     if not approved:
-        return (f"ERROR: design for unit {slug!r} is recorded ({rel}) but NOT approved. The operator must "
+        return (f"ERROR: design for unit {slug!r} is recorded ({_display_doc_path(rel)}) but NOT approved. The operator must "
                 f"approve it — run /approve (or set `approved: true` in the design doc) — before an "
                 f"implementation handover.")
     return None
@@ -1587,6 +1624,10 @@ def record_design(title: str, body: str, *, slug: "Optional[str]" = None) -> str
         ddir = vdir / "decisions"
         ddir.mkdir(parents=True, exist_ok=True)
         doc = ddir / "design.md"        # single canonical design doc — re-recording replaces it (resets approval)
+        # #1267: the model's body frequently already opens with its own top-level heading; injecting
+        # `# {title}` on top of that produces a DUPLICATE H1. Inject the title heading only when the body
+        # does not already lead with one (the frontmatter `title:` stays canonical either way).
+        heading = "" if body.lstrip().startswith("# ") else f"# {title}\n\n"
         content = (
             "---\n"
             "type: decision\n"
@@ -1594,7 +1635,7 @@ def record_design(title: str, body: str, *, slug: "Optional[str]" = None) -> str
             "approved: false\n"
             f"title: {title}\n"
             "---\n\n"
-            f"# {title}\n\n"
+            f"{heading}"
             f"{body}"
         )
         doc.write_text(content, encoding="utf-8", newline="\n")
@@ -1602,7 +1643,7 @@ def record_design(title: str, body: str, *, slug: "Optional[str]" = None) -> str
             reconcile_vault(target, links=False)
         except Exception:  # noqa: BLE001 — projection must not fail on a reconcile hiccup
             pass
-        return (doc.relative_to(vault_root())).as_posix()
+        return _display_doc_path((doc.relative_to(vault_root())).as_posix())   # #1276: navigable path
 
 
 def _approve_design(slug: "Optional[str]" = None) -> str:
@@ -1620,7 +1661,7 @@ def _approve_design(slug: "Optional[str]" = None) -> str:
         if not doc.is_file():
             return (f"ERROR: unit {target!r} has no design to approve — record one first "
                     f"(record_design). Nothing changed.")
-        rel = doc.relative_to(vault_root()).as_posix()
+        rel = _display_doc_path(doc.relative_to(vault_root()).as_posix())   # #1276: navigable path
         text = doc.read_text(encoding="utf-8")
         if _fm_is_true(_parse_frontmatter(text).get("approved")):
             return f"Design for {target!r} is already approved ({rel})."
@@ -1632,7 +1673,11 @@ def _approve_design(slug: "Optional[str]" = None) -> str:
             reconcile_vault(target, links=False)
         except Exception:  # noqa: BLE001
             pass
-    return f"OK: approved the design for {target!r} ({rel}) — implementation handovers are now unblocked."
+    return (f"OK: approved the design for {target!r} ({rel}) — implementation handovers are now unblocked.\n"
+            f"👉 Next: ask the model to break the approved design into units — it creates ONE epic plus ALL "
+            f"implementation units via plan_units (no handovers yet). Then `/auto on [N]` drains them: the "
+            f"engine stages, launches and advances unit after unit until the epic is done; `/auto off` keeps "
+            f"it guided (the engine recommends each next unit, you drive).")
 
 
 def _set_frontmatter_flag(text: str, key: str, value: str) -> str:
@@ -1968,6 +2013,20 @@ def init_registry(workdir: "Path | str") -> None:
         _ACTIVE_PROJECT = None
         _pc.set_current(None)   # never leave a stale ctx behind the "un-isolated" claim
         return
+    # #1263: an active project whose root vanished out-of-band (e.g. the operator deleted the workdir tree)
+    # must NOT be silently re-scaffolded + re-bound as an empty dir — warn and fall back to `default`, so a
+    # project the operator believes gone does not reappear. (A completed `/project delete` already drops the
+    # entry; this guards the manual out-of-band deletion path.)
+    _default_id = getattr(_pr, "DEFAULT_PROJECT_ID", "default")
+    if (_ACTIVE_PROJECT is not None and _ACTIVE_PROJECT.id != _default_id
+            and _ACTIVE_PROJECT.root and not Path(_ACTIVE_PROJECT.root).exists()):
+        _ui_print(col(f"[WARN] active project {_ACTIVE_PROJECT.id!r} root is gone "
+                      f"({_ACTIVE_PROJECT.root}); falling back to the default project", C.YELLOW))
+        _ACTIVE_PROJECT = _REGISTRY.get(_default_id)
+        try:
+            _REGISTRY.set_active(_default_id)
+        except Exception:  # noqa: BLE001
+            pass
     try:
         bind_active()
     except Exception as e:   # noqa: BLE001 — S14-2: a corrupt active entry must NEVER bind to the base
@@ -2166,9 +2225,16 @@ class _ThinkFilter:
     OPEN  = "<think>"
     CLOSE = "</think>"
 
-    def __init__(self):
+    def __init__(self, open_tag: "Optional[str]" = None, close_tag: "Optional[str]" = None):
+        # #1266: parameterizable so the SAME incremental suppressor also hides a model-emitted
+        # <tool_call>…</tool_call> block (a TEXT tool call, not a native tool_calls delta) from the LIVE
+        # render; the defaults keep the <think> behaviour (back-compat). The raw content still reaches
+        # `parts` in the stream loop, so the post-turn text→tool_call recovery is UNAFFECTED.
+        self.OPEN     = open_tag or self.OPEN
+        self.CLOSE    = close_tag or self.CLOSE
         self.in_think = False
         self.buf      = ""
+        self.entered  = False   # flips once on entering a suppressed block → drives a one-time render hint
 
     @staticmethod
     def _safe_cut(s: str, tag: str) -> int:
@@ -2194,6 +2260,7 @@ class _ThinkFilter:
                 out.append(self.buf[:i])
                 self.buf = self.buf[i + len(self.OPEN):]
                 self.in_think = True
+                self.entered  = True   # #1266: record entering a suppressed block (upstream one-time hint)
             else:
                 j = self.buf.find(self.CLOSE)
                 if j == -1:
@@ -2751,6 +2818,34 @@ TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "plan_units",
+            "description": (
+                "Materialize the APPROVED design's FULL decomposition in ONE call: creates one "
+                "'epic' task plus ALL implementation units as pending tasks linked to it "
+                "(parent=epic id) — deliberately WITHOUT handovers (each unit's handover is "
+                "authored later, when the loop selects that unit). Use this ONCE after design "
+                "approval instead of staging tasks one by one; the engine then works the units "
+                "off in deterministic order (priority, then creation) until the epic is done. "
+                "The store assigns ids/created_at and checks topic duplicates (fail-closed, "
+                "atomic: on any refusal NOTHING is created). To add units to an existing open "
+                "epic later (plan change), pass epic_id instead of epic_json. Within the batch, "
+                "a unit may depend on a sibling via 'unit:<n>' (its 1-based position)."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "epic_json":  {"type": "string", "description": "epic task JSON as a string (title, description, priority required; type is fixed to 'epic'; omit id/created_at)"},
+                    "units_json": {"type": "string", "description": "JSON ARRAY of unit task objects (each: type, priority, title, description required; optional dependencies — real Task-IDs or 'unit:<n>' sibling refs)"},
+                    "epic_id":    {"type": "string", "description": "optional — add the units under this EXISTING open epic instead of creating one (omit epic_json then)"},
+                    "force":      {"type": "boolean", "description": "optional — override dedup (ONLY on an explicit operator instruction)"}
+                },
+                "required": ["units_json"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "launch_coder",
             "description": ("Start the coding agent for the CURRENT staged handover NOW (the one you just "
                             "created via stage_handover). Resolves the newest pending task that has a "
@@ -3225,24 +3320,31 @@ def _breaker_snapshot() -> Dict[str, str]:
 _QUALITY_BREAKER = None
 
 # #456 (FORK-D): task_class is derived DETERMINISTICALLY from task_json.type — never from model output.
-# Security/architecture get their own class (the OPUS matrix); verification = analysis; everything else
-# is coding. The class only SCOPES failover/peer selection to task-appropriate agents (it does NOT
-# override the orchestrator's staged pick — operator-confirmed 2026-06-25).
+# #1287 (operator role model, 2026-07-08 — REVERSES the 2026-06-25 "staged pick is authoritative" rule):
+# every task TYPE maps to a cost TIER, and the coder is chosen DETERMINISTICALLY as the cheapest CAPABLE
+# agent for that tier (`_route_code_agent`), so the model's `to:` no longer decides which coder runs. Tiers:
+#   complex  → the strongest/priciest coder (OPUS): security/architecture/optimization.
+#   standard → the mid coders (SONNET/CODEX): ordinary implementation/features/refactors (the DEFAULT).
+#   routine  → the cheapest coders (KIMI/GROK): mechanical scaffolding/docs/cleanup/build.
+#   analysis → the broad/cheap set (SONNET/KIMI): verification/research.
+# The class→coders matrix (which coder serves each tier, cheapest-capable first by cost_per_1k) lives in
+# code_agents.classes (public default = OPUS/SONNET; conf/ adds the private CODEX/KIMI/GROK). The operator
+# pin still overrides at launch (`_effective_code_agent`).
 _TASK_CLASS_BY_TYPE = {
-    "security": "security", "security-audit": "security",
-    "architecture": "architecture",
-    "verification": "analysis",
+    "security": "complex", "security-audit": "complex",
+    "architecture": "complex", "optimization": "complex",
+    "documentation": "routine", "concept": "routine", "cleanup": "routine", "smoke-test": "routine",
+    "verification": "analysis", "research": "analysis",
 }
 
 def _task_class(task: Dict[str, Any]) -> str:
     t = str((task or {}).get("type") or "").strip().lower()
-    return _TASK_CLASS_BY_TYPE.get(t, "coding")
+    return _TASK_CLASS_BY_TYPE.get(t, "standard")
 
-# #500 (FORK-D follow-up, token-balancing): auto-tier the handover reasoning effort by the derived
-# task_class — security/architecture get xhigh (the OPUS matrix), routine work (coding/analysis) gets high.
-# An UNMAPPED class returns None ⇒ fail-open: the effort chain is left unchanged (a future class cannot
-# silently force an effort until it is mapped here).
-_EFFORT_BY_CLASS = {"security": "xhigh", "architecture": "xhigh", "coding": "high", "analysis": "high"}
+# #500/#1287: auto-tier the handover reasoning effort by the derived task_class (cost tier) — complex gets
+# xhigh, standard/analysis get high, routine (mechanical) gets medium. An UNMAPPED class returns None ⇒
+# fail-open: the effort chain is left unchanged (a future class cannot silently force an effort until mapped).
+_EFFORT_BY_CLASS = {"complex": "xhigh", "standard": "high", "routine": "medium", "analysis": "high"}
 
 def _effort_for_class(task_class: Optional[str]) -> Optional[str]:
     return _EFFORT_BY_CLASS.get(task_class or "")
@@ -3301,6 +3403,14 @@ def _effective_code_agent(staged: str, task_class: Optional[str] = None) -> str:
     if not chosen or not _breaker_tripped(chosen):
         return chosen
     return _cheapest_available_peer(exclude_tripped=True, task_class=task_class) or chosen
+
+def _route_code_agent(task: Dict[str, Any]) -> Optional[str]:
+    """#1287: the DETERMINISTIC primary coder for a task — the cheapest CAPABLE agent for its cost tier
+    (`_task_class`), so a routine scaffold/doc lands on a cheap coder and OPUS is reserved for the complex
+    tier, regardless of the orchestrator model's pick. Returns None when nothing is routable (unmapped class
+    or none available) ⇒ the caller keeps the model's agent as a fail-soft fallback. The operator pin still
+    overrides at launch (`_effective_code_agent`)."""
+    return _cheapest_available_peer(exclude_tripped=True, task_class=_task_class(task))
 
 def _tools_with_agent_enum(tools: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """#449: replace the static ``agent`` enum (OPUS/SONNET) in the handover tool schemas with the
@@ -3466,6 +3576,23 @@ def _advance_pipeline(task_id: str, agent: str, next_task_id: Optional[str] = No
     return result
 
 
+def _feedback_status(text: str) -> str:
+    """Dev-loop stabilization: extract the coder's completion STATUS token, tolerant to WHERE it was placed.
+    The engine's own coder prompt dictates a leading ``status:`` line, but a coder may instead put it inside
+    the ``---`` frontmatter — a bare leading ``status: done`` (before the fence) was invisible to
+    ``_parse_frontmatter`` (which needs ``lines[0]=='---'``), so a COMPLETED task stalled forever. Try the
+    frontmatter first; else a BOUNDED head-scan of the first ~20 lines (so a ``status:`` buried deep in prose
+    is NOT matched — refuse-on-uncertain stays). Returns the FIRST value token, lowercased, or ``""``."""
+    fm = _parse_frontmatter(text or "")
+    raw = next((v for k, v in fm.items() if k.strip().lower() == "status"), "")
+    if not raw:
+        head = "\n".join((text or "").splitlines()[:20])
+        m = re.search(r"(?im)^\s*status:\s*(\w+)", head)
+        raw = m.group(1) if m else ""
+    toks = raw.strip().split()
+    return toks[0].lower() if toks else ""
+
+
 def _advance_gate(fb_text: str) -> "Optional[str]":
     """S2 (#1224): the BASIC no-blind-advance gate. Opt-in (default OFF → byte-identical). An advance to done
     is allowed only when the feedback declares ``status: done``; ``blocked``/``clarification_needed`` is
@@ -3474,18 +3601,17 @@ def _advance_gate(fb_text: str) -> "Optional[str]":
     (refuse) or ``None`` (allow)."""
     if not ADVANCE_GATE_ENABLED:
         return None
-    fm = _parse_frontmatter(fb_text or "")
-    # Tolerant: case-insensitive KEY (the parser preserves key case, so `Status:` must still match) + FIRST
-    # token of the value (so `status: done (all tests green)` still reads as done). Refuse-on-uncertain stays.
-    raw = next((v for k, v in fm.items() if k.strip().lower() == "status"), "").strip().lower()
-    status = raw.split()[0] if raw else ""
-    if status == "done":
-        return None
+    # Single-authority stabilization (presence-based): completion is decided by the feedback FILE'S
+    # PRESENCE (the caller already fail-closes on a missing file — that is the ONE authority for 'done', with
+    # the exit-0 ingest-stamp behind it). The status token is now an ADVISORY DOWNGRADE only — it may HOLD a
+    # finished task ONLY on an EXPLICIT `status: blocked`/`clarification_needed`. A present feedback with a
+    # done / mis-placed / absent token ADVANCES (as SF always did), deleting the whole stall class where a
+    # bare leading `status:` (vs a frontmatter parser) or a prose-only capture defeated a content parser.
+    status = _feedback_status(fb_text or "")
     if status in ("blocked", "clarification_needed"):
         return (f"ERROR: not advancing — the feedback status is {status!r}, not done. Resolve it first; the "
                 f"task stays in_progress (no blind advance).")
-    return ("ERROR: not advancing — the feedback carries no recognized completion status (expected "
-            "`status: done`). 'No signal ≠ done', fail-closed — the task stays in_progress.")
+    return None   # presence + no explicit non-done ⇒ advance (SF-grade completion; token is advisory only)
 
 
 def _advance_pipeline_impl(task_id: str, agent: str, next_task_id: Optional[str] = None) -> str:
@@ -3516,20 +3642,25 @@ def _advance_pipeline_impl(task_id: str, agent: str, next_task_id: Optional[str]
         return (f"OK: task {task_id} is already done — no re-advance needed. "
                 f"feedback is in {(archive_feedback_dir() / f'{task_id}_{agent}-feedback.md').as_posix()}")
 
-    # 0. Fail-closed gate: feedback MUST exist
-    # Primary: <initiative>/.work/feedback/ (reconciler inbox)
-    # Fallback: <initiative>/.work/archive/feedback/ (already archived by the reconciler)
-    fb = feedback_dir() / f"{task_id}_{agent}-feedback.md"
-    if not fb.exists():
-        fb_arch = archive_feedback_dir() / f"{task_id}_{agent}-feedback.md"
-        if fb_arch.exists():
-            fb = fb_arch
-            log.append(f"feedback read from archive: {fb_arch}")
-        else:
-            return (f"ERROR: feedback missing: {fb.as_posix()} "
-                    f"and {fb_arch.as_posix()} "
-                    f"— the task is NOT considered complete. Pipeline not advanced.")
-    log.append(f"feedback found: {fb}")
+    # 0. Fail-closed gate: feedback MUST exist. Dev-loop stabilization (Fix 4): key the match on the TASK ID
+    #    and derive the TRUE agent from the matched FILENAME (via _FB_RE) — never reconstruct the name from the
+    #    caller-supplied agent, which routing (#1287/#1292) can skew into a permanent miss. Prefer the exact
+    #    caller agent (newest), else the newest matching file; keep the configured-agent fail-closed filter.
+    def _fb_agent(p: "Path") -> str:
+        m = _FB_RE.search(p.name)
+        return m.group(1).upper() if m else ""
+    _cands = sorted(
+        [p for p in (list(feedback_dir().glob(f"{task_id}_*-feedback.md"))
+                     + list(archive_feedback_dir().glob(f"{task_id}_*-feedback.md")))
+         if _code_agent_registry().has(_fb_agent(p))],
+        key=lambda p: p.stat().st_mtime)
+    if not _cands:
+        return (f"ERROR: feedback missing: no {task_id}_*-feedback.md in "
+                f"{feedback_dir().as_posix()} nor its archive — the task is NOT complete. Pipeline not advanced.")
+    _exact = [p for p in _cands if _fb_agent(p) == agent]
+    fb = _exact[-1] if _exact else _cands[-1]      # exact caller agent (newest), else newest matching feedback
+    agent = _fb_agent(fb)                          # the TRUE runner, from the filename (authoritative for the rest)
+    log.append(f"feedback found: {fb} (agent {agent})")
     if ADVANCE_GATE_ENABLED:   # S2 (#1224): basic no-blind-advance gate — only read/parse feedback when ON (byte-identical off)
         try:
             _fbtext = fb.read_text(encoding="utf-8")
@@ -3539,8 +3670,7 @@ def _advance_pipeline_impl(task_id: str, agent: str, next_task_id: Optional[str]
         if _gate_err:
             # S7 (#1229): the refused task stays in_progress — mark it BLOCKED so the operator sees the stall on
             # the board/steering instead of a healthy-looking in_progress (transition() clears it on advance).
-            _st = (next((v for k, v in _parse_frontmatter(_fbtext or "").items()
-                         if k.strip().lower() == "status"), "").strip().lower().split() or [""])[0]
+            _st = _feedback_status(_fbtext or "")   # dev-loop stab: same tolerant parse as the gate
             try:
                 store.mark_blocked(task_id, reason=_gate_err.replace("ERROR: ", "")[:200],
                                    kind=_st if _st in ("blocked", "clarification_needed") else "blocked")
@@ -3580,6 +3710,28 @@ def _advance_pipeline_impl(task_id: str, agent: str, next_task_id: Optional[str]
             log.append(f"task {task_id} → tasks/done (status=done)")
         except KeyError:
             log.append("task-json not found (skip)")
+
+        # 3x. #1296: epic auto-complete — a tracker record has no coder feedback, so its completion
+        # is DERIVED, not advanced: when the just-advanced task was the LAST open child of an epic,
+        # the engine transitions the epic to done itself (deterministic, ledgered here). Fail-soft:
+        # a missing/foreign parent id or a check hiccup never breaks the completed advance.
+        _parent = str((existing or {}).get("parent") or "").strip()
+        if _parent:
+            try:
+                _ptask = store.get(_parent)
+                if _ptask is None:
+                    log.append(f"parent {_parent} not found (skip epic auto-complete)")
+                elif (str(_ptask.get("type", "")).lower() == "epic"
+                        and _ptask.get("status") != "done"):
+                    _sibs = [t for t in store.list() if str(t.get("parent") or "") == _parent]
+                    if _sibs and all(t.get("status") == "done" for t in _sibs):
+                        store.transition(_parent, "done")
+                        log.append(f"epic {_parent} auto-completed (all {len(_sibs)} units done)")
+                    else:
+                        _left = sum(1 for t in _sibs if t.get("status") != "done")
+                        log.append(f"epic {_parent}: {_left} unit(s) still open")
+            except Exception as _e:  # noqa: BLE001
+                log.append(f"epic auto-complete check failed (skip): {_e}")
 
         # 3a. Memory: store the task completion as an episode (fail-soft)
         if _MEMORY is not None and _MEMORY.is_available():
@@ -3655,7 +3807,23 @@ def _advance_pipeline_impl(task_id: str, agent: str, next_task_id: Optional[str]
         return f"ERROR: pipeline step failed: {e}\nso far:\n" + "\n".join(f"  - {l}" for l in log)
 
     _reconcile_active_soft()   # C2: keep the active initiative's INDEX.md fresh (fail-soft, index only)
-    return f"OK: pipeline advanced for {task_id} ({agent})\n" + "\n".join(f"  - {l}" for l in log)
+    result = f"OK: pipeline advanced for {task_id} ({agent})\n" + "\n".join(f"  - {l}" for l in log)
+    # #1296 (guided mode): with the continuation OFF nothing follows automatically — so the advance
+    # RESULT itself names the deterministically selected next unit and the exact step to proceed
+    # (the same recommendation the steering state carries). Fail-soft, advisory only.
+    if not AUTOPILOT_AUTOPLAN:
+        try:
+            _nxt, _elig, _n_open = _select_next_unit(store)
+            if _nxt is not None:
+                result += (f"\n👉 Next open unit: {_nxt['id']} ({str(_nxt.get('title') or '')!r}) — stage its "
+                           f"handover via stage_handover (task_id='{_nxt['id']}', no task_json), or `/auto on` "
+                           f"to drain all open units automatically.")
+            elif _n_open > 0:
+                result += (f"\n⚠ {_n_open} open unit(s) but NONE selectable (blocked / unsatisfied "
+                           f"dependencies) — inspect /board.")
+        except Exception:  # noqa: BLE001 — the recommendation must never break a completed advance
+            pass
+    return result
 
 
 # ─── Path guard: detect invented codebase paths in the handover ───
@@ -3683,6 +3851,69 @@ def _handover_path_warnings(handover_md: str) -> List[str]:
 
 
 # ─── Macro tool: publish a handover (OPT-2, store-backed) ──
+def _enrich_handover(tid: str, handover_md: str, fields: Dict[str, Any], log: List[str]) -> str:
+    """Shared handover enrichment (#1296 parity — used by BOTH staging paths, create and re-hand):
+    normalize the embedded task id, append the token-budgeted Memory brief (#458 D1, fail-soft) and
+    the advisory ACE/lesson context (#863/#877/#880). ``fields`` supplies title/type (the creation
+    payload on the create path; the STORED task on the re-hand path). Every stage is fail-soft —
+    enrichment never breaks a staging call."""
+    ho_md = _normalize_handover_id(handover_md, tid)
+    # The richer token-budgeted Memory brief from past patterns (#458 D1, fail-soft):
+    # body-keyed search + optional relational hits + the shared warm rolling summary.
+    if _MEMORY is not None and _MEMORY.is_available():
+        try:
+            warm_summary = ""
+            if _WARM is not None:
+                try:
+                    warm_summary = (_WARM.get_session(_active_warm_session(), "summary") or "").strip()
+                except Exception:
+                    warm_summary = ""
+            mem_ctx = _MEMORY.brief(
+                body=ho_md,
+                task_type=fields.get("type", ""),
+                title=fields.get("title", ""),
+                warm_summary=warm_summary,
+                budget_tokens=MEMORY_BRIEF_TOKENS,
+                count_tokens=_count_tokens,
+            )
+            if mem_ctx:
+                ho_md = ho_md.rstrip() + "\n\n---\n\n" + mem_ctx
+                log.append("Memory context injected")
+        except Exception:
+            pass
+    # Advisory loop-lessons for the active scope (ADR-0011 AD-10 / S14-4) — appended to the handover
+    # the way the Memory brief above is, but INDEPENDENT of Mem0 (a lesson backend may be wired even
+    # when Mem0 is not). With NO provider registered ``lessons.brief`` returns "" → ``ho_md`` is
+    # unchanged and no I/O happens, so this is byte-identical to the pre-seam engine.
+    try:
+        from ack import lessons as _lessons   # lazy: never import ack at gx10 top-level (S6b lesson)
+        ns = _active_mem_ns()
+        # ACE (#863): the always-on PlaybookStore exposes a query-aware relevant-bullet read
+        # (`context_for`, keyed by the task title + handover body) — the 32k-safe Generator read that
+        # injects only the most relevant subset of a large playbook (#366). Any other provider (or a
+        # foreign extension) keeps the string-only `brief`. Duck-typed so the seam stays generic.
+        prov = _lessons.get_provider()
+        if hasattr(prov, "context_for"):
+            q = (fields.get("title", "") + "\n" + ho_md).strip()
+            lesson_ctx = prov.context_for([ns], query=q)
+            # M4-0 (#877): remember WHICH bullets were injected into this task's handover so the
+            # post_feedback consumer can rate them helpful/harmful (E-004/H-002). Advisory + fail-soft.
+            _ids = _ace_bullet_ids(lesson_ctx)
+            _ace_record_injected(tid, _ids)
+            # M4-3 (#880): also DURABLY record the injected ids keyed by the task id + any issue# the
+            # handover references (the standard `Closes #N` linkage), so the per-UNIT dev-process
+            # ledger scan (M4-2) can populate Trajectory.used_bullet_ids (E-004 for the dev-loop unit).
+            _ace_persist_injected(_ace_unit_keys(tid, fields, ho_md), _ids)
+        else:
+            lesson_ctx = _lessons.brief([ns])
+        if lesson_ctx:
+            ho_md = ho_md.rstrip() + "\n\n---\n\n## Lessons\n\n" + lesson_ctx
+            log.append("Lesson context injected")
+    except Exception:   # noqa: BLE001 — advisory: a lesson read must never break a turn
+        pass
+    return ho_md
+
+
 def _ack_validate(fields: Dict[str, Any]) -> Optional[str]:
     """ACK soft-path gate: validates a model-emitted task_json against the
     ACK contract. Returns an EXACT error string on a violation, otherwise None
@@ -3780,60 +4011,7 @@ def _stage_handover_impl(task_id: Optional[str], agent: str, handover_md: str,
                 return f"ERROR: {e} — no task created."
             tid = task["id"]
             log.append(f"task created: {tid} (pending, created_at={task['created_at']})")
-            ho_md = _normalize_handover_id(handover_md, tid)
-            # append the richer token-budgeted Memory brief from past patterns (#458 D1, fail-soft):
-            # body-keyed search + optional relational hits + the shared warm rolling summary.
-            if _MEMORY is not None and _MEMORY.is_available():
-                try:
-                    warm_summary = ""
-                    if _WARM is not None:
-                        try:
-                            warm_summary = (_WARM.get_session(_active_warm_session(), "summary") or "").strip()
-                        except Exception:
-                            warm_summary = ""
-                    mem_ctx = _MEMORY.brief(
-                        body=ho_md,
-                        task_type=fields.get("type", ""),
-                        title=fields.get("title", task.get("title", "")),
-                        warm_summary=warm_summary,
-                        budget_tokens=MEMORY_BRIEF_TOKENS,
-                        count_tokens=_count_tokens,
-                    )
-                    if mem_ctx:
-                        ho_md = ho_md.rstrip() + "\n\n---\n\n" + mem_ctx
-                        log.append("Memory context injected")
-                except Exception:
-                    pass
-            # Advisory loop-lessons for the active scope (ADR-0011 AD-10 / S14-4) — appended to the handover
-            # the way the Memory brief above is, but INDEPENDENT of Mem0 (a lesson backend may be wired even
-            # when Mem0 is not). With NO provider registered ``lessons.brief`` returns "" → ``ho_md`` is
-            # unchanged and no I/O happens, so this is byte-identical to the pre-seam engine.
-            try:
-                from ack import lessons as _lessons   # lazy: never import ack at gx10 top-level (S6b lesson)
-                ns = _active_mem_ns()
-                # ACE (#863): the always-on PlaybookStore exposes a query-aware relevant-bullet read
-                # (`context_for`, keyed by the task title + handover body) — the 32k-safe Generator read that
-                # injects only the most relevant subset of a large playbook (#366). Any other provider (or a
-                # foreign extension) keeps the string-only `brief`. Duck-typed so the seam stays generic.
-                prov = _lessons.get_provider()
-                if hasattr(prov, "context_for"):
-                    q = (fields.get("title", "") + "\n" + ho_md).strip()
-                    lesson_ctx = prov.context_for([ns], query=q)
-                    # M4-0 (#877): remember WHICH bullets were injected into this task's handover so the
-                    # post_feedback consumer can rate them helpful/harmful (E-004/H-002). Advisory + fail-soft.
-                    _ids = _ace_bullet_ids(lesson_ctx)
-                    _ace_record_injected(tid, _ids)
-                    # M4-3 (#880): also DURABLY record the injected ids keyed by the task id + any issue# the
-                    # handover references (the standard `Closes #N` linkage), so the per-UNIT dev-process
-                    # ledger scan (M4-2) can populate Trajectory.used_bullet_ids (E-004 for the dev-loop unit).
-                    _ace_persist_injected(_ace_unit_keys(tid, fields, ho_md), _ids)
-                else:
-                    lesson_ctx = _lessons.brief([ns])
-                if lesson_ctx:
-                    ho_md = ho_md.rstrip() + "\n\n---\n\n## Lessons\n\n" + lesson_ctx
-                    log.append("Lesson context injected")
-            except Exception:   # noqa: BLE001 — advisory: a lesson read must never break a turn
-                pass
+            ho_md = _enrich_handover(tid, handover_md, fields, log)
             ho = handovers_dir() / f"{tid}_{agent}.md"
             _atomic_write(ho, ho_md)
             log.append(f"handover written: {ho} ({len(ho_md)} chars)")
@@ -3850,9 +4028,27 @@ def _stage_handover_impl(task_id: Optional[str], agent: str, handover_md: str,
             if gate_err:
                 return gate_err
             tid = task_id
+            # #1296 parity: the lazily staged unit handover (the continuation's [NEXT-UNIT] path)
+            # gets the SAME enrichment as a created one — id normalization, memory brief, lessons.
+            ho_md = _enrich_handover(tid, handover_md, existing, log)
             ho = handovers_dir() / f"{tid}_{agent}.md"
-            _atomic_write(ho, handover_md)
-            log.append(f"handover written: {ho} ({len(handover_md)} chars)")
+            _atomic_write(ho, ho_md)
+            log.append(f"handover written: {ho} ({len(ho_md)} chars)")
+            # Canonical identity (#1294 fix 3, extended to the re-hand path): the staged agent IS
+            # the assignment — stamp assigned_to so filename == assigned_to == body `to:` and the
+            # reconciler's first guess matches what actually runs. Fail-soft: a stamping hiccup
+            # never breaks the staging.
+            if str(existing.get("assigned_to") or "").strip().upper() != agent:
+                try:
+                    p, s = store._find(tid)
+                    if p:
+                        data = json.loads(p.read_text(encoding="utf-8"))
+                        if isinstance(data, dict):
+                            data["assigned_to"] = agent
+                            _atomic_write(p, json.dumps(data, ensure_ascii=False, indent=2))
+                            log.append(f"assigned_to stamped: {agent}")
+                except Exception:  # noqa: BLE001
+                    pass
 
         if set_active:
             store.project_active()
@@ -3876,6 +4072,256 @@ def _stage_handover_impl(task_id: Optional[str], agent: str, handover_md: str,
         )
     _reconcile_active_soft()   # C2: keep the active initiative's INDEX.md fresh (fail-soft, index only)
     return result
+
+
+# ─── Macro tool: plan_units — epic decomposition in ONE deterministic step (#1296) ──
+_UNIT_DEP_PLACEHOLDER_RE = re.compile(r"^unit:(\d+)$")
+
+
+def _plan_units(epic_json: "Optional[Any]" = None, units_json: "Optional[Any]" = None,
+                epic_id: "Optional[str]" = None, force: bool = False) -> str:
+    """Serialized wrapper (mirrors ``_stage_handover``): publish the epic + its units under the
+    per-project+track vault lock so the id scan + batch writes can't interleave with a concurrent
+    vault mutation."""
+    with _vault_lock():
+        return _plan_units_impl(epic_json, units_json, epic_id=epic_id, force=force)
+
+
+def _plan_units_impl(epic_json: "Optional[Any]", units_json: "Optional[Any]",
+                     epic_id: "Optional[str]" = None, force: bool = False) -> str:
+    """#1296: materialize an approved design's FULL decomposition as tracker records in ONE call —
+    one ``epic`` task + N child units (``parent`` = the epic id), all ``pending`` and deliberately
+    WITHOUT handovers: each unit's handover is authored lazily when the continuation selects it
+    (anchors stay real, the plan-change duty stays possible). Deterministic + fail-closed:
+    every unit is ACK-validated and topic-deduped BEFORE anything is written (atomic — on any
+    refusal nothing is created; on a mid-write error the created files are rolled back).
+    ``epic_id`` targets an EXISTING open epic instead (plan-change: add units mid-run); a done
+    epic is refused. In-batch ``dependencies`` may reference sibling units as ``unit:<n>``
+    (1-based order in *units_json*) — resolved to the minted Task-IDs after creation."""
+    _blk = _internal_target_blocks_normal()           # #979: normal pipeline is off on an internal target
+    if _blk:
+        return f"ERROR: {_blk}"
+    store = _store()
+
+    # ── Parse inputs ────────────────────────────────────────────
+    def _as_obj(raw: "Any", what: str) -> "tuple[Optional[Any], Optional[str]]":
+        if raw is None or isinstance(raw, (dict, list)):
+            return raw, None
+        try:
+            return json.loads(raw), None
+        except (TypeError, json.JSONDecodeError) as e:
+            return None, f"ERROR: {what} is not valid JSON: {e} — nothing created."
+    epic_fields, err = _as_obj(epic_json, "epic_json")
+    if err:
+        return err
+    units, err = _as_obj(units_json, "units_json")
+    if err:
+        return err
+    if not isinstance(units, list) or not units or not all(isinstance(u, dict) for u in units):
+        return "ERROR: units_json must be a non-empty JSON array of unit objects — nothing created."
+
+    # ── Resolve the epic: existing (epic_id) or to-be-created (epic_json) ──
+    existing_epic: "Optional[Dict[str, Any]]" = None
+    if epic_id:
+        if not _TASK_ID_RE.match(epic_id):
+            return f"ERROR: invalid epic_id: {epic_id!r} (expected e.g. KGC-3)"
+        existing_epic = store.get(epic_id)
+        if existing_epic is None:
+            return f"ERROR: no such epic {epic_id!r} — nothing created."
+        if str(existing_epic.get("type", "")).lower() != "epic":
+            return (f"ERROR: task {epic_id} has type {existing_epic.get('type')!r}, not 'epic' — "
+                    f"units can only be added under an epic. Nothing created.")
+        if existing_epic.get("status") == "done":
+            return (f"ERROR: epic {epic_id} is already done — a completed epic does not take new "
+                    f"units. Plan a NEW epic (plan_units with epic_json) instead. Nothing created.")
+    else:
+        if not isinstance(epic_fields, dict):
+            return "ERROR: epic_json (object) or epic_id is required — nothing created."
+        etype = str(epic_fields.get("type", "epic")).lower()
+        if etype != "epic":
+            return f"ERROR: epic_json.type must be 'epic' (was {etype!r}) — nothing created."
+        epic_fields = dict(epic_fields)
+        epic_fields["type"] = "epic"
+
+    # ── Pre-validate EVERY record before anything is written (atomic) ──
+    checked: "List[Dict[str, Any]]" = []
+    for i, u in enumerate(units, 1):
+        f = dict(u)
+        utype = str(f.get("type", "")).lower()
+        if utype == "epic":
+            return f"ERROR: unit {i} has type 'epic' — epics nest exactly one level (units under one epic). Nothing created."
+        # Split sibling placeholders (unit:<n>) from real Task-ID dependencies; placeholders are
+        # resolved AFTER the ids are minted, real ids must validate against the contract now.
+        deps = f.get("dependencies") or []
+        if not isinstance(deps, list):
+            return f"ERROR: unit {i}: dependencies must be a list. Nothing created."
+        placeholders: "List[tuple[int, int]]" = []      # (dep-slot, referenced unit ordinal)
+        real_deps: "List[str]" = []
+        for d in deps:
+            m = _UNIT_DEP_PLACEHOLDER_RE.match(str(d).strip())
+            if m:
+                ref = int(m.group(1))
+                if not (1 <= ref <= len(units)) or ref == i:
+                    return (f"ERROR: unit {i}: dependency {d!r} references unit {ref}, which is not "
+                            f"another unit of this batch (1..{len(units)}, not itself). Nothing created.")
+                placeholders.append((len(real_deps) + len(placeholders), ref))
+            else:
+                real_deps.append(str(d))
+        f["dependencies"] = real_deps
+        ack_err = _ack_validate(f)
+        if ack_err:
+            return (f"ERROR: unit {i} violates the ACK contract (nothing created):\n" + ack_err
+                    + "\n→ fix the fields and call plan_units again.")
+        gate_err = _design_gate(utype, active_slug())
+        if gate_err:
+            return gate_err
+        f["__placeholders"] = placeholders
+        checked.append(f)
+    if existing_epic is None:
+        ack_err = _ack_validate({k: v for k, v in epic_fields.items()})
+        if ack_err:
+            return ("ERROR: epic_json violates the ACK contract (nothing created):\n" + ack_err
+                    + "\n→ fix the fields and call plan_units again.")
+
+    # ── Dedup: against the store (all statuses, incl. done) AND within the batch ──
+    if not force:
+        if existing_epic is None:
+            dup = store.find_duplicate(epic_fields.get("title", ""), epic_fields.get("description", ""))
+            if dup:
+                return (f"ERROR: duplicate — a task on the epic's topic already exists as {dup}. "
+                        f"Add units to it via plan_units(epic_id='{dup}', ...) if it is the same epic, "
+                        f"or (only when instructed) set force=true. Nothing created.")
+        for i, f in enumerate(checked, 1):
+            dup = store.find_duplicate(f.get("title", ""), f.get("description", ""))
+            if dup:
+                return (f"ERROR: duplicate — unit {i} ({f.get('title')!r}) matches existing task {dup}. "
+                        f"Nothing created; drop or rename the unit (force only on instruction).")
+            tok_i = store._tokens(f"{f.get('title','')} {f.get('description','')}")
+            for j, g in enumerate(checked[:i - 1], 1):
+                same_key = store._title_key(f.get("title", "")) == store._title_key(g.get("title", ""))
+                if same_key or store._jaccard(
+                        tok_i, store._tokens(f"{g.get('title','')} {g.get('description','')}")) >= store.dedup_threshold:
+                    return (f"ERROR: units {j} and {i} are topic duplicates of each other "
+                            f"({g.get('title')!r} vs {f.get('title')!r}). Nothing created.")
+
+    # ── Create (epic first, then units); roll back everything on a mid-write error ──
+    created: "List[Dict[str, Any]]" = []
+    log: "List[str]" = []
+    try:
+        if existing_epic is None:
+            epic = store.create(epic_fields, force=bool(force))
+            created.append(epic)
+            eid = epic["id"]
+            log.append(f"epic created: {eid} ({epic_fields.get('title')!r})")
+        else:
+            eid = existing_epic.get("id") or epic_id
+            log.append(f"epic: {eid} (existing, {existing_epic.get('title')!r})")
+        minted: "List[Dict[str, Any]]" = []
+        for f in checked:
+            placeholders = f.pop("__placeholders")
+            f["parent"] = eid
+            task = store.create(f, force=bool(force))
+            created.append(task)
+            task["__placeholders"] = placeholders
+            minted.append(task)
+        # Resolve sibling placeholders now that every unit id exists (write-through, atomic per file).
+        for task in minted:
+            placeholders = task.pop("__placeholders")
+            if not placeholders:
+                continue
+            deps = list(task.get("dependencies") or [])
+            for _slot, ref in placeholders:
+                deps.append(minted[ref - 1]["id"])
+            task["dependencies"] = deps
+            _atomic_write(store._path(task["id"], "pending"),
+                          json.dumps(task, ensure_ascii=False, indent=2))
+            log.append(f"{task['id']}: sibling dependencies resolved → {deps}")
+    except DuplicateTaskError as e:
+        for t in created:
+            p, _s = store._find(t["id"])
+            if p:
+                p.unlink(missing_ok=True)
+        return (f"ERROR: duplicate — a task on the same topic already exists as {e.existing_id}. "
+                f"Nothing created (batch rolled back).")
+    except Exception as e:  # noqa: BLE001 — atomicity: never leave a half-created decomposition
+        for t in created:
+            p, _s = store._find(t["id"])
+            if p:
+                p.unlink(missing_ok=True)
+        return f"ERROR: plan_units failed: {e} — batch rolled back, nothing created."
+
+    unit_ids = [t["id"] for t in created if str(t.get("type", "")).lower() != "epic"]
+    for t in created:
+        if str(t.get("type", "")).lower() != "epic":
+            log.append(f"unit created: {t['id']} [{t.get('type')}/{t.get('priority')}] {t.get('title')!r}")
+    _write_board()
+    _reconcile_active_soft()
+    nxt, _elig, _open = _select_next_unit(store)
+    if nxt and AUTOPILOT_AUTOPLAN:
+        # Continuation already armed: this same turn is the bootstrap — the model authors the first
+        # unit's handover right away (the post-advance turns take over from there).
+        tail = (f"\nAUTOMATION ARMED — author the FIRST unit's handover NOW: ONE stage_handover call "
+                f"with task_id='{nxt['id']}' ({nxt.get('title')!r}) and NO task_json. The loop "
+                f"advances + continues from there by itself.")
+    elif nxt:
+        tail = (f"\nNext open unit: {nxt['id']} ({nxt.get('title')!r}) — `/auto on [N]` drains all "
+                f"units automatically; in guided mode, stage its handover via stage_handover "
+                f"(task_id='{nxt['id']}', no task_json).")
+    else:
+        tail = ""
+    return (f"OK: epic {eid} planned with {len(unit_ids)} unit(s) — all pending, handover-less "
+            f"(each handover is authored when the unit is selected)\n"
+            + "\n".join(f"  - {l}" for l in log) + tail)
+
+
+# ─── #1296: pure next-unit selection (the select-unit leg of the contract loop) ──
+_UNIT_PRIORITY_ORDER = {"critical": 0, "high": 1, "medium": 2, "normal": 3, "low": 4}
+
+
+def _unit_sort_key(task: "Dict[str, Any]") -> "tuple":
+    """Deterministic selection order: priority → created_at → numeric id. Mirrors the GitHub
+    selector ('highest-priority open sub-issue first'); an unknown priority ranks LAST (fail-soft,
+    never ahead of an explicit one)."""
+    prio = _UNIT_PRIORITY_ORDER.get(str(task.get("priority", "")).strip().lower(), len(_UNIT_PRIORITY_ORDER))
+    m = re.search(r"-(\d+)$", str(task.get("id", "")))
+    return (prio, task.get("created_at", ""), int(m.group(1)) if m else 1 << 30)
+
+
+def _select_next_unit(store: "TaskStore") -> "tuple[Optional[Dict[str, Any]], int, int]":
+    """The DETERMINISTIC select-unit policy (#1296, pure code — no model): among the OPEN units
+    (pending, not an epic, no handover staged yet) pick the one to work next. Eligible = not
+    ``blocked`` and every ``dependencies`` entry is done (an unknown dep id counts as UNSATISFIED —
+    fail-closed). Order: priority → created_at → numeric id. Returns ``(winner|None,
+    eligible_count, open_count)`` — ``open_count > 0`` with no winner is a dependency/blocked
+    deadlock the caller must surface (never a silent idle)."""
+    open_units = [t for t in store.list("pending")
+                  if str(t.get("type", "")).lower() != "epic"
+                  and _find_handover(t.get("id") or "") is None]
+    if not open_units:
+        return None, 0, 0
+    done_ids = {t.get("id") for t in store.list("done")}
+    eligible = [t for t in open_units
+                if not t.get("blocked")
+                and all(d in done_ids for d in (t.get("dependencies") or []))]
+    if not eligible:
+        return None, 0, len(open_units)
+    return sorted(eligible, key=_unit_sort_key)[0], len(eligible), len(open_units)
+
+
+def _work_in_flight(store: "TaskStore") -> bool:
+    """#1296: is the pipeline actively working? True on any ``in_progress`` task or any pending
+    task WITH a staged handover (launchable — the launcher's job, not the planner's). Handover-less
+    pending units (an epic's open backlog) and epic records do NOT count — they are exactly what
+    the continuation exists to drain."""
+    for t in store.list("in_progress"):
+        if str(t.get("type", "")).lower() != "epic":
+            return True
+    for t in store.list("pending"):
+        if str(t.get("type", "")).lower() == "epic":
+            continue
+        if _find_handover(t.get("id") or "") is not None:
+            return True
+    return False
 
 
 # ─── TaskStore: deterministic task truth (model 3) ─────
@@ -4151,12 +4597,15 @@ class TaskStore:
             if b is None:
                 return                       # no active initiative → no projection (soft)
             active = b / WORKFLOW_DIR / "active.md"
-            # in_progress ranks before pending; within, by created_at/id.
+            # in_progress ranks before pending; within, by created_at/id. #1296: pending units may
+            # be handover-less (an epic's open backlog) — walk newest-first and project the first
+            # task that actually HAS a handover, so a staged handover is never shadowed into idle
+            # by a newer, not-yet-staged unit.
             cands = [(0, t) for t in self.list("pending")] + \
                     [(1, t) for t in self.list("in_progress")]
-            if cands:
-                cands.sort(key=lambda it: (it[0], it[1].get("created_at", ""), it[1].get("id", "")))
-                ho = self._handover_path(cands[-1][1].get("id", ""))
+            cands.sort(key=lambda it: (it[0], it[1].get("created_at", ""), it[1].get("id", "")))
+            for _rank, t in reversed(cands):
+                ho = self._handover_path(t.get("id", ""))
                 if ho and ho.exists():
                     _atomic_write(active, ho.read_text(encoding="utf-8"))
                     return
@@ -4567,13 +5016,32 @@ def _steering_state_block() -> str:
                 lines.append("- design gate: no design on record — implementation handovers are BLOCKED "
                              "(record_design first, then /approve).")
             elif not _ap:
-                lines.append(f"- design gate: design recorded ({_rel}) but NOT approved — implementation "
+                lines.append(f"- design gate: design recorded ({_display_doc_path(_rel)}) but NOT approved — implementation "
                              f"handovers BLOCKED until /approve.")
             else:
                 lines.append("- design gate: design approved — implementation handovers allowed.")
         lines.append(f"- tasks: {n_pending} pending · {n_prog} in_progress")
+        # #1296: the select-unit recommendation — the SAME deterministic policy the continuation
+        # uses, surfaced per turn so guided mode (auto off) can drive the loop by hand.
+        try:
+            _unit, _elig, _n_open = _select_next_unit(store)
+            if _unit is not None:
+                _pp = str(_unit.get("parent") or "").strip()
+                lines.append(f"- next open unit: {_unit['id']} ({str(_unit.get('title') or '')!r})"
+                             + (f" under epic {_pp}" if _pp else "")
+                             + " — stage its handover via stage_handover (task_id, no task_json); "
+                               "/auto on drains all open units automatically.")
+            elif _n_open > 0:
+                lines.append(f"- next open unit: NONE selectable — {_n_open} open unit(s) blocked or "
+                             f"dependency-gated (see /board).")
+        except Exception:  # noqa: BLE001 — the recommendation is advisory, never break the turn
+            pass
+        _full_auto = _WATCHER_ENABLED and AUTOPILOT_ENABLED and AUTOPILOT_AUTOPLAN
+        _no_auto   = not (_WATCHER_ENABLED or AUTOPILOT_ENABLED or AUTOPILOT_AUTOPLAN)
         lines.append(f"- watcher: {'on' if _WATCHER_ENABLED else 'off'} · "
-                     f"autopilot: {'on' if AUTOPILOT_ENABLED else 'off'}")
+                     f"autopilot: {'on' if AUTOPILOT_ENABLED else 'off'} · "
+                     f"continuation: {'on' if AUTOPILOT_AUTOPLAN else 'off'}"
+                     + ("  [auto: FULL]" if _full_auto else "  [auto: GUIDED]" if _no_auto else "  [auto: MIXED]"))
         lines.append("Trust these fields over any filesystem probe; do NOT invent a vault path.")
         return "\n".join(lines)
     except Exception:  # noqa: BLE001 — a per-turn hint must never break a turn
@@ -6050,23 +6518,58 @@ def _run_tool_dispatch(name: str, args: Dict[str, Any]) -> str:
             return _advance_pipeline(tid, ag, nxt)
 
         elif name == "stage_handover":
+            # #1287: route the MODEL's agent pick to the cheapest CAPABLE coder for the task's cost tier (this is
+            # the orchestrator's TOOL call, so a direct operator/internal/test _stage_handover keeps its explicit
+            # agent). Fix 3 (dev-loop stab): when routing wins, STAMP the routed agent as the SINGLE canonical
+            # identity — task_json.assigned_to AND the handover body `to:` — so filename == assigned_to == body
+            # (else the coder mirrors a stale agent into feedback `from:` and readers / the reconciler first-guess
+            # misattribute). Fail-soft: keep the model's pick when nothing routes.
+            _agent = args.get("agent", "")
+            _tj_out = args.get("task_json")
+            _ho_out = args.get("handover_md", "")
+            try:
+                _fields = _tj_out if isinstance(_tj_out, dict) else (json.loads(_tj_out) if isinstance(_tj_out, str) and _tj_out.strip() else None)
+                # #1296 parity: the re-hand path (task_id, no task_json — the continuation's
+                # [NEXT-UNIT] staging) routes off the STORED task, so a lazily staged unit gets the
+                # same deterministic cost routing as a created one.
+                if not isinstance(_fields, dict) and args.get("task_id"):
+                    _stored = _store().get(str(args.get("task_id")))
+                    if isinstance(_stored, dict):
+                        _fields = _stored
+                _routed = _route_code_agent(_fields) if isinstance(_fields, dict) else None
+                if _routed and _routed != _agent:
+                    _agent = _routed
+                    if isinstance(_fields, dict) and _tj_out is not None:
+                        _fields["assigned_to"] = _routed
+                        _tj_out = _fields if isinstance(args.get("task_json"), dict) else json.dumps(_fields)
+                    _ho_out = re.sub(r"(?im)^(\s*to:\s*).*$", lambda m: m.group(1) + _routed, _ho_out, count=1)
+            except Exception:  # noqa: BLE001 — routing must never break the tool call
+                pass
             # S6b: route through the curated facade (the engine driver delegates to _stage_handover).
             if _devapi is not None and _devapi.get_driver() is not None:
                 return _devapi.stage_handover(
-                    args.get("agent", ""),
-                    args.get("handover_md", ""),
+                    _agent,
+                    _ho_out,
                     task_id=args.get("task_id"),
-                    task_json=args.get("task_json"),
+                    task_json=_tj_out,
                     set_active=args.get("set_active", True),
                     force=args.get("force", False),
                 )
             return _stage_handover(
                 args.get("task_id"),
-                args.get("agent", ""),
-                args.get("handover_md", ""),
-                args.get("task_json"),
+                _agent,
+                _ho_out,
+                _tj_out,
                 args.get("set_active", True),
                 args.get("force", False),
+            )
+
+        elif name == "plan_units":
+            return _plan_units(
+                args.get("epic_json"),
+                args.get("units_json"),
+                epic_id=args.get("epic_id") or None,
+                force=args.get("force", False),
             )
 
         elif name == "check_task_exists":
@@ -7039,6 +7542,7 @@ class GX10:
         th.start()
 
         tf        = _ThinkFilter()
+        tf_tool   = _ThinkFilter("<tool_call>", "</tool_call>")   # #1266: hide raw text tool-call markup from the render
         parts: List[str] = []
         tool_acc: Dict[int, Dict[str, str]] = {}
         prefix    = [False]
@@ -7066,8 +7570,11 @@ class GX10:
                 t_first[0] = time.time()
 
             if getattr(delta, "content", None):
-                parts.append(delta.content)
-                renderer.feed(tf.feed(delta.content))
+                parts.append(delta.content)                       # RAW content — feeds the post-turn tool-call recovery
+                renderer.feed(tf_tool.feed(tf.feed(delta.content)))   # #1266: strip <think> AND <tool_call> from the render
+                if tf_tool.entered and not tool_note[0]:          # #1266: one-time hint for the TEXT tool-call path
+                    tool_note[0] = True
+                    _ui_print(col("  ⋯ tool call …", C.GRAY))
 
             if getattr(delta, "tool_calls", None):
                 # B: fill dead time — as soon as tool tokens arrive (and no
@@ -7087,7 +7594,8 @@ class GX10:
                         if fn.arguments:
                             slot["arguments"] += fn.arguments
 
-        renderer.feed(tf.flush())
+        renderer.feed(tf_tool.feed(tf.flush()))   # #1266: drain the think filter THROUGH the tool-call filter
+        renderer.feed(tf_tool.flush())
         renderer.flush()
         if prefix[0]:
             _ui_print("")   # closing newline after streamed content
@@ -8309,7 +8817,9 @@ def _project_new_mint(agent: "GX10", arg_str: str) -> str:
     seeded = ""
     if typ:
         try:
-            v = initiative_new(name, typ)                # seed the first work unit under the now-active project
+            # #1276 (facet 2): seed the unit under a CANONICAL `main` slug, NOT the project name — so the vault
+            # doc path is `<project>/vault/main/…`, not the redundant `<project>/vault/<project>/…` double name.
+            v = initiative_new("main", typ)              # seed the first work unit under the now-active project
             seeded = f" · seeded {typ} unit '{v.slug}'"
         except Exception as e:  # noqa: BLE001 — seed is best-effort (incl. FS errors); the project is still valid
             seeded = f" · (unit seed skipped: {e})"
@@ -8392,16 +8902,20 @@ def _project_delete(agent: "Optional[GX10]", args: "List[str]") -> str:
         if not sw.startswith("[switch] now on"):
             return f"[project] cannot delete the active project — switch to {default_id} failed: {sw}"
     root = proj.root
-    # Forget every memory scope the project owns BEFORE dropping the registry entry (so an interruption can
-    # never leave orphan memory behind a still-removed entry). Best-effort; a forget hiccup never blocks the
-    # delete, and re-running delete (or the S15 orphan-GC) cleans any residue.
-    forgotten = 0
-    for sc in _project_scopes(proj):
-        try:
-            _forget_scope(sc)
-            forgotten += 1
-        except Exception:  # noqa: BLE001
-            pass
+    # #1263: forget the project's memory scopes in the BACKGROUND. A synchronous remote /delete_all (up to the
+    # memory client's add_timeout, over LAN) on the single request thread FROZE the whole engine + the client
+    # (which has no own timeout) — the delete must return promptly. The registry removal below is authoritative
+    # and fast; any residual partition is swept by the S15 orphan-GC. Best-effort + fail-soft per scope.
+    scopes = list(_project_scopes(proj))
+    forgotten = len(scopes)
+    if scopes:
+        def _bg_forget(_scopes=scopes):
+            for sc in _scopes:
+                try:
+                    _forget_scope(sc)
+                except Exception:  # noqa: BLE001
+                    pass
+        threading.Thread(target=_bg_forget, daemon=True, name="project-forget").start()
 
     if not purge:
         # Atomic against root reuse: remove only if pid still owns this exact root.
@@ -8411,7 +8925,7 @@ def _project_delete(agent: "Optional[GX10]", args: "List[str]") -> str:
             return f"[project] delete failed: {e!r}"
         if removed is None:
             return f"[project] {pid} was already removed or changed underneath — nothing deleted"
-        return f"[project] deleted {pid} (forgot {forgotten} memory scope(s))"
+        return f"[project] deleted {pid} (forgetting {forgotten} memory scope(s) in the background)"
 
     # --purge: the directory delete must be claimed while STILL serialized against re-registration.
     ok, why = _safe_to_purge(root)
@@ -8423,7 +8937,7 @@ def _project_delete(agent: "Optional[GX10]", args: "List[str]") -> str:
             return f"[project] delete failed: {e!r}"
         if removed is None:
             return f"[project] {pid} was already removed or changed underneath — nothing deleted"
-        return (f"[project] deleted {pid} (forgot {forgotten} memory scope(s)) · "
+        return (f"[project] deleted {pid} (forgetting {forgotten} memory scope(s) in the background) · "
                 f"purge refused ({why}) — dir left at {root}")
     # Under the registry lock: verify ownership, rename the root to a fresh unique tombstone (claims it), and
     # drop the entry — atomically. Then rmtree the tombstone outside the lock.
@@ -8438,9 +8952,9 @@ def _project_delete(agent: "Optional[GX10]", args: "List[str]") -> str:
     _removed, tomb = res
     try:
         shutil.rmtree(tomb)
-        return f"[project] deleted {pid} (forgot {forgotten} memory scope(s)) · purged {root}"
+        return f"[project] deleted {pid} (forgetting {forgotten} memory scope(s) in the background) · purged {root}"
     except OSError as e:
-        return (f"[project] deleted {pid} (forgot {forgotten} memory scope(s)) · "
+        return (f"[project] deleted {pid} (forgetting {forgotten} memory scope(s) in the background) · "
                 f"removed but the tombstone could not be deleted: {e} (at {tomb})")
 
 
@@ -8844,8 +9358,75 @@ def _dispatch(agent: GX10, user_input: str):
         _ui_print(agent.manual_cat(user_input[4:].strip()))
     elif cmd == "ls" or cmd.startswith("ls "):
         _ui_print(agent.manual_ls(user_input[2:].strip() or "."))
+    elif cmd == "auto" or cmd.startswith("auto "):
+        # #1296: the consolidated automation meta-switch. `auto on [N]` = FULL automation — watcher
+        # (feedback→advance) + autopilot (launch) + continuation (post-advance next-unit/backlog
+        # planning) coherently on, optional N = the max-tasks cap. `auto off` = GUIDED mode — nothing
+        # fires by itself; the engine still selects the next unit deterministically and RECOMMENDS it
+        # (steering state / this status), the operator drives each step. The granular toggles
+        # (/watcher /autopilot /autoplan) remain the advanced layer underneath.
+        global _WATCHER_ENABLED, AUTOPILOT_ENABLED, AUTOPILOT_AUTOPLAN, AUTOPILOT_MAX_TASKS, _AUTOPLAN_DONE
+        parts = cmd.split()
+        arg   = parts[1] if len(parts) > 1 else ""
+        n_arg = parts[2] if len(parts) > 2 else None
+        if arg == "on":
+            if n_arg is not None:
+                try:
+                    AUTOPILOT_MAX_TASKS = int(n_arg)
+                    if _EFFECTIVE_CFG: _EFFECTIVE_CFG["autopilot"]["autoplan_max_tasks"] = AUTOPILOT_MAX_TASKS
+                except ValueError:
+                    _ui_print(col(f"[AUTO] invalid number: {n_arg!r}", C.RED))
+                    return  # type: ignore
+            _WATCHER_ENABLED   = True
+            AUTOPILOT_ENABLED  = True
+            _AUTOPLAN_DONE     = 0
+            AUTOPILOT_AUTOPLAN = True
+            if _EFFECTIVE_CFG:
+                _EFFECTIVE_CFG["watcher"]["enabled"]    = True
+                _EFFECTIVE_CFG["autopilot"]["enabled"]  = True
+                _EFFECTIVE_CFG["autopilot"]["autoplan"] = True
+            cap = (f"max {AUTOPILOT_MAX_TASKS} tasks, stops automatically" if AUTOPILOT_MAX_TASKS > 0
+                   else "UNBOUNDED — every unit is a paid coder run; cap it with `auto on N`")
+            _ui_print(col(f"[AUTO] FULL automation ON — watcher + autopilot "
+                          f"(max_concurrent={AUTOPILOT_MAX_CONCURRENT}) + continuation ({cap}).", C.GREEN))
+            _ui_print(col("  The loop now advances finished tasks, stages the next open unit and "
+                          "launches its coder until the epic is drained. `auto off` returns to guided mode.",
+                          C.GRAY))
+            # #1296 bootstrap: the first unit of a planned epic has no predecessor advance — arming
+            # the loop kicks its [NEXT-UNIT] authoring turn itself (idle + selectable unit only).
+            if not _continuation_kick():
+                _pipeline_hint = _empty_pipeline_hint()   # #1268: no silent no-op on an empty pipeline
+                if _pipeline_hint:
+                    _ui_print(col(_pipeline_hint, C.GRAY))
+        elif arg == "off":
+            _WATCHER_ENABLED   = False
+            AUTOPILOT_ENABLED  = False
+            AUTOPILOT_AUTOPLAN = False
+            _AUTOPLAN_DONE     = 0
+            if _EFFECTIVE_CFG:
+                _EFFECTIVE_CFG["watcher"]["enabled"]    = False
+                _EFFECTIVE_CFG["autopilot"]["enabled"]  = False
+                _EFFECTIVE_CFG["autopilot"]["autoplan"] = False
+            _ui_print(col("[AUTO] GUIDED mode — nothing fires by itself (advance/launch/planning are "
+                          "yours); the engine keeps recommending the next step.", C.YELLOW))
+            _pipeline_hint = _empty_pipeline_hint()
+            if _pipeline_hint:
+                _ui_print(col(_pipeline_hint, C.GRAY))
+        else:
+            _full = _WATCHER_ENABLED and AUTOPILOT_ENABLED and AUTOPILOT_AUTOPLAN
+            _none = not (_WATCHER_ENABLED or AUTOPILOT_ENABLED or AUTOPILOT_AUTOPLAN)
+            mode = (col("FULL automation", C.GREEN) if _full
+                    else col("GUIDED", C.YELLOW) if _none
+                    else col("MIXED (granular toggles)", C.CYAN))
+            limit_str = f"max={AUTOPILOT_MAX_TASKS}" if AUTOPILOT_MAX_TASKS > 0 else "max=unbounded"
+            _ui_print(f"  auto: {mode}  |  watcher {'on' if _WATCHER_ENABLED else 'off'} · "
+                      f"autopilot {'on' if AUTOPILOT_ENABLED else 'off'} · "
+                      f"continuation {'on' if AUTOPILOT_AUTOPLAN else 'off'} ({limit_str}, "
+                      f"done={_AUTOPLAN_DONE})  |  auto on [N] / auto off")
+            _pipeline_hint = _empty_pipeline_hint()
+            if _pipeline_hint:
+                _ui_print(col(_pipeline_hint, C.GRAY))
     elif cmd.startswith("watcher"):
-        global _WATCHER_ENABLED
         arg = cmd.split()[-1] if len(cmd.split()) > 1 else ""
         if arg == "on":
             _WATCHER_ENABLED = True
@@ -8859,7 +9440,6 @@ def _dispatch(agent: GX10, user_input: str):
             state = col("ON", C.GREEN) if _WATCHER_ENABLED else col("OFF", C.YELLOW)
             _ui_print(f"  auto-advance (reconciler): {state}  |  watcher on / watcher off")
     elif cmd.startswith("autopilot"):
-        global AUTOPILOT_ENABLED
         arg = cmd.split()[-1] if len(cmd.split()) > 1 else ""
         if arg == "on":
             AUTOPILOT_ENABLED = True
@@ -8870,6 +9450,9 @@ def _dispatch(agent: GX10, user_input: str):
                 # S7 (#1229): only true in coupled mode — decoupled autopilot is self-sufficient.
                 msg += "  ⚠ reconciler is OFF — 'watcher on' is required, else nothing happens."
             _ui_print(col(msg, C.GREEN))
+            _pipeline_hint = _empty_pipeline_hint()   # #1268: no silent no-op on an empty pipeline
+            if _pipeline_hint:
+                _ui_print(col(_pipeline_hint, C.GRAY))
         elif arg == "off":
             AUTOPILOT_ENABLED = False
             if _EFFECTIVE_CFG: _EFFECTIVE_CFG["autopilot"]["enabled"] = False
@@ -8878,7 +9461,6 @@ def _dispatch(agent: GX10, user_input: str):
             state = col("ON", C.GREEN) if AUTOPILOT_ENABLED else col("OFF", C.YELLOW)
             _ui_print(f"  autopilot: {state}  |  autopilot on / autopilot off")
     elif cmd.startswith("autoplan"):
-        global AUTOPILOT_AUTOPLAN, AUTOPILOT_MAX_TASKS, _AUTOPLAN_DONE
         parts = cmd.split()
         arg   = parts[1] if len(parts) > 1 else ""
         n_arg = parts[2] if len(parts) > 2 else None
@@ -8897,17 +9479,24 @@ def _dispatch(agent: GX10, user_input: str):
             if AUTOPILOT_MAX_TASKS > 0:
                 limit_info = f", max {AUTOPILOT_MAX_TASKS} tasks — stops automatically"
                 _ui_print(col(
-                    f"[AUTOPLAN] ON{limit_info}",
+                    f"[AUTOPLAN] continuation ON{limit_info}",
                     C.GREEN))
             else:
                 _ui_print(col(
-                    "[AUTOPLAN] ON — max_tasks=0 (INFINITE LOOP, no automatic stop!)\n"
-                    "  → recommendation: set a limit with  autoplan off  then  autoplan on N",
+                    "[AUTOPLAN] continuation ON — max_tasks=0 (no automatic stop: an epic's unit "
+                    "count bounds a design drain, but a capability backlog runs until it is empty!)\n"
+                    "  → recommendation: cap it with  autoplan on N  (or  auto on N)",
                     C.YELLOW))
             _ui_print(col(
-                "  ⚠ WARNING: NEVER use autoplan with a paid API subscription!\n"
-                "    Every planning step = one model turn = cost. Local vLLM instances only!",
+                "  ⚠ COST: every continued task launches a PAID coder run (claude/codex/…) — the "
+                "planner turn is the cheap part.\n"
+                "    Use a local vLLM for planning and set a task cap unless you mean it.",
                 C.RED))
+            # #1296 bootstrap: arming the continuation kicks the first open unit's authoring turn.
+            if not _continuation_kick():
+                _pipeline_hint = _empty_pipeline_hint()   # #1268: no silent no-op on an empty pipeline
+                if _pipeline_hint:
+                    _ui_print(col(_pipeline_hint, C.GRAY))
         elif arg == "off":
             AUTOPILOT_AUTOPLAN = False
             _AUTOPLAN_DONE     = 0
@@ -9146,8 +9735,28 @@ def _do_launch(task_id: str, agent: str):
     except Exception:  # noqa: BLE001 — effort tiering must never block a launch
         _rec = None
     effort = _resolve_handover_effort(effort, _task_class(_rec) if _rec else None, spec.effort)
+    # #1288: the ENGINE — not the handover body — owns the feedback filename+location for EVERY coder. The
+    # CODEX branch gets it via `-o {feedback}`; the Claude `--print` shape has no such flag, so state the exact
+    # path in the prompt (overriding any divergent name the orchestrator wrote into the handover body), else a
+    # completed Claude run drops its feedback where the reconciler never looks → the task stays in_progress and
+    # the pipeline stalls.
+    _fbd = feedback_dir(soft=True)
+    _fb_name = f"{task_id}_{agent}-feedback.md"
+    _fb_path = (_fbd / _fb_name) if _fbd is not None else None
+    _fb_disp = _fb_path.as_posix() if _fb_path is not None else _fb_name
+    # Fix 5 (dev-loop stab): state the engine's ground-truth PROJECT NAME + CODE ROOT so the coder builds HERE,
+    # aligned to the project — not a design-derived, double-nested project inside the code root (#1291).
+    _proot = _project_root()
+    _proj = (_proot.name if _proot else "") or "this project"
     prompt = (f"Autonomously read and work the handover {ho.as_posix()}. "
-              f"Follow the instructions in .claude/CLAUDE.md.")
+              f"Follow the instructions in .claude/CLAUDE.md. "
+              f"Build ALL code directly under the current working directory (the code root of project "
+              f"'{_proj}'); do NOT create a top-level wrapper directory named after the design — that "
+              f"double-nests the tree. "
+              f"When the work is finished you MUST write your handover feedback to EXACTLY this file — this "
+              f"exact path and filename, ignoring any other feedback filename the handover body may name: "
+              f"{_fb_disp}. The FIRST line of that file must be `status: done` when complete (the pipeline "
+              f"advances ONLY on `status: done`), otherwise `status: blocked` or `status: clarification_needed`.")
     _bin = spec.bin or AUTOPILOT_CLAUDE_BIN
     _tmpl = spec.cmd_template or ""
     # #449 (review B-1): the Claude `--print` autopilot shape KEEPS its stream plumbing (--verbose +
@@ -9171,8 +9780,7 @@ def _do_launch(task_id: str, agent: str):
         # would otherwise render an EMPTY path. Point it at the feedback file the reconciler advances on,
         # so the agent's final message lands where the autopilot already looks.
         from commands import build_agent_argv
-        _fbd = feedback_dir(soft=True)
-        cap = str((_fbd / f"{task_id}_{agent}-feedback.md")) if _fbd else f"{task_id}_{agent}-feedback.md"
+        cap = str(_fb_path) if _fb_path is not None else _fb_name   # #1288: same feedback path stated in the prompt
         argv = build_agent_argv(_tmpl, bin=_bin, model=str(model), effort=str(effort),
                                 permission=spec.permission_mode or "", prompt=prompt, feedback=cap)
     # Autopilot logs are engine machinery (subprocess stdout), not an initiative artefact → under
@@ -9253,6 +9861,20 @@ def _do_launch(task_id: str, agent: str):
         try:
             fb_dir = feedback_dir(soft=True)     # B3: <initiative>/.work/feedback (soft)
             found = list(fb_dir.glob(f"{task_id}_*-feedback.md")) if (fb_dir and fb_dir.exists()) else []
+            # Dev-loop stab (ingest stamp): a CAPTURE-mode coder (codex/kimi/grok via `-o {feedback}`) dumps its
+            # raw final turn with NO guaranteed `status:` token. If the run exited 0 and wrote a non-empty
+            # feedback carrying no recognized status, STAMP a leading `status: done` — the PROCESS signal
+            # (exit 0 + non-empty content) is the engine-owned completion fact, not model prose.
+            if ok:
+                for _fb in found:
+                    try:
+                        _txt = _fb.read_text(encoding="utf-8")
+                    except Exception:   # noqa: BLE001
+                        continue
+                    if _txt.strip() and not _feedback_status(_txt):
+                        _fb.write_text("status: done\n" + _txt, encoding="utf-8", newline="\n")
+                        _ui_print(col(f"  [AUTO] {task_id}: stamped `status: done` on {_fb.name} "
+                                      f"(exit 0, capture had no status token)", C.CYAN))
             if not found:
                 # Task already completed? → no alert (advance deleted the feedback correctly)
                 t = _store().get(task_id)
@@ -9475,12 +10097,16 @@ def _reconcile_once(store: "TaskStore", enqueue, seen_mtime: Dict[str, float],
                 break
         if fb is None:
             continue
-        key = (tid, agent)
-        if key in enqueued:
-            continue
         try:
             mt = fb.stat().st_mtime
         except OSError:
+            continue
+        # Fix 2 (dev-loop stab): key the enqueue-dedup on the feedback MTIME too. The old (tid,agent) latch was
+        # added BEFORE the async advance ran, so an advance that REFUSED (gate: malformed status) latched the
+        # task forever — a corrected/re-written feedback never re-fired and the stall was permanent until a
+        # process restart. Including mtime makes a changed feedback a NEW key ⇒ it re-fires and recovers.
+        key = (tid, agent, mt)
+        if key in enqueued:
             continue
         # Completeness gate: mtime stable across a tick → fully written
         if seen_mtime.get(str(fb)) != mt:
@@ -9517,11 +10143,38 @@ def _reconciler_loop(stop_event: threading.Event, interval: float):
 
 
 # ─── Application UI ───────────────────────────────────────────
+def _empty_pipeline_hint() -> "Optional[str]":
+    """#1268/#1296: when autonomous mode is switched on but nothing is actively running, SAY what the loop
+    will do next — instead of a silent no-op. Three states: work in flight → None (the loop acts); open
+    handover-less units → name the selected next unit (or the dependency deadlock); nothing at all → the
+    seed hint (plan_units from the approved design), plus whether the capability-backlog leg could continue
+    afterwards. Never raises (returns None when the store is unavailable — never break the toggle)."""
+    try:
+        s = _store()
+        if _work_in_flight(s):
+            return None
+        unit, _elig, n_open = _select_next_unit(s)
+    except Exception:  # noqa: BLE001 — no store / no project → skip the hint, never break the toggle
+        return None
+    if unit is not None:
+        return (f"  ⓘ {n_open} open unit(s) — next: {unit['id']} ({unit.get('title')!r}). With automation on "
+                f"the engine stages + runs it after each advance; in guided mode, stage its handover via "
+                f"stage_handover (task_id='{unit['id']}', no task_json).")
+    if n_open > 0:
+        return (f"  ⚠ {n_open} open unit(s) but NONE is selectable — blocked or with unsatisfied "
+                f"dependencies. Inspect /board and unblock (clear the block / finish or fix the dependency).")
+    has_backlog = bool((_EFFECTIVE_CFG or {}).get("paths", {}).get("active_capability_backlog"))
+    tail = "" if has_backlog else " (no capability backlog is configured either, so nothing continues after that)"
+    return ("  ⓘ pipeline empty — nothing to run yet. Seed it: ask the model to break the approved "
+            "design into units via plan_units (one epic + ALL implementation units)" + tail + ".")
+
+
 def _autoplan_prompt(tid: str) -> Optional[str]:
-    """Build the 'plan the next task' prompt for autoplan from the configured
-    capability backlog (``paths.active_capability_backlog``). Returns None when no
-    backlog is configured — autoplan then has no source to plan from and stays idle
-    (generic-safe: no vessel-specific default is assumed)."""
+    """Build the 'plan the next task' prompt from the configured capability backlog
+    (``paths.active_capability_backlog``) — the SECOND continuation leg (#1296): it runs only
+    when no open unit is left to drain. Returns None when no backlog is configured — this leg
+    then has no source and the tick goes idle WITHOUT disarming (generic-safe: no vessel-specific
+    default is assumed)."""
     backlog = (_EFFECTIVE_CFG or {}).get("paths", {}).get("active_capability_backlog")
     if not backlog:
         return None
@@ -9542,39 +10195,113 @@ def _autoplan_prompt(tid: str) -> Optional[str]:
     )
 
 
-def _autoplan_tick(tid: str, enqueue) -> None:
-    """After a successful advance: count it, enforce the max-tasks limit, and when the
-    pipeline is empty enqueue the next planning turn. ``enqueue(prompt:str)`` puts the
-    turn on the input queue. Gated on ``AUTOPILOT_AUTOPLAN`` only — independent of
-    autopilot's *launch* side, so it works in the server/client split (server plans,
-    client executes, server advances, server plans again)."""
+def _next_unit_prompt(done_tid: "Optional[str]", unit: "Dict[str, Any]") -> str:
+    """#1296: the [NEXT-UNIT] staging turn — the engine has already SELECTED the unit
+    (deterministic policy); the model's only job is to AUTHOR its handover. The unit exists in
+    the store, so the call is stage_handover with task_id and WITHOUT task_json. ``done_tid`` is
+    the just-advanced predecessor (its feedback carries the plan-change duty) — None on the
+    BOOTSTRAP kick (arming the loop on a freshly planned epic: no predecessor yet)."""
+    parent = str(unit.get("parent") or "").strip()
+    progress = ""
+    if parent:
+        try:
+            sibs = [t for t in _store().list() if str(t.get("parent") or "") == parent]
+            n_done = sum(1 for t in sibs if t.get("status") == "done")
+            progress = f" — epic {parent}: {n_done}/{len(sibs)} units done"
+        except Exception:  # noqa: BLE001 — progress is advisory
+            progress = f" — epic {parent}"
+    if done_tid:
+        fb_dir = archive_feedback_dir()
+        head = (f"[NEXT-UNIT] Task {done_tid} is complete. The engine selected the next open unit"
+                f"{progress}: ")
+        duty = (f"PLAN-CHANGE DUTY: first read the completed task's feedback "
+                f"({(fb_dir / (done_tid + '_<agent>-feedback.md')).as_posix()}). Plan-relevant items under "
+                f"## Issues (effort change, new dependency, path correction, architecture insight)? → Then "
+                f"FIRST adjust the plan (add units via plan_units with epic_id, or report), THEN continue. ")
+    else:
+        head = f"[NEXT-UNIT] Automation armed. The engine selected the FIRST open unit{progress}: "
+        duty = ""
+    return (
+        head
+        + f"{unit['id']} [{unit.get('type')}/{unit.get('priority')}] "
+          f"{unit.get('title')!r} — {unit.get('description', '')} "
+        + duty
+        + f"AUTHOR THE HANDOVER NOW: ONE stage_handover call with task_id='{unit['id']}' and NO "
+          f"task_json (the unit already exists — a task_json would create a duplicate). Codebase "
+          f"paths ONLY verified via search_files / a shell listing — do NOT guess; the code from "
+          f"completed units EXISTS, extend it. AUTONOMY DUTY: no questions; if this unit is obsolete "
+          f"or impossible, say why and stage nothing."
+    )
+
+
+def _continuation_kick() -> bool:
+    """#1296 bootstrap: the continuation is edge-triggered on an ADVANCE — but the FIRST unit of a
+    freshly planned epic has no predecessor advance, so arming the loop (`/auto on`, `/autoplan on`)
+    must kick it once itself. When the continuation is armed, nothing is in flight and a unit is
+    selectable, enqueue its [NEXT-UNIT] authoring turn on the input queue (consumed exactly like a
+    post-advance continuation turn). Returns True when a turn was enqueued. Fail-soft: never raises
+    (arming a toggle must not break on a store hiccup)."""
+    try:
+        if not AUTOPILOT_AUTOPLAN:
+            return False
+        s = _store()
+        if _work_in_flight(s):
+            return False
+        unit, _elig, _n_open = _select_next_unit(s)
+        if unit is None:
+            return False
+        _INPUT_QUEUE.put(_next_unit_prompt(None, unit))
+        _ui_print(col(f"  → [CONTINUATION] bootstrapping: authoring the handover for "
+                      f"{unit['id']} ({str(unit.get('title') or '')!r})", C.CYAN))
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _continuation_tick(tid: str, enqueue) -> None:
+    """#1296: after a successful advance — count it, enforce the max-tasks limit, and when nothing
+    is actively running continue the loop in leg order: (1) next OPEN UNIT of the decomposition →
+    enqueue its [NEXT-UNIT] handover-authoring turn; (2) no units left → the capability-backlog
+    autoplan leg (``_autoplan_prompt``); (3) no source at all → idle, ARMED (a missing source is
+    an informational line per advance, never a silent self-disable — only the max-tasks limit
+    stops the loop). ``enqueue(prompt:str)`` puts the turn on the input queue. Gated on
+    ``AUTOPILOT_AUTOPLAN`` only — independent of autopilot's *launch* side, so it works in the
+    server/client split (server plans, client executes, server advances, server plans again)."""
     global _AUTOPLAN_DONE, AUTOPILOT_AUTOPLAN
     if not AUTOPILOT_AUTOPLAN:
         return
     _AUTOPLAN_DONE += 1
-    _ui_print(col(f"  [AUTOPLAN] {_AUTOPLAN_DONE}"
+    _ui_print(col(f"  [CONTINUATION] {_AUTOPLAN_DONE}"
                   + (f"/{AUTOPILOT_MAX_TASKS}" if AUTOPILOT_MAX_TASKS > 0 else "")
                   + " tasks completed", C.CYAN))
     if AUTOPILOT_MAX_TASKS > 0 and _AUTOPLAN_DONE >= AUTOPILOT_MAX_TASKS:
         AUTOPILOT_AUTOPLAN = False
         if _EFFECTIVE_CFG:
             _EFFECTIVE_CFG["autopilot"]["autoplan"] = False
-        _ui_print(col(f"\n  ✓ [AUTOPLAN] limit reached ({_AUTOPLAN_DONE}/"
-                      f"{AUTOPILOT_MAX_TASKS}) — autoplan stopped.", C.GREEN))
+        _ui_print(col(f"\n  ✓ [CONTINUATION] limit reached ({_AUTOPLAN_DONE}/"
+                      f"{AUTOPILOT_MAX_TASKS}) — continuation stopped.", C.GREEN))
         return
     s = _store()
-    if s.list("pending") or s.list("in_progress"):
-        return                       # pipeline not empty → nothing to plan
+    if _work_in_flight(s):
+        return                       # something runs / is staged → the launcher's turn, not ours
+    unit, _elig, n_open = _select_next_unit(s)
+    if unit is not None:
+        enqueue(_next_unit_prompt(tid, unit))
+        _ui_print(col(f"\n  → [CONTINUATION] next open unit after {tid}: {unit['id']} "
+                      f"({unit.get('title')!r}) — authoring its handover", C.CYAN))
+        return
+    if n_open > 0:
+        _ui_print(col(f"  ⚠ [CONTINUATION] {n_open} open unit(s) but NONE selectable — blocked or "
+                      f"unsatisfied dependencies. Inspect /board; the loop stays armed.", C.YELLOW))
+        return
     prompt = _autoplan_prompt(tid)
     if prompt is None:
-        AUTOPILOT_AUTOPLAN = False   # no backlog → autoplan has no source
-        if _EFFECTIVE_CFG:
-            _EFFECTIVE_CFG["autopilot"]["autoplan"] = False
-        _ui_print(col("  [AUTOPLAN] no backlog configured "
-                      "(paths.active_capability_backlog) — autoplan off.", C.YELLOW))
+        _ui_print(col("  [CONTINUATION] pipeline drained — no open units, no capability backlog "
+                      "(paths.active_capability_backlog). Idle, armed.", C.CYAN))
         return
     enqueue(prompt)
-    _ui_print(col(f"\n  → [AUTOPLAN] queue empty after {tid} — planning the next task", C.CYAN))
+    _ui_print(col(f"\n  → [AUTOPLAN] queue empty after {tid} — planning the next task "
+                  f"from the backlog", C.CYAN))
 
 
 def _code_defaults() -> Dict[str, Any]:
@@ -9771,11 +10498,13 @@ def _code_defaults() -> Dict[str, Any]:
                 {"provider_id": "claude-opus",   "kind": "cli", "agent_id": "OPUS",
                  "display": "Claude Opus 4.8",   "model": "claude-opus-4-8", "bin": "claude",
                  "cmd_template": "{bin} --model {model} --effort {effort} --permission-mode {permission} --print {prompt}",
-                 "effort": "xhigh", "permission_mode": "acceptEdits"},
+                 "effort": "xhigh", "permission_mode": "acceptEdits",
+                 "cost_per_1k_in": 0.015, "cost_per_1k_out": 0.075},   # #1287: priciest → complex tier only
                 {"provider_id": "claude-sonnet", "kind": "cli", "agent_id": "SONNET",
                  "display": "Claude Sonnet 5", "model": "claude-sonnet-5", "bin": "claude",
                  "cmd_template": "{bin} --model {model} --effort {effort} --permission-mode {permission} --print {prompt}",
-                 "effort": "high", "permission_mode": "acceptEdits"},
+                 "effort": "high", "permission_mode": "acceptEdits",
+                 "cost_per_1k_in": 0.003, "cost_per_1k_out": 0.015},   # #1287: cheaper → standard/routine/analysis
             ],
             # #454: runtime operator OVERRIDE — `/coders use <id>` pins one agent so ALL handovers run
             # on it (the runtime switch); None ⇒ use the orchestrator's task-chosen (staged) agent. An
@@ -9795,16 +10524,16 @@ def _code_defaults() -> Dict[str, Any]:
                 "exit_codes": [],
                 "json_event_types": [],
             },
-            # #456: task_class → the agents CAPABLE of that class (the operator matrix: OPUS for
-            # security/architecture, all-rounders for coding, the cheaper/broad set for analysis). This
-            # SCOPES failover (#455) + distinct-reviewer (#457) to task-appropriate agents — it does NOT
-            # override the orchestrator's staged pick. Public default lists only OPUS/SONNET; conf/ adds
-            # CODEX/KIMI. An unknown/missing class ⇒ no restriction (fail-open, byte-identical to #455).
+            # #1287: task_class (cost TIER) → the coders CAPABLE of it. The DETERMINISTIC primary pick is the
+            # cheapest capable entry by cost_per_1k (`_route_code_agent` at stage_handover); it also scopes
+            # failover (#455) + distinct-reviewer (#457). Public default lists only OPUS/SONNET (complex→OPUS;
+            # everything cheaper→SONNET); conf/ adds the private CODEX/KIMI/GROK. Unknown/missing class ⇒ no
+            # restriction (fail-open). REVERSES the 2026-06-25 "staged pick authoritative" rule per the operator.
             "classes": {
-                "security":     ["OPUS"],
-                "architecture": ["OPUS"],
-                "coding":       ["OPUS", "SONNET"],
-                "analysis":     ["SONNET"],
+                "complex":  ["OPUS"],
+                "standard": ["SONNET", "OPUS"],
+                "routine":  ["SONNET"],
+                "analysis": ["SONNET"],
             },
         },
         "onboarding": {

@@ -143,6 +143,27 @@ test('processOne — uploads the captured final message via the {feedback} fallb
   assert.equal(calls.length, 1);
   assert.equal(calls[0]?.['content'], 'CAPTURED'); // the {feedback} capture is read when no feedback file is written
   assert.equal(calls[0]?.['exit_code'], 0);
+  // #1300: after a SUCCESSFUL upload the agent scratch is gone (handover drop + feedback + capture)
+  const scratch = join(dir, '.ironclad', 'agent');
+  await assert.rejects(fs.access(join(scratch, 'handovers', 'T2_OPUS.md')));
+  await assert.rejects(fs.access(join(scratch, 'feedback', 'T2_OPUS-output.md')));
+  await assert.rejects(fs.access(join(scratch, 'feedback', 'T2_OPUS-feedback.md')));
+});
+
+test('processOne — a FAILED run keeps its scratch for diagnosis + retry (#1300)', async () => {
+  const dir = await fs.mkdtemp(join(tmpdir(), 'ink-ho-'));
+  const failer = join(dir, 'fail.cjs');
+  await fs.writeFile(failer, "process.exit(1);", 'utf8');
+  const srv = {
+    async feedback(): Promise<Json> {
+      return {classification: 'task-failed'};
+    },
+  } as unknown as Server;
+  const cfg: HandoverCfg = {...baseCfg, claudeBinOverride: process.execPath, agentCmdOverride: `{bin} ${failer.replace(/\\/g, '/')}`};
+  const ok = await processOne(srv, {id: 'T4', agent: 'OPUS', handover: 'do w'}, dir, cfg, new Set(['T4']), () => {});
+  assert.equal(ok, false);
+  // the handover drop survives a failed run — the retry re-reads it and the operator can inspect it
+  await fs.access(join(dir, '.ironclad', 'agent', 'handovers', 'T4_OPUS.md'));
 });
 
 test('Pool — caps concurrency at max', async () => {

@@ -91,6 +91,17 @@ AGENT_CMD = AGENT_CMD_OVERRIDE or DEFAULT_AGENT_CMD
 DEFAULT_MAX_AGENTS = int(os.environ.get("GX10_MAX_AGENTS", "3"))
 #: #455: how much of a code-agent's stderr to upload for the server-side exhausted classifier (a
 #: bounded tail — the budget/quota signal is at the end; never ship an unbounded log over the wire).
+def _strip_confirm(message: str) -> Tuple[str, bool]:
+    """#935/#1281: `--yes`/`--confirm` is the operator's confirmation for a destructive command — a standalone
+    token in ANY position (not only trailing; `--yes --purge` used to slip past the old endswith check).
+    Returns (message without the flag, whether it was present)."""
+    toks = message.rstrip().split()
+    kept = [t for t in toks if t not in ("--yes", "--confirm")]
+    if len(kept) != len(toks):
+        return " ".join(kept), True
+    return message.rstrip(), False
+
+
 _STDERR_TAIL_CHARS = 4000
 #: CLI-3 (#503): serializes the check-then-claim in dispatch_pending so an overlapping /auto poll + /work
 #: (or two poll ticks) can't both claim+launch the same handover.
@@ -276,11 +287,9 @@ class Server:
         # #935: uniform confirm affordance — a trailing `--yes`/`--confirm` on a destructive command is the
         # confirmation (stripped here, sent as confirm=True). Keeps every client's flow input-free: on a
         # needs_confirm reply the caller just tells the user to re-run with --yes.
-        _m = message.rstrip()
-        for _flag in (" --yes", " --confirm"):
-            if _m.endswith(_flag):
-                message, confirm = _m[: -len(_flag)].rstrip(), True
-                break
+        # #935/#1281: `--yes`/`--confirm` (in ANY position) is the destructive-command confirmation.
+        message, _confirmed = _strip_confirm(message)
+        confirm = confirm or _confirmed
         body = json.dumps({"message": message, "confirm": confirm}).encode("utf-8")
         req = urllib.request.Request(self.base + "/chat/stream", data=body, method="POST")
         req.add_header("Content-Type", "application/json")

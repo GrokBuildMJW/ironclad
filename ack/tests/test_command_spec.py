@@ -67,8 +67,10 @@ def test_generate_declares_its_required_flags():
 
 def test_catalogue_entries_serialize_every_verb():
     # #931: the serialized form served via /catalogue for client-side command generation.
+    # #1264: deprecated verbs are excluded from the advertised catalogue, so the count is the non-deprecated
+    # verbs — not len(COMMAND_SPECS).
     entries = cs.catalogue_entries()
-    assert len(entries) == len(cs.COMMAND_SPECS)
+    assert len(entries) == len([c for c in cs.COMMAND_SPECS if not cs.is_deprecated(c)])
     for e in entries:
         assert set(e) == {"name", "tier", "usage", "summary", "subcommands", "flags"}   # #936: + structured
         assert e["tier"] in cs.VERB_TIERS and e["summary"]
@@ -77,6 +79,16 @@ def test_catalogue_entries_serialize_every_verb():
     lc = next(e for e in entries if e["name"] == "lifecycle")
     assert "gate" in lc["usage"] and "--tree" in lc["usage"]     # subcommands + flags render into usage
     assert "gate" in lc["subcommands"] and any(f["name"] == "--tree" for f in lc["flags"])
+
+
+def test_catalogue_excludes_deprecated_but_keeps_dispatchable():
+    # #1264: a deprecated alias (e.g. /initiative) must NOT be advertised via /catalogue (nor autocomplete),
+    # yet stays a real, dispatchable spec verb (the entry + its dispatch branch remain for back-compat).
+    names = {e["name"] for e in cs.catalogue_entries()}
+    assert "initiative" not in names                        # not advertised
+    assert cs.by_verb("initiative") is not None             # still a real spec verb (dispatchable)
+    assert cs.is_deprecated(cs.by_verb("initiative"))       # classified deprecated → drives the exclusion
+    assert "project" in names                               # the canonical verb IS advertised
 
 
 def test_guided_usage_is_spec_derived():

@@ -69,6 +69,23 @@ def test_index_preserves_manual_content_outside_block(tmp_path):
     assert "ironclad:index:auto" in out
 
 
+def test_index_migrates_legacy_marker_in_place(tmp_path):
+    # #1265: an INDEX.md written with the legacy (German, descriptive) START marker is rewritten to the
+    # current English marker IN PLACE — the managed block is replaced, never DUPLICATED.
+    gx10.initiative_new("Proj", "software")
+    idxp = tmp_path / "vault" / "proj" / "INDEX.md"
+    legacy = "<!-- ironclad:index:auto START — generiert von reconcile_vault, nicht von Hand ändern -->"
+    idxp.write_text(f"# Proj — INDEX\n\nHANDNOTE\n\n{legacy}\nstale body\n<!-- ironclad:index:auto END -->\n",
+                    encoding="utf-8")
+    gx10.reconcile_vault("proj")
+    out = idxp.read_text(encoding="utf-8")
+    assert legacy not in out                                  # the German marker is gone
+    assert gx10._INDEX_AUTO_START in out                      # replaced by the current English marker
+    assert out.count("ironclad:index:auto START") == 1        # exactly ONE managed block — no duplicate append
+    assert "stale body" not in out                            # the block content was regenerated
+    assert "HANDNOTE" in out                                  # manual prose outside the block survives
+
+
 def test_index_idempotent(tmp_path):
     gx10.initiative_new("Proj", "software")
     _decision("proj", "db", "DB-Wahl", "2026-06-20", "[infra]")

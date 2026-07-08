@@ -116,6 +116,53 @@ def test_pending_handovers_surfaces_staged_task(tmp_path, monkeypatch):
     assert item["effort"] == "high"
 
 
+def test_pending_handover_agent_name_in_to_is_not_the_model(tmp_path, monkeypatch):
+    # #1279 (completes #1236 on the /pending path — the guard existed only in _do_launch): the handover's
+    # `to:` is the RECIPIENT AGENT ("to: OPUS"), which `_parse_handover_meta` returns as `model`. An agent id
+    # must NOT be shipped as the model — before the fix /pending shipped `model: "OPUS"`, so the client
+    # rendered `-m OPUS` and a non-Claude coder CLI failed (exit 1, e.g. CODEX "unknown option '-m'").
+    monkeypatch.chdir(tmp_path)
+    gx10.initiative_new("Demo", "software")
+    store = gx10._store()
+    store.create({"type": "feature", "priority": "high", "title": "wire it", "description": "x"}, force=True)
+    tid = store.list("pending")[0]["id"]
+    ho_dir = gx10.handovers_dir()
+    ho_dir.mkdir(parents=True, exist_ok=True)
+    (ho_dir / f"{tid}_OPUS.md").write_text("---\nto: OPUS\neffort: high\n---\nbody", encoding="utf-8")
+    item = server._pending_handovers()[0]
+    assert item["agent"] == "OPUS"
+    assert item["model"] == "claude-opus-4-8"        # spec.model — NOT the agent name "OPUS"
+    assert item["effort"] == "high"                  # the orchestrator's effort choice is still honoured
+
+
+def _stage_opus(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    gx10.initiative_new("Demo", "software")
+    store = gx10._store()
+    store.create({"type": "feature", "priority": "high", "title": "wire it", "description": "x"}, force=True)
+    tid = store.list("pending")[0]["id"]
+    ho_dir = gx10.handovers_dir()
+    ho_dir.mkdir(parents=True, exist_ok=True)
+    (ho_dir / f"{tid}_OPUS.md").write_text("---\nto: OPUS\n---\nbody", encoding="utf-8")
+
+
+def test_pending_handover_ships_the_resolved_bin_path(tmp_path, monkeypatch):
+    # #1279: /pending must ship the boot-probe RESOLVED bin path (the exact executable /coders shows), NOT the
+    # logical `spec.bin` — else the client spawns a bare `codex` and node's PATH picks the wrong install.
+    _stage_opus(tmp_path, monkeypatch)
+    monkeypatch.setattr(server, "_probe_cached", lambda: {"OPUS": r"C:\resolved\claude.EXE"})
+    item = server._pending_handovers()[0]
+    assert item["bin"] == r"C:\resolved\claude.EXE"   # the resolved path, not the logical bin
+
+
+def test_pending_handover_bin_falls_back_to_spec_when_unresolved(tmp_path, monkeypatch):
+    # #1279: an unresolved probe (agent absent on this machine) falls back to the logical spec.bin.
+    _stage_opus(tmp_path, monkeypatch)
+    monkeypatch.setattr(server, "_probe_cached", lambda: {})   # nothing resolved
+    item = server._pending_handovers()[0]
+    assert item["bin"] == "claude"                    # spec.bin fallback (OPUS's logical bin)
+
+
 # --------------------------------------------------------------------------- #
 # HTTP routes end to end (real server, stubbed agent + dispatch).
 # --------------------------------------------------------------------------- #
@@ -572,18 +619,20 @@ def test_coders_snapshot_shows_breaker_and_pin_resets(monkeypatch, _clean_breake
 
 # ── #456: task_class derivation + task_class-scoped failover (capability matrix) ──────────────────
 @pytest.mark.parametrize("ttype,expected", [
-    ("security", "security"), ("security-audit", "security"), ("architecture", "architecture"),
-    ("verification", "analysis"), ("feature", "coding"), ("bugfix", "coding"),
-    ("implementation", "coding"), ("", "coding"), ("unknown-type", "coding"),
+    ("security", "complex"), ("security-audit", "complex"), ("architecture", "complex"),
+    ("optimization", "complex"), ("documentation", "routine"), ("cleanup", "routine"),
+    ("verification", "analysis"), ("research", "analysis"),
+    ("feature", "standard"), ("bugfix", "standard"), ("implementation", "standard"),
+    ("", "standard"), ("unknown-type", "standard"),
 ])
 def test_task_class_derivation(ttype, expected):
-    assert gx10._task_class({"type": ttype}) == expected   # deterministic from task_json.type (no model trust)
+    assert gx10._task_class({"type": ttype}) == expected   # #1287: deterministic cost tier from task type
 
 
 def test_class_capable_agents_failopen(monkeypatch):
     monkeypatch.setattr(gx10, "_EFFECTIVE_CFG", gx10._code_defaults(), raising=False)
-    assert gx10._class_capable_agents("security") == ["OPUS"]
-    assert gx10._class_capable_agents("coding") == ["OPUS", "SONNET"]
+    assert gx10._class_capable_agents("complex") == ["OPUS"]
+    assert gx10._class_capable_agents("standard") == ["SONNET", "OPUS"]
     assert gx10._class_capable_agents("zzz") is None        # unknown class → no restriction (fail-open)
     assert gx10._class_capable_agents(None) is None
 
@@ -591,10 +640,10 @@ def test_class_capable_agents_failopen(monkeypatch):
 def test_failover_scoped_by_task_class(_clean_breaker, monkeypatch):
     monkeypatch.setattr(gx10, "_EFFECTIVE_CFG", gx10._code_defaults(), raising=False)
     gx10._breaker_trip("OPUS")
-    # coding: SONNET is capable → failover to SONNET
-    assert gx10._effective_code_agent("OPUS", task_class="coding") == "SONNET"
-    # security: only OPUS is capable → keep OPUS (NEVER fail over to a non-security agent), fail-closed
-    assert gx10._effective_code_agent("OPUS", task_class="security") == "OPUS"
+    # standard: SONNET is capable → failover to SONNET
+    assert gx10._effective_code_agent("OPUS", task_class="standard") == "SONNET"
+    # complex: only OPUS is capable → keep OPUS (NEVER fail over to a cheaper non-complex agent), fail-closed
+    assert gx10._effective_code_agent("OPUS", task_class="complex") == "OPUS"
     # unknown class / no class → no restriction (byte-identical to #455)
     assert gx10._effective_code_agent("OPUS", task_class="zzz") == "SONNET"
     assert gx10._effective_code_agent("OPUS") == "SONNET"

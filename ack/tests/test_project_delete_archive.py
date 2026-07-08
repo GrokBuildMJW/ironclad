@@ -2,6 +2,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import threading
 import types
 from pathlib import Path
 import pytest
@@ -121,6 +122,47 @@ def test_project_scopes_main_only():
 def test_project_scopes_with_tracks():
     proj = types.SimpleNamespace(mem_ns="ns", tracks=["main", "feat"])
     assert gx10._project_scopes(proj) == ["ns", "ns::track::feat"]
+
+
+# ---------------------------------------------------------------------------
+# #1263 — delete never freezes (background forget) + boot never re-scaffolds a vanished active project
+# ---------------------------------------------------------------------------
+
+def test_delete_backgrounds_the_memory_forget(env, monkeypatch):
+    # #1263: the memory forget runs in the BACKGROUND — /project delete removes the registry entry
+    # synchronously and returns promptly, instead of blocking on the remote /delete_all (which froze the engine).
+    gx10._REGISTRY.register("proj", str(env / "proj"))
+    ev = threading.Event()
+    forgot = []
+    monkeypatch.setattr(gx10, "_forget_scope", lambda sc: (forgot.append(sc), ev.set()))
+    out = gx10._project_delete(None, ["proj"])
+    assert "deleted proj" in out and "background" in out
+    assert gx10._REGISTRY.get("proj") is None            # registry entry removed synchronously (authoritative)
+    assert ev.wait(2.0) and forgot                        # the forget DID run — on a background thread
+
+
+def test_init_registry_falls_back_when_active_root_missing(tmp_path, monkeypatch):
+    # #1263 (secondary): a boot whose ACTIVE project's root vanished out-of-band must fall back to `default`,
+    # NOT silently re-scaffold + bind the missing project (which made a deleted project reappear as an empty dir).
+    monkeypatch.setenv("GX10_HOME", str(tmp_path / "home"))
+    wd = tmp_path / "wd"
+    wd.mkdir()
+    reg = pr.Registry(home=tmp_path / "home")
+    reg.ensure_default(wd)
+    reg.register("ghost", str(tmp_path / "gone"), make_active=True)   # root never created
+    assert reg.load()["active"] == "ghost"
+    gx10._REGISTRY = None
+    gx10._ACTIVE_PROJECT = None
+    gx10._BOOT_WORKDIR = None
+    pc.set_current(None)
+    monkeypatch.setattr(gx10, "_ui_print", lambda *a, **k: None)
+    gx10.init_registry(wd)
+    assert gx10._ACTIVE_PROJECT is not None and gx10._ACTIVE_PROJECT.id == "default"   # fell back, ghost not bound
+    assert gx10._REGISTRY.load()["active"] == "default"                                 # persisted the fallback
+    gx10._REGISTRY = None
+    gx10._ACTIVE_PROJECT = None
+    gx10._BOOT_WORKDIR = None
+    pc.set_current(None)
 
 
 def test_project_scopes_empty_ns():

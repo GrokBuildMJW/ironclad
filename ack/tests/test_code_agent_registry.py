@@ -275,6 +275,16 @@ def test_do_launch_genuine_model_override_in_to_still_wins(tmp_path, monkeypatch
     assert argv[argv.index("--model") + 1] == "claude-opus-4-8"   # the frontmatter model override is honoured
 
 
+def test_claude_launch_prompt_states_the_exact_feedback_path(tmp_path, monkeypatch):
+    # #1288: the Claude `--print` coder must be TOLD the exact feedback file the reconciler advances on
+    # ({task_id}_{agent}-feedback.md) — not left to infer a (possibly divergent) name from the handover body,
+    # which stalled the pipeline (a completed run dropped feedback where the reconciler never looks).
+    argv, tid = _capture_launch_argv(monkeypatch, tmp_path, "OPUS", frontmatter="---\nto: OPUS\n---\nho")
+    prompt = argv[-1]                                             # the --print prompt is the last argv element
+    assert f"{tid}_OPUS-feedback.md" in prompt                   # the exact reconciler-expected feedback filename
+    assert "status: done" in prompt                              # and the advance contract the reconciler needs
+
+
 # ── Server resolves the FULL spec into the /pending item; client renders it ─────────────────────
 def _stage_handover_file(tmp_path, monkeypatch, token: str, frontmatter: str = "") -> str:
     monkeypatch.chdir(tmp_path)
@@ -290,12 +300,13 @@ def _stage_handover_file(tmp_path, monkeypatch, token: str, frontmatter: str = "
 
 def test_pending_handover_embeds_full_spec(tmp_path, monkeypatch):
     _stage_handover_file(tmp_path, monkeypatch, "OPUS")
+    monkeypatch.setattr(server, "_probe_cached", lambda: {})   # #1279: unresolved probe ⇒ bin falls back to spec.bin
     pend = server._pending_handovers()
     assert len(pend) == 1
     item = pend[0]
     assert item["agent"] == "OPUS"
     assert item["model"] == "claude-opus-4-8"          # from the registry spec
-    assert item["bin"] == "claude"
+    assert item["bin"] == "claude"                     # spec.bin fallback (no resolved bin mocked)
     assert item["cmd_template"] and "{prompt}" in item["cmd_template"]
     assert item["permission"] == "acceptEdits"
 
@@ -567,14 +578,19 @@ def test_disabled_agent_is_never_a_failover_peer(monkeypatch):
 
 
 # ── #500: auto-tier the handover reasoning effort by the derived task_class ──────────────────────────
-def test_effort_for_class_maps_security_and_architecture_to_xhigh():
-    assert gx10._effort_for_class("security") == "xhigh"
-    assert gx10._effort_for_class("architecture") == "xhigh"
+def test_effort_for_class_maps_complex_to_xhigh():
+    # #1287: security/architecture/optimization all map to the `complex` tier → xhigh.
+    assert gx10._effort_for_class("complex") == "xhigh"
+    assert gx10._task_class({"type": "security"}) == "complex"
+    assert gx10._task_class({"type": "architecture"}) == "complex"
+    assert gx10._task_class({"type": "optimization"}) == "complex"
 
 
-def test_effort_for_class_maps_routine_classes_to_high():
-    assert gx10._effort_for_class("coding") == "high"
+def test_effort_for_class_maps_standard_and_analysis_to_high_routine_to_medium():
+    # #1287: standard/analysis → high; the mechanical `routine` tier → medium.
+    assert gx10._effort_for_class("standard") == "high"
     assert gx10._effort_for_class("analysis") == "high"
+    assert gx10._effort_for_class("routine") == "medium"
 
 
 def test_effort_for_class_unmapped_is_none_fail_open():
@@ -589,9 +605,22 @@ def test_resolve_handover_effort_explicit_override_wins():
 
 
 def test_resolve_handover_effort_auto_tiers_by_class_when_no_explicit():
-    assert gx10._resolve_handover_effort(None, "security", "medium") == "xhigh"
-    assert gx10._resolve_handover_effort(None, "architecture", None) == "xhigh"
-    assert gx10._resolve_handover_effort(None, "coding", "medium") == "high"
+    assert gx10._resolve_handover_effort(None, "complex", "medium") == "xhigh"
+    assert gx10._resolve_handover_effort(None, "complex", None) == "xhigh"
+    assert gx10._resolve_handover_effort(None, "standard", "medium") == "high"
+    assert gx10._resolve_handover_effort(None, "routine", "high") == "medium"
+
+
+def test_route_code_agent_is_deterministic_cheapest_per_tier():
+    # #1287: DETERMINISTIC routing — the cheapest CAPABLE coder per tier, NOT the model's pick / "first wins"
+    # OPUS. Public default (OPUS/SONNET): complex → OPUS (only capable), everything cheaper → SONNET.
+    gx10._apply_config(gx10._code_defaults())
+    assert gx10._route_code_agent({"type": "security"}) == "OPUS"          # complex tier
+    assert gx10._route_code_agent({"type": "architecture"}) == "OPUS"      # complex tier
+    assert gx10._route_code_agent({"type": "optimization"}) == "OPUS"      # complex tier
+    assert gx10._route_code_agent({"type": "implementation"}) == "SONNET"  # standard (default) → cheaper than OPUS
+    assert gx10._route_code_agent({"type": "documentation"}) == "SONNET"   # routine → cheapest capable
+    assert gx10._route_code_agent({"type": "verification"}) == "SONNET"    # analysis
 
 
 def test_resolve_handover_effort_fail_open_to_spec_then_default():

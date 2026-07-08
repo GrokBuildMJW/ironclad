@@ -3,7 +3,7 @@
  */
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {createStreamParser, type ToolFrame} from '../src/net/stream.js';
+import {createStreamParser, stripConfirm, type ToolFrame} from '../src/net/stream.js';
 
 const NUL = String.fromCharCode(0);
 const enc = new TextEncoder();
@@ -24,6 +24,14 @@ test('stream parser — text + tool frame toggle, split across chunks', async ()
   assert.deepEqual(texts, ['hello', 'world']);
   assert.equal(frames.length, 1);
   assert.deepEqual(frames[0], {id: 'a', name: 'read_file', args: {path: 'x'}});
+});
+
+test('stripConfirm — #1281: --yes/--confirm recognised in any position, not only trailing', () => {
+  assert.deepEqual(stripConfirm('project delete X --purge --yes'), {msg: 'project delete X --purge', confirm: true});
+  assert.deepEqual(stripConfirm('project delete X --yes --purge'), {msg: 'project delete X --purge', confirm: true});
+  assert.deepEqual(stripConfirm('project delete X --confirm'), {msg: 'project delete X', confirm: true});
+  assert.deepEqual(stripConfirm('project delete X --purge'), {msg: 'project delete X --purge', confirm: false});
+  assert.deepEqual(stripConfirm('normal chat'), {msg: 'normal chat', confirm: false});
 });
 
 test('stream parser — multi-byte UTF-8 split across chunks', async () => {

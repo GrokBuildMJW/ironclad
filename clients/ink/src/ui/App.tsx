@@ -15,7 +15,7 @@ import type {Server} from '../net/server.js';
 import {classify, completions, argCompletions, catalogueToCommands, HELP_TEXT, type Command} from '../commands.js';
 import {chatStream} from '../net/stream.js';
 import {answerBody, createRouter} from '../stream/route.js';
-import {renderMarkdown, StreamMarkdown} from '../markdown.js';
+import {renderMarkdown} from '../markdown.js';
 import {useStatusPoller} from './useStatusPoller.js';
 import {
   newPasteStore, isMultilinePaste, storePaste, expandPastes, stripSentinels,
@@ -188,15 +188,18 @@ export function App({
     return () => clearInterval(id);
   }, [thinking]);
 
-  async function streamTurn(payload: string, conversational = true): Promise<void> {
+  async function streamTurn(payload: string, conversational = true, echo?: string): Promise<void> {
+    // #1278: echo what the operator TYPED — a slash-command keeps its leading `/` so it is visibly distinct
+    // from a chat message (the wire `payload` is slash-stripped; only the echo shows the original input).
+    const shown = echo ?? payload;
     commit(
       <Box marginTop={1}>
-        <Text color={DIM}>{`> ${payload}`}</Text>
+        <Text color={DIM}>{`> ${shown}`}</Text>
       </Box>,
     );
     // MEM-11: only real conversational turns are kept (persisted + summarised). Slash commands
     // (/status, /clear, /config, /ls, …) are repeatable — show them, but don't record them.
-    if (conversational) transcriptRef.current.push(`> ${payload}`);
+    if (conversational) transcriptRef.current.push(`> ${shown}`);
     const idx = Math.floor(Date.now() / 137) % VERBS.length;
     verbRef.current = VERBS[idx] ?? 'Working';
     t0Ref.current = Date.now();
@@ -206,7 +209,6 @@ export function App({
     setAgent(''); // #453: clear last turn's coder so a non-routed turn shows no stale "live" indicator
     setSearch(''); // S9: clear last turn's web-search summary
     setLiveAnswer('');
-    const stream = new StreamMarkdown(Math.max(20, width - 4));
     let lastRender = 0;
     const router = createRouter();
     const ac = new AbortController();
@@ -226,7 +228,7 @@ export function App({
             const now = Date.now();
             if (now - lastRender > 33) {
               lastRender = now;
-              setLiveAnswer(stream.render(answerBody(router)));
+              setLiveAnswer(answerBody(router));
             }
           },
           onTool: (f) => runPassthroughTool(srv, f),
@@ -238,7 +240,8 @@ export function App({
         // #956: the reason is the full localized line (reason + how-to-confirm) → print it single-language
         commit(<Text color={DIM}>{`  ⚠ ${ci.command}: ${ci.reason}`}</Text>);
         abortRef.current = null;
-        return;
+        setThinking(false); // #1304: the early return skips the tail — without this the client is
+        return;             // wedged in thinking forever (input swallowed, Esc has nothing to abort)
       }
       if (res?.needs_guide) {   // #955: structured guided input — show the fields; nothing executed
         const g = res.needs_guide;
@@ -252,6 +255,7 @@ export function App({
           commit(<Text color={DIM}>{`    ${f.name}  (${bits.join(', ')})`}</Text>);
         }
         abortRef.current = null;
+        setThinking(false); // #1304: same leak as the needs_confirm branch
         return;
       }
     } catch (e) {
@@ -409,10 +413,13 @@ export function App({
           commit(<Text color={DIM}>{`  done: ${ok}/${jobs.length} cleanly uploaded`}</Text>);
         }
       } else if (name === 'auto') {
+        // #1296: /auto is the CONSOLIDATED automation switch. The client half is the dispatch
+        // poller (pull /pending, run coders locally); the engine half (watcher + autopilot +
+        // continuation) is mirrored by forwarding the same command — one verb drives both sides.
         const pool = (poolRef.current ??= new Pool(maxAgents));
         const arg = (payload.split(/\s+/)[1] ?? '').toLowerCase();
         if (arg === 'on') {
-          if (autoRef.current) commit(<Text color={DIM}> [AUTO] already running</Text>);
+          if (autoRef.current) commit(<Text color={DIM}> [AUTO] poller already running</Text>);
           else {
             autoRef.current = setInterval(() => {
               void dispatchPending(srv, codedir, hcfg, pool, claimedRef.current, hlog);
@@ -424,10 +431,11 @@ export function App({
             clearInterval(autoRef.current);
             autoRef.current = null;
             commit(<Text color={DIM}> [AUTO] poller OFF</Text>);
-          } else commit(<Text color={DIM}> [AUTO] was not active</Text>);
+          } else commit(<Text color={DIM}> [AUTO] poller was not active</Text>);
         } else {
-          commit(<Text color={DIM}>{`  [AUTO] ${autoRef.current ? 'AN' : 'AUS'}  |  /auto on / /auto off`}</Text>);
+          commit(<Text color={DIM}>{`  [AUTO] poller ${autoRef.current ? 'ON' : 'OFF'}  |  /auto on [N] / /auto off`}</Text>);
         }
+        await streamTurn(payload, false, `/${payload}`);
       }
     } catch (e) {
       // #454: HttpError carries the server's JSON error detail in its message — show that, not 'Error: …'.
@@ -451,7 +459,7 @@ export function App({
       commit(<Text color={DIM}>{`  unknown command — did you mean  /${name} ?`}</Text>);
       return;
     }
-    await streamTurn(payload, kind === 'turn'); // MEM-11: server slash-commands aren't persisted
+    await streamTurn(payload, kind === 'turn', line.trim()); // #1278: echo the original input (keeps the slash)
   }
 
   // #149: fetch the server's prompt/skill catalogue once, lazily, the first time a slash menu opens
@@ -552,11 +560,9 @@ export function App({
       {/* #1148: the SCROLLABLE region — transcript + the live streaming tail. mount scrolls this. */}
       <Box flexDirection="column" flexGrow={1}>
         <Static items={items}>{(item) => <Box key={item.id}>{item.node}</Box>}</Static>
-        {liveAnswer ? (
-          <Box paddingLeft={2} marginTop={1}>
-            <Text>{liveAnswer}</Text>
-          </Box>
-        ) : null}
+        {/* #1277: fold tool calls in the LIVE preview via the SAME path as the commit, so a tool call is
+            collapsed WHILE it streams instead of showing expanded and folding only at the end of the turn. */}
+        {liveAnswer ? renderTurnBody(liveAnswer, Math.max(20, width - 4)) : null}
       </Box>
       {/* #1148: the FIXED chrome — the working/thinking line + input + menu + footer + brand. mount stamps
           this at the viewport bottom (paintFixed) so it stays pinned while the transcript above scrolls

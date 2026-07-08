@@ -163,9 +163,7 @@ def test_graph_json_is_key_order_independent():
 
 
 def test_frozen_markers_unchanged():
-    assert (
-        gx10._INDEX_AUTO_START
-        == "<!-- ironclad:index:auto START — generiert von reconcile_vault, nicht von Hand ändern -->"
-    )
+    # #1265: the INDEX marker is now English + description-less, consistent with its sibling markers.
+    assert gx10._INDEX_AUTO_START == "<!-- ironclad:index:auto START -->"
     assert gx10._LINKS_AUTO_START == "<!-- ironclad:related:auto START -->"
     assert gx10._LIFECYCLE_AUTO_START == "<!-- ironclad:lifecycle:auto START -->"

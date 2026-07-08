@@ -66,6 +66,16 @@ def test_build_argv_embedded_placeholder():
     assert argv == ["tool", "--model=kimi-x", "hi there"]
 
 
+def test_strip_confirm_any_position():
+    # #1281: `--yes`/`--confirm` is the destructive-command confirmation in ANY position, not only trailing —
+    # `--yes --purge` (a flag after --yes) must be recognised too.
+    assert client._strip_confirm("project delete X --purge --yes") == ("project delete X --purge", True)
+    assert client._strip_confirm("project delete X --yes --purge") == ("project delete X --purge", True)
+    assert client._strip_confirm("project delete X --confirm") == ("project delete X", True)
+    assert client._strip_confirm("project delete X --purge") == ("project delete X --purge", False)
+    assert client._strip_confirm("normal chat") == ("normal chat", False)
+
+
 def test_build_argv_codex_template_drops_claude_only_flags():
     # #442 (epic #440 Phase 2): the template-driven client lane runs Codex with ZERO core change.
     # `codex exec` REJECTS --effort/--permission-mode/-a (verified live, §C0R-8); a Codex cmd_template

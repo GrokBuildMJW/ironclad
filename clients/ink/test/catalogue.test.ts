@@ -37,8 +37,18 @@ test('#149 completions merges static + dynamic; a built-in command wins on a nam
   assert.deepEqual(completions('code-', extra).map((c) => c.name), ['code-review']);
 });
 
-test('#149 completions with no extra is the static set (back-compat)', () => {
-  assert.equal(completions('').length, COMMANDS.length);
+test('#149 completions with no extra is the static set minus hidden (back-compat)', () => {
+  const visible = COMMANDS.filter((c) => !c.hidden);
+  assert.equal(completions('').length, visible.length);
+});
+
+test('#1264 a deprecated/hidden verb is never advertised in autocomplete but stays in the registry', () => {
+  // hidden from the completion dropdown (no name, no prefix match)...
+  assert.ok(!completions('').some((c) => c.name === 'initiative'));
+  assert.ok(!completions('init').some((c) => c.name === 'initiative'));
+  // ...yet it remains a real static entry — dispatchable if typed, and it satisfies the ink↔spec parity
+  // coverage guard (which requires every spec verb to be present in COMMANDS).
+  assert.ok(COMMANDS.some((c) => c.name === 'initiative' && c.hidden));
 });
 
 test('#149 Server.catalogue() GETs /catalogue and shapes prompts/skills', async () => {

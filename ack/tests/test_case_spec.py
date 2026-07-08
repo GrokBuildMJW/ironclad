@@ -227,3 +227,19 @@ def test_vllm_config_uses_structured_outputs_not_guided():
 def test_vllm_schema_is_lint_clean():
     cfg = vllm_structured_output_config()
     assert lint_schema_for_xgrammar(cfg["structured_outputs"]["json"]) == []
+
+
+def test_epic_type_is_valid_and_never_capability_gated():
+    # #1296: the epic tracker record — a valid TaskType, grammar-clean, and NOT a buildable type
+    # (Lodestar must not demand a capability for it).
+    from ack.case_spec import TaskSpec, TaskType
+    from ack.lodestar.spec import CAPABILITY_REQUIRED_TYPES, CapabilityTaskSpec
+
+    t = TaskSpec.model_validate({"type": "epic", "priority": "high",
+                                 "title": "the design epic", "description": "d"})
+    assert t.type == "epic"
+    assert TaskType.EPIC not in CAPABILITY_REQUIRED_TYPES
+    c = CapabilityTaskSpec.model_validate({"type": "epic", "priority": "high",
+                                           "title": "the design epic", "description": "d"})
+    assert c.capability is None
+    assert lint_schema_for_xgrammar(TaskSpec.model_json_schema()) == []

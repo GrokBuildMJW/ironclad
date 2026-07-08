@@ -4,6 +4,152 @@ All notable changes to Ironclad are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/); the project is **pre-release** (0.0.x).
 Released versions are listed below.
 
+## [0.0.27]
+### Added
+- **Design-driven autonomous continuation — an approved design now drains to done end-to-end.** Previously a
+  design-driven project stopped after its first task: the post-advance planner could only continue from a
+  configured capability backlog, and with none it silently disarmed itself — nothing ever staged the next
+  unit. Three pieces close the loop:
+  - **`plan_units` (new macro)**: after design approval, ONE call materializes the FULL decomposition — one
+    `epic` task (new ACK `TaskType.EPIC`) plus ALL implementation units as pending tasks linked via `parent`,
+    deliberately handover-less (each unit's handover is authored lazily when the loop selects it). Atomic +
+    fail-closed (per-unit ACK validation, topic dedup incl. within the batch, full rollback on error);
+    `epic_id` adds units to an existing open epic; in-batch sibling dependencies as `unit:<n>`. The engine
+    auto-completes the epic when its last unit advances; the board shows per-epic unit progress.
+  - **Select-next-unit continuation** (`_continuation_tick`): after every advance the engine deterministically
+    selects the next open unit (priority → created_at → id; skips blocked; dependencies must be done — a
+    deadlock is surfaced, never a silent idle) and asks the model for exactly that unit's handover
+    (`[NEXT-UNIT]` turn → `stage_handover` with `task_id`); with no open units the capability-backlog leg
+    continues as before; with no source the loop idles ARMED (no more self-disable — only the `max_tasks`
+    cap stops it). Arming (`/auto on`, `/autoplan on`) bootstraps the loop for the FIRST unit of a freshly
+    planned epic (no predecessor advance exists yet), and `plan_units` under an armed loop has the
+    same turn author the first handover — found live in the E2E acceptance run.
+  - **`/auto on [N]` / `/auto off` (automation meta-switch)**: one operator verb for the whole loop — full
+    automation (watcher + autopilot + continuation, optional task cap) vs guided mode (nothing fires by
+    itself; the engine recommends the selected next unit in the per-turn steering state and the operator
+    drives). The granular toggles remain as the advanced layer; in the recommended client `/auto` also
+    drives the local handover poller.
+### Changed
+- **Client agent scratch is cleaned after a successful upload**: the terminal client's HTTP-mediated
+  handover round-trip materializes per-task scratch under `<codedir>/.ironclad/agent/` (the handover
+  drop the coder reads + the feedback/capture files). These accumulated per task; after a successful
+  `POST /feedback` they are now removed (fail-soft). A FAILED run keeps its scratch for diagnosis and
+  the retry; the server-side `.work/archive/` history remains the durable record.
+- **Lazily staged handovers get full parity**: the `stage_handover` re-hand path (existing `task_id`, no
+  task_json — the continuation's staging form) now applies the same id normalization, Memory brief and
+  lesson/ACE context injection as task creation, routes the coder deterministically off the STORED task,
+  and stamps the staged agent as `assigned_to` (canonical identity: filename == assigned_to == body `to:`).
+- **active.md projection with handover-less units**: the projection now walks newest-first to the first task
+  that actually HAS a handover, so a staged handover is never shadowed into `idle` by a newer, not-yet-staged
+  unit of the decomposition.
+- **Cost warning tells the truth**: the unbounded-continuation warning now names the real cost — every
+  continued unit launches a PAID coder run (the local planner turn is the cheap part) — and recommends a cap
+  (`auto on N` / `autoplan on N`).
+- **Deterministic, cost-aware coder routing** (#1287): the coder for a handover was the orchestrator model's
+  pick, which defaulted to the priciest coder for everything — routine scaffolding and running a build ran on
+  the most expensive model even at medium effort. Coder selection is now DETERMINISTIC: each task TYPE maps to
+  a cost TIER (`complex`/`standard`/`routine`/`analysis`) and `stage_handover` routes to the CHEAPEST CAPABLE
+  coder for that tier (`_route_code_agent`, by `cost_per_1k`), reserving the top-tier coder for `complex`
+  (security/architecture/optimization). The operator pin still overrides. Reverses the 2026-06-25 "staged pick
+  is authoritative" rule.
+
+### Fixed
+- **Terminal client froze permanently on every confirm/guide reply**: the destructive-command
+  warning ("re-run with --yes") and the guided-input listing returned early WITHOUT leaving the
+  thinking state — every subsequent keystroke was swallowed and Esc had nothing left to abort, so
+  the session was wedged for good. Both early-return branches now release the turn state; a
+  regression test drives the real component against a stub engine and types after the warning.
+- **Single-authority completion (presence-wins)** — a follow-up to the dev-loop stabilization, from a comparison
+  with the *proven-stable* predecessor gx10 loop of the: it decided completion by the
+  feedback FILE'S PRESENCE, never by parsing model-authored content. The advance gate now does the same — the
+  `status:` token is ADVISORY (it HOLDS a finished task only on an EXPLICIT `blocked`/`clarification_needed`);
+  a present feedback with a done / mis-placed / absent token ADVANCES. This deletes the whole stall class
+  where a bare leading `status:` (vs a frontmatter parser) or a prose-only capture defeated a content parse,
+  keeping the explicit-blocked guard. Principle: every engine-owned fact has ONE authoritative source.
+- **Autonomous dev-loop stabilization** — engine-owned robustness so a completed coder run reliably advances
+  the pipeline (fixes THE STALL surfaced during a live run, plus #1288/#1291/#1292 follow-ups). One unifying
+  principle: engine-owned facts (completion STATUS, routed AGENT, feedback PATH, PROJECT, CODE ROOT) are
+  stamped/read by the engine, never round-tripped through model-authored free text. (1) The advance gate reads
+  the completion `status:` tolerantly (`_feedback_status` — an in-frontmatter OR a bare leading line, via a
+  bounded head-scan) matching exactly what the engine's own coder prompt emits (a bare leading `status: done`
+  used to be invisible to the frontmatter parser → the completed task stalled forever); a capture-mode coder's
+  exit-0 non-empty feedback with no status token is stamped `status: done` at ingest. (2) A gate refusal is
+  now a RETRY point — the reconciler dedup keys on the feedback mtime — not a dead-end until restart. (3) The
+  routed agent is stamped as the single canonical identity (`assigned_to` + handover `to:`) so filename /
+  assigned_to / body / feedback `from:` agree. (4) The advance matches the feedback by TASK ID (glob),
+  deriving the agent from the filename, never a caller-supplied (routing-skewed) agent. (5) The coder prompt
+  states the project name + code root and forbids a design-named wrapper directory (no `src/<name>/<name>/`).
+- **Autonomous pipeline no longer stalls on a completed Claude coder run** (#1288): a finished OPUS/SONNET
+  (`claude --print`) coder wrote its feedback under the handover body's own id/location (e.g. a divergent
+  `<other-id>-feedback.md` in `.work/handovers/`), while the reconciler advances only on
+  `{task_id}_{agent}-feedback.md` in `feedback_dir()` — so the task stayed `in_progress` forever despite a
+  `status: done` result. The engine now states the exact feedback path (and the `status:` contract) in the
+  Claude coder prompt, mirroring the CODEX `-o {feedback}` capture, so a completed run lands where the
+  reconciler looks and the pipeline advances.
+- **Design-doc paths are shown in the operator's frame** (#1276): `record_design`, `/approve` and the design-
+  gate status reported a vault-root-relative path (`<slug>/decisions/design.md`) that did not resolve from the
+  project root (the leading `vault/` was missing). They now surface a navigable project-root-relative path
+  (`vault/<slug>/decisions/design.md`); the internal value the gate resolves against is unchanged. `/project
+  new` also now seeds the single software unit under a canonical `main` slug (not the project name), so the
+  doc no longer double-nests as `<project>/vault/<project>/…` — it is `<project>/vault/main/…`.
+- **Tool calls fold in the LIVE streaming preview, not only at commit** (#1277): the terminal client rendered
+  the streaming answer as raw text (tool calls shown expanded) and only folded them into collapsed blocks when
+  the turn committed. The live preview now renders through the same `splitToolBlocks` path as the committed
+  turn, so a tool call is collapsed while it streams.
+- **The terminal client echoes a slash-command WITH its leading slash** (#1278): a typed `/work` was echoed as
+  `> work` — identical to a chat message — inviting a `work` vs `/work` mix-up. The echo (and the persisted
+  transcript) now show the original input, so a command is visibly distinct from a plain message.
+- **Code-agent handovers ship the RESOLVED bin path on `/pending`** (#1279): `/pending` shipped the LOGICAL
+  `bin` (e.g. `codex`) instead of the boot-probe-resolved executable path, so the terminal client spawned a
+  bare `codex` and node's PATH could pick the wrong install (an npm shim / a Store desktop app) that rejects
+  `exec -m` — the coder exited without producing code. `/pending` now ships the resolved path the boot probe
+  found (the exact one `/coders` reports), falling back to the logical `bin` only when unresolved.
+- **Destructive-command confirmation accepts `--yes`/`--confirm` in any position** (#1281): the confirmation
+  was only recognised as a TRAILING token, so `project delete X --yes --purge` (a flag after `--yes`) re-fired
+  the confirm gate ("Re-run with --yes") even though the operator had already confirmed. `--yes`/`--confirm`
+  is now stripped as a standalone token from anywhere in the message.
+- **Code-agent handovers no longer ship the agent id as the model on `/pending`** (#1279): the `/pending`
+  serialization read the handover's `to:` (the recipient AGENT, e.g. `to: CODEX`) into the `model` field, so
+  the terminal client rendered `-m CODEX` and a non-Claude coder CLI exited immediately (`unknown option '-m'`
+  / model-not-supported — no code produced). The #1236 guard that already dropped an agent-id-as-model in
+  `_do_launch` is now applied on the `/pending` path too, so `spec.model` (the agent's real model) wins; a
+  genuine model string in `to:` still overrides.
+- **Deprecated `/initiative` alias no longer advertised** (#1264): `/initiative` (the alias for `/project`)
+  stays dispatchable for back-compat but is now hidden from `GET /catalogue` and the terminal client's
+  slash-autocomplete. A single `is_deprecated` convention (a verb whose spec summary says so) is shared by the
+  model-facing command surface and the client-facing catalogue; the ink client marks the entry `hidden` and
+  drops it from completions while keeping it in the parity registry.
+- **No duplicate top-level heading in recorded design docs** (#1267): `record_design` injects `# {title}` only
+  when the body does not already open with its own H1, so `decisions/design.md` no longer starts with two `#`
+  headings (the frontmatter `title:` stays canonical either way).
+- **`/approve` recommends the next step** (#1269): after approving a design, the confirmation now points to the
+  concrete continuation (break the design into implementation tasks / stage the first handover), mirroring the
+  guided recommendation `record_design` already emits — instead of leaving the operator at a dead end.
+- **Streaming no longer shows raw `<tool_call>` markup** (#1266): when the model emits a tool call as text
+  (`<tool_call>…</tool_call>` — e.g. a reasoning turn where the endpoint returns no native `tool_calls`), the
+  live stream filter now suppresses that block like `<think>`: `_ThinkFilter` is parameterized and the chat
+  stream chains a second instance for `<tool_call>`. The RAW content still feeds the post-turn text→tool_call
+  recovery, so the call still executes and folds in; a one-time "⋯ tool call" hint replaces the raw JSON.
+- **English `ironclad:index:auto` marker + in-place migration** (#1265): the auto-managed `INDEX.md` block
+  marker is now English and description-less, consistent with the `board`/`lifecycle`/`related` markers (it was
+  a frozen German string). `reconcile_vault` normalizes any prior `ironclad:index:auto START …` marker to the
+  current one before rewriting the block, so an existing vault's managed block is migrated **in place**, never
+  duplicated (idempotent). The export is fully English here now — the english-only allowlist no longer needs a
+  marker exception.
+- **Autonomous mode reports an empty pipeline instead of a silent no-op** (#1268): enabling `autopilot on` /
+  `autoplan on` when nothing is queued now prints a one-time hint — the pipeline is empty, seed the first unit
+  (break the approved design into implementation tasks / stage a handover), and (when no
+  `paths.active_capability_backlog` is configured) that autoplan cannot bootstrap one either. autoplan is a
+  post-advance continuation from a capability backlog, not a bootstrap from an approved design, so on a fresh
+  project it otherwise did nothing with no feedback.
+- **`/project delete` no longer freezes the engine + client; a vanished active project can't reappear** (#1263):
+  the memory-scope forget on delete now runs on a background thread — a synchronous remote `/delete_all` (up to
+  the memory client's timeout, over LAN) used to freeze the whole single-driver engine (and the client, which
+  has no own timeout) for as long as the call hung. The registry removal stays synchronous + authoritative; any
+  residual partition is swept by the S15 orphan-GC. Separately, `init_registry` now falls back to `default`
+  (with a warning) when the active project's root has vanished out-of-band, instead of silently re-scaffolding +
+  re-binding it — so a project the operator deleted does not reappear as an empty dir after a reboot.
+
 ## [0.0.26]
 ### Added
 - **Grok (xAI) documented as a headless code-agent CLI** (#1246): a `docs/code-agents.md` example for the

@@ -75,3 +75,44 @@ test('Enter on an empty line is a no-op (does not crash the render loop)', () =>
   assert.match(stripAnsi(out.text()), /Ironclad/, 'still alive');
   inst.unmount();
 });
+
+test('#1304: a needs_confirm reply returns the client to idle — typing works again (no thinking wedge)', async () => {
+  // Stub engine: every /chat/stream POST answers with the #935 needs_confirm JSON (exactly what the
+  // real server sends for a destructive command without --yes); everything else gets bare JSON.
+  const http = await import('node:http');
+  const stub = http.createServer((req, res) => {
+    res.writeHead(200, {'Content-Type': 'application/json; charset=utf-8'});
+    if (req.url === '/chat/stream') {
+      res.end(JSON.stringify({ok: true, needs_confirm: {command: 'project delete', tier: 'destructive',
+        reason: 'irreversible — this can delete work; nothing changed. Re-run with --yes to confirm.'}}));
+    } else res.end('{}');
+  });
+  await new Promise<void>((r) => stub.listen(0, '127.0.0.1', r));
+  const port = (stub.address() as {port: number}).port;
+
+  const out = fakeStdout(100, 30);
+  const inp = fakeStdin();
+  const srv = new Server(`http://127.0.0.1:${port}`, {timeoutMs: 2000});
+  const inst = mount(<App srv={srv} codedir="." maxAgents={3} />, {stdout: out.stream, stdin: inp.stream, altScreen: false});
+
+  const waitFor = async (pred: () => boolean, ms = 3000): Promise<void> => {
+    const t0 = Date.now();
+    while (!pred()) {
+      if (Date.now() - t0 > ms) throw new Error('waitFor timed out');
+      await new Promise((r) => setTimeout(r, 25));
+    }
+  };
+
+  for (const ch of '/project delete x') inp.emitData(ch);
+  inp.emitData('\r');
+  await waitFor(() => stripAnsi(out.text()).includes('Re-run with --yes'));
+
+  // THE regression: before the fix the early return leaked thinking=true — every keystroke was
+  // swallowed forever (and Esc had nothing left to abort). Typing must reach the buffer again.
+  out.clear();
+  inp.emitData('q');
+  await waitFor(() => stripAnsi(out.text()).includes('q'));
+
+  inst.unmount();
+  await new Promise<void>((r) => stub.close(() => r()));
+});
