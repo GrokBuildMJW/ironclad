@@ -38,6 +38,17 @@ def test_old_string_not_found(tmp_path):
     assert f.read_text(encoding="utf-8") == "hello\n"                # unchanged
 
 
+def test_noop_edit_is_error_not_false_success(tmp_path):
+    # #1317: a no-op edit (old_string == new_string, or already applied) must NOT report success — it
+    # surfaces as ERROR, so "OK: edited" always means the bytes actually changed (the false-success half
+    # of the orchestrator-bridge bug).
+    f = tmp_path / "x.py"
+    f.write_text("a = 1\n", encoding="utf-8")
+    out = gx10.run_tool("edit_file", {"path": str(f), "old_string": "a = 1", "new_string": "a = 1"})
+    assert out.startswith("ERROR: no change")
+    assert f.read_text(encoding="utf-8") == "a = 1\n"                # byte-identical, nothing written
+
+
 def test_ambiguous_without_replace_all_is_refused(tmp_path):
     f = tmp_path / "x.py"
     f.write_text("x\nx\n", encoding="utf-8")

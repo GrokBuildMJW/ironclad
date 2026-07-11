@@ -60,20 +60,21 @@ export const COMMANDS: readonly Command[] = [
   {name: 'ls', scope: 'server', usage: '[path]', desc: 'list a directory in the server workdir'},
   {name: 'write', scope: 'server', usage: '<path>', desc: 'write the last response to a file'},
   {name: 'cat', scope: 'server', usage: '<path>', desc: 'show a file in the server workdir'},
-  {name: 'watcher', scope: 'server', usage: 'on|off', desc: 'auto-advance (reconciler)'},
+  {name: 'watcher', scope: 'server', usage: 'on|off', desc: 'deprecated alias for /auto on|off'},
   {name: 'autopilot', scope: 'server', usage: 'on|off', desc: 'autopilot'},
   {name: 'autoplan', scope: 'server', usage: 'on|off [N]', desc: 'auto-plan the next tasks'},
   {name: 'log-terminal', scope: 'server', usage: 'on|off', desc: 'live autopilot log window'},
   {name: 'initiative', scope: 'server', usage: 'new <name> --type mpr|software | list | use <slug> | active | reconcile', desc: 'manage the initiative-centric vault (a deprecated alias for /project)', hidden: true},
   {name: 'project', scope: 'server', usage: 'list [--all] | new <name> [--type mpr|software] [--path <dir>] | active | track new|use|list | delete <id> [--purge] | archive|unarchive <id>', desc: 'manage isolated projects (the guided setup command; /initiative is a deprecated alias)'},
   {name: 'switch', scope: 'server', usage: '<project_id>', desc: 'rebind the engine to a project (own paths + memory partition)'},
-  {name: 'approve', scope: 'server', usage: '[slug]', desc: "approve the active unit's design so implementation handovers are unblocked (S5, no blind coding)"},
+  {name: 'approve', scope: 'server', usage: 'design [slug] | constraint <id|all> [--slug <s>] | [slug]', desc: "approve a design (bare /approve or /approve design) or promote constraints (/approve constraint); pending constraint forks block design approval"},
+  {name: 'dismiss', scope: 'server', usage: 'constraint <id|all> [--slug <s>]', desc: 'dismiss a suggested typed constraint so it stops gating'},
   {name: 'board', scope: 'server', usage: '[slug]', desc: 'render the task board (pending/in_progress/done) to BOARD.md and show it'},
   {name: 'generate', scope: 'server', usage: '[--kind case|prompt] --domain <d> --case <c> --description <text> [--prefix x] [--dry-run]', desc: 'scaffold a paved-road capability into the active project library'},
   // #952: complete the server-verb subset so it covers command_spec (guarded by check_ink_command_parity.py).
   // Missing these three permanently blinded the did-you-mean net to the epic's own worst-offender verbs.
   {name: 'lifecycle', scope: 'server', usage: 'gate [--slug <s>] [--tree <sha>] [--ledger <p>] [--stages tests,reviews,delivery]', desc: 'run the DELIVER-leg lifecycle-completeness gate'},
-  {name: 'fork', scope: 'server', usage: '[unit]', desc: 'show the MPR architecture-decision proposal at a fork (read-only)'},
+  {name: 'fork', scope: 'server', usage: 'list | decide <fork-id> --choice keep|counter | [fork-id|unit]', desc: 'list pending constraint-fork envelopes / MPR proposals, or resolve one (opaque fork ids)'},
   {name: 'ace', scope: 'server', usage: 'warmup|eval [--ledger <path>]', desc: 'ACE playbook ops (warm-start / efficiency diagnostic)'},
 ];
 

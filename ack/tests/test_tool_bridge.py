@@ -85,6 +85,37 @@ def test_local_tool_routes_to_bridge_when_active():
     assert gx10.run_tool("execute_command", {"command": "ls"}) == "BRIDGED:execute_command:None"
 
 
+def test_bridge_frame_ships_exec_cwd_only_for_non_default_project(monkeypatch, tmp_path):
+    # #1317: the TR frame ships the active project's exec cwd ONLY for a genuinely non-default project (so a
+    # bridged tool runs THERE); the DEFAULT project OMITS it → the client keeps its own cwd (byte-identical).
+    import project_context as _pc
+    from project_context import ProjectContext
+    monkeypatch.setattr(gx10, "_BOOT_WORKDIR", Path(str(tmp_path / "boot")))
+
+    def _frame(root):
+        frames = []
+        bridge = server.ToolBridge(frames.append, timeout=5)
+
+        def _run():
+            if root is not None:
+                _pc.set_current(ProjectContext("p", root, ""))   # bind on THIS request thread (≙ bind_active)
+            bridge.request("read_file", {"path": "a.py"})
+
+        t = threading.Thread(target=_run)
+        t.start()
+        for _ in range(50):
+            if frames:
+                break
+            time.sleep(0.02)
+        payload = json.loads(frames[0][len(server._TR_PREFIX):-len(server._TR_SUFFIX)])
+        bridge.deliver(payload["id"], "x")
+        t.join(2)
+        return payload
+
+    assert "exec_cwd" not in _frame(None)                        # default (no non-default ctx) → omitted
+    assert _frame(str(tmp_path))["exec_cwd"] == str(tmp_path)     # non-default project → its root shipped
+
+
 def test_nonlocal_tool_not_routed(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     gx10._LOCAL_TOOL_BRIDGE = lambda name, args: "SHOULD_NOT_HAPPEN"

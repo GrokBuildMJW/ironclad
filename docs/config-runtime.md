@@ -113,6 +113,17 @@ for the lesson provider API.
 | `loop_profiles.default` | `{}` | per-run loop-budget overrides (`max_iterations` / `retry_budget` / `effort`); empty ⇒ the engine globals apply (the live chat-loop bound) |
 | `loop_profiles.by_type` | `{}` | per-`TaskType` overrides, e.g. `{"research": {"max_iterations": 40}}` — **reserved** (resolved but not yet consumed by a per-type loop) |
 
+## Constraint compliance toggles (`constraint_gate.*` / `safety.*` / `ace.fork_mpr.*`)
+
+| Key | Default | Meaning |
+|---|---|---|
+| `constraint_gate.enabled` | `false` | L1 capture tool + presence gate + verbatim handover injection (ADR-0015); off ⇒ byte-identical |
+| `safety.constraint_conflict_detect` | `false` | L2 structured conflict detect + durable fork-envelope emission at `record_design` (#1337) **and** L3 fail-closed typed hard-check at `/approve design` + impl `stage_handover` / `plan_units` (#1342 / ADR-0016). Off ⇒ byte-identical (no detect, no ledger write, no hard-check) |
+| `ace.fork_mpr.enabled` | `false` | MPR worker at a recognized fork **and** the S4 constraint-envelope worker (`/fork` recommendation fill + decide→learn) (#1340); **separate** from conflict-detect (flag split: detect vs MPR worker). Off ⇒ no worker, no learn |
+
+Gate/feature flags use **strict** boolean coercion (`_as_bool`): only JSON `true` or the true strings
+`true` / `1` / `yes` / `on` enable a flag; `"false"` / garbage fail soft to off.
+
 ## Provider router (`providers.*`)
 
 The provider router/dispatcher is **off by default** (`server` setup); it is enabled in the `local` setup.

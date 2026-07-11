@@ -17,6 +17,7 @@ export interface ToolFrame {
   id: string;
   name: string;
   args: Record<string, unknown>;
+  execCwd?: string; // #1317: server-shipped active-project exec cwd (mount) — where the bridged tool runs
 }
 
 export interface StreamHandlers {
@@ -26,14 +27,20 @@ export interface StreamHandlers {
 
 async function dispatchFrame(seg: string, onTool?: StreamHandlers['onTool']): Promise<void> {
   const json = seg.startsWith('TR') ? seg.slice(2) : seg;
-  let payload: {id?: string; name?: string; args?: Record<string, unknown>};
+  let payload: {id?: string; name?: string; args?: Record<string, unknown>; exec_cwd?: string};
   try {
     payload = JSON.parse(json) as typeof payload;
   } catch {
     return; // malformed frame — drop, never break the stream (parity with client.py)
   }
   if (!payload.id || !payload.name) return;
-  if (onTool) await onTool({id: payload.id, name: payload.name, args: payload.args ?? {}});
+  if (onTool) {
+    // #1317: carry the server-shipped exec cwd through, but only add the field when present so a frame
+    // without it stays byte-identical to {id, name, args} (parity with the pre-#1317 stream).
+    const toolFrame: ToolFrame = {id: payload.id, name: payload.name, args: payload.args ?? {}};
+    if (payload.exec_cwd) toolFrame.execCwd = payload.exec_cwd;
+    await onTool(toolFrame);
+  }
 }
 
 /** A pure, testable feeder: push byte chunks; push `null` to flush at end-of-stream. */

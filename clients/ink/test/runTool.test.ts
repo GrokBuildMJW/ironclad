@@ -18,6 +18,30 @@ test('write_file then read_file round-trips with exact OK string', async () => {
   await fs.rm(d, {recursive: true, force: true});
 });
 
+test('runTool resolves relative paths + runs execute_command in the shipped baseCwd (#1317)', async () => {
+  const base = await tmp();
+  // a relative write/read resolves UNDER base (the server-shipped active project), not process.cwd()
+  const w = await runTool('write_file', {path: 'sub/f.txt', content: 'hi'}, base);
+  assert.equal(w, 'OK: Written 2 chars to sub/f.txt');
+  assert.equal(await fs.readFile(path.join(base, 'sub', 'f.txt'), 'utf-8'), 'hi');
+  assert.equal(await runTool('read_file', {path: 'sub/f.txt'}, base), 'hi');
+  // execute_command runs with cwd=base → a relative shell redirect lands under base, not process.cwd()
+  await runTool('execute_command', {command: 'echo cwdtest > marker.txt'}, base);
+  const there = await fs.stat(path.join(base, 'marker.txt')).then(() => true).catch(() => false);
+  assert.ok(there, 'execute_command ran in the shipped baseCwd');
+  await fs.rm(base, {recursive: true, force: true});
+});
+
+test('runTool falls back to process.cwd() when baseCwd is missing on this host; absolute paths unaffected (#1317)', async () => {
+  const d = await tmp();
+  const ghost = path.join(d, 'does-not-exist');
+  const p = path.join(d, 'x.txt'); // an ABSOLUTE path is unaffected by base either way
+  const w = await runTool('write_file', {path: p, content: 'ok'}, ghost);
+  assert.equal(w, `OK: Written 2 chars to ${p}`);
+  assert.equal(await fs.readFile(p, 'utf-8'), 'ok');
+  await fs.rm(d, {recursive: true, force: true});
+});
+
 test('read_file missing → ERROR: Not found with the raw path', async () => {
   const d = await tmp();
   const p = path.join(d, 'nope.txt');

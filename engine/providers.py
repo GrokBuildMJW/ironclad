@@ -77,10 +77,12 @@ class ProviderSpec(BaseModel):
     bin_glob: Optional[str] = None       # cli: #451/FORK-A3 — private-layer glob to a rotating launcher
                                          #   path (e.g. a hashed AppData dir); resolved newest when `bin`
                                          #   is not on PATH. Lives in conf/ (never a literal path in core/).
+    models_probe: Optional[str] = None   # cli: opt-in args appended to the resolved bin to list models
+    models_pattern: Optional[str] = None # cli: optional regex used only to display advertised model ids
     effort: Optional[str] = None         # cli: default effort ({effort}), per-item overridable
     permission_mode: Optional[str] = None  # cli: {permission}; None → inherits CLAUDE_PERMISSION_MODE
     mcp_template: Optional[str] = None   # cli: #480 — per-CLI read-only Memory MCP config args, injected
-                                         #   into the {mcp} placeholder ONLY under the sealed profile. The
+                                         #   into the {mcp} placeholder when memory is configured. The
                                          #   {mcp_server} token renders to the python invocation of
                                          #   memory_mcp.py. Lives in conf/ (per-CLI flag shape).
     cost_per_1k_in: float = 0.0          # $/1k input tokens (routing cost axis; local = 0.0)
@@ -283,6 +285,71 @@ def probe_code_agents(registry: "CodeAgentRegistry") -> Dict[str, Optional[str]]
 RESULT_OK = "ok-feedback"            # the agent produced feedback → advance
 RESULT_FAILED = "task-failed"        # the agent ran but produced no usable result (not a budget signal)
 RESULT_UNAVAILABLE = "agent-unavailable"   # budget/quota exhausted → trip the breaker + fail over
+
+
+class ModelCheck(BaseModel):
+    agent_id: Optional[str] = None
+    configured: str
+    ok: bool
+    available: List[str] = Field(default_factory=list)
+    available_raw: str = ""
+
+
+def model_advertised(model: str, output: str) -> bool:
+    """Whole-token model-id search for an advertised CLI model list. Pure and never raises."""
+    try:
+        m = (model or "").strip()
+        if not m or not output:
+            return False
+        return re.search(rf"(?<![\w.\-]){re.escape(m)}(?![\w.\-])", output) is not None
+    except Exception:
+        return False
+
+
+def parse_advertised_models(output: str, pattern: Optional[str] = None) -> List[str]:
+    """Display-only extraction of model ids from a CLI models listing. Pure and fail-soft."""
+    try:
+        text = output or ""
+        found = []
+        if pattern:
+            try:
+                matches = re.findall(pattern, text)
+                for item in matches:
+                    if isinstance(item, tuple):
+                        item = next((x for x in item if x), "")
+                    s = str(item).strip()
+                    if s:
+                        found.append(s)
+            except re.error:
+                found = []
+        if not found:
+            found = re.findall(r"(?<![\w.\-])[A-Za-z0-9][A-Za-z0-9._\-]*[A-Za-z0-9](?![\w.\-])", text)
+        out: List[str] = []
+        seen = set()
+        for s in found:
+            if s and s not in seen:
+                seen.add(s)
+                out.append(s)
+        return out
+    except Exception:
+        return []
+
+
+def validate_model(spec: ProviderSpec, output: str) -> Optional[ModelCheck]:
+    """Validate an opt-in code-agent model probe result. Returns None when probing is disabled/empty."""
+    try:
+        if spec is None or not spec.models_probe or not (output or "").strip():
+            return None
+        configured = spec.model or ""
+        return ModelCheck(
+            agent_id=spec.agent_id,
+            configured=configured,
+            ok=model_advertised(configured, output),
+            available=parse_advertised_models(output, spec.models_pattern),
+            available_raw=(output or "")[:600],
+        )
+    except Exception:
+        return None
 
 
 def classify_agent_result(*, exit_code: Optional[int], stderr: str,

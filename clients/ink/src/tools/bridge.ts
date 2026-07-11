@@ -30,7 +30,7 @@ export function pendingToolResults(): number {
 export async function runPassthroughTool(srv: Server, frame: ToolFrame): Promise<void> {
   let result: string;
   try {
-    result = await runTool(frame.name, frame.args);
+    result = await runTool(frame.name, frame.args, frame.execCwd);
   } catch (e) {
     result = `ERROR: ${e instanceof Error ? e.message : String(e)}`;
   }

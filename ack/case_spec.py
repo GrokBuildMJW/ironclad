@@ -181,6 +181,18 @@ class TaskSpec(BaseModel):
         default=None,
         description="Task-ID. Minted by the TaskStore, not the agent.",
     )
+    # #1341 (epic #1344 S5): optional machine-checkable constraint fields. Declared
+    # explicitly because ``extra='forbid'`` rejects undeclared keys. Absent → validates
+    # identically to pre-typed task_json (byte-identical). No conditional-required logic
+    # here (that is S6 hard-check).
+    language: Optional[str] = Field(
+        default=None,
+        description="Optional implementation-language constraint (allow-listed token).",
+    )
+    network: Optional[bool] = Field(
+        default=None,
+        description="Optional network-access constraint (true=allowed, false=forbidden).",
+    )
 
     # --- field validators -------------------------------------------------- #
     @field_validator("title", "description")

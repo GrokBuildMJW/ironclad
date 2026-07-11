@@ -261,8 +261,17 @@ class ToolBridge:
         ev = threading.Event()
         with self._lock:
             self._pending[rid] = {"event": ev, "result": None}
-        self._emit(_TR_PREFIX + json.dumps({"id": rid, "name": name, "args": args})
-                   + _TR_SUFFIX)
+        # #1317: ship the active project's exec cwd so the client runs the bridged tool THERE, not in its
+        # frozen startup codedir. ONLY for a genuinely non-default project (gx10._exec_cwd() not None) —
+        # the DEFAULT project OMITS it, so the client keeps its own process.cwd() (byte-identical: a client
+        # and server on the same fs launched from DIFFERENT directories must not be yanked to the server's
+        # cwd). bind_active already ran on this request thread, so _exec_cwd() resolves the active project.
+        # Additive/optional: an older client ignores the field.
+        frame: Dict[str, Any] = {"id": rid, "name": name, "args": args}
+        _ecwd = gx10._exec_cwd()
+        if _ecwd:
+            frame["exec_cwd"] = _ecwd
+        self._emit(_TR_PREFIX + json.dumps(frame) + _TR_SUFFIX)
         if not ev.wait(self._timeout):
             with self._lock:
                 self._pending.pop(rid, None)
@@ -284,7 +293,7 @@ class ToolBridge:
 # --------------------------------------------------------------------------- #
 # Bootstrap — same config pipeline + agent construction the CLI uses (main()),
 # but headless: no prompt_toolkit, autopilot forced OFF (the client launches
-# code-agents, never the server), watcher ON (the reconciler must advance).
+# code-agents, never the server). The watcher follows the /auto meta-switch.
 # --------------------------------------------------------------------------- #
 def bootstrap(config_path: Optional[str] = None) -> Tuple[gx10.GX10, Dict[str, Any], Optional[Path], Path]:
     cfg = gx10._code_defaults()
@@ -333,10 +342,9 @@ def bootstrap(config_path: Optional[str] = None) -> Tuple[gx10.GX10, Dict[str, A
         except Exception:
             pass
 
-    # Server policy: never launch claude itself (that's the client's job), but keep
-    # the feedback reconciler running so posted feedback advances tasks.
+    # Server policy: never launch claude itself (that's the client's job). The feedback
+    # watcher is controlled by /auto, so boot and /auto off both leave it disabled.
     gx10.AUTOPILOT_ENABLED = False
-    gx10._WATCHER_ENABLED = True
     return agent, cfg, cfg_path, workdir
 
 
@@ -398,6 +406,13 @@ def _pending_handovers() -> list[Dict[str, Any]]:
     store = gx10._store()
     reg = gx10._code_agent_registry()          # #449: config-driven code-agent registry
     probe = _probe_cached()                    # #1279: boot-probe RESOLVED bin path per agent (as /coders uses)
+    # #1307: the code root the client must launch the coder IN — the active project's EXECUTION cwd
+    # (`_exec_cwd()` = <project-root>/<code_subdir>). The do_GET handler bound this thread to the active
+    # project (bind_active) before calling us, so `_exec_cwd()` resolves it. Without this the client fell
+    # back to its own static `codedir` (the engine's boot workdir) and wrote one project's code into
+    # another project's tree — a project-isolation escape. `None` (the default project, no code_subdir)
+    # → the process workdir, byte-identical to before.
+    exec_cwd = str(gx10._exec_cwd() or os.getcwd())   # str(): the /pending item is JSON — never a Path
     out: list[Dict[str, Any]] = []
     for task in store.list("pending"):
         tid = task.get("id") or ""
@@ -435,6 +450,8 @@ def _pending_handovers() -> list[Dict[str, Any]]:
             "agent": agent,
             "title": task.get("title"),
             "type": task.get("type"),
+            # #1307: the code root the client must launch the coder IN (the active project's exec cwd).
+            "cwd": exec_cwd,
             "handover_file": ho.name,
             "handover": content,
             # #449 (C0R-9): the SERVER resolves the FULL agent spec from the registry; the client is a
@@ -448,10 +465,10 @@ def _pending_handovers() -> list[Dict[str, Any]]:
             "bin": probe.get(agent) or spec.bin,
             "cmd_template": spec.cmd_template,
             "permission": spec.permission_mode,
-            # #480: the read-only Memory MCP, gated server-side on the sealed profile + a configured memory
-            # service + the agent's mcp_template. The client fills the {mcp} placeholder with `mcp` and sets
-            # `mcp_env` on the agent subprocess (the spawned MCP inherits the memory connection). ("",{})
-            # under open/token ⇒ the launch is byte-identical to today.
+            # #480/#994-S10: the read-only Memory MCP is always on when a memory service is configured
+            # and the agent ships an mcp_template. The client fills the {mcp} placeholder with `mcp`
+            # and sets `mcp_env` on the agent subprocess (the spawned MCP inherits the memory connection).
+            # ("",{}) when memory is unconfigured or the agent has no mcp_template.
             **dict(zip(("mcp", "mcp_env"), gx10._mcp_for_launch(spec))),
         })
     return out
@@ -880,12 +897,30 @@ class _Handler(BaseHTTPRequestHandler):
                 strat = gx10._revise_on_failure(tid, cls)
                 if cls == providers.RESULT_UNAVAILABLE:
                     gx10._breaker_trip(agent, "budget/quota exhausted")
+                    try:
+                        _stderr = (data.get("stderr") or "")[:400]
+                        gx10._store().mark_blocked(
+                            tid,
+                            reason="budget/quota exhausted" + (f" — {_stderr}" if _stderr else ""),
+                            kind="unavailable",
+                        )
+                    except Exception:  # noqa: BLE001
+                        pass
                     self._send(200, {"ok": True, "classification": cls,
                                      "action": "breaker-tripped → failover on the next poll",
                                      **({"failure_class": fc} if fc else {}),
                                      **({"strategy": strat} if strat else {})})
                     return
                 if cls == providers.RESULT_FAILED:
+                    try:
+                        gx10._store().mark_blocked(
+                            tid,
+                            reason=f"coder failed (exit {data.get('exit_code')}), no feedback — "
+                                   f"{(data.get('stderr') or '')[:400]}",
+                            kind="errored",
+                        )
+                    except Exception:  # noqa: BLE001
+                        pass
                     self._send(200, {"ok": True, "classification": cls, "action": "no-feedback",
                                      **({"failure_class": fc} if fc else {}),
                                      **({"strategy": strat} if strat else {})})
@@ -1008,6 +1043,12 @@ def serve(host: str = "0.0.0.0", port: int = 8100,
     except Exception as _pe:
         print(f"  [agents] probe failed ({_pe!r}) — assuming no local agent", flush=True)
         _cli_ok = False
+    try:
+        for mm in gx10._validate_code_agent_models():
+            print(f"  [agents] WARNING: agent {mm.agent_id}: model {mm.configured!r} not offered by the CLI "
+                  f"— available: {', '.join(mm.available) or mm.available_raw.strip()[:200]}", flush=True)
+    except Exception:  # noqa: BLE001
+        pass
     try:
         topo = gx10.resolve_offload_topology(cfg, cli_available=_cli_ok)   # FAIL-CLOSED on bad topology
     except ValueError as e:

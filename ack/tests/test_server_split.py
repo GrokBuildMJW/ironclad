@@ -163,6 +163,27 @@ def test_pending_handover_bin_falls_back_to_spec_when_unresolved(tmp_path, monke
     assert item["bin"] == "claude"                    # spec.bin fallback (OPUS's logical bin)
 
 
+def test_pending_handover_ships_the_exec_cwd(tmp_path, monkeypatch):
+    # #1307: /pending must ship the code root the client launches the coder IN (the active project's exec
+    # cwd). Without it the client spawned the coder in its own stale startup `codedir` (the boot workdir)
+    # and wrote one project's code into another project's tree — a project-isolation escape.
+    _stage_opus(tmp_path, monkeypatch)
+    item = server._pending_handovers()[0]
+    assert item["cwd"]                                        # a concrete cwd is shipped
+    assert isinstance(item["cwd"], str)                       # wire contract: JSON string, never a Path
+    assert Path(item["cwd"]).resolve() == Path.cwd().resolve()  # == the active project's exec cwd
+
+
+def test_pending_handover_cwd_honours_code_subdir(tmp_path, monkeypatch):
+    # #1307/#1237: with a code_subdir configured the shipped cwd is <root>/<code_subdir> (created on
+    # demand), so the client builds the product tree isolated from the control-plane (vault/, .ironclad/).
+    _stage_opus(tmp_path, monkeypatch)
+    monkeypatch.setattr(gx10, "CODE_SUBDIR", "src")
+    item = server._pending_handovers()[0]
+    assert Path(item["cwd"]).name == "src"
+    assert Path(item["cwd"]).is_dir()                         # created on demand by _exec_cwd
+
+
 # --------------------------------------------------------------------------- #
 # HTTP routes end to end (real server, stubbed agent + dispatch).
 # --------------------------------------------------------------------------- #
@@ -208,10 +229,12 @@ def _post(port, path, body):
 
 
 def test_http_health_and_chat_capture(tmp_path, monkeypatch):
+    monkeypatch.setattr(gx10, "_WATCHER_ENABLED", False, raising=False)
     httpd, port = _start_server(monkeypatch, tmp_path)
     try:
         health = _get(port, "/health")
         assert health["ok"] and health["model"] == "stub-model"
+        assert health["watcher"] is False
         # #385: Cold (memory) and Warm tiers are reported SEPARATELY; with neither configured in the stub
         # both read "off" (a Warm outage can no longer hide behind a Cold-only `memory: up`).
         assert health["memory"] == "off" and health["warm"] == "off"
@@ -607,6 +630,35 @@ def test_http_feedback_classifies_exhausted_trips_breaker(tmp_path, monkeypatch,
         httpd.shutdown()
 
 
+def test_http_feedback_failed_no_feedback_marks_task_blocked(tmp_path, monkeypatch, _clean_breaker):
+    httpd, port = _start_server(monkeypatch, tmp_path)
+    try:
+        gx10._store().create({"type": "bugfix", "priority": "high", "title": "t", "description": "d"}, force=True)
+        tid = gx10._store().list("pending")[0]["id"]
+        gx10._store().transition(tid, "in_progress")
+        r = _post(port, "/feedback", {"task_id": tid, "agent": "OPUS", "content": "",
+                                      "exit_code": 2, "stderr": "unknown model"})
+        assert r["classification"] == "task-failed"
+        t = gx10._store().get(tid)
+        assert t["blocked_kind"] == "errored"
+        assert "unknown model" in t["blocked_reason"]
+    finally:
+        httpd.shutdown()
+
+
+def test_http_feedback_ok_does_not_mark_task_blocked(tmp_path, monkeypatch, _clean_breaker):
+    httpd, port = _start_server(monkeypatch, tmp_path)
+    try:
+        gx10._store().create({"type": "bugfix", "priority": "high", "title": "t", "description": "d"}, force=True)
+        tid = gx10._store().list("pending")[0]["id"]
+        gx10._store().transition(tid, "in_progress")
+        r = _post(port, "/feedback", {"task_id": tid, "agent": "OPUS", "content": "status: done\nok"})
+        assert r["classification"] == "ok-feedback"
+        assert not gx10._store().get(tid).get("blocked")
+    finally:
+        httpd.shutdown()
+
+
 def test_coders_snapshot_shows_breaker_and_pin_resets(monkeypatch, _clean_breaker):
     monkeypatch.setattr(gx10, "_EFFECTIVE_CFG", gx10._code_defaults(), raising=False)
     gx10._breaker_trip("OPUS", "budget/quota exhausted")
@@ -701,7 +753,7 @@ def test_autopilot_launch_path_failover_is_task_class_scoped(tmp_path, monkeypat
     assert launched_cmds == [(tid, "OPUS")]
 
 
-# ── #480: gated read-only Memory MCP injection (sealed profile only) ──────────────────────────────
+# ── #480/#994-S10: always-on read-only Memory MCP injection when memory + template exist ──────────
 def _mcp_spec():
     import providers
     return providers.ProviderSpec(

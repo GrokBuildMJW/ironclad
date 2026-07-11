@@ -96,10 +96,11 @@ Found something broken? The same loop fixes it:
 The code-agent runs headless, so it can't stop to ask you to approve each action. Two
 modes (set `GX10_CLAUDE_PERMISSION_MODE`):
 
-- **`acceptEdits`** (default) — auto-accepts file edits/writes. Enough for "write code +
-  write the test."
-- **`bypassPermissions`** — also lets it run commands (e.g. `pytest`, git). Needed for the
-  full *write-and-run-the-test* loop.
+- **`bypassPermissions`** (default) — also lets it run commands (e.g. `pytest`, git).
+  Needed for the full *write-and-run-the-test* loop, so it is the default (an autonomous
+  coder must be able to run the tests it writes).
+- **`acceptEdits`** — auto-accepts file edits/writes only (no commands). Restricts the
+  coder to "write code + write the test" — it cannot then run it.
 
 `bypassPermissions` means the agent can run commands on your machine. That's fine for the
 intended use — **your machine, your code, you asked for it** — but understand it before

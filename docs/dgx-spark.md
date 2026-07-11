@@ -127,5 +127,11 @@ curl -s http://localhost:8100/health             # {"ok": true, "model": "qwen3.
   few minutes.
 - **Concurrency:** vLLM batches `--max-num-seqs` (8) concurrent sequences — Ironclad's
   `/fanout` exploits this for parallel reasoning (measured ~5.8× over serial).
+- **Large-context prefill:** for streaming OpenAI-compatible calls, the HTTP read timeout
+  also bounds time-to-first-token because vLLM emits no body bytes during prefill. A
+  roughly 64k-context request can exceed the public 120s default on this hardware while
+  the model is healthy. For Spark deployments, set `connection.first_token_timeout_s`
+  generously and keep it above `context.turn_idle_timeout_s`; keep
+  `connection.connect_timeout_s` short so dead endpoints still fail fast.
 - **One model at a time:** with 128 GB unified, run a single NVFP4 MoE plus the small
   services; don't try to co-host a second large model.

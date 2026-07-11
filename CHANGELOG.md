@@ -4,6 +4,312 @@ All notable changes to Ironclad are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/); the project is **pre-release** (0.0.x).
 Released versions are listed below.
 
+## [0.0.28]
+### Fixed
+
+- #1405 fixes constraint-fork resolution so `keep` no longer strands approval on the rejected
+  counter design. `ForkEnvelope` now carries the counter design body plus an optional compliant-prior
+  snapshot; `keep` clears the rejected counter from `design.md` or restores the prior compliant
+  design, while `counter` promotes the counter body into `design.md`. The path remains default-off /
+  byte-identical when `safety.constraint_conflict_detect` is off.
+- #1405/#1404 hardens the constraint-fork decision edge cases: revalidation-sourced counter
+  promotion always writes `design.md` as `approved: false` / `type: proposal`, `keep` reconciles
+  `design.md` before marking the envelope resolved, and approved-design revalidation warnings include
+  the concrete `/fork decide <fork-id> --choice keep|counter` commands.
+
+### Changed
+
+- #1407 failed/empty code-agent surfacing is always on: a local failed/empty coder run is now marked
+  blocked `errored` with its captured log tail, and the clean-stderr client lane can still mark
+  `errored` or `unavailable`, instead of leaving the unit silently `in_progress`.
+- #1404 surfaces concrete ready-to-run `/fork decide <fork-id> --choice keep|counter` commands with
+  option labels wherever a pending constraint fork is shown, so operators no longer have to find and
+  type the opaque fork id from a generic placeholder.
+- #1400 hardens truncation-finalize accounting: a finalized runaway now silently folds the exhausted
+  generation into the same per-turn/session perf counters as the finalizing generation, records successful
+  finalize telemetry separately, shows the normal spinner while finalizing, and removes the transient nudge
+  by identity.
+- #1396 keeps typed constraint body detection best-effort and presence-only while tightening precision: network body signals are now restrictive-only (offline, none, forbidden), so permissive `allowed` / `online` prose is intentionally not gated; language body signals require an implementation verb or an explicit key / `only` / `must` / `requires` / `use` form, so bare `in <language>` / `using <language>` no longer fires; English restrictive network recall now mirrors the German no/without bridge.
+- #1396 adds narrow typed-constraint detector recall for `offline-only`, `network is forbidden`, and `Internet verboten`, while applying the existing language object-noun guard to German `verwende` / `nutze` language forms.
+
+### Added
+
+- #1407 adds opt-in boot and launch model validation for code agents via `models_probe` and
+  `models_pattern`. The engine compares the configured model against the CLI's advertised list, warns at
+  boot, and refuses launches of a cached mismatching model with a named error.
+- #1400 adds opt-in `generation.finalize_on_truncation` / `GX10_FINALIZE_ON_TRUNCATION`: a streaming
+  reasoning runaway that exhausts the output budget inside `<think>` (`finish_reason=length`, no answer)
+  is salvaged into one bounded no-think finalize instead of a blank turn. It fires at most once per turn,
+  never persists the transient nudge, and remains default-off / byte-identical.
+- #1399 adds default-off resumable partial-persist for post-first-token stream wedges: when the decoupled timeout
+  knobs are enabled and the engine watchdog aborts after streamed content has begun, the cleaned partial answer is
+  saved so the stalled turn is resumable. Partial tool calls are dropped, unclosed `<think>` content is never
+  persisted, and the default public path remains byte-identical.
+- #1397 adds default-off LLM timeout decoupling for large-context prefills:
+  `connection.connect_timeout_s` / `GX10_LLM_CONNECT_TIMEOUT_S` and
+  `connection.first_token_timeout_s` / `GX10_LLM_FIRST_TOKEN_TIMEOUT_S` can keep connection setup short while
+  giving time-to-first-token a model-sized budget. The per-turn idle watchdog is phase-aware (generous before
+  the first chunk, tight between chunks after that) with a pre-first-token backstop above the httpx read
+  deadline, so the named first-token timeout remains reachable; retries no longer re-issue a large-context turn
+  after a first-token timeout; and first-token timeout errors name the cause and the config knob to raise.
+  Invalid optional timeout values now fail soft to unset, and all knobs are off by default, preserving the
+  existing single-float client timeout.
+- Added `_constraint_typed_unresolved`, a fail-soft engine reader for typed `source: suggested`
+  constraints as the foundation for the #1372 unresolved-constraint gate, plus tightened
+  `record_constraints.source` tool guidance for #1369. Gated behavior remains default-off.
+- Added the `/dismiss constraint <id|all>` command and the #1370 unresolved-constraint approval
+  gate: with `safety.constraint_conflict_detect` on, suggested typed constraints now block
+  deviating or omitting `/approve design` calls until the design aligns, the operator dismisses
+  the suggestion, or the operator promotes it to HARD and resolves the resulting fork. HARD
+  promotion/rewrite paths now revalidate recorded approved designs and revoke contradictory
+  approvals. `/dismiss` is an intentional unconditional command-surface addition; gated behavior
+  remains default-off.
+- Surfaced unresolved suggested typed constraints truthfully in per-turn steering (#1371): the
+  constraint state now labels them as advisory, shows `/approve constraint <id|all>` and
+  `/dismiss constraint <id|all>` resolution paths, reports design mismatches or omissions, and
+  only prints a BLOCKED clause when `safety.constraint_conflict_detect` is enabled.
+
+- **Constraint steering survives context recovery and routes deviations through operator-owned forks**
+  (#1362, #1363): with the constraint gate enforced, the authoritative per-turn state now shows the
+  normalized HARD typed floor and any recorded design's typed proposal, then directs HARD changes through
+  `record_design` → `/fork decide keep|counter`. The orchestrator prompt forbids prose renegotiation and
+  silent `record_constraints` replacement; gate-off steering remains byte-identical.
+- **HARD constraint overwrite guard** (#1364): when conflict detection is enabled,
+  `record_constraints` refuses a model attempt to change or clear an existing typed HARD floor before
+  writing. Declared-none captures ignore contradictory typed parameters, suggested captures cannot be
+  promoted into the HARD floor by a merge, and operator-confirmed overrides may deliberately clear or
+  replace the floor; the default-off path remains byte-identical.
+- **L2/L3 constraint E2E capstone** (#1359, epic #1344 S7): real-dispatch integration proof that
+  `record_constraints` → conflicting `record_design` → pending `ForkEnvelope` → `/fork list` →
+  `/approve design` blocked → `/fork decide` keep|counter → L3 hard-check (refuse-until-rerecord
+  on keep; override-and-proceed on counter) → impl `stage_handover` (omission fail-closed; L1
+  verbatim injection on success) runs end-to-end with both gates on; both flags off remain
+  byte-identical (no fork, no block, no hard-check). Test-only — no engine changes. ADR-0016.
+- **L3 structured hard-check at the implementation boundary** (#1342, epic #1344 S6): pure
+  `ack.ace.constraint_conflict.hardcheck` (frozen `Violation` with `kind=missing|mismatch`;
+  first `TYPED_KEYS` HARD-floor failure wins; omission fails when `require_present`; never
+  raises) plus engine `_constraint_hardcheck` gated by default-off
+  `safety.constraint_conflict_detect`. Fail-closed at **`/approve design`** (after the S4
+  pending-fork block, before `approved: true`), **impl `stage_handover`** (create + re-hand),
+  and **`plan_units` children** — compares design/task typed `language`/`network` to
+  `_constraint_typed` HARD values. Couples with S4 decide: `keep` → design must match;
+  `counter` → overridden floor matches. `record_design` stays advisory (L2 fork only).
+  `force` does not bypass. Flag off remains byte-identical. ADR-0016.
+- **L2 durable project-scoped fork worker + `/fork` surface + decide→learn** (#1340, epic #1344 S4):
+  optional MPR `artifact_slug` port routes `runs_dir`/gate/INDEX to a validated initiative
+  (`None` ⇒ byte-identical active binding); when `ace.fork_mpr.enabled` is on, a worker drains
+  pending `ForkEnvelope`s with **context captured at submit** (`contextvars.copy_context` +
+  `ctx.run` per item — ReflectionWorker is a long-lived daemon). The safe-queue run lock is
+  **process-local and non-durable** (in-memory set keyed by `fork_id`, mirrors M5
+  `_ACE_FORK_INFLIGHT`) — never a persisted `inflight` claim — so a hard crash re-drains
+  `pending` + `recommendation is None` envelopes (#17). Fills `recommendation`/`matrix` under the
+  envelope's slug (switch-before-drain + submit-time ProjectContext proof). `/fork` / `/fork list`
+  shows pending envelopes (opaque ids, supersession of older same-category); empty M5 fall-through
+  stays byte-identical when both flags are off. `/fork decide <fork-id> --choice keep|counter` is
+  the R5 state machine (fail-closed, idempotent — keep leaves constraints unchanged, counter
+  overrides typed HARD with `operator-override`); `/approve design` (bare `/approve` preserved) is
+  blocked while a pending constraint fork exists and **refuses fail-closed** on a ledger-read
+  error when `CONSTRAINT_CONFLICT_DETECT` is on; `/approve constraint <id|all> [--slug]` promotes
+  suggested→hard. decide→learn feeds ACE from the envelope resolution (fail-soft). Both
+  `safety.constraint_conflict_detect` and `ace.fork_mpr.enabled` off remain byte-identical.
+  command_spec + Ink autocomplete updated. ADR-0016.
+- **L2 structured constraint-conflict detector + durable fork-envelope emission** (#1337, epic
+  #1344 S3): pure `ack.ace.constraint_conflict.detect_conflict` (first differing `TYPED_KEYS`
+  entry → frozen `Conflict`; never raises) and pure `ack.ace.fork_envelope` (`ForkEnvelope`,
+  opaque stable `make_fork_id` excluding free-text `question`, `build_constraint_envelope` with
+  keep/counter options). When default-off `safety.constraint_conflict_detect` is on,
+  `record_design` compares HARD typed constraints to design typed fields and persists a pending
+  envelope under `vault/<slug>/proposals/forks/<fork_id>.json` (atomic, idempotent by `fork_id`;
+  fail-soft). Flag off remains byte-identical. Detect+persist only — no MPR run, no `/fork`
+  surface, no handover compare/gate (S4/S6). ADR-0016.
+- **Typed constraint fields + hard/soft classifier + L2/L3 flags** (#1341, epic #1344 S5):
+  pure `ack.ace.constraint_types` allow-list (`language` / `network` normalize + alias-fold,
+  never raises); optional typed params on `record_constraints` / `record_design` (invalid →
+  `GateRefusal`; omitted → S1-identical frontmatter); `source: hard|suggested` provenance and
+  `_constraint_typed` HARD-only reader; optional `TaskSpec.language` / `network` (extra=forbid);
+  default-off `safety.constraint_conflict_detect` (`CONSTRAINT_CONFLICT_DETECT`, strict `_as_bool`)
+  for L2 detect + L3 hard-check (MPR worker still `ace.fork_mpr.enabled`). S5 plumbing —
+  S3 wires detect+persist; S6 wires hard-check. ADR-0016.
+- **L1 constraint E2E capstone** (#1343): integration proof that the full L1 flow
+  (`record_constraints` → presence-gate → `record_design` → `/approve` → handover
+  carries a single verbatim `<!-- IRONCLAD:CONSTRAINTS -->` block) runs through the real
+  `run_tool` / `_run_tool_dispatch` path; plus gate-off byte-identical, synthetic
+  `_apply_config` activation, and `CAPTURED_NONE` E2E. Test-only — no engine changes.
+- **L1 constraint presence-gate + verbatim handover injection** (#1339): when `constraint_gate.enabled` is on,
+  `record_design`, `plan_units`, and implementation `stage_handover` (create and re-hand) refuse until the
+  active unit has constraints on record (`CAPTURED` or `CAPTURED_NONE`). A single `_constraint_status` snapshot
+  drives both the gate and the injection (no TOCTOU). Captured bodies are prepended inside one
+  `<!-- IRONCLAD:CONSTRAINTS -->…` block (idempotent strip-then-add on re-hand); `CAPTURED_NONE` strips a
+  stale block and injects nothing. Design/analysis handovers stay ungated. `force` does not bypass. Default
+  off remains byte-identical.
+- **L1 constraint capture** (#1338): adds the deterministic `record_constraints` tool and the single canonical
+  `<unit>/decisions/constraints.md` decision, including explicit `declared_none`, reserved-marker refusal, and
+  a bounded fail-soft `UNCAPTURED` / `CAPTURED_NONE` / `CAPTURED` reader. The config-only
+  `constraint_gate.enabled` flag conditionally exposes the tool and steering status; it defaults off, keeping
+  existing flows byte-identical.
+- **Cross-model second-opinion `review` tool** (#1221, epic #1212): a dedicated, generic
+  `review(focus?, agent?, paths?)` that gets an independent second opinion from **any** configured
+  code-agent (KIMI / SONNET / CODEX / OPUS / … — not codex-only) over a working `git diff` (default),
+  named files/docs/decisions (`paths`), or any artifact. Mechanism: `_code_agent_registry()` +
+  `client.default_cli_runner` (existing synchronous hardened-env CLI runner) — no new backend.
+  Capability-detected (`_review_available()` when a reviewer binary resolves); config `review.agent` +
+  `review.timeout_s`; SOFT distinct-reviewer anti-affinity (#457) against the producer pin; a READ in
+  `_INGESTION_TOOLS` (injection-fenced + char-capped). System-prompt routing: call `review` — never
+  self-review.
+
+### Fixed
+
+- **Ink handover stdout isolation** (#1406): locally launched code-agents no longer inherit stdout into
+  the terminal owned by the Ink renderer. The client now captures piped stdout, preventing input-box /
+  scrollback corruption under `/auto`, writes coder stdout and stderr to a per-task
+  `.ironclad/agent/logs/<task>_<agent>.log`, shows only a controlled stderr summary plus short tail
+  instead of raw coder output, and uses stdout as the last-resort handover result when a coder emits
+  only to stdout.
+- **Capture-completeness gate for typed constraints** (#1396): when `constraint_gate.enabled`
+  is on, `record_constraints` now refuses fail-closed if DE/EN constraint prose strongly states
+  an implementation `language` or `network` requirement but the corresponding typed field is
+  omitted. The detector is conservative and presence-only: it emits which category is stated,
+  not a detected value, and the refusal asks for that category's typed field without asserting
+  `network=none|allowed` or a language value. It still limits language detection to curated
+  values (`python` / `rust` / `javascript` / `typescript` / `go`), skips declared-none captures,
+  and leaves gate-off behavior byte-identical. German network detection now uses tight
+  negation-to-network bridges, widens explicit network recall, and language object-noun
+  precision also blocks `written in Go modules`, `using go.mod`, and `using Go-modules` while
+  preserving direct requirements such as `written in Go`.
+- Polished the suggested typed-constraint copy (#1394): model-facing `record_constraints` prose no
+  longer glues parameter help into the top-level tool description, unresolved suggested floors no
+  longer over-claim as operator-stated, and dismissed same-value typed categories are covered for
+  explicit `source="hard"` re-arming.
+- Hardened `record_constraints` field-level provenance merges (#1390, #1391, #1392): an unchanged
+  plain re-supply no longer promotes an existing SUGGESTED or dismissed typed category to HARD,
+  dismissed typed values survive sibling re-records and can still be re-armed with
+  `/approve constraint <cat>`, the `record_constraints.source` copy is conflict-detect-aware,
+  and `/dismiss constraint all` now reports that it dismissed typed constraints rather than only
+  suggested ones.
+
+- **Suggested constraints re-check approved designs after approval** (#1385): with conflict
+  detection on, recording a new SUGGESTED typed floor after a design is already approved now
+  appends a non-blocking `WARNING` when that approved design omits or deviates from the suggestion,
+  pointing the operator to re-align the design, `/dismiss constraint <id>`, or
+  `/approve constraint <id>`. Suggested-only conflicts do not revoke approval; HARD writes keep the
+  existing revoke/revalidation behavior.
+- **Field-level constraint provenance** (#1379, #1382): typed constraint provenance is now tracked
+  per category via `source_language` / `source_network` with legacy doc-level `source` fallback.
+  Readers split HARD and SUGGESTED values per category, `/dismiss` and `/approve` stamp only the
+  requested typed fields (or every present field for `all`), `/approve constraint <cat>` re-arms a
+  dismissed category as HARD, and `record_constraints` allows suggested captures in a different
+  category without silently promoting them. `/dismiss constraint all` is a deliberate operator-only
+  reset that dismisses every present typed category, including HARD ones; the model cannot invoke it.
+- **Constraint approval clears stale realignment forks and truthful suggested-floor copy** (#1383,
+  #1384): with conflict detection on, `/approve design` now resolves a pending same-category
+  constraint fork when the current recorded design has been realigned to satisfy the HARD typed
+  floor, while still refusing when the design continues to conflict. Suggested typed constraint
+  steering/tool copy now describes detect-on behavior as gating/protective and detect-off behavior
+  as advisory-only.
+- **Constraint exception handling is explicit when conflict detection is enabled** (#1380, #1381):
+  unresolved suggested-constraint soft-check failures now refuse `/approve design` fail-closed instead
+  of silently approving, and approved-design revalidation probe failures now surface a non-fatal
+  `WARNING` so promotion and `/fork decide counter` writes remain durable while operators are told to
+  re-check manually. Conflict detection off remains byte-identical.
+- **Docs: corrected a stale comment that referenced a non-existent `GX10_DESIGN_GATE` env override** (#1347): the design gate is config-only (`design_gate.enabled`); `_env_overrides()` has no such mapping.
+- **Gate config flags use strict boolean coercion** (#1346): `design_gate.enabled` and
+  `advance_gate.enabled` (plus the same-pattern `*.enabled` / `automation.decoupled` config flags) now go
+  through `_as_bool` instead of bare `bool(...)`. A string config value such as `"false"`, `"0"`, or
+  `"garbage"` no longer wrongly enables a gate (`bool("false")` is `True` in Python); only JSON `true` or
+  an explicit case-insensitive true string (`"true"` / `"1"` / `"yes"` / `"on"`) turns a flag on. Fail-soft
+  try/except → False is unchanged.
+- **Designs are persisted immediately after research** (#1335): the orchestrator prompt now makes
+  `record_design` the mandatory next action after a research or `web_search` phase, and the authoritative
+  no-design steering state tells the model to call the tool immediately instead of returning a prose-only
+  proposal that cannot arm the gate or be approved.
+- **Recorded designs remain proposals until operator approval** (#1336): `record_design` now writes the
+  canonical `decisions/design.md` as `type: proposal` with `approved: false`; `/approve` atomically promotes
+  it to `type: decision` and `approved: true`. The gate remains fail-closed on `approved`, so legacy
+  unapproved decisions stay pending and self-correct on the next record or approval without a destructive
+  migration pass. The refusal now directs operators only to `/approve`, preventing a manual flag edit from
+  leaving inconsistent frontmatter.
+- **Forced task creation never duplicates an exact title** (#1330): `force=true` now bypasses only fuzzy
+  topic matching; exact normalized-title matches remain fail-closed and direct handovers back to the existing
+  task ID instead of suggesting force.
+- **Coder handovers identify the configured code root** (#1328): when `paths.code_subdir` is active, the
+  engine now injects an idempotent handover note that tells the coder its working directory is already the
+  code root, preventing an extra subdirectory prefix from producing `src/src`-style source trees.
+- **Orchestrator task-type vocabulary matches the ACK contract** (#1329): the planning and handover
+  prompt now uses `optimization` for performance work and labels scaffolding as `implementation`, while a
+  parity test prevents prompt task-type values from drifting beyond `ack.case_spec.TaskType` again.
+- **Guided mode recommends the launch instead of auto-starting the coder** (#1327): the orchestrator
+  system prompt instructed the model to call `launch_coder` itself in guided mode (`/auto off`),
+  contradicting the documented `off = guided mode: engine recommends, operator drives` semantics (already
+  reflected in the status matrix). Guided mode now STOPs after staging the handover and recommends the
+  launch to the operator, calling `launch_coder` only on explicit operator instruction; `/auto on`
+  (the harness launches) is unchanged and `launch_coder` stays an operator-triggerable tool.
+- **`review` config-default never self-reviews when a peer exists** (#1221): `_pick_reviewer` applied
+  anti-affinity only after the config `review.agent` short-circuit, so a config equal to the producer pin
+  could return a self-review while a peer was runnable. Config-default / no-arg now prefers a runnable
+  peer in that case (SOFT waive only when the producer is sole runnable); an explicit `agent` arg stays
+  honored. The tool's model-facing `agent` enum is also LIVE from `_code_agent_registry()` (via
+  `_tools_with_agent_enum`), not hard-coded OPUS/SONNET.
+- **Docs: Memory MCP launch semantics.** The Memory MCP docs and server/client comments now reflect the
+  #994-S10 always-on semantics when a memory service is configured and the agent ships an `mcp_template`,
+  instead of the retired sealed-gating claim.
+- **Coder logs are live and abort-survivable.** The server-side `_do_launch` path now captures coder stdout
+  through a line-drained pipe and a write-through logfile reader instead of handing the child a block-buffered
+  file handle, so `<task>_<agent>.log` can be tailed during the run and retains flushed partial output after
+  a kill, timeout, crash, or interrupt. The parent decodes stdout as UTF-8 with replacement characters, so
+  invalid bytes cannot kill the drainer and wedge the child behind a full pipe. Follow-up scope:
+  `claude --print` is still the current log contract; switching to `--output-format stream-json` is a
+  separate format and feedback-parser change.
+- **ACK gx10 test isolation no longer leaks config/runtime state.** The autouse fixture now snapshots the
+  gx10 engine globals rebounded by `_apply_config`, restores mutable registries between tests, and keeps ACE
+  lifecycle globals out of the snapshot path so live workers are stopped and hard-cleared, preventing
+  order-dependent #1298 pollution.
+- **Watcher automation now hangs off `/auto`.** The feedback watcher defaults OFF at boot, `/auto on` enables
+  it with autopilot and continuation, and `/auto off` disables it again. The old `/watcher on|off` command is
+  kept only as a compatibility alias for the same `/auto` paths, so `/health` no longer reports
+  `watcher:true` before autonomous mode is armed.
+- **The orchestrator's own file/command tools now run in the active project.** With a client offering local
+  tools (`code_locality=mount`), the orchestrator's bridged `read_file`/`write_file`/`execute_command`/… ran
+  in the client's frozen startup directory (the boot workdir), not the active project — so after an in-session
+  project switch the agent's own tools targeted the wrong tree. And `edit_file` (the one code-tool that ran
+  server-side) resolved the same relative path to a different file, so it could report `OK: edited` without
+  the change landing. The server now ships the active project's exec cwd in each tool-bridge frame; both
+  clients run the tool there (falling back to their own directory when that path is absent — remote / older
+  engine); and `edit_file` refuses a no-op edit (`old_string == new_string` / already applied) instead of a
+  false success.
+- **Handover body names the right coder.** The frontmatter `to:` (the resolved agent, and the handover
+  filename) is authoritative, but the model authors the free-form body Meta block and could name a
+  different agent there (e.g. `Recipient: CODEX` on a Sonnet handover) — confusing for the coder that
+  reads it. The engine now rewrites the body `Recipient:` line to the resolved agent, so the body agrees
+  with the frontmatter.
+- **Decomposed units now carry their build order.** The engine already selects units in dependency order
+  (a unit runs only once its `dependencies` are done, priority breaking ties among ready units), but a
+  small orchestrator model tended to leave `dependencies` empty — so `plan_units` produced a plan the
+  selector ordered by priority, mis-ordering the build (e.g. a module before its scaffolding). The
+  decomposition prompt now guides declaring the real build-order edges (`unit:<n>` — scaffolding before
+  modules, a module after the models/utils it imports, tests after the code), and `plan_units` appends a
+  steering note when a multi-unit plan declares no dependencies at all.
+- **No more double-driving the coder under `/auto`.** With autonomous mode on, the loop launches staged
+  handovers itself (the client polls `/pending`), yet `plan_units` still told the orchestrator to author the
+  first unit's handover — and the orchestrator would also call `launch_coder`, a second launcher racing the
+  loop for the single coder slot (a confusing `BUSY` collision + a contradictory "already running" message).
+  `launch_coder` now **defers with a clear no-op when `/auto` owns launching** (it launches only in guided
+  mode, `/auto` off), and the `plan_units` armed-automation prompt tells the orchestrator explicitly not to
+  call `launch_coder`.
+- **Coder project isolation on the local/desktop topology.** A code-agent launched by the client (the
+  `/pending` poll behind `/work` and `/auto`) ran in the client's static startup working directory, so
+  after an in-session project switch a coder could build one project's code into another project's tree —
+  the client never re-synced its working directory to the active project. The server now ships the active
+  project's execution root (its exec cwd = `<project-root>/<code_subdir>`) in each `/pending` item, and the
+  client launches the coder THERE; the agent scratch (handover in / feedback out) stays client-local via
+  absolute paths, so the feedback round-trip is independent of the coder's working directory. Falls back to
+  the client's own directory when the server ships no cwd (older engine) — byte-identical.
+- **Autonomous coder can now run the tests it writes.** The headless code-agent launched by the client ran
+  with `--permission-mode acceptEdits`, which auto-accepts file edits but **not** commands — so in a
+  non-interactive `--print` run every `python`/`pytest` invocation was silently denied and the coder could
+  never self-verify. The coder default is now `bypassPermissions` (parity with the server-side autopilot
+  launch, which already uses `--dangerously-skip-permissions`), so the full write-and-run-the-test loop
+  works out of the box. Set `GX10_CLAUDE_PERMISSION_MODE=acceptEdits` to restrict a coder to edits only.
+
 ## [0.0.27]
 ### Added
 - **Design-driven autonomous continuation — an approved design now drains to done end-to-end.** Previously a
@@ -179,7 +485,7 @@ Released versions are listed below.
 - **Design→implementation approval gate — no blind coding** (#1227): the orchestrator can no longer jump from
   an analysis straight to a coding handover. `record_design` persists the design as a `decisions/` doc
   (`stage: design`, `approved: false`); the engine then **refuses an implementation `stage_handover`** until
-  the operator approves it via **`/approve`** (or `approved: true` in the design doc) — a fail-closed pre-code
+  the operator approves it via **`/approve`** — a fail-closed pre-code
   gate (`force` does not bypass it) — opt-in via `design_gate.enabled` (default off; byte-identical when off, DEV-1 enables it). Design/analysis/documentation handovers are unaffected. The per-turn
   steering-state block surfaces the gate state so the model knows why a handover would be refused.
 - **`launch_coder` — the orchestrator starts a staged handover on demand** (#1226): the model is the single

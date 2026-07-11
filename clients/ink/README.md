@@ -90,7 +90,7 @@ Secret-free: no private host/IP lives in the package — the config file sits on
 | `tunnelCmd` / `GX10_TUNNEL_CMD`       | client-managed tunnel for the `sealed` profile     | _(none)_                 |
 | `srcDir` / `GX10_SRC`                  | repo root for `/update` (rebuild from source)      | _(none)_                 |
 | `claudeEffort` / `GX10_CLAUDE_EFFORT` | code-agent reasoning effort                        | `high`                   |
-| `claudePermissionMode` / `GX10_CLAUDE_PERMISSION_MODE` | code-agent permission mode        | `acceptEdits`            |
+| `claudePermissionMode` / `GX10_CLAUDE_PERMISSION_MODE` | code-agent permission mode (default lets the coder run its own tests) | `bypassPermissions`      |
 
 Env-only: `GX10_STATE` overrides the per-project session-state file path; `GX10_RESUME` /
 `GX10_NO_RESUME` opt into / force off session resume (`NO_RESUME` wins).

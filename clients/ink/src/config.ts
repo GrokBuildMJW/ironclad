@@ -83,7 +83,7 @@ export function loadConfig(): Config {
     tunnelCmd: opt('GX10_TUNNEL_CMD', f.tunnelCmd),
     claudeBin: str('GX10_CLAUDE_BIN', f.claudeBin, 'claude'),
     claudeEffort: str('GX10_CLAUDE_EFFORT', f.claudeEffort, 'high'),
-    claudePermissionMode: str('GX10_CLAUDE_PERMISSION_MODE', f.claudePermissionMode, 'acceptEdits'),
+    claudePermissionMode: str('GX10_CLAUDE_PERMISSION_MODE', f.claudePermissionMode, 'bypassPermissions'),
     agentCmd: str(
       'GX10_AGENT_CMD',
       f.agentCmd,

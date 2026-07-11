@@ -68,16 +68,33 @@ def test_missing_required_fields_rejected(store):
 
 def test_same_topic_duplicate_guarded(store):
     store.create(dict(VALID))
-    with pytest.raises(gx10.DuplicateTaskError):
+    with pytest.raises(gx10.DuplicateTaskError) as exc_info:
         store.create({**VALID, "title": "Add rate limiting to the API",
                       "description": "Throttle the public API per client, per key."})
+    assert exc_info.value.exact is False
 
 
-def test_force_overrides_duplicate(store):
+def test_force_overrides_fuzzy_duplicate(store):
     store.create(dict(VALID))
-    forced = store.create(dict(VALID), force=True)   # same topic, but forced
+    forced = store.create({**VALID, "title": "Add rate limiting to the API",
+                           "description": "Throttle the public API per client, per key."},
+                          force=True)
     assert forced["status"] == "pending"
     assert len(store.list("pending")) == 2
+
+
+def test_force_does_not_override_exact_title_duplicate(store):
+    existing = store.create(dict(VALID))
+    with pytest.raises(gx10.DuplicateTaskError) as unforced:
+        store.create(dict(VALID))
+    assert unforced.value.existing_id == existing["id"]
+    assert unforced.value.exact is True
+
+    with pytest.raises(gx10.DuplicateTaskError) as forced:
+        store.create(dict(VALID), force=True)
+    assert forced.value.existing_id == existing["id"]
+    assert forced.value.exact is True
+    assert [task["id"] for task in store.list("pending")] == [existing["id"]]
 
 
 def test_unknown_id_get_is_none(store):

@@ -163,33 +163,42 @@ export class Pool {
 /** The run signal reported back to the server (#455 / INK-HANDOVER-2): exit code + a stderr tail so a
  *  budget/quota-exhausted run is classified `agent-unavailable` (trip the breaker + fail over) instead
  *  of retrying the same agent forever. `enoent` ⇒ the binary was missing (exit_code null). */
-type SpawnResult = {enoent: true} | {rc: number | null; stderr: string};
+type SpawnResult = {enoent: true} | {rc: number | null; stdout: string; stderr: string};
 
-/** Spawn the code-agent; capture stderr (and surface it) so the run signal can be reported. */
+/** Spawn the code-agent; capture stdout/stderr so output stays under the Ink renderer's control. */
 function spawnAgent(argv: string[], codedir: string, env: NodeJS.ProcessEnv): Promise<SpawnResult> {
   return new Promise((resolve) => {
     let done = false;
-    let stderr = '';
+    const outChunks: Buffer[] = [];
+    const errChunks: Buffer[] = [];
     const fin = (r: SpawnResult): void => {
       if (!done) {
         done = true;
         resolve(r);
       }
     };
-    // stdout inherits (the agent's progress shows live); stderr is PIPED so we can both surface it and
-    // report a tail to the server (≙ client.py subprocess.run(..., stderr=PIPE)).
+    // stdout/stderr are piped so a local code-agent cannot write directly into the Ink-owned terminal.
     const child = spawn(argv[0] as string, argv.slice(1), {
       cwd: codedir,
-      stdio: ['ignore', 'inherit', 'pipe'],
+      stdio: ['ignore', 'pipe', 'pipe'],
       env,
     });
-    child.stderr?.on('data', (d: Buffer) => {
-      stderr += d.toString();
+    child.stdout?.on('data', (d: Buffer) => {
+      outChunks.push(d);
     });
-    child.on('error', (e) =>
-      fin((e as NodeJS.ErrnoException).code === 'ENOENT' ? {enoent: true} : {rc: 1, stderr}),
-    );
-    child.on('close', (code) => fin({rc: code, stderr}));
+    child.stderr?.on('data', (d: Buffer) => {
+      errChunks.push(d);
+    });
+    child.on('error', (e) => {
+      const stdout = Buffer.concat(outChunks).toString('utf-8');
+      const stderr = Buffer.concat(errChunks).toString('utf-8');
+      fin((e as NodeJS.ErrnoException).code === 'ENOENT' ? {enoent: true} : {rc: 1, stdout, stderr});
+    });
+    child.on('close', (code) => {
+      const stdout = Buffer.concat(outChunks).toString('utf-8');
+      const stderr = Buffer.concat(errChunks).toString('utf-8');
+      fin({rc: code, stdout, stderr});
+    });
   });
 }
 
@@ -213,32 +222,35 @@ export async function runHandover(
   const hoName = str(item['handover_file']) || `${tid}_${agent}.md`;
   const hoText = str(item['handover']);
 
-  // Local agent scratch is kept OUT of the project root: a hidden .ironclad/agent/ drop zone
-  // (the handover round-trip is HTTP-mediated, so this path is independent of the server's initiative).
+  // Local agent scratch is kept OUT of the product tree: a hidden .ironclad/agent/ drop zone under the
+  // client's codedir (the handover round-trip is HTTP-mediated, independent of the server's initiative).
   const hoDir = path.join(codedir, '.ironclad', 'agent', 'handovers');
   await fs.mkdir(hoDir, {recursive: true});
-  await fs.writeFile(path.join(hoDir, hoName), hoText, 'utf-8');
+  const hoPath = path.join(hoDir, hoName);
+  await fs.writeFile(hoPath, hoText, 'utf-8');
 
   const spec = resolveLaunch(item, cfg); // INK-HANDOVER-1 (#503): bin/template/model/effort/permission/mcp
   const fbName = `${tid}_${agent}-feedback.md`;
   const capName = `${tid}_${agent}-output.md`; // #443: deterministic {feedback} capture path
-  const prompt =
-    `Autonomously read and complete the handover at .ironclad/agent/handovers/${hoName}. ` +
-    `Follow any agent guide in this repo (e.g. AGENTS.md / CLAUDE.md). When done, write a ` +
-    `short result summary to .ironclad/agent/feedback/${fbName}.`;
-
-  const argv = buildAgentArgv(spec.template, {
-    bin: spec.bin,
-    model: spec.model,
-    effort: spec.effort,
-    permission: spec.permission,
-    prompt,
-    feedback: `.ironclad/agent/feedback/${capName}`, // relative to codedir (the agent's cwd)
-    mcp: spec.mcp,
-  });
+  // #1307: BUILD PRODUCT CODE in the active project's code root — the server ships it per `/pending`
+  // item (`cwd` = the engine's exec cwd for the active project = <project-root>/<code_subdir>). Honour it
+  // ONLY when it is a real directory on THIS host: in a remote/sealed topology the client does not share
+  // the server's filesystem, so that absolute path won't exist — fall back to the client's own `codedir`
+  // (today's behaviour, byte-identical for that topology), as we also do when no `cwd` is shipped (older
+  // engine). This closes the isolation escape where a coder launched after an in-session `/switch` spawned
+  // in the client's stale startup `codedir` and wrote one project's code into another project's tree.
+  const shippedCwd = str(item['cwd']);
+  let launchCwd = codedir;
+  if (shippedCwd) {
+    try {
+      if ((await fs.stat(shippedCwd)).isDirectory()) launchCwd = shippedCwd;
+    } catch {
+      /* shipped cwd not present on this host (remote/sealed) → keep codedir */
+    }
+  }
 
   // #443 (review F-1): unlink BOTH result paths before launching so a stale file from a prior failed
-  // attempt can never be read as THIS run's result (the codedir persists across re-runs).
+  // attempt can never be read as THIS run's result (the scratch dir persists across re-runs).
   const fbDir = path.join(codedir, '.ironclad', 'agent', 'feedback');
   await fs.mkdir(fbDir, {recursive: true});
   const fbPath = path.join(fbDir, fbName);
@@ -246,16 +258,50 @@ export async function runHandover(
   await fs.rm(fbPath, {force: true});
   await fs.rm(capPath, {force: true});
 
-  log(`  → code-agent (local): ${tid} (${agent}, ${spec.model}, effort=${spec.effort})  cwd=${codedir}`);
+  // #1307: the coder's scratch stays under `codedir` but the launch cwd is the project code root, so the
+  // handover-in / feedback-out paths handed to the coder are ABSOLUTE — resolved independently of its cwd,
+  // and the client reads the feedback back from the same place regardless of where the product tree lives.
+  const prompt =
+    `Autonomously read and complete the handover at ${hoPath}. ` +
+    `Follow any agent guide in this repo (e.g. AGENTS.md / CLAUDE.md). When done, write a ` +
+    `short result summary to ${fbPath}.`;
+
+  const argv = buildAgentArgv(spec.template, {
+    bin: spec.bin,
+    model: spec.model,
+    effort: spec.effort,
+    permission: spec.permission,
+    prompt,
+    feedback: capPath, // #443 capture; absolute so it is independent of the coder's cwd (#1307)
+    mcp: spec.mcp,
+  });
+
+  log(`  → code-agent (local): ${tid} (${agent}, ${spec.model}, effort=${spec.effort})  cwd=${launchCwd}`);
   // #480: the spawned MCP inherits the memory connection from the agent's env — it travels here, NEVER
   // on the MCP JSON-RPC wire (secret-free). Empty mcp_env under open/token ⇒ byte-identical launch.
   const env: NodeJS.ProcessEnv = {...process.env, PYTHONIOENCODING: 'utf-8', ...spec.mcpEnv};
-  const res = await spawnAgent(argv, codedir, env);
+  const res = await spawnAgent(argv, launchCwd, env);
   if ('enoent' in res) {
     log(`  ✗ code-agent binary '${argv[0] ?? spec.bin}' not found (set GX10_CLAUDE_BIN / GX10_AGENT_CMD) — handover ${tid} skipped`);
     return {fb: null, meta: {exit_code: null, stderr: 'binary-not-found'}};
   }
-  if (res.stderr.trim()) log(res.stderr.replace(/\s+$/, '')); // keep the agent's stderr visible
+  const logDir = path.join(codedir, '.ironclad', 'agent', 'logs');
+  const logPath = path.join(logDir, `${tid}_${agent}.log`);
+  try {
+    await fs.mkdir(logDir, {recursive: true});
+    await fs.writeFile(
+      logPath,
+      `# ${tid} ${agent} (exit ${res.rc})\n\n## stdout\n${res.stdout}\n\n## stderr\n${res.stderr}\n`,
+      'utf-8',
+    );
+  } catch {
+    /* fail-soft — the handover result path is more important than diagnostic logging */
+  }
+  if (res.stderr.trim()) {
+    log(`  ⓘ ${agent} stderr (${res.stderr.length} chars) -> ${logPath}`);
+    const tail = res.stderr.trim().split(/\r?\n/).slice(-2).join(' | ').slice(-200);
+    if (tail) log(`     ${tail}`);
+  }
   const meta = {exit_code: res.rc, stderr: res.stderr.slice(-STDERR_TAIL_CHARS)};
 
   try {
@@ -272,6 +318,10 @@ export async function runHandover(
     }
   } catch {
     /* no capture either */
+  }
+  if (res.stdout.trim()) {
+    log(`  ⓘ no feedback file — captured ${res.stdout.length} chars from stdout`);
+    return {fb: res.stdout, meta};
   }
   log(`  ⚠ agent exited (exit ${res.rc}) without a feedback file ${fbName} or a captured message`);
   return {fb: null, meta};
@@ -290,6 +340,7 @@ async function cleanupAgentScratch(codedir: string, item: Item): Promise<void> {
     path.join(base, 'handovers', hoName),
     path.join(base, 'feedback', `${tid}_${agent}-feedback.md`),
     path.join(base, 'feedback', `${tid}_${agent}-output.md`),
+    path.join(base, 'logs', `${tid}_${agent}.log`),
   ]) {
     try {
       await fs.rm(p, {force: true});

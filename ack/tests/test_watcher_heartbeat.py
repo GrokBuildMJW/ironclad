@@ -133,7 +133,9 @@ def test_autopilot_double_message_only_when_coupled(monkeypatch, tmp_path):
     prints.clear()
     monkeypatch.setattr(gx10, "AUTOMATION_DECOUPLED", False)
     gx10._dispatch(None, "autopilot on")
-    assert "watcher on" in " ".join(prints)             # coupled → the hint is still shown (byte-identical)
+    text = " ".join(prints)
+    assert "/auto on" in text                           # coupled → the hint points at the meta-switch
+    assert "watcher on" not in text
 
 
 # ── Slice B: detect-progress heartbeat ────────────────────────────────────────

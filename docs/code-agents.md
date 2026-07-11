@@ -15,7 +15,7 @@ One env var, `GX10_AGENT_CMD`, is the command template. Placeholders:
 | `{bin}` | the binary (also settable via `GX10_CLAUDE_BIN`) |
 | `{model}` | the model the orchestrator picked for the task |
 | `{effort}` | the effort level (`GX10_CLAUDE_EFFORT`, default `high`) |
-| `{permission}` | the permission mode (`GX10_CLAUDE_PERMISSION_MODE`, default `acceptEdits`) |
+| `{permission}` | the permission mode (`GX10_CLAUDE_PERMISSION_MODE`, default `bypassPermissions` so the coder can run the tests it writes) |
 | `{prompt}` | the instruction (stays a **single argument**, even with spaces) |
 | `{feedback}` | a result-capture path — a CLI that writes its final message to a file (e.g. Codex `-o {feedback}`) gets a deterministic fallback if it skips the feedback file (point 4); optional |
 
@@ -45,7 +45,7 @@ implementation), declare them in the **code-agent registry** — a config block,
     { "provider_id": "claude-opus",  "kind": "cli", "agent_id": "OPUS",
       "model": "claude-opus-4-8",  "bin": "claude", "display": "Claude Opus 4.8",
       "cmd_template": "{bin} --model {model} --effort {effort} --permission-mode {permission} --print {prompt}",
-      "effort": "xhigh", "permission_mode": "acceptEdits" },
+      "effort": "xhigh", "permission_mode": "bypassPermissions" },
     { "provider_id": "codex", "kind": "cli", "agent_id": "CODEX", "model": "gpt-5.5", "bin": "codex",
       "cmd_template": "{bin} exec -m {model} -s workspace-write -c 'approval_policy=\"never\"' --skip-git-repo-check -o {feedback} {prompt}" }
   ]
@@ -98,13 +98,21 @@ implementation), declare them in the **code-agent registry** — a config block,
   (by mtime) is used, for a CLI installed under a **rotating/hashed launcher path**. Env vars (`%VAR%` /
   `$VAR`) and `~` in `bin_glob` are expanded. Keep the concrete install path in your own `conf/` (it is a
   deployment detail, not part of the core mechanism); see the verified Codex example below for the shape.
+- **Model validation (advisory, opt-in).** A code-agent may declare `models_probe` (arguments appended to
+  the resolved CLI binary to list advertised models) and optional `models_pattern` (regex for extracting
+  model ids for display). At boot the server runs the probe best-effort, warns when the configured `model`
+  is not advertised, and caches the result; a later launch of that exact mismatching model is refused with
+  a named board-visible error instead of spawning a coder that stalls silently. CLIs without a stable
+  models-list subcommand simply omit `models_probe`, which keeps validation off and preserves the launch
+  path. Failed or empty coder runs are also surfaced on the board as `⚠ ERRORED` or `⚠ UNAVAILABLE` with
+  captured stderr in both the local lane and the client `/feedback` lane.
 - **Read-only Memory MCP (`mcp_template`, #480).** An MCP-capable CLI can LIVE-query the project memory
   during a handover. Put a `{mcp}` placeholder in the agent's `cmd_template` and an `mcp_template` (the
   per-CLI MCP config — Claude `--mcp-config <json>`, Codex `-c mcp_servers.*`; the `{mcp_cmd}`/`{mcp_script}`
-  tokens render to the python invocation of `memory_mcp.py`). The MCP is injected **only under the `sealed`
-  trust profile** and when a memory service is configured — otherwise `{mcp}` is empty and the launch is
-  unchanged. The connection is passed via the spawned process's env (secret-free, never on the MCP wire),
-  and the read is **read-only**, scoped to the project memory namespace.
+  tokens render to the python invocation of `memory_mcp.py`). The MCP is injected whenever a memory service
+  is configured and the agent ships an `mcp_template`, regardless of trust profile — otherwise `{mcp}` is
+  empty and the launch is unchanged. The connection is passed via the spawned process's env (secret-free,
+  never on the MCP wire), and the read is **read-only**, scoped to the project memory namespace.
 
 **Precedence.** Per field the client resolves: an **explicit client-side `GX10_AGENT_CMD` /
 `GX10_CLAUDE_BIN`** (the single-agent BYO override below) **wins**, else the **server-resolved registry
@@ -181,11 +189,13 @@ template — the orchestrator's model hint is then ignored and the CLI uses its 
 
 ## Notes
 
-- **Permissions / autonomy.** A headless agent can't stop to ask. For the full
-  *write-and-run-the-test* loop the agent must be allowed to run commands — for Claude
-  Code that's `GX10_CLAUDE_PERMISSION_MODE=bypassPermissions`; other CLIs have their own
-  auto-approve flag. Understand it before enabling: it runs commands on your machine,
-  against your code. See [`self-maintenance.md`](self-maintenance.md).
+- **Permissions / autonomy.** A headless agent can't stop to ask, and a real handover
+  implies running the tests it writes — so the coder **defaults to `bypassPermissions`**
+  (parity with the server-side autopilot launch, which uses `--dangerously-skip-permissions`).
+  This runs commands on your machine, against your code; set
+  `GX10_CLAUDE_PERMISSION_MODE=acceptEdits` for an edits-only coder (no commands, so it
+  cannot self-run tests), and other CLIs have their own auto-approve flag. See
+  [`self-maintenance.md`](self-maintenance.md).
 - **Concurrency.** `GX10_MAX_AGENTS` bounds how many run at once (default 3).
 - **Quick check.** Set `GX10_AGENT_CMD`, start a small handover, and confirm the agent
   writes `.ironclad/agent/feedback/<ID>_<AGENT>-feedback.md`. If it doesn't, the CLI either

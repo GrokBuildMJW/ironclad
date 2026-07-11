@@ -106,7 +106,7 @@ export function shellGuard(command: string): string | null {
 // the caller needs the exit code to gate the #1193 listing-count prepend on real success.
 type ExecResult = {text: string; code: number | null};
 
-function execCommand(command: string, timeoutS: number): Promise<ExecResult> {
+function execCommand(command: string, timeoutS: number, cwd: string): Promise<ExecResult> {
   return new Promise((resolve) => {
     let child;
     if (process.platform === 'win32') {
@@ -115,10 +115,10 @@ function execCommand(command: string, timeoutS: number): Promise<ExecResult> {
       const bash = gitBash();
       child =
         bash && detectShell(command) === 'bash'
-          ? spawn(bash, ['-lc', command], {stdio: ['ignore', 'pipe', 'pipe']})
-          : spawn('powershell', winPowershellArgs(command), {stdio: ['ignore', 'pipe', 'pipe']});
+          ? spawn(bash, ['-lc', command], {cwd, stdio: ['ignore', 'pipe', 'pipe']})
+          : spawn('powershell', winPowershellArgs(command), {cwd, stdio: ['ignore', 'pipe', 'pipe']});
     } else {
-      child = spawn(command, {shell: true, stdio: ['ignore', 'pipe', 'pipe']});
+      child = spawn(command, {shell: true, cwd, stdio: ['ignore', 'pipe', 'pipe']});
     }
     const out: Buffer[] = [];
     const err: Buffer[] = [];
@@ -209,11 +209,32 @@ function rangedRead(text: string, args: Args): string | null {
 }
 
 // ── dispatch ─────────────────────────────────────────────────────────────────
-export async function runTool(name: string, args: Args): Promise<string> {
+export async function runTool(name: string, args: Args, baseCwd?: string): Promise<string> {
+  // #1317: run the bridged tool in the server-shipped active-project cwd (`baseCwd`) when it exists on THIS
+  // host (code_locality=mount); otherwise the client's own process.cwd() (remote/sealed / an older engine
+  // that ships no cwd) — byte-identical fallback. Every relative path arg + execute_command resolves
+  // against `base`, so bridged tools target the active project instead of the frozen startup codedir.
+  let base = process.cwd();
+  let override = false;
+  if (baseCwd) {
+    try {
+      if ((await fs.stat(baseCwd)).isDirectory()) {
+        base = baseCwd;
+        override = true;
+      }
+    } catch {
+      /* not present on this host → keep process.cwd() (byte-identical fallback) */
+    }
+  }
+  // R resolves a relative path arg against the shipped active-project cwd ONLY when one was shipped AND
+  // exists (the mount bridge case); with no override it is the IDENTITY, so every non-bridged caller — and
+  // the raw model-supplied path echoed in ERROR/OK strings — stays byte-identical. Callers keep the RAW
+  // arg for display and use R(arg) only for the actual fs operation target.
+  const R = (v: string): string => (override && !path.isAbsolute(v) ? path.resolve(base, v) : v);
   try {
     switch (name) {
       case 'read_file': {
-        const p = reqStr(args, 'path');
+        const p = R(reqStr(args, 'path'));
         let buf: Buffer;
         try {
           buf = await fs.readFile(p);
@@ -244,7 +265,7 @@ export async function runTool(name: string, args: Args): Promise<string> {
       }
 
       case 'write_file': {
-        const p = reqStr(args, 'path');
+        const p = R(reqStr(args, 'path'));
         const content = reqStr(args, 'content');
         await mkdirp(path.dirname(p));
         const tmp = path.join(path.dirname(p), path.basename(p) + '.tmp');
@@ -254,12 +275,13 @@ export async function runTool(name: string, args: Args): Promise<string> {
       }
 
       case 'list_directory': {
-        const raw = args['path'] === undefined ? '.' : String(args['path']);
+        const rawArg = args['path'] === undefined ? '.' : String(args['path']);
+        const raw = R(rawArg);                                   // resolved target for readdir/classify/stat
         let entries;
         try {
           entries = await fs.readdir(raw, {withFileTypes: true});
         } catch (e) {
-          if (errCode(e) === 'ENOENT') return `ERROR: Not found: ${pyPathStr(raw)}`;
+          if (errCode(e) === 'ENOENT') return `ERROR: Not found: ${pyPathStr(rawArg)}`;   // #1317: raw path, parity
           throw e;
         }
         const total = entries.length;
@@ -328,11 +350,11 @@ export async function runTool(name: string, args: Args): Promise<string> {
           if (t === null) throw new Error(`invalid timeout: ${JSON.stringify(args['timeout'])}`);
           timeoutS = t;
         }
-        let r = await execCommand(command, timeoutS);
+        let r = await execCommand(command, timeoutS, base);
         // #1196 ≙ gx10.py: BSD/macOS `ls` rejects the GNU-only `--color=always` (exit != 0), which would
         // drop the fs-computed header/Answer (gated on exit 0). Retry the LISTING without the colour flag.
         if (r.code !== 0 && command.includes('--color=always') && listingTargetForCommand(command) !== null) {
-          r = await execCommand(command.replace(/\s*--color=always\b/g, ''), timeoutS);
+          r = await execCommand(command.replace(/\s*--color=always\b/g, ''), timeoutS, base);
         }
         let out = r.text;
         // #1193/#1195 ≙ gx10.py: a successful simple listing is prepended with the deterministic
@@ -340,7 +362,7 @@ export async function runTool(name: string, args: Args): Promise<string> {
         // bridge does it itself. Only on exit 0 with real output (an ERROR/timeout/empty result gets none).
         if (r.code === 0 && out) {
           const target = listingTargetForCommand(command);
-          const names = target === null ? null : await directoryEntryNames(target);
+          const names = target === null ? null : await directoryEntryNames(R(target));
           if (names !== null) {
             // ONE snapshot feeds header AND answer data (no self-contradicting TOCTOU pair).
             // #1202: the machine AnswerData line is rendered into the localized ready-made `Answer:`
@@ -363,8 +385,8 @@ export async function runTool(name: string, args: Args): Promise<string> {
       }
 
       case 'move_file': {
-        const src = reqStr(args, 'source');
-        let dst = reqStr(args, 'destination');
+        const src = R(reqStr(args, 'source'));
+        let dst = R(reqStr(args, 'destination'));
         // ≙ shutil.move: destination an existing directory → move INTO it (dst/basename(src)).
         try {
           if ((await fs.stat(dst)).isDirectory()) dst = path.join(dst, path.basename(src));
@@ -390,13 +412,13 @@ export async function runTool(name: string, args: Args): Promise<string> {
       }
 
       case 'delete_file': {
-        await fs.unlink(reqStr(args, 'path'));
+        await fs.unlink(R(reqStr(args, 'path')));
         return `OK: Deleted ${args['path']}`;
       }
 
       case 'copy_file': {
-        const src = reqStr(args, 'source');
-        let dst = reqStr(args, 'destination');
+        const src = R(reqStr(args, 'source'));
+        let dst = R(reqStr(args, 'destination'));
         try {
           await fs.access(src);
         } catch {
@@ -421,7 +443,7 @@ export async function runTool(name: string, args: Args): Promise<string> {
 
       case 'search_files': {
         const raw = reqStr(args, 'pattern');
-        const directory = args['directory'] === undefined ? '.' : String(args['directory']);
+        const directory = R(args['directory'] === undefined ? '.' : String(args['directory']));
         const filePattern = args['file_pattern'] === undefined ? '*.md' : String(args['file_pattern']);
         let hit: (line: string) => boolean;
         try {
@@ -451,7 +473,7 @@ export async function runTool(name: string, args: Args): Promise<string> {
       }
 
       case 'create_directory': {
-        await fs.mkdir(reqStr(args, 'path'), {recursive: true});
+        await fs.mkdir(R(reqStr(args, 'path')), {recursive: true});
         return `OK: Created ${args['path']}`;
       }
 

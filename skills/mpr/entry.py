@@ -132,10 +132,14 @@ def _resolve_store(mod: Any) -> Any:
     return getattr(mod, "STORE", None)
 
 
-def _engine_deps() -> Deps:
+def _engine_deps(*, artifact_slug: Optional[str] = None) -> Deps:
     """Bind the real engine handles (Spec 04 §2 Weg 1) — lazy + fail-soft. Engine absent → minimal Deps
     (run_mpr then degrades to a clear ERROR string). Server-side glue; the orchestration is tested with
-    stubs, this binding is verified on deploy."""
+    stubs, this binding is verified on deploy.
+
+    #1340 (S4): optional *artifact_slug* routes ``runs_dir`` to that initiative's vault (not the drain-
+    time active). When ``None`` the binding is byte-identical to the active-initiative path.
+    """
     d = Deps()
     try:  # noqa: BLE001 — every binding step is best-effort
         import gx10  # engine module (server-side; core/engine on sys.path at runtime)
@@ -170,10 +174,27 @@ def _engine_deps() -> Deps:
         # (vault/<slug>/runs) instead of the WORKDIR root. Without an active initiative the config
         # default stays; mpr_research_run then gates the run fail-closed anyway, before anything is created.
         # getattr (fail-soft like the other bindings) — a minimal/old engine stub may not have the fn.
-        _arootsoft = getattr(gx10, "artifact_root_soft", None)
-        _vp = _arootsoft() if callable(_arootsoft) else None
-        if _vp is not None:
-            d.runs_dir = (_vp / "runs").as_posix()
+        # #1340: when *artifact_slug* is set (validated by the caller), bind runs_dir to THAT slug's vault
+        # so a fork worker never pollutes the drain-time active initiative (#16).
+        _slug = (artifact_slug or "").strip()
+        if _slug:
+            _vroot = getattr(gx10, "vault_root", None)
+            _root = _vroot() if callable(_vroot) else None
+            if _root is not None:
+                d.runs_dir = (Path(_root) / _slug / "runs").as_posix()
+            # Soft pollution only if TaskStore still routes via active_slug — skip indexing for a
+            # targeted slug run; the SSOT is the envelope + runs_dir (INDEX reconcile still fires).
+            d.index_runs = False
+            d.store = None
+        else:
+            _arootsoft = getattr(gx10, "artifact_root_soft", None)
+            _vp = _arootsoft() if callable(_arootsoft) else None
+            if _vp is not None:
+                d.runs_dir = (_vp / "runs").as_posix()
+            d.store = _resolve_store(gx10)
+            # #984: MPR is an embedded dev-process function (there is no reasoning-only project type any more),
+            # so an embedded run's manifest is always indexed in the active (software) initiative's TaskStore.
+            d.index_runs = True
         d.enabled = cfg.enabled                       # runtime active-gate (default ON; /config set mpr.enabled off to pause)
         d.pool = cfg.providers.pool
         d.routing = cfg.providers.routing.model_dump()
@@ -181,10 +202,6 @@ def _engine_deps() -> Deps:
         d.sovereignty = cfg.sovereignty.model_dump()
         d.reducer = getattr(gx10, "_reduce_worker_results", None)
         d.writer = getattr(gx10, "_atomic_write", None)
-        d.store = _resolve_store(gx10)
-        # #984: MPR is an embedded dev-process function (there is no reasoning-only project type any more),
-        # so an embedded run's manifest is always indexed in the active (software) initiative's TaskStore.
-        d.index_runs = True
         d.registry = get_registry(_MPR_ROOT)
         workers = getattr(gx10, "_WORKERS", None)
         if workers is not None and getattr(workers, "client", None) is not None:
@@ -214,26 +231,47 @@ def _engine_deps() -> Deps:
 
 
 def mpr_research_run(query: str, *, route_hint: str = "", domain_hint: str = "", mode_hint: str = "",
-                     files: Optional[List[str]] = None, audit_level: str = "") -> str:
+                     files: Optional[List[str]] = None, audit_level: str = "",
+                     artifact_slug: Optional[str] = None) -> str:
     """The public ``run`` (§4 signature → drives the tool schema via derive_tool_schema). Sync, never
-    raises. Binds the engine handles and delegates to run_mpr."""
+    raises. Binds the engine handles and delegates to run_mpr.
+
+    #1340 (S4 / #16): optional *artifact_slug* routes the run's ``runs_dir`` / gate / INDEX reconcile
+    to an existing initiative of the active project (validated; refuse if unknown). ``None`` keeps
+    today's active-initiative binding (byte-identical).
+    """
     # B3 fail-closed: an MPR run creates artifacts (runs/<id>/…) → requires an active initiative,
     # otherwise it would write into the project root. A clear note instead of writing to the root.
+    # #1340: when *artifact_slug* is provided, the gate checks THAT slug (not the drain-time active).
     _gx = None
+    _target_slug: Optional[str] = None
     try:
         import gx10 as _gx  # type: ignore
-        if _gx.artifact_root_soft() is None:
+        _want = (artifact_slug or "").strip() if artifact_slug is not None else ""
+        if artifact_slug is not None:
+            if not _want:
+                return ("ERROR: mpr_research: artifact_slug is empty — refuse. "
+                        "Pass a real initiative slug or omit the parameter.")
+            _exists = getattr(_gx, "initiative_exists", None)
+            if not (callable(_exists) and _exists(_want)):
+                return (f"ERROR: mpr_research: unknown initiative {_want!r} for artifact_slug — "
+                        "refuse (must be an existing unit of the active project).")
+            _target_slug = _want
+        elif _gx.artifact_root_soft() is None:
             return ("ERROR: mpr_research: no active initiative — the artifacts would have no home. "
                     "Run `/initiative new <name> --type mpr` (or `--type software`) first.")
     except Exception:  # noqa: BLE001 — no engine context (standalone) → normal run
         _gx = None
+        _target_slug = (artifact_slug or "").strip() or None
     out = run_mpr(query, route_hint=route_hint, domain_hint=domain_hint, mode_hint=mode_hint,
-                  files=files, audit_level=audit_level, deps=_engine_deps())
-    # C2: after a real run, keep the active initiative's INDEX.md fresh (fail-soft, index only;
-    # not on ERROR/decline/disabled — no artifact was created there).
+                  files=files, audit_level=audit_level,
+                  deps=_engine_deps(artifact_slug=_target_slug))
+    # C2: after a real run, keep the target initiative's INDEX.md fresh (fail-soft, index only;
+    # not on ERROR/decline/disabled — no artifact was created there). #1340: when artifact_slug is
+    # set, reconcile THAT slug — never the drain-time active.
     if _gx is not None and out and not out.startswith(("ERROR", "MPR declined", "MPR is disabled")):
         try:
-            _slug = _gx.active_slug()
+            _slug = _target_slug or _gx.active_slug()
             if _slug:
                 _gx.reconcile_vault(_slug, links=False)
         except Exception:  # noqa: BLE001

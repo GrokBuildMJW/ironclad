@@ -20,6 +20,7 @@ if str(_ENGINE) not in sys.path:
     sys.path.insert(0, str(_ENGINE))
 
 import gx10  # noqa: E402
+import providers  # noqa: E402
 
 _TASK = {"type": "feature", "priority": "high", "title": "wire", "description": "x"}
 
@@ -41,6 +42,8 @@ def _setup(monkeypatch, tmp_path, *, agent="OPUS", stage=True, frontmatter="---\
     gx10.STORE = None
     gx10._AUTOPILOT_ACTIVE = 0            # isolate from any prior test's slot accounting
     gx10._AUTOPILOT_PROCS.clear()
+    gx10._CODE_AGENT_BREAKER.clear()
+    gx10._MODEL_CHECK_CACHE.clear()
     monkeypatch.setattr(gx10, "_ui_print", lambda *a, **k: None)  # cp1252-safe (the _wait daemon prints)
     monkeypatch.chdir(tmp_path)
     gx10.initiative_new("Auto", "software")
@@ -68,6 +71,45 @@ def test_launch_coder_launches_staged_and_flips_in_progress(monkeypatch, tmp_pat
     assert out.startswith("OK:")
     assert len(popen) == 1                              # the coder was actually spawned
     assert gx10._store().get(tid)["status"] == "in_progress"
+
+
+def test_launch_coder_defers_to_auto_when_autopilot_owns_the_drive(monkeypatch, tmp_path):
+    # #1309: with /auto on (autopilot + watcher, the meta-switch state) the loop launches staged handovers
+    # itself — launch_coder must DEFER with a clear no-op instead of racing the loop for the single coder
+    # slot (the "BUSY" collision + the contradictory double message in the design-driven loop).
+    tid, popen = _setup(monkeypatch, tmp_path)
+    monkeypatch.setattr(gx10, "AUTOPILOT_ENABLED", True, raising=False)
+    monkeypatch.setattr(gx10, "_WATCHER_ENABLED", True, raising=False)   # /auto meta-switch → loop is live
+    out = _launch()
+    assert "/auto owns launching" in out and tid in out
+    assert len(popen) == 0                               # NOT launched here — the loop owns launching
+    assert gx10._store().get(tid)["status"] == "pending" # untouched (no premature in_progress flip)
+
+
+def test_launch_coder_still_launches_in_autopilot_only_mixed_state(monkeypatch, tmp_path):
+    # #1309 (Codex review): the low-level `autopilot on` ALONE (watcher off + automation.decoupled False)
+    # does NOT run the reconciler loop — nothing else launches — so launch_coder must NOT defer there, else
+    # the staged task strands forever. It still launches manually (the guided fallback).
+    tid, popen = _setup(monkeypatch, tmp_path)
+    monkeypatch.setattr(gx10, "AUTOPILOT_ENABLED", True, raising=False)
+    monkeypatch.setattr(gx10, "_WATCHER_ENABLED", False, raising=False)
+    monkeypatch.setattr(gx10, "AUTOMATION_DECOUPLED", False, raising=False)
+    out = _launch()
+    assert out.startswith("OK:") and "/auto owns launching" not in out
+    assert len(popen) == 1                               # launched manually — not stranded
+    assert gx10._store().get(tid)["status"] == "in_progress"
+
+
+def test_launch_coder_surfaces_unknown_agent_even_under_auto(monkeypatch, tmp_path):
+    # #1309 (Codex review): the /auto defer runs AFTER the fail-closed agent validation — an unknown/
+    # disabled staged agent must still surface as an ERROR, never be masked by a misleading "auto owns" OK
+    # (the reconciler skips unconfigured agents too, so the task would otherwise strand pending forever).
+    tid, popen = _setup(monkeypatch, tmp_path, agent="NOPE")     # staged for an unconfigured agent
+    monkeypatch.setattr(gx10, "AUTOPILOT_ENABLED", True, raising=False)
+    monkeypatch.setattr(gx10, "_WATCHER_ENABLED", True, raising=False)
+    out = _launch()
+    assert "ERROR" in out and "/auto owns launching" not in out
+    assert len(popen) == 0                                      # nothing launched; the config error surfaced
 
 
 def test_launch_coder_noop_when_nothing_staged(monkeypatch, tmp_path):
@@ -177,3 +219,124 @@ def test_launch_coder_error_when_spawn_fails(monkeypatch, tmp_path):
     assert out.startswith("ERROR")
     assert gx10._store().get(tid)["status"] == "pending"   # not flipped on a failed spawn
     assert gx10._autopilot_active() == before              # slot released
+
+
+def test_launch_coder_cached_model_mismatch_marks_blocked_without_spawn(monkeypatch, tmp_path):
+    tid, popen = _setup(monkeypatch, tmp_path)
+    gx10._MODEL_CHECK_CACHE["OPUS"] = providers.ModelCheck(
+        agent_id="OPUS",
+        configured="claude-opus-4-8",
+        ok=False,
+        available=["claude-opus-4.1"],
+        available_raw="claude-opus-4.1",
+    )
+    out = _launch(task_id=tid)
+    t = gx10._store().get(tid)
+    assert out.startswith("ERROR")
+    assert popen == []
+    assert t["status"] == "in_progress"
+    assert t["blocked_kind"] == "errored"
+    assert "not offered" in t["blocked_reason"]
+
+
+def test_launch_coder_empty_model_cache_keeps_launch_path(monkeypatch, tmp_path):
+    tid, popen = _setup(monkeypatch, tmp_path)
+    out = _launch(task_id=tid)
+    assert out.startswith("OK:")
+    assert len(popen) == 1
+
+
+def test_surface_coder_result_marks_failed_empty_run_blocked(monkeypatch, tmp_path):
+    tid, _popen = _setup(monkeypatch, tmp_path)
+    gx10._store().transition(tid, "in_progress")
+    log = tmp_path / "coder.log"
+    log.write_text("unknown model grok-build\n", encoding="utf-8")
+    gx10._surface_coder_result(tid, "OPUS", 1, log)
+    t = gx10._store().get(tid)
+    assert t["blocked_kind"] == "errored"
+    assert "coder exit 1" in t["blocked_reason"]
+    assert "unknown model" in t["blocked_reason"]
+
+
+def test_surface_coder_result_does_not_classify_merged_log_as_unavailable(monkeypatch, tmp_path):
+    tid, _popen = _setup(monkeypatch, tmp_path)
+    gx10._store().transition(tid, "in_progress")
+    monkeypatch.setattr(gx10, "_EFFECTIVE_CFG", gx10._code_defaults(), raising=False)
+    log = tmp_path / "coder.log"
+    log.write_text("normal stdout: rate limit and quota notes from the task\n", encoding="utf-8")
+    gx10._CODE_AGENT_BREAKER.clear()
+    gx10._surface_coder_result(tid, "OPUS", 1, log)
+    t = gx10._store().get(tid)
+    assert t["blocked_kind"] == "errored"
+    assert t["blocked_kind"] != "unavailable"
+    assert "coder exit 1" in t["blocked_reason"]
+    assert "rate limit and quota" in t["blocked_reason"]
+    assert not gx10._breaker_tripped("OPUS")
+
+
+def test_surface_coder_result_with_usable_feedback_is_not_blocked(monkeypatch, tmp_path):
+    tid, _popen = _setup(monkeypatch, tmp_path)
+    gx10._store().transition(tid, "in_progress")
+    (gx10.feedback_dir() / f"{tid}_OPUS-feedback.md").write_text("status: done\nok", encoding="utf-8")
+    gx10._surface_coder_result(tid, "OPUS", 0, tmp_path / "missing.log")
+    assert not gx10._store().get(tid).get("blocked")
+
+
+def test_validate_code_agent_models_populates_cache_and_returns_mismatch(monkeypatch, tmp_path):
+    _setup(monkeypatch, tmp_path, stage=False)
+    spec = providers.ProviderSpec(
+        provider_id="grok",
+        kind=providers.ProviderKind.CLI,
+        agent_id="GROK",
+        model="grok-build",
+        bin="grok",
+        models_probe="models",
+        cmd_template="{bin} -m {model} {prompt}",
+    )
+
+    class _Reg:
+        def names(self):
+            return ["GROK"]
+
+        def resolve(self, aid):
+            return spec
+
+    class _CP:
+        stdout = "grok-4.5\ngrok-composer-2.5-fast"
+        stderr = ""
+
+    monkeypatch.setattr(gx10, "_code_agent_registry", lambda: _Reg())
+    monkeypatch.setattr(providers, "resolve_agent_bin", lambda s: "grok")
+    monkeypatch.setattr(gx10.subprocess, "run", lambda *a, **k: _CP())
+    mismatches = gx10._validate_code_agent_models()
+    assert [m.agent_id for m in mismatches] == ["GROK"]
+    assert gx10._MODEL_CHECK_CACHE["GROK"].configured == "grok-build"
+
+
+def test_validate_code_agent_models_probe_failure_is_empty_fail_soft(monkeypatch, tmp_path):
+    _setup(monkeypatch, tmp_path, stage=False)
+    spec = providers.ProviderSpec(
+        provider_id="grok",
+        kind=providers.ProviderKind.CLI,
+        agent_id="GROK",
+        model="grok-build",
+        bin="grok",
+        models_probe="models",
+        cmd_template="{bin} -m {model} {prompt}",
+    )
+
+    class _Reg:
+        def names(self):
+            return ["GROK"]
+
+        def resolve(self, aid):
+            return spec
+
+    monkeypatch.setattr(gx10, "_code_agent_registry", lambda: _Reg())
+    monkeypatch.setattr(providers, "resolve_agent_bin", lambda s: "grok")
+
+    def _boom(*a, **k):
+        raise TimeoutError("hung")
+
+    monkeypatch.setattr(gx10.subprocess, "run", _boom)
+    assert gx10._validate_code_agent_models() == []

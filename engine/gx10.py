@@ -182,6 +182,8 @@ MAX_TOKENS       = 8192          # output (generation) token reserve. PERF-10: r
                                  # window; the token budget (#371/#372) reserves it accurately. Tunable —
                                  # generation.max_tokens / GX10_MAX_TOKENS: raise for longer single
                                  # outputs, lower for more context headroom (#379, default kept at 8192).
+FINALIZE_ON_TRUNCATION = False  # generation.finalize_on_truncation / GX10_FINALIZE_ON_TRUNCATION:
+                                 # opt-in salvage for a length-truncated reasoning-only answer.
 # #366: the SMALLEST output budget still worth proceeding with. The output reserve above is a CEILING,
 # not a fixed floor: when the full reserve would push the prompt over the window, `_preflight_context`
 # reserves LESS output — down to this minimum — so the turn proceeds LOSSLESSLY (all context kept, a
@@ -268,7 +270,7 @@ def _read_char_cap() -> int:
 #: but `search_files`/`list_directory`/`execute_command` do NOT, and the local-tool bridge returns before
 #: read_file's cap — so ALL of them are capped here. Deliberately NOT web_search/parallel_reason/MPR/memory:
 #: those return already-budgeted or structured JSON payloads a blind head+tail cap would corrupt.
-_INGESTION_TOOLS = frozenset({"read_file", "list_directory", "search_files", "execute_command", "fetch_url", "view_issue", "pr_status"})
+_INGESTION_TOOLS = frozenset({"read_file", "list_directory", "search_files", "execute_command", "fetch_url", "view_issue", "pr_status", "review"})
 _INGEST_MARKER_SLACK = 512   # a result read_file already capped (cap + its own marker) must pass through here
 
 
@@ -457,12 +459,96 @@ RETRY_BACKOFF    = 1.5           # OPT-4: wait time (s) before 1× retry on an A
 # retries = a silent multi-minute stall. Applied at EVERY OpenAI() construction (the agent client + the ACE
 # reflector; workers/MPR reuse the agent client). Tunable via connection.request_timeout_s / GX10_LLM_TIMEOUT_S.
 LLM_REQUEST_TIMEOUT_S = 120.0    # seconds per LLM request (connect+read); a slow LAN 35B first-token stays well under
+LLM_CONNECT_TIMEOUT_S: "Optional[float]" = None      # GX10_LLM_CONNECT_TIMEOUT_S / connection.connect_timeout_s
+LLM_FIRST_TOKEN_TIMEOUT_S: "Optional[float]" = None  # GX10_LLM_FIRST_TOKEN_TIMEOUT_S / connection.first_token_timeout_s
+# None is byte-identical: the OpenAI client still receives the single float LLM_REQUEST_TIMEOUT_S.
 LLM_MAX_RETRIES       = 1        # SDK client retries; kept low so it can't compound _make_completion's own retry
 # Guard 1 / S2 (#1132/epic #1130): per-turn IDLE watchdog. If a turn makes NO progress (no generation chunk, no
 # completed generation, no tool result) for this long it is aborted AND SURFACED ("⏱ TURN ABORTED — model
 # stalled"), never a silent indefinite hold of the agent lock. A backstop ABOVE the per-request LLM timeout,
 # reset on every progress signal so a slow-but-progressing deep turn (e.g. an MPR panel) is never killed. 0 ⇒ off.
 TURN_IDLE_TIMEOUT_S   = 240.0    # seconds of NO progress before a turn is declared stalled (GX10_TURN_IDLE_TIMEOUT_S)
+_REASONING_FINALIZE_NUDGE = (
+    "Your previous reply exhausted the token budget on reasoning and produced no answer. "
+    "Give your final answer now, directly and concisely, with NO further reasoning."
+)
+
+
+def _opt_float(v):
+    if v is None or (isinstance(v, str) and v.strip().lower() in ("", "auto", "none")):
+        return None
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _decoupled() -> bool:
+    return LLM_FIRST_TOKEN_TIMEOUT_S is not None and LLM_FIRST_TOKEN_TIMEOUT_S > 0
+
+
+def _is_timeout_error(e) -> bool:
+    try:
+        import httpx
+        if isinstance(e, httpx.TimeoutException):
+            return True
+    except Exception:
+        pass
+    try:
+        import openai
+        if isinstance(e, openai.APITimeoutError):
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _client_timeout():
+    if not _decoupled():
+        return LLM_REQUEST_TIMEOUT_S
+    import httpx
+    connect = LLM_CONNECT_TIMEOUT_S or LLM_REQUEST_TIMEOUT_S
+    return httpx.Timeout(connect=connect,
+                         read=LLM_FIRST_TOKEN_TIMEOUT_S,
+                         write=LLM_REQUEST_TIMEOUT_S,
+                         pool=LLM_REQUEST_TIMEOUT_S)
+
+
+def _idle_limit(first_token_seen: bool) -> float:
+    if _decoupled() and not first_token_seen:
+        # Backstop above the httpx read deadline so the named first-token
+        # timeout fires first, and pre-HTTP work cannot consume that budget.
+        return max(TURN_IDLE_TIMEOUT_S, float(LLM_FIRST_TOKEN_TIMEOUT_S) + TURN_IDLE_TIMEOUT_S)
+    return TURN_IDLE_TIMEOUT_S
+
+
+def _generation_error_outcome(stream: bool, err, first_token_seen: bool) -> Dict[str, Any]:
+    if stream and _decoupled() and _is_timeout_error(err) and not first_token_seen:
+        return {"kind": "error", "detail": f"first-token timeout after {float(LLM_FIRST_TOKEN_TIMEOUT_S):.0f}s (model still prefilling -- raise connection.first_token_timeout_s)"}
+    return {"kind": "error", "detail": f"API: {err}"}
+
+
+def _finalize_outcome(outcome: Dict[str, Any], watchdog_tripped: bool, first_token_seen: bool) -> Dict[str, Any]:
+    if watchdog_tripped and outcome.get("kind") != "error":
+        return {"kind": "stalled", "detail": f"no progress for {_idle_limit(first_token_seen):.0f}s"}
+    return outcome
+
+
+def _should_persist_partial(
+    decoupled: bool, watchdog_tripped: bool, first_token_seen: bool, in_think: Optional[bool]
+) -> bool:
+    return decoupled and watchdog_tripped and first_token_seen and in_think is False
+
+
+def _partial_assistant_message(content: str) -> Optional[Dict[str, str]]:
+    cleaned = TOOLCALL_RE.sub("", clean(content))
+    tool_call_start = cleaned.find("<tool_call>")
+    if tool_call_start != -1 and cleaned.find("</tool_call>", tool_call_start) == -1:
+        cleaned = cleaned[:tool_call_start]
+    cleaned = cleaned.strip()
+    if not cleaned:
+        return None
+    return {"role": "assistant", "content": cleaned}
 # Engine machinery lives hidden under STATE_ROOT (initiative-independent): session.json, the
 # local warm cache (memory/), config.json/active (ITYPE). Relative to WORKDIR (after chdir = CWD),
 # overridable via cfg["paths"]["state_root"] (default ".ironclad") — absolute too. Boundary
@@ -515,6 +601,12 @@ FORGE_REPO       = ""
 # `mock`. The native token is read name-indirectly from the env var NAMED here (never a secret literal in core).
 FORGE_ADAPTER    = "cli"
 FORGE_TOKEN_ENV  = "GX10_FORGE_TOKEN"
+# #1221: generic cross-model second-opinion review. CAPABILITY-DETECTED — offered when a code-agent
+# binary resolves on this box (the reviewer runs via client.default_cli_runner; no new backend).
+# Config: review.agent (default reviewer; empty ⇒ anti-affinity pick) + review.timeout_s.
+REVIEW_AGENT     = ""            # agent_id from code_agents.pool; empty ⇒ distinct-peer pick (#457 SOFT)
+REVIEW_TIMEOUT_S = 180.0         # bounded synchronous call (single agent-lock; never a watch/poll)
+_REVIEW_MATERIAL_CAP = 80_000    # char cap on assembled material before the reviewer prompt
 # #1083: outbound escalation notification. A HUMAN_ESCALATION fires the `escalation` hook; when a webhook is
 # configured (deploy secret via GX10_NOTIFY_WEBHOOK / notify.webhook — NEVER a URL literal in core) the
 # notifier POSTs it to an off-duty human. Empty ⇒ no consumer registered (byte-identical default-off).
@@ -1529,8 +1621,17 @@ def lifecycle_completeness(slug: str, *, required_stages: "List[str]", tree_sha:
 # ─── S5 (#1227): fail-closed design→impl approval gate (no blind coding, R2/R3) ───────────────────
 # Opt-in, default OFF → byte-identical (the shared engine + all non-DEV-1 flows + the test suite are
 # unaffected), exactly like the verify/quality/strategy seams. DEV-1 turns it ON via `design_gate.enabled`
-# (config) / GX10_DESIGN_GATE to enforce no-blind-coding.
+# (config) to enforce no-blind-coding.
 DESIGN_GATE_ENABLED = False
+# Constraint capture + presence gate + handover injection are opt-in, default OFF -> byte-identical off.
+# Config `constraint_gate.enabled` (S1 #1338 capture/status; S2 #1339 gate + verbatim injection).
+CONSTRAINT_GATE_ENABLED = False
+# #1341 / #1337 / #1342 (epic #1344 S5+S3+S6): L2 conflict-detect + L3 hard-check — default OFF → byte-identical.
+# Config `safety.constraint_conflict_detect`. When ON, `record_design` detects typed HARD conflicts and
+# persists a pending ForkEnvelope under vault/<slug>/proposals/forks/ (detect+persist). S4 (#1340) adds the
+# MPR worker + /fork list/decide + /approve design block when a pending envelope exists; MPR worker reuses
+# `ace.fork_mpr.enabled`. S6 (#1342) fail-closed hard-check at `/approve design` + impl stage_handover/plan_units.
+CONSTRAINT_CONFLICT_DETECT = False
 # S2 (#1224): the BASIC public no-blind-advance gate — opt-in (default OFF → byte-identical, like design_gate).
 # When on, an advance to `done` requires a feedback `status: done`; blocked/clarification_needed/no-status is
 # refused ("no signal ≠ done"). The FULL composed gate (coupling/CI/quality guards) stays PRIVATE (the addon).
@@ -1538,7 +1639,7 @@ DESIGN_GATE_ENABLED = False
 ADVANCE_GATE_ENABLED = False
 # S7 (#1229): disentangle /watcher (feedback-advance) from /autopilot (launch) — two orthogonal concerns over
 # ONE reconciler loop. Opt-in (default OFF → byte-identical: the loop is gated on _WATCHER_ENABLED only, launch
-# needs watcher on, and `autopilot on` warns that watcher is required). When ON: autopilot is self-sufficient
+# needs watcher on, and `autopilot on` points the operator at `/auto on`). When ON: autopilot is self-sufficient
 # (the loop runs if EITHER is on; the feedback side stays _WATCHER-gated) and the contradictory double message
 # is suppressed. DEV-1 turns it on via `automation.decoupled`.
 AUTOMATION_DECOUPLED = False
@@ -1547,6 +1648,7 @@ AUTOMATION_DECOUPLED = False
 # stalled. 0.0 ⇒ off / byte-identical (mirrors TURN_IDLE_TIMEOUT_S). DEV-1 sets `heartbeat.stall_seconds`.
 HEARTBEAT_STALL_S = 0.0
 DESIGN_STAGE = "design"
+CONSTRAINT_STAGE = "constraints"
 # Task types that PRODUCE CODE — a stage_handover of one of these is REFUSED until the active unit has an
 # APPROVED design. Design/analysis types (architecture, concept, research, documentation, verification,
 # smoke-test, cleanup) are the stage that PRODUCES the design → never gated. (Not `_task_class`, which lumps
@@ -1561,6 +1663,274 @@ _IMPLEMENTATION_TASK_TYPES = frozenset({
 def _fm_is_true(v: object) -> bool:
     """Frontmatter values arrive as strings (via `_parse_frontmatter`). Coerce an approval flag."""
     return str(v or "").strip().lower() in ("true", "yes", "1", "approved")
+
+
+UNCAPTURED = "UNCAPTURED"
+CAPTURED_NONE = "CAPTURED_NONE"
+CAPTURED = "CAPTURED"
+_CONSTRAINT_MARKERS = ("<!-- IRONCLAD:CONSTRAINTS -->", "<!-- /IRONCLAD:CONSTRAINTS -->")
+_CONSTRAINT_TYPED_CATEGORIES = ("language", "network")
+_CONSTRAINT_HARD_SOURCES = ("", "hard", "explicit", "approved", "operator-override")
+
+
+class GateRefusal(Exception):
+    """Typed deterministic gate refusal. The message intentionally has no output prefix."""
+
+
+def _trim_constraint_body(body: str) -> str:
+    """Trim blank lines at the edges without changing content lines or their line endings."""
+    if not body or not body.strip():
+        return ""
+    body = re.sub(r"\A(?:[ \t]*(?:\r\n|\r|\n))+", "", body)
+    return re.sub(r"(?:(?:\r\n|\r|\n)[ \t]*)+\Z", "", body)
+
+
+def _constraint_effective_source(fm: "Dict[str, str]", category: str) -> str:
+    """Return per-category provenance, falling back to legacy doc-level ``source``."""
+    cat = (category or "").strip().lower()
+    return str(fm.get(f"source_{cat}") or fm.get("source") or "").strip().lower()
+
+
+def _constraint_status(slug: "Optional[str]") -> "tuple[str, Optional[str]]":
+    """Tri-state constraint status for *slug* from its canonical ``decisions/constraints.md``.
+
+    One bounded file read, pure and fail-soft: malformed, inconsistent, poisoned, oversized, or unreadable
+    documents are indistinguishable from a missing capture and return ``UNCAPTURED``.
+    """
+    if not slug:
+        return (UNCAPTURED, None)
+    doc = vault_root() / slug / "decisions" / "constraints.md"
+    try:
+        if not doc.is_file():
+            return (UNCAPTURED, None)
+        raw = doc.read_bytes()
+        if len(raw) > 65536:
+            return (UNCAPTURED, None)
+        text = raw.decode("utf-8")
+        lines = text.splitlines(keepends=True)
+        if not lines or lines[0].strip() != "---":
+            return (UNCAPTURED, None)
+        closing = next((i for i, line in enumerate(lines[1:], 1) if line.strip() == "---"), None)
+        if closing is None:
+            return (UNCAPTURED, None)
+        fm = _parse_frontmatter(text)
+        if not fm:
+            return (UNCAPTURED, None)
+        body = "".join(lines[closing + 1:])
+        if any(marker in body for marker in _CONSTRAINT_MARKERS):
+            return (UNCAPTURED, None)
+        body = _trim_constraint_body(body)
+        declared_none = _fm_is_true(fm.get("declared_none"))
+        if declared_none and not body:
+            return (CAPTURED_NONE, None)
+        if not declared_none and body:
+            return (CAPTURED, body)
+        return (UNCAPTURED, None)
+    except Exception:  # noqa: BLE001 -- a constraint-status probe must never raise
+        return (UNCAPTURED, None)
+
+
+def _constraint_typed(slug: "Optional[str]") -> "Dict[str, Any]":
+    """Return the recorded HARD typed constraint fields for *slug* (``language`` / ``network``).
+
+    Reads the same canonical ``decisions/constraints.md`` as :func:`_constraint_status`. Suggested
+    captures (``source: suggested``) are excluded from the HARD reader. SUGGESTED typed values
+    are not ignored globally: :func:`_constraint_typed_unresolved` makes them engine-visible via
+    a complementary reader; advisory until the design-approval softcheck / steering consume it
+    (S2/S3). Pure, fail-soft: missing / unreadable / soft / none → ``{}``. Never raises.
+    """
+    if not slug:
+        return {}
+    doc = vault_root() / slug / "decisions" / "constraints.md"
+    try:
+        if not doc.is_file():
+            return {}
+        raw = doc.read_bytes()
+        if len(raw) > 65536:
+            return {}
+        text = raw.decode("utf-8")
+        fm = _parse_frontmatter(text)
+        if not fm:
+            return {}
+        from ack.ace.constraint_types import parse_typed  # lazy: never import ack at top-level
+        typed = parse_typed(fm)
+        return {
+            k: typed[k] for k in _CONSTRAINT_TYPED_CATEGORIES
+            if k in typed and _constraint_effective_source(fm, k) in _CONSTRAINT_HARD_SOURCES
+        }
+    except Exception:  # noqa: BLE001 -- a typed-constraint probe must never raise
+        return {}
+
+
+def _constraint_typed_unresolved(slug: "Optional[str]") -> "Dict[str, Any]":
+    """Return the recorded UNRESOLVED (``source: suggested``) typed constraint fields for *slug*.
+
+    The per-category complement of :func:`_constraint_typed`: it returns ``language`` / ``network``
+    ONLY when that category's effective provenance is ``suggested`` (a typed value the model
+    captured but did not promote to a HARD floor). The two readers are mutually exclusive per
+    category; a mixed document may return different categories from each reader.
+    Pure, fail-soft: missing / unreadable / hard / dismissed / absent-source / none -> ``{}``. Never raises.
+
+    Engine-visible via a complementary reader; advisory until the design-approval softcheck /
+    steering consume it (S2/S3), without reading the model's ``source`` label at decision time.
+    """
+    if not slug:
+        return {}
+    doc = vault_root() / slug / "decisions" / "constraints.md"
+    try:
+        if not doc.is_file():
+            return {}
+        raw = doc.read_bytes()
+        if len(raw) > 65536:
+            return {}
+        text = raw.decode("utf-8")
+        fm = _parse_frontmatter(text)
+        if not fm:
+            return {}
+        from ack.ace.constraint_types import parse_typed  # lazy: never import ack at top-level
+        typed = parse_typed(fm)
+        return {
+            k: typed[k] for k in _CONSTRAINT_TYPED_CATEGORIES
+            if k in typed and _constraint_effective_source(fm, k) == "suggested"
+        }
+    except Exception:  # noqa: BLE001 -- a typed-constraint probe must never raise
+        return {}
+
+
+def _constraint_typed_by_source(slug: "Optional[str]", source: str) -> "Dict[str, Any]":
+    """Return typed constraint fields whose effective provenance matches *source*.
+
+    Merge-only helper: dismissed values must survive sibling re-records so an operator can
+    later re-arm them with ``/approve constraint``. Enforcement readers still exclude them.
+    """
+    wanted = (source or "").strip().lower()
+    if not slug or not wanted:
+        return {}
+    doc = vault_root() / slug / "decisions" / "constraints.md"
+    try:
+        if not doc.is_file():
+            return {}
+        raw = doc.read_bytes()
+        if len(raw) > 65536:
+            return {}
+        text = raw.decode("utf-8")
+        fm = _parse_frontmatter(text)
+        if not fm:
+            return {}
+        from ack.ace.constraint_types import parse_typed  # lazy: never import ack at top-level
+        typed = parse_typed(fm)
+        return {
+            k: typed[k] for k in _CONSTRAINT_TYPED_CATEGORIES
+            if k in typed and _constraint_effective_source(fm, k) == wanted
+        }
+    except Exception:  # noqa: BLE001 -- a typed-constraint probe must never raise
+        return {}
+
+
+def _constraint_gate(slug: "Optional[str]", *,
+                     snapshot: "Optional[tuple[str, Optional[str]]]" = None) -> "Optional[str]":
+    """L1 presence gate (C4/C10.7): refuse design/decomposition/implementation until the unit has
+    constraints on record (``CAPTURED`` or ``CAPTURED_NONE``). Returns an ERROR string or ``None``.
+
+    Accepts an optional pre-read *snapshot* so a caller can enforce a single status read that also
+    drives injection (no TOCTOU). Pure/deterministic — no model call. Opt-in via
+    ``CONSTRAINT_GATE_ENABLED`` (default OFF → byte-identical).
+    """
+    if not CONSTRAINT_GATE_ENABLED:
+        return None
+    status, _ = snapshot if snapshot is not None else _constraint_status(slug)
+    if not slug:
+        return ("ERROR: constraints not on record — call record_constraints before "
+                "design/decomposition/implementation.")
+    if status == UNCAPTURED:
+        return ("ERROR: constraints not on record — call record_constraints before "
+                "design/decomposition/implementation.")
+    return None
+
+
+def _constraint_hardcheck(slug: "Optional[str]", provided_typed: "Optional[Dict[str, Any]]",
+                          *, require_present: bool = True) -> "Optional[str]":
+    """L3 fail-closed typed hard-check (#1342 / epic #1344 S6): refuse when *provided_typed*
+    omits or mismatches a HARD typed floor from :func:`_constraint_typed`.
+
+    Returns an ERROR string or ``None`` (allow). Flag-off / no HARD typed constraint → ``None``
+    (byte-identical). Pure/deterministic — no model call. Callers invoke only at the
+    **implementation** boundary (``/approve design``, impl ``stage_handover``, ``plan_units``
+    children); ``record_design`` stays advisory (L2 fork only).
+    """
+    if not CONSTRAINT_CONFLICT_DETECT:
+        return None
+    try:
+        ct = _constraint_typed(slug)
+        if not ct:
+            return None
+        from ack.ace.constraint_conflict import hardcheck  # lazy: never import ack at top-level
+        v = hardcheck(ct, provided_typed or {}, require_present=require_present)
+        if v is None:
+            return None
+        cat = v.category
+        req = v.required
+        hint = _pending_fork_decide_hints(slug)
+        hint_tail = f"\n{hint}" if hint else ""
+        if v.kind == "missing":
+            return (
+                f"ERROR: HARD constraint {cat}={req!r} is required but the typed field is "
+                f"missing — declare {cat!r} on the design/task to match the recorded floor "
+                f"(or `/fork decide` if a pending constraint fork exists). Nothing changed."
+                f"{hint_tail}"
+            )
+        return (
+            f"ERROR: HARD constraint {cat}={req!r} does not match provided {v.provided!r} — "
+            f"align the typed {cat!r} field to the constraint "
+            f"(or `/fork decide` if a pending constraint fork exists). Nothing changed."
+            f"{hint_tail}"
+        )
+    except Exception:  # noqa: BLE001 — hard-check probe must never raise into a write path
+        # Fail-closed when the flag is on and the probe itself breaks (no silent open-the-gate).
+        return ("ERROR: constraint hard-check failed (internal) — refuse (fail-closed). "
+                "Nothing changed.")
+
+
+def _constraint_softcheck(slug: "Optional[str]", provided_typed: "Optional[Dict[str, Any]]",
+                          *, require_present: bool = True) -> "Optional[str]":
+    """LENIENT approval gate over UNRESOLVED (``source: suggested``) typed constraints.
+
+    Flag-off / no unresolved typed constraint / matching design -> ``None``. Mismatch or omission
+    returns an operator-resolution message and never raises.
+    """
+    if not CONSTRAINT_CONFLICT_DETECT:
+        return None
+    try:
+        unresolved = _constraint_typed_unresolved(slug)
+        if not unresolved:
+            return None
+        from ack.ace.constraint_conflict import hardcheck  # lazy: never import ack at top-level
+        v = hardcheck(unresolved, provided_typed or {}, require_present=require_present)
+        if v is None:
+            return None
+        provided = "" if v.provided is None else f" ({v.provided!r})"
+        return (
+            f"ERROR: the recorded typed constraint {v.category}={v.required!r} is UNRESOLVED "
+            f"(suggested) and the design sets/omits {v.category}{provided}. Resolve before "
+            f"approval: (a) align the design (record_design {v.category}={v.required}), "
+            f"(b) `/dismiss constraint {v.category}` if it was a wrong guess, or "
+            f"(c) `/approve constraint {v.category}` to make it HARD then `/fork decide` the counter "
+            "if you truly intend the deviation. Nothing changed."
+        )
+    except Exception:  # noqa: BLE001 -- a softcheck probe must never raise into approval
+        return ("ERROR: constraint soft-check failed (internal) -- refuse "
+                "(fail-closed). Nothing changed.")
+
+
+def _task_typed_fields(fields: "Optional[Dict[str, Any]]") -> "Dict[str, Any]":
+    """Normalize optional TaskSpec ``language`` / ``network`` from a task dict (fail-soft ``{}``)."""
+    if not fields:
+        return {}
+    try:
+        from ack.ace.constraint_types import parse_typed  # lazy
+        return parse_typed(fields)
+    except Exception:  # noqa: BLE001
+        return {}
 
 
 def _unit_design_status(slug: "Optional[str]") -> "tuple[bool, bool, Optional[str]]":
@@ -1598,25 +1968,259 @@ def _design_gate(task_type: str, slug: "Optional[str]") -> "Optional[str]":
                 f"(/approve), THEN stage the implementation handover.")
     if not approved:
         return (f"ERROR: design for unit {slug!r} is recorded ({_display_doc_path(rel)}) but NOT approved. The operator must "
-                f"approve it — run /approve (or set `approved: true` in the design doc) — before an "
+                f"approve it — run /approve — before an "
                 f"implementation handover.")
     return None
 
 
-def record_design(title: str, body: str, *, slug: "Optional[str]" = None) -> str:
+def _fork_ledger_dir(slug: str) -> Path:
+    """Initiative-vault path for durable constraint-fork envelopes: ``proposals/forks/``.
+
+    Same vault-root resolution as ``record_design`` (``vault_root()/<slug>``). Creates the
+    directory tree when missing. Callers must hold (or re-enter) ``_vault_lock`` for writes.
+    """
+    d = vault_root() / slug / "proposals" / "forks"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _persist_fork_envelope(env: Any) -> None:
+    """Atomically write ``<proposals/forks>/<fork_id>.json`` under ``_vault_lock``.
+
+    Idempotent: same ``fork_id`` overwrites the file (never duplicates). Lazy-imports the pure
+    ack envelope type so engine top-level stays free of ack imports.
+    """
+    from ack.ace.fork_envelope import ForkEnvelope  # lazy: never import ack at gx10 top-level
+
+    if not isinstance(env, ForkEnvelope):
+        return
+    fork_id = (env.fork_id or "").strip()
+    slug = (env.slug or "").strip()
+    if not fork_id or not slug:
+        return
+    with _vault_lock():
+        path = _fork_ledger_dir(slug) / f"{fork_id}.json"
+        payload = json.dumps(env.to_dict(), ensure_ascii=False, indent=2) + "\n"
+        _atomic_write(path, payload)
+
+
+def _load_fork_envelopes(slug: "Optional[str]", *, fail_closed: bool = False) -> "list":
+    """Load every readable fork envelope for *slug*.
+
+    Skips unreadable individual entries. Returns ``[]`` when the ledger dir is missing /
+    empty. When *fail_closed* is False (default — list/scan paths), dir-level I/O errors
+    also yield ``[]``. When True (``/approve design`` under ``CONSTRAINT_CONFLICT_DETECT``),
+    dir-level failures re-raise so the caller can refuse fail-closed.
+    """
+    from ack.ace.fork_envelope import ForkEnvelope  # lazy
+
+    if not slug:
+        return []
+    try:
+        d = vault_root() / slug / "proposals" / "forks"
+        if not d.is_dir():
+            return []
+        out: "list" = []
+        for p in sorted(d.glob("*.json")):
+            try:
+                data = json.loads(p.read_text(encoding="utf-8"))
+                env = ForkEnvelope.from_dict(data)
+                if env.fork_id:
+                    out.append(env)
+            except Exception:  # noqa: BLE001 — skip unreadable/malformed entries
+                continue
+        return out
+    except Exception:  # noqa: BLE001 — list/scan stay fail-soft; approve can opt into fail-closed
+        if fail_closed:
+            raise
+        return []
+
+
+def _emit_constraint_conflict_envelope(target: str, design_doc: Path,
+                                       *, prior_design_text: "Optional[str]" = None) -> None:
+    """Detect HARD typed design-vs-constraint conflict and persist a pending ForkEnvelope.
+
+    Detect + persist only (S3 / #1337). recommendation/matrix stay None (S4 fills them).
+    Caller guards with ``CONSTRAINT_CONFLICT_DETECT``; this path must never raise into
+    ``record_design`` (outer try/except is the safety net).
+    """
+    import hashlib
+
+    from ack.ace.constraint_conflict import detect_conflict, hardcheck  # lazy
+    from ack.ace.constraint_types import parse_typed
+    from ack.ace.fork_envelope import build_constraint_envelope
+
+    ct = _constraint_typed(target)
+    design_text = design_doc.read_text(encoding="utf-8")
+    dt = parse_typed(design_text)
+    conflict = detect_conflict(ct, dt)
+    if conflict is None:
+        return
+    cpath = vault_root() / target / "decisions" / "constraints.md"
+    constraint_rev = (
+        hashlib.sha256(cpath.read_bytes()).hexdigest() if cpath.is_file() else ""
+    )
+    design_rev = hashlib.sha256(design_doc.read_bytes()).hexdigest()
+    restore_design = None
+    if prior_design_text:
+        try:
+            if hardcheck(ct, parse_typed(prior_design_text), require_present=True) is None:
+                restore_design = prior_design_text
+        except Exception:  # noqa: BLE001 -- prior snapshot is best-effort metadata
+            restore_design = None
+    env = build_constraint_envelope(
+        mem_ns=_active_mem_ns(),
+        slug=target,
+        conflict=conflict,
+        constraint_rev=constraint_rev,
+        design_rev=design_rev,
+        counter_design=design_text,
+        restore_design=restore_design,
+    )
+    _persist_fork_envelope(env)
+    # #1340 (S4): when the MPR worker gate is on, submit this envelope for off-hot-path fill
+    # (recommendation/matrix). Fail-soft — emission already succeeded.
+    try:
+        _ace_submit_constraint_envelope(env)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _revalidate_approved_design(slug: "Optional[str]") -> "Optional[str]":
+    """Re-check the recorded design after a HARD constraint floor changes.
+
+    DETECT-gated and fail-soft: promotion / override writes must not break if this probe hits an
+    unexpected read or parse error. Mismatches emit the idempotent fork envelope; approved designs
+    are revoked when they omit or contradict the now-HARD floor.
+    """
+    if not CONSTRAINT_CONFLICT_DETECT:
+        return None
+    try:
+        target = (slug or "").strip()
+        if not target:
+            return None
+        design_doc = vault_root() / target / "decisions" / "design.md"
+        if not design_doc.is_file():
+            return None
+        text = design_doc.read_text(encoding="utf-8")
+        fm = _parse_frontmatter(text)
+        from ack.ace.constraint_conflict import detect_conflict  # lazy
+        from ack.ace.constraint_types import parse_typed  # lazy
+        design_typed = parse_typed(text)
+        hc = _constraint_hardcheck(target, design_typed, require_present=True)
+        if hc is None:
+            return None
+        hard_typed = _constraint_typed(target)
+        conflict = detect_conflict(hard_typed, design_typed)
+        if conflict is not None:
+            try:
+                _emit_constraint_conflict_envelope(target, design_doc, prior_design_text=None)
+            except Exception:  # noqa: BLE001 -- fork emission is best-effort here
+                pass
+            hint = ""
+            try:
+                hint = _pending_fork_decide_hints(target)
+            except Exception:  # noqa: BLE001 -- warning must remain fail-soft
+                hint = ""
+            cat = conflict.category
+            detail = (f"HARD constraint {cat}={conflict.required!r} conflicts with the recorded "
+                      f"design value {conflict.counter!r}; resolve the fork (`/fork decide`).")
+            if hint:
+                detail = f"{detail}\n{hint}"
+        else:
+            missing = next((k for k in ("language", "network")
+                            if k in hard_typed and k not in design_typed), "")
+            req = hard_typed.get(missing)
+            detail = (f"HARD constraint {missing}={req!r} is missing from the recorded design; "
+                      "re-record a compliant design then re-/approve (no fork -- an omission is "
+                      "not a counter-value).")
+        if _fm_is_true(fm.get("approved")):
+            new = _set_frontmatter_flag(text, "approved", "false")
+            new = _set_frontmatter_flag(new, "type", "proposal")
+            if new != text:
+                with _vault_lock():
+                    design_doc.write_text(new, encoding="utf-8", newline="\n")
+                    try:
+                        reconcile_vault(target, links=False)
+                    except Exception:  # noqa: BLE001
+                        pass
+            return f"WARNING: design approval REVOKED for {target!r} -- {detail}"
+        return f"WARNING: recorded design for {target!r} conflicts with the HARD floor -- {detail}"
+    except Exception as ex:  # noqa: BLE001 -- revalidation must never break the caller's write
+        return (f"WARNING: could not revalidate the approved design for {target!r} "
+                f"against the updated constraint ({type(ex).__name__}) -- re-check it "
+                "manually; nothing was auto-revoked.")
+
+
+def _warn_approved_design_on_suggested_constraint(slug: "Optional[str]") -> "Optional[str]":
+    """Re-check an already-approved design after a SUGGESTED typed constraint write.
+
+    Suggested floors are advisory until promoted, so this never revokes approval and never blocks the
+    write. It only mirrors the approval-time soft-check as a post-write operator warning.
+    """
+    if not CONSTRAINT_CONFLICT_DETECT:
+        return None
+    try:
+        target = (slug or "").strip()
+        if not target:
+            return None
+        design_doc = vault_root() / target / "decisions" / "design.md"
+        if not design_doc.is_file():
+            return None
+        text = design_doc.read_text(encoding="utf-8")
+        fm = _parse_frontmatter(text)
+        if not _fm_is_true(fm.get("approved")):
+            return None
+        from ack.ace.constraint_types import parse_typed  # lazy
+        sc_err = _constraint_softcheck(target, parse_typed(text), require_present=True)
+        if not sc_err:
+            return None
+        warning = sc_err
+        if warning.startswith("ERROR: "):
+            warning = "WARNING: " + warning[len("ERROR: "):]
+        elif not warning.startswith("WARNING:"):
+            warning = "WARNING: " + warning
+        warning = warning.replace("Resolve before approval:", "Resolve before implementation:")
+        warning = warning.replace("Nothing changed.", "The constraint was recorded; design approval was not revoked.")
+        return warning
+    except Exception as ex:  # noqa: BLE001 -- suggested re-check must never break record_constraints
+        return (f"WARNING: could not re-check the approved design for {target!r} "
+                f"against the suggested constraint ({type(ex).__name__}) -- re-check it "
+                "manually; design approval was not revoked.")
+
+
+def record_design(title: str, body: str, *, slug: "Optional[str]" = None,
+                  language: str = "", network: str = "") -> str:
     """S5 (#1227): persist a DESIGN doc for the active (or *slug*) unit — the pre-code lifecycle artifact the
-    design→impl gate reads. Writes ``<slug>/decisions/<name>-design.md`` with contract-guaranteed frontmatter
-    (``type: decision`` · ``stage: design`` · ``approved: false``), so the model cannot forget the fields the
+    design→impl gate reads. Writes ``<slug>/decisions/design.md`` with contract-guaranteed frontmatter
+    (``type: proposal`` · ``stage: design`` · ``approved: false``), so the model cannot forget the fields the
     gate needs, then reconciles the vault (cross-links, R4). A fresh recording resets approval to ``false`` (a
     changed design must be re-approved). Fail-closed: no resolvable unit raises ``ValueError``. Returns the
-    doc path (posix)."""
+    doc path (posix).
+
+    #1341: optional typed ``language`` / ``network`` params are normalized via ``ack.ace.constraint_types``
+    and persisted as design frontmatter keys when provided + valid. Invalid provided value →
+    ``GateRefusal``. Default (no typed param) → frontmatter unchanged from S1.
+
+    #1337 (S3): when ``CONSTRAINT_CONFLICT_DETECT`` is on, after the design is written a pure detector
+    compares HARD typed constraints to the design typed fields and, on conflict, persists a pending
+    ``ForkEnvelope`` under ``proposals/forks/`` (idempotent by ``fork_id``). Fail-soft: emission never
+    breaks the design write. Flag off → byte-identical (no detect, no ledger write). No MPR / no
+    ``/fork`` / no handover gate here (S4/S6).
+    """
     target = (slug or active_slug() or "").strip()
     if not target:
         raise ValueError("no active unit for record_design")
+    # S2 (#1339): constraints-before-design — refuse BEFORE any write (C4 step 1 precedes step 2).
+    c_err = _constraint_gate(target)
+    if c_err:
+        raise GateRefusal(c_err.split("ERROR: ", 1)[-1])
     title = (title or "").strip() or "Design"
     body = str(body).replace("\r\n", "\n").replace("\r", "\n")
     if not body.endswith("\n"):
         body += "\n"
+    # #1341: optional typed design fields (fail-closed when a value is provided but not allow-listed).
+    typed_fm_lines = _typed_frontmatter_lines(language, network, refuse_invalid=True)
     with _vault_lock():
         vdir = vault_root() / target
         if not (vdir / "meta.md").is_file():
@@ -1630,29 +2234,573 @@ def record_design(title: str, body: str, *, slug: "Optional[str]" = None) -> str
         heading = "" if body.lstrip().startswith("# ") else f"# {title}\n\n"
         content = (
             "---\n"
-            "type: decision\n"
+            "type: proposal\n"
             f"stage: {DESIGN_STAGE}\n"
             "approved: false\n"
             f"title: {title}\n"
+            f"{typed_fm_lines}"
             "---\n\n"
             f"{heading}"
             f"{body}"
         )
+        prior_text = None
+        if CONSTRAINT_CONFLICT_DETECT and doc.is_file():
+            try:
+                prior_text = doc.read_text(encoding="utf-8")
+            except Exception:  # noqa: BLE001 -- prior snapshot must not break record_design
+                prior_text = None
         doc.write_text(content, encoding="utf-8", newline="\n")
         try:
             reconcile_vault(target, links=False)
         except Exception:  # noqa: BLE001 — projection must not fail on a reconcile hiccup
             pass
+        # #1337: L2 structured conflict detect + durable fork-envelope emission (default-off).
+        if CONSTRAINT_CONFLICT_DETECT:
+            try:
+                _emit_constraint_conflict_envelope(target, doc, prior_design_text=prior_text)
+            except Exception as e:  # noqa: BLE001 — emission must never break record_design
+                try:
+                    _ui_print(f"[WARN] constraint-conflict envelope emission failed: {e!r}")
+                except Exception:  # noqa: BLE001
+                    pass
         return _display_doc_path((doc.relative_to(vault_root())).as_posix())   # #1276: navigable path
 
 
-def _approve_design(slug: "Optional[str]" = None) -> str:
-    """S5 (#1227): stamp ``approved: true`` into the active (or *slug*) unit's ``stage: design`` doc — the
-    operator's influence/approval point that unblocks implementation handovers. File-based (R1). Returns a
-    human message. Fail-closed: no unit / no design doc → a clear ERROR, nothing changed."""
+def _typed_frontmatter_lines(language: str = "", network: str = "", *,
+                             refuse_invalid: bool = True) -> str:
+    """Normalize optional typed params to frontmatter lines (``language:`` / ``network:``).
+
+    Empty / whitespace = not provided (no line). A non-empty value that fails the allow-list raises
+    ``GateRefusal`` when *refuse_invalid* (capture/design fail-closed). Never invents keys.
+    """
+    from ack.ace.constraint_types import (  # lazy: never import ack at gx10 top-level
+        normalize_language,
+        normalize_network,
+    )
+    lines = ""
+    lang_raw = str(language or "").strip()
+    if lang_raw:
+        lang = normalize_language(lang_raw)
+        if lang is None:
+            if refuse_invalid:
+                raise GateRefusal(f"invalid language value: {lang_raw!r}")
+        else:
+            lines += f"language: {lang}\n"
+    if isinstance(network, bool):
+        lines += f"network: {'true' if network else 'false'}\n"
+    else:
+        net_raw = str(network or "").strip()
+        if net_raw:
+            net = normalize_network(net_raw)
+            if net is None:
+                if refuse_invalid:
+                    raise GateRefusal(f"invalid network value: {net_raw!r}")
+            else:
+                lines += f"network: {'true' if net else 'false'}\n"
+    return lines
+
+
+def record_constraints(title: str, body: str, *, slug: "Optional[str]" = None,
+                       language: str = "", network: str = "", source: str = "") -> str:
+    """Persist the canonical L1 constraint capture for the active (or *slug*) unit.
+
+    Empty/whitespace and the case-insensitive ``none`` sentinel record an explicit no-constraints decision;
+    every other body is stored verbatim apart from leading/trailing blank lines. Deterministic and fail-closed
+    on an unresolved unit or a reserved injection marker.
+
+    #1341: optional typed ``language`` / ``network`` are normalized and persisted as frontmatter keys only
+    when provided + valid (invalid → ``GateRefusal``). Provenance ``source: hard|suggested`` is written when
+    an explicit ``Constraints:`` marker is present, a typed param is passed, or the model sets
+    ``source='suggested'``. Default (no typed param / no source signal) → S1-identical frontmatter.
+    """
+    target = (slug or active_slug() or "").strip()
+    if not target:
+        raise ValueError("no active unit for record_constraints")
+    title = (title or "").strip() or "Constraints"
+    body = str(body)
+    if any(marker in body for marker in _CONSTRAINT_MARKERS):
+        raise GateRefusal("constraints body may not contain the reserved IRONCLAD:CONSTRAINTS marker")
+    declared_none = not body.strip() or body.strip().lower() == "none"
+    captured_body = "" if declared_none else _trim_constraint_body(body)
+    # Enforce the write-side invariant even if a future sentinel/normalization rule changes above.
+    declared_none = not captured_body
+    # #1341: typed allow-list + hard/soft provenance (pure ack classifier).
+    from ack.ace.constraint_types import (  # lazy
+        body_states_typed_constraint,
+        classify as _classify_constraint,
+        has_constraints_marker,
+        parse_typed,
+    )
+    typed_fm_lines = "" if declared_none else _typed_frontmatter_lines(language, network, refuse_invalid=True)
+    typed_supplied = bool(typed_fm_lines)
+    explicit = has_constraints_marker(body)
+    src_arg = (source or "").strip()
+    provenance = ""
+    provenance_line = ""
+    if not declared_none and (typed_supplied or explicit or src_arg):
+        if CONSTRAINT_CONFLICT_DETECT and src_arg.lower() == "operator-override":
+            provenance = "operator-override"
+        else:
+            provenance = _classify_constraint(
+                explicit_marker=explicit,
+                typed_supplied=typed_supplied,
+                source=src_arg,
+            )
+        provenance_line = f"source: {provenance}\n"
+    with _vault_lock():
+        vdir = vault_root() / target
+        if not (vdir / "meta.md").is_file():
+            raise ValueError(_msg("vault.no_initiative", slug=target, root=vault_root().as_posix()))
+        ddir = vdir / "decisions"
+        ddir.mkdir(parents=True, exist_ok=True)
+        doc = ddir / "constraints.md"
+        if CONSTRAINT_GATE_ENABLED and not declared_none:
+            stated_typed = body_states_typed_constraint(body)
+            if stated_typed:
+                supplied_typed = parse_typed({"language": language, "network": network})
+                existing_typed = {}
+                try:
+                    if doc.is_file():
+                        existing_typed = parse_typed(doc.read_text(encoding="utf-8"))
+                except Exception:  # noqa: BLE001 -- fail-closed below if the field was not supplied
+                    existing_typed = {}
+                for category in _CONSTRAINT_TYPED_CATEGORIES:
+                    if category not in stated_typed or category in supplied_typed or category in existing_typed:
+                        continue
+                    raise GateRefusal(
+                        f"the constraint body appears to state a {category} requirement but the typed "
+                        f"{category} field is not set. Set the {category} field when recording so the floor "
+                        "is enforceable -- a prose-only constraint cannot be gated "
+                        "(design approval / deviation checks read the typed field)."
+                    )
+        # #1364: a model capture may add to, but never silently renegotiate, the recorded
+        # HARD typed floor. Keep this wholly behind the L2/L3 flag so the off path remains
+        # byte-identical. ``operator-override`` is the deliberate, operator-confirmed path.
+        if CONSTRAINT_CONFLICT_DETECT:
+            incoming_typed = parse_typed(body) if explicit and not declared_none else {}
+            if not declared_none:
+                incoming_typed.update(parse_typed({"language": language, "network": network}))
+            existing_hard = _constraint_typed(target)
+            existing_unresolved = _constraint_typed_unresolved(target)
+            existing_dismissed = _constraint_typed_by_source(target, "dismissed")
+            existing_typed = {}
+            existing_typed.update(existing_hard)
+            existing_typed.update(existing_unresolved)
+            existing_typed.update(existing_dismissed)
+            existing_fm = {}
+            try:
+                if doc.is_file():
+                    existing_fm = _parse_frontmatter(doc.read_text(encoding="utf-8"))
+            except Exception:  # noqa: BLE001 -- provenance preservation is best-effort
+                existing_fm = {}
+            if src_arg.lower() != "operator-override":
+                replacing_hard = set(existing_hard)
+                if not declared_none:
+                    replacing_hard &= set(incoming_typed)
+                if replacing_hard and (declared_none or provenance == "suggested"):
+                    raise GateRefusal(
+                        "A HARD constraint is already on record and cannot be silently cleared or "
+                        "replaced by a suggested capture. To deviate, record a counter-proposal design "
+                        "(record_design) — the engine surfaces a /fork for the operator to decide "
+                        "(keep|counter)."
+                    )
+                for category, attempted in incoming_typed.items():
+                    existing = existing_hard.get(category)
+                    if existing is not None and existing != attempted:
+                        raise GateRefusal(
+                            f"A HARD constraint {category}={existing} is already on record and cannot be "
+                            f"silently changed to {attempted}. To deviate, record a counter-proposal design "
+                            "(record_design) — the engine surfaces a /fork for the operator to decide "
+                            "(keep|counter)."
+                        )
+            # A body-only edit or a call adding one category must retain all other HARD typed
+            # fields; otherwise the unconditional document rewrite would silently delete them.
+            merged_typed = dict(existing_typed)
+            merged_typed.update(incoming_typed)
+            if existing_typed and not declared_none:
+                typed_fm_lines = _typed_frontmatter_lines(
+                    merged_typed.get("language", ""), merged_typed.get("network", ""))
+                if src_arg.lower() != "operator-override" and provenance != "suggested":
+                    provenance_line = "source: hard\n"
+            if not declared_none:
+                if merged_typed:
+                    source_by_category = {
+                        category: (
+                            _constraint_effective_source(existing_fm, category)
+                            or ("hard" if category in existing_hard else "suggested")
+                        )
+                        for category in merged_typed
+                    }
+                    explicit_provenance = bool(src_arg) or explicit
+                    for category, incoming_value in incoming_typed.items():
+                        existing_value = existing_typed.get(category)
+                        if explicit_provenance or incoming_value != existing_value:
+                            source_by_category[category] = provenance or "hard"
+                    distinct_sources = set(source_by_category.values())
+                    if len(distinct_sources) == 1:
+                        provenance_line = f"source: {next(iter(distinct_sources))}\n"
+                    else:
+                        provenance_line = "".join(
+                            f"source_{category}: {source_by_category[category]}\n"
+                            for category in _CONSTRAINT_TYPED_CATEGORIES
+                            if category in source_by_category
+                        )
+        content = (
+            "---\n"
+            "type: decision\n"
+            f"stage: {CONSTRAINT_STAGE}\n"
+            f"declared_none: {'true' if declared_none else 'false'}\n"
+            f"title: {title}\n"
+            f"{typed_fm_lines}"
+            f"{provenance_line}"
+            "---\n"
+            f"{captured_body}"
+        )
+        doc.write_text(content, encoding="utf-8", newline="")
+        try:
+            reconcile_vault(target, links=False)
+        except Exception:  # noqa: BLE001 -- projection must not fail on a reconcile hiccup
+            pass
+        warning = (
+            _revalidate_approved_design(target)
+            if any(
+                line.strip() in (
+                    "source: hard",
+                    "source: operator-override",
+                    "source_language: hard",
+                    "source_network: hard",
+                    "source_language: operator-override",
+                    "source_network: operator-override",
+                )
+                for line in provenance_line.splitlines()
+            )
+            else None
+        )
+        if warning is None and any(
+            line.strip() in (
+                "source: suggested",
+                "source_language: suggested",
+                "source_network: suggested",
+            )
+            for line in provenance_line.splitlines()
+        ):
+            warning = _warn_approved_design_on_suggested_constraint(target)
+        rel = _display_doc_path(doc.relative_to(vault_root()).as_posix())
+        return rel + (f"\n{warning}" if warning else "")
+
+
+def _pending_constraint_forks(slug: "Optional[str]") -> "list":
+    """Visible pending constraint-fork envelopes for *slug* (latest per category; supersedes older).
+
+    #1340: used by the fail-closed ``/approve design`` block. When
+    ``CONSTRAINT_CONFLICT_DETECT`` is on, ledger read errors **propagate** so approval refuses
+    fail-closed (no silent open-the-gate). When the flag is off, any error → ``[]``
+    (byte-identical — no ledger ⇒ no block).
+    """
+    try:
+        return _visible_pending_fork_envelopes(
+            slug, fail_closed=bool(CONSTRAINT_CONFLICT_DETECT))
+    except Exception:  # noqa: BLE001
+        if CONSTRAINT_CONFLICT_DETECT:
+            raise
+        return []
+
+
+def _resolve_forks_satisfied_by_design(slug: "Optional[str]",
+                                       design_typed: "Optional[Dict[str, Any]]") -> int:
+    """Resolve pending constraint forks made moot by the current design matching the HARD floor.
+
+    DETECT-gated and fail-soft: approval still runs the normal pending-fork block and L3 hard-check
+    afterwards, so a resolver hiccup must not become a bypass.
+    """
+    if not CONSTRAINT_CONFLICT_DETECT:
+        return 0
+    try:
+        target = (slug or "").strip()
+        if not target:
+            return 0
+        hard_typed = _constraint_typed(target)
+        if not hard_typed:
+            return 0
+        from ack.ace.constraint_conflict import detect_conflict  # lazy
+
+        resolved = 0
+        for env in _pending_constraint_forks(target):
+            try:
+                cat = (getattr(env, "category", "") or "").strip()
+                if not cat:
+                    continue
+                scoped_hard = {cat: hard_typed[cat]} if cat in hard_typed else {}
+                if not scoped_hard:
+                    continue
+                if (design_typed or {}).get(cat) != hard_typed[cat]:
+                    continue
+                conflict = detect_conflict(scoped_hard, design_typed or {})
+                if conflict is not None:
+                    continue
+                env.resolution = {
+                    "choice_id": "realigned",
+                    "value": (design_typed or {}).get(cat),
+                }
+                env.status = "resolved"
+                env.inflight = False
+                _persist_fork_envelope(env)
+                resolved += 1
+            except Exception:  # noqa: BLE001 -- one stale envelope must not break approval
+                continue
+        return resolved
+    except Exception:  # noqa: BLE001 -- fail-soft resolver; hard-check remains the real gate
+        return 0
+
+
+def _approve_command(arg: "Optional[str]" = None) -> str:
+    """#1340 (S4): ``/approve`` surface split.
+
+    - bare ``/approve`` or ``/approve design [slug]`` — design approval (preserved S5 path)
+    - ``/approve <slug>`` — still design approval for that unit (legacy form)
+    - ``/approve constraint <id|all> [--slug <s>]`` — promote suggested constraints / apply typed override
+    """
+    raw = (arg or "").strip()
+    parts = raw.split() if raw else []
+    if not parts:
+        return _approve_design(None)
+    head = parts[0].lower()
+    if head == "design":
+        return _approve_design(parts[1] if len(parts) > 1 else None)
+    if head == "constraint":
+        return _approve_constraint(" ".join(parts[1:]))
+    # Legacy: /approve <slug>
+    return _approve_design(raw)
+
+
+def _dismiss_command(arg: "Optional[str]" = None) -> str:
+    """Route ``/dismiss constraint <id|all> [--slug <s>]``."""
+    raw = (arg or "").strip()
+    parts = raw.split() if raw else []
+    if not parts or parts[0].lower() != "constraint":
+        return "ERROR: usage: /dismiss constraint <id|all> [--slug <unit>]"
+    return _dismiss_constraint(" ".join(parts[1:]))
+
+
+def _dismiss_constraint(arg: str) -> str:
+    """Dismiss a suggested typed constraint so it stops gating, preserving an audit trail."""
+    parts = (arg or "").split()
+    if not parts:
+        return "ERROR: usage: /dismiss constraint <id|all> [--slug <unit>]"
+    target_id = parts[0].strip().lower()
+    if target_id not in ("all", "language", "network"):
+        return f"ERROR: unknown constraint id {target_id!r} -- use language, network, or all."
+    slug = ""
+    if "--slug" in parts:
+        i = parts.index("--slug")
+        slug = parts[i + 1] if i + 1 < len(parts) else ""
+    target = (slug or active_slug() or "").strip()
+    if not target:
+        return "ERROR: no active unit -- nothing to dismiss."
+    doc = vault_root() / target / "decisions" / "constraints.md"
+    if not doc.is_file():
+        return (f"ERROR: unit {target!r} has no constraints on record -- call record_constraints first. "
+                "Nothing changed.")
+    try:
+        text = doc.read_text(encoding="utf-8")
+    except Exception as ex:  # noqa: BLE001
+        return f"ERROR: could not read constraints for {target!r} ({ex!r})."
+    fm = _parse_frontmatter(text)
+    if not fm:
+        return f"ERROR: constraints for {target!r} have no readable frontmatter. Nothing changed."
+    from ack.ace.constraint_types import parse_typed  # lazy
+    typed = parse_typed(fm)
+    if target_id in ("language", "network") and target_id not in typed:
+        return f"ERROR: constraints for {target!r} have no typed {target_id!r} field. Nothing changed."
+    categories = [target_id] if target_id in ("language", "network") else [
+        category for category in _CONSTRAINT_TYPED_CATEGORIES if category in typed
+    ]
+    if not categories:
+        return f"ERROR: constraints for {target!r} have no typed fields. Nothing changed."
+    blocked = [
+        category for category in categories
+        if target_id != "all" and _constraint_effective_source(fm, category) not in ("suggested", "dismissed")
+    ]
+    if blocked:
+        found = ", ".join(
+            f"{category}={_constraint_effective_source(fm, category) or 'absent'}"
+            for category in blocked
+        )
+        return (f"ERROR: only source='suggested' constraints can be dismissed "
+                f"(found {found}). Nothing changed.")
+    if all(_constraint_effective_source(fm, category) == "dismissed" for category in categories):
+        return f"OK: constraint for {target!r} is already dismissed (idempotent no-op)."
+    dismissible_before = {
+        category for category in categories
+        if _constraint_effective_source(fm, category) != "dismissed"
+    }
+    new = text
+    for category in categories:
+        new = _set_frontmatter_flag(new, f"source_{category}", "dismissed")
+    if target_id == "all":
+        new = _set_frontmatter_flag(new, "source", "dismissed")
+    if new == text:
+        return f"ERROR: could not dismiss constraint for {target!r}. Nothing changed."
+    with _vault_lock():
+        doc.write_text(new, encoding="utf-8", newline="\n")
+        try:
+            reconcile_vault(target, links=False)
+        except Exception:  # noqa: BLE001
+            pass
+    rel = _display_doc_path(doc.relative_to(vault_root()).as_posix())
+    dismissed_after = set(typed) - set(_constraint_typed(target)) - set(_constraint_typed_unresolved(target))
+    changed = [category for category in categories if category in dismissed_after]
+    if target_id == "all":
+        changed = [category for category in changed if category in dismissible_before]
+    if not changed:
+        return f"ERROR: dismiss write for {target!r} did not dismiss a typed field. Nothing changed."
+    return (f"OK: dismissed typed constraint for {target!r} ({rel})"
+            + (f", id={target_id}." if target_id != "all" else f" (all: {', '.join(changed)})."))
+
+
+def _approve_constraint(arg: str) -> str:
+    """#1340: promote suggested constraints to HARD, or re-stamp typed fields (operator surface).
+
+    ``/approve constraint <id|all> [--slug <s>]`` — *id* is a typed category (``language`` /
+    ``network``) or ``all``. Fail-closed when nothing is on record. Provenance becomes ``hard``
+    (promotion) unless a caller already stamped ``operator-override`` via the decide path.
+    """
+    parts = (arg or "").split()
+    if not parts:
+        return ("ERROR: usage: /approve constraint <id|all> [--slug <unit>] — promote suggested "
+                "constraints to HARD (or re-stamp typed provenance).")
+    target_id = parts[0].strip().lower()
+    slug = ""
+    if "--slug" in parts:
+        i = parts.index("--slug")
+        slug = parts[i + 1] if i + 1 < len(parts) else ""
     target = (slug or active_slug() or "").strip()
     if not target:
         return "ERROR: no active unit — nothing to approve."
+    doc = vault_root() / target / "decisions" / "constraints.md"
+    if not doc.is_file():
+        return (f"ERROR: unit {target!r} has no constraints on record — call record_constraints first. "
+                "Nothing changed.")
+    try:
+        text = doc.read_text(encoding="utf-8")
+    except Exception as ex:  # noqa: BLE001
+        return f"ERROR: could not read constraints for {target!r} ({ex!r})."
+    fm = _parse_frontmatter(text)
+    if not fm:
+        return f"ERROR: constraints for {target!r} have no readable frontmatter. Nothing changed."
+    if target_id not in ("all", "language", "network"):
+        return (f"ERROR: unknown constraint id {target_id!r} — use language, network, or all.")
+    from ack.ace.constraint_types import parse_typed  # lazy
+    typed = parse_typed(fm)
+    if target_id in ("language", "network") and target_id not in typed:
+        return (f"ERROR: constraints for {target!r} have no typed {target_id!r} field. Nothing changed.")
+    categories = [target_id] if target_id in ("language", "network") else [
+        category for category in _CONSTRAINT_TYPED_CATEGORIES if category in typed
+    ]
+    if not categories:
+        return f"ERROR: constraints for {target!r} have no typed fields. Nothing changed."
+    new = text
+    for category in categories:
+        new = _set_frontmatter_flag(new, f"source_{category}", "hard")
+    if target_id == "all":
+        new = _set_frontmatter_flag(new, "source", "hard")
+    if new == text:
+        warning = _revalidate_approved_design(target)
+        active = [category for category in categories if _constraint_typed(target).get(category) not in (None, "")]
+        return ((f"Constraints for {target!r} already HARD/promoted. Nothing changed."
+                 if active else
+                 f"Constraints for {target!r} already stamped, but no typed HARD floor is active. Nothing changed.")
+                + (f"\n{warning}" if warning else ""))
+    with _vault_lock():
+        doc.write_text(new, encoding="utf-8", newline="\n")
+        try:
+            reconcile_vault(target, links=False)
+        except Exception:  # noqa: BLE001
+            pass
+    rel = _display_doc_path(doc.relative_to(vault_root()).as_posix())
+    warning = _revalidate_approved_design(target)
+    active = [category for category in categories if _constraint_typed(target).get(category) not in (None, "")]
+    floor_msg = (" Typed HARD floor is now active for L2/L3."
+                 if active else
+                 " No typed HARD floor is active after the write.")
+    return (f"OK: approved constraint for {target!r} ({rel}) — source=hard"
+            + (f", id={target_id}" if target_id != "all" else f" (all: {', '.join(categories)}).")
+            + floor_msg
+            + (f"\n{warning}" if warning else ""))
+
+
+def _override_constraint_typed(slug: str, category: str, value: "Any",
+                               *, provenance: str = "operator-override") -> "Optional[str]":
+    """#1340 decide-counter path: set a typed HARD field on constraints.md (operator override).
+
+    Returns None on clean success, an ERROR: string on override failure, or a WARNING: string
+    when the override succeeded but the recorded design still conflicts with a remaining HARD
+    floor (a fresh fork was emitted / an approval revoked). Never raises.
+    """
+    try:
+        target = (slug or "").strip()
+        cat = (category or "").strip().lower()
+        if not target or cat not in ("language", "network"):
+            return "ERROR: override needs a unit slug and language|network category."
+        doc = vault_root() / target / "decisions" / "constraints.md"
+        if not doc.is_file():
+            return f"ERROR: unit {target!r} has no constraints.md to override."
+        text = doc.read_text(encoding="utf-8")
+        # Normalise value for frontmatter.
+        if cat == "network":
+            fm_val = "true" if value in (True, "true", "True", 1, "1") else "false"
+        else:
+            fm_val = str(value).strip().lower()
+        new = _set_frontmatter_flag(text, cat, fm_val)
+        new = _set_frontmatter_flag(new, f"source_{cat}", provenance)
+        with _vault_lock():
+            doc.write_text(new, encoding="utf-8", newline="\n")
+            try:
+                reconcile_vault(target, links=False)
+            except Exception:  # noqa: BLE001
+                pass
+        return _revalidate_approved_design(target)
+    except Exception as ex:  # noqa: BLE001
+        return f"ERROR: could not override constraint ({ex!r})."
+
+
+def _approve_design(slug: "Optional[str]" = None) -> str:
+    """S5 (#1227): promote the active (or *slug*) unit's ``stage: design`` proposal to a decision and stamp
+    ``approved: true`` — the operator's influence/approval point that unblocks implementation handovers.
+    File-based (R1). Returns a human message. Fail-closed: no unit / no design doc → a clear ERROR, nothing
+    changed.
+
+    #1340 (S4 / R5): a **pending** constraint-fork envelope for the unit BLOCKS design approval
+    (fail-closed) — resolve with ``/fork decide`` first. No ledger / no pending → byte-identical.
+    """
+    target = (slug or active_slug() or "").strip()
+    if not target:
+        return "ERROR: no active unit — nothing to approve."
+    design_typed: "Dict[str, Any]" = {}
+    try:
+        design_doc = vault_root() / target / "decisions" / "design.md"
+        if design_doc.is_file():
+            from ack.ace.constraint_types import parse_typed  # lazy
+            design_typed = parse_typed(design_doc.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001 -- the existing hard-check path handles parse/read failure fail-closed
+        design_typed = {}
+    _resolve_forks_satisfied_by_design(target, design_typed)
+    # #1340: pending constraint fork blocks design approval (fail-closed).
+    # When CONSTRAINT_CONFLICT_DETECT is on, a ledger-read failure also refuses (fail-closed);
+    # flag off ⇒ no ledger probe block (byte-identical).
+    try:
+        pending = _pending_constraint_forks(target)
+    except Exception as ex:  # noqa: BLE001 — flag-on fail-closed path only
+        return (f"ERROR: could not read constraint-fork ledger for {target!r} "
+                f"({type(ex).__name__}: {ex}) — refuse design approval (fail-closed). "
+                "Nothing changed.")
+    if pending:
+        fid = getattr(pending[0], "fork_id", "") or "?"
+        hints = "\n" + "\n".join(_fork_decide_hint(env) for env in pending)
+        return (f"ERROR: pending constraint fork {fid} — resolve with "
+                f"`/fork decide {fid} --choice keep|counter` before approving the design. "
+                "Nothing changed."
+                f"{hints}")
     with _vault_lock():
         vdir = vault_root() / target
         if not (vdir / "meta.md").is_file():
@@ -1665,7 +2813,17 @@ def _approve_design(slug: "Optional[str]" = None) -> str:
         text = doc.read_text(encoding="utf-8")
         if _fm_is_true(_parse_frontmatter(text).get("approved")):
             return f"Design for {target!r} is already approved ({rel})."
+        # #1342 (S6): L3 hard-check — refuse approval when the design omits/mismatches a HARD
+        # typed floor. Runs AFTER the pending-fork block (S4) and BEFORE stamping approved.
+        # record_design stays advisory (emits L2 fork only); the hard floor is here.
+        hc_err = _constraint_hardcheck(target, design_typed, require_present=True)
+        if hc_err:
+            return hc_err
+        sc_err = _constraint_softcheck(target, design_typed, require_present=True)
+        if sc_err:
+            return sc_err
         new = _set_frontmatter_flag(text, "approved", "true")
+        new = _set_frontmatter_flag(new, "type", "decision")
         if new == text:
             return f"ERROR: could not stamp approval on the design doc for {target!r} ({rel})."
         doc.write_text(new, encoding="utf-8", newline="\n")
@@ -1900,6 +3058,13 @@ def _reconcile_orphan_memory(*, dry_run: bool = True) -> Dict[str, Any]:
     return out
 
 
+#: #1317: a per-call override of the exec cwd. A bridged client (Ink / thin CLI) receives the server-shipped
+#: active-project exec cwd and sets this around ``run_tool`` so its LOCAL tool execution (relative-path
+#: resolution + ``execute_command`` cwd) targets the active project, not the client's frozen boot workdir.
+_EXEC_CWD_OVERRIDE: "contextvars.ContextVar[Optional[str]]" = contextvars.ContextVar(
+    "_EXEC_CWD_OVERRIDE", default=None)
+
+
 def _exec_cwd() -> "Optional[str]":
     """The filesystem working directory for MODEL-DRIVEN execution — the code-tools (read/write/list/…),
     ``execute_command``, and the launched code-agent — under the active ProjectContext (ADR-0011 AD-1 / S9c).
@@ -1916,6 +3081,9 @@ def _exec_cwd() -> "Optional[str]":
     runs under ``<root>/<CODE_SUBDIR>`` (created on demand) so the software tree is isolated from the control-
     plane (vault/, .ironclad/ keep resolving to the project root via ``_project_root``). Empty ⇒ the pre-
     isolation behaviour, byte-identical."""
+    _ov = _EXEC_CWD_OVERRIDE.get()      # #1317: a bridged client's run_tool sets the server-shipped active-
+    if _ov:                            # project exec cwd for the call → its LOCAL tool ops resolve there.
+        return _ov
     pc = _pc.current() if _pc is not None else None
     root: "Optional[str]" = None
     if pc is not None and pc.root and not (_BOOT_WORKDIR is not None and Path(pc.root) == _BOOT_WORKDIR):
@@ -2183,9 +3351,46 @@ def _setup_output() -> None:
     _COLOR_ENABLED = _color_supported()
 
 THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
+_THINK_OPEN_RE = re.compile(r"<think>", re.I)
+TOOLCALL_RE = re.compile(r"<tool_call>.*?</tool_call>", re.DOTALL)
 
 def clean(text: str) -> str:
     return THINK_RE.sub("", text).strip() if text else ""
+
+
+def _answer_is_empty(content: object) -> bool:
+    if not content:
+        return True
+    txt = clean(str(content))
+    m = _THINK_OPEN_RE.search(txt)
+    if m:
+        txt = txt[:m.start()]
+    return not txt.strip()
+
+
+def _should_finalize_truncation(flag: bool, finalized: bool, tool_calls: object,
+                                finish_reason: object, content: object) -> bool:
+    return (
+        bool(flag)
+        and not finalized
+        and not tool_calls
+        and finish_reason == "length"
+        and _answer_is_empty(content)
+    )
+
+
+def _accumulate_generation_metrics(perf: Dict[str, Any], turn: Dict[str, Any],
+                                   metrics: Optional[Dict[str, Any]]) -> bool:
+    if not metrics:
+        return False
+    perf["gens"]       += 1
+    perf["prompt"]     += metrics.get("prompt_tokens") or 0
+    perf["completion"] += metrics.get("completion_tokens") or 0
+    perf["wall"]       += metrics.get("total") or 0.0
+    turn["gens"]       += 1
+    turn["prompt"]     += metrics.get("prompt_tokens") or 0
+    turn["completion"] += metrics.get("completion_tokens") or 0
+    return True
 
 # ─── Thinking auto-classification ────────────────────────────
 # Safe failure mode: when in doubt, THINK. Thinking is only switched off for clear
@@ -2350,6 +3555,7 @@ _TOOL_LABELS = {
     "comment_on_issue": ("Comment", "number"),
     "pr_status":        ("PR-checks", "number"),
     "web_search":       ("Search", "query"),
+    "review":           ("Review", "focus"),
 }
 
 
@@ -2396,7 +3602,7 @@ _UI_SINK: Optional[Callable[[str], None]] = None
 _INPUT_QUEUE: _q.Queue        = _q.Queue()
 _CANCEL_EVENT                 = threading.Event()
 _RELOAD_FLAG                  = False
-_WATCHER_ENABLED              = True    # auto-advance via reconciler (stable now → default on)
+_WATCHER_ENABLED              = False   # auto-advance via reconciler; enabled only by /auto on
 RECONCILER_INTERVAL           = 3.0     # polling interval (s)
 _ADVANCE_CMD                  = "\x00advance\x00"   # internal structured reconciler command
 _LAUNCH_CMD                   = "\x00launch\x00"    # internal autopilot launch command
@@ -2871,7 +4077,7 @@ TOOLS = [
             "description": ("Persist the DESIGN for the active unit BEFORE any implementation. Call this "
                             "after your analysis: `title` = the design's title, `body` = the design (goal, "
                             "the chosen approach/technology + WHY, architecture, the facets to cover). It "
-                            "writes a decisions/ doc the engine's design-gate reads, then you STOP — an "
+                            "writes a decisions/ proposal the engine's design-gate reads, then you STOP — an "
                             "implementation stage_handover is REFUSED until the operator approves the design "
                             "(/approve). This is the no-blind-coding contract (R2)."),
             "parameters": {
@@ -2879,13 +4085,65 @@ TOOLS = [
                 "properties": {
                     "title": {"type": "string", "description": "the design's title"},
                     "body": {"type": "string",
-                             "description": "the design content — approach/technology + why, architecture, facets"}
+                             "description": "the design content — approach/technology + why, architecture, facets"},
+                    # #1341: optional machine-checkable typed fields (allow-listed; invalid → refusal).
+                    "language": {"type": "string",
+                                 "description": "optional — design language token (e.g. python, rust, go)"},
+                    "network": {"type": "string",
+                                "description": "optional — design network stance (none/forbidden or allowed)"},
                 },
                 "required": ["title", "body"]
             }
         }
     }
 ]
+
+# #1338: conditional L1 constraint-capture tool. It is deliberately separate from static ``TOOLS`` so the
+# default-off model surface remains byte-identical.
+CONSTRAINT_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "record_constraints",
+        "description": ("Capture the active unit's hard constraints, taboos, and scope floor BEFORE design. "
+                        "Call deterministically with `title` and the constraints `body`; use `none` when the "
+                        "unit explicitly has no constraints. Optional typed `language`/`network` values "
+                        "(allow-listed) and `source` provenance are persisted as frontmatter. "
+                        "OMIT `source` for anything the operator stated (even casually, e.g. 'in Python') — it is a HARD operator mandate. "
+                        "Set `suggested` ONLY for a value YOU inferred that the operator did NOT state. "
+                        "Under the protection profile (conflict-detect on) a `suggested` typed value "
+                        "GATES `/approve`: a deviating/omitting design is BLOCKED until the operator runs "
+                        "`/approve constraint <id>` (make it HARD) or `/dismiss constraint <id>` "
+                        "(drop it); otherwise it is advisory (promote with `/approve constraint`). "
+                        "Never mark an operator's stated constraint suggested. "
+                        "The engine writes the single canonical decisions/constraints.md document."),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "title": {"type": "string", "description": "the constraint set's title"},
+                "body": {"type": "string",
+                         "description": "the unit's hard constraints, taboos, and scope floor, or `none`"},
+                # #1341: optional typed HARD/SUGGESTED fields (allow-listed; invalid → refusal).
+                "language": {"type": "string",
+                             "description": "optional — language constraint token (e.g. py, python, rust)"},
+                "network": {"type": "string",
+                            "description": "optional — network constraint (none/forbidden or allowed)"},
+                "source": {"type": "string",
+                           "description": ("optional — provenance of a TYPED value. OMIT it for anything "
+                                           "the operator stated (even casually, e.g. 'in Python') — it is a "
+                                           "HARD operator mandate. Set `suggested` ONLY for a value YOU "
+                                           "inferred that the operator did NOT state. Under the protection "
+                                           "profile (conflict-detect on) a `suggested` typed value GATES "
+                                           "`/approve`: a deviating/"
+                                           "omitting design is BLOCKED until the operator runs "
+                                           "`/approve constraint <id>` "
+                                           "(make it HARD) or `/dismiss constraint <id>` (drop it); otherwise "
+                                           "it is advisory (promote with `/approve constraint`). Never mark an "
+                                           "operator's stated constraint suggested.")},
+            },
+            "required": ["title", "body"],
+        },
+    },
+}
 
 # query_memory is offered as soon as memory is CONFIGURED (any mode, NOT onboarding-only):
 # _effective_tools() adds [MEMORY_TOOL, DEEP_MEMORY_TOOL] when `_MEMORY is not None`. (The
@@ -3176,6 +4434,50 @@ PR_STATUS_TOOL = {
     },
 }
 
+# #1221 (epic #1212): generic cross-model second-opinion review — ANY configured code-agent (KIMI/SONNET/
+# CODEX/OPUS/…), not codex-only; works in EVERY area (a git diff by default, or named paths for docs/
+# decisions/plans/artifacts). Mechanism: `_code_agent_registry()` + `client.default_cli_runner` (existing
+# synchronous hardened-env CLI runner) — no new reviewer backend. Capability-detected (offered only when a
+# reviewer agent is runnable on this box). A READ of untrusted reviewer text → `_INGESTION_TOOLS`. Bounded
+# synchronous call (`review.timeout_s`), never a watch/poll.
+REVIEW_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "review",
+        "description": (
+            "Get an INDEPENDENT cross-model second opinion from a configured code-agent reviewer (KIMI / "
+            "SONNET / CODEX / OPUS / … — any agent in the registry). Use this to review a working git diff "
+            "(default), named files/docs/decisions/plans (`paths`), or any artifact you produced or are "
+            "weighing — NEVER self-review. Optional `focus` steers the review; optional `agent` selects the "
+            "reviewer (default: config `review.agent`, else a distinct peer from the producer via anti-affinity). "
+            "Returns the reviewer's structured findings (Summary / Findings / Recommendations / Verdict). "
+            "Bounded and synchronous — not a watch/poll."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "focus": {
+                    "type": "string",
+                    "description": "optional review focus (e.g. 'security', 'API contract', 'doc completeness')",
+                },
+                "agent": {
+                    "type": "string",
+                    "description": ("optional reviewer agent_id from the code-agent registry; default is "
+                                    "config review.agent or a distinct peer (never self-review when a peer exists)"),
+                    "enum": ["OPUS", "SONNET"],
+                },
+                "paths": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": ("optional files/docs/artifacts to review; omit to review the working "
+                                    "git diff (staged + unstaged vs HEAD)"),
+                },
+            },
+            "required": [],
+        },
+    },
+}
+
 # #1074 (epic #1043 quick-win): read a specific http(s) page verbatim (RFCs/standards/API specs/docs) —
 # web_search FINDS pages, fetch_url READS one. Offered only when the trust profile allows outbound
 # (blocked under sealed unless security.web_in_sealed). Bounded: a hard byte cap + a basic SSRF guard
@@ -3438,8 +4740,9 @@ def _all_tool_names(include_plugins: bool = True) -> frozenset:
             n = ((t or {}).get("function") or {}).get("name")
             if n:
                 names.add(n)
-    for sn in ("MEMORY_TOOL", "DEEP_MEMORY_TOOL", "MEMORY_WRITE_TOOL", "PARALLEL_TOOL", "WEBSEARCH_TOOL",
-               "CREATE_ISSUE_TOOL", "VIEW_ISSUE_TOOL", "CREATE_PR_TOOL", "COMMENT_ISSUE_TOOL", "PR_STATUS_TOOL", "FETCH_URL_TOOL", "USE_SKILL_TOOL", "USE_PROMPT_TOOL"):
+    for sn in ("CONSTRAINT_TOOL", "MEMORY_TOOL", "DEEP_MEMORY_TOOL", "MEMORY_WRITE_TOOL", "PARALLEL_TOOL", "WEBSEARCH_TOOL",
+               "CREATE_ISSUE_TOOL", "VIEW_ISSUE_TOOL", "CREATE_PR_TOOL", "COMMENT_ISSUE_TOOL", "PR_STATUS_TOOL",
+               "REVIEW_TOOL", "FETCH_URL_TOOL", "USE_SKILL_TOOL", "USE_PROMPT_TOOL"):
         t = g.get(sn)
         n = ((t or {}).get("function") or {}).get("name") if isinstance(t, dict) else None
         if n:
@@ -3476,6 +4779,188 @@ def _forge_available() -> bool:
         return False
 
 
+def _review_available() -> bool:
+    """#1221: capability check for the `review` tool — offered when AT LEAST ONE code-agent binary
+    resolves on this box (the reviewer runs via ``default_cli_runner``). Mirrors ``_forge_available()``
+    (uniformly capability-detected; lights up on the desktop/local topology where coder CLIs live).
+    Never raises."""
+    try:
+        from providers import probe_code_agents
+        return any(probe_code_agents(_code_agent_registry()).values())
+    except Exception:  # noqa: BLE001 — a flaky probe must never break the turn
+        return False
+
+
+try:
+    _MODEL_PROBE_TIMEOUT_S = float(os.environ.get("GX10_MODEL_PROBE_TIMEOUT_S") or 8.0)
+except Exception:  # noqa: BLE001
+    _MODEL_PROBE_TIMEOUT_S = 8.0
+_MODEL_CHECK_CACHE: Dict[str, "ModelCheck"] = {}
+
+
+def _probe_agent_model(spec, bin_path):
+    """Run an opt-in code-agent models probe and return a pure providers.ModelCheck, fail-soft."""
+    try:
+        if spec is None or not getattr(spec, "models_probe", None) or not bin_path:
+            return None
+        from providers import validate_model
+        argv = [bin_path] + shlex.split(spec.models_probe)
+        cp = subprocess.run(
+            argv, stdin=subprocess.DEVNULL, capture_output=True, text=True, errors="replace",
+            timeout=_MODEL_PROBE_TIMEOUT_S,
+        )
+        merged = (cp.stdout or "") + ("\n" if cp.stdout and cp.stderr else "") + (cp.stderr or "")
+        if not merged.strip():
+            return None
+        return validate_model(spec, merged)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _validate_code_agent_models() -> list:
+    """Populate the opt-in model-check cache and return cached mismatches. Never raises into boot."""
+    out = []
+    try:
+        from providers import resolve_agent_bin
+        reg = _code_agent_registry()
+        for aid in reg.names():
+            spec = reg.resolve(aid)
+            if spec is None or not getattr(spec, "models_probe", None):
+                continue
+            check = _probe_agent_model(spec, resolve_agent_bin(spec))
+            if check is None:
+                continue
+            _MODEL_CHECK_CACHE[aid.upper()] = check
+            if check.ok is False:
+                out.append(check)
+    except Exception:  # noqa: BLE001
+        return []
+    return out
+
+
+def _cached_model_mismatch(agent) -> Optional["ModelCheck"]:
+    """Return a cached opt-in mismatch for an agent, or None when unprobed/ok. Never raises."""
+    try:
+        mm = _MODEL_CHECK_CACHE.get((agent or "").upper())
+        return mm if mm is not None and mm.ok is False else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _pick_reviewer(requested: Optional[str] = None) -> Optional[str]:
+    """#1221: resolve the reviewer agent_id. Explicit ``agent`` arg wins (fail-closed if unknown /
+    unrunnable) — a deliberate request is honored even if it equals the producer. Config-default /
+    no-arg path: prefer config ``review.agent`` when runnable **and** not a self-review against a
+    runnable peer; else a SOFT distinct-peer pick that excludes the producer pin (#457 anti-affinity —
+    waive and keep the only capable agent when exclusion would empty the set). Returns None when
+    nothing is runnable."""
+    from providers import resolve_agent_bin
+    reg = _code_agent_registry()
+
+    def runnable(aid: str) -> bool:
+        if not aid or not reg.has(aid):
+            return False
+        return bool(resolve_agent_bin(reg.resolve(aid)))
+
+    req = (requested or "").strip().upper()
+    if req:
+        return req if runnable(req) else None
+
+    # SOFT distinct-reviewer anti-affinity (#457): never self-review when a peer exists.
+    # Applies to the config-default / no-arg path only (explicit arg is already honored above).
+    producer = _code_agent_pin()
+    candidates = [a for a in reg.names() if runnable(a)]
+    if not candidates:
+        return None
+    peers = [a for a in candidates if a != producer] if producer else list(candidates)
+
+    cfg_agent = (REVIEW_AGENT or "").strip().upper()
+    if cfg_agent and runnable(cfg_agent):
+        # Config default is fine unless it would self-review while a peer is runnable.
+        if not producer or cfg_agent != producer or not peers:
+            return cfg_agent
+        return peers[0]
+
+    if peers:
+        return peers[0]
+    return candidates[0]
+
+
+def _normalize_review_paths(paths_arg) -> List[str]:
+    """Accept an array of strings OR a comma-separated string (models sometimes emit either)."""
+    if paths_arg is None or paths_arg == "":
+        return []
+    if isinstance(paths_arg, (list, tuple)):
+        return [str(p).strip() for p in paths_arg if str(p).strip()]
+    return [p.strip() for p in str(paths_arg).split(",") if p.strip()]
+
+
+def _assemble_review_material(paths_arg) -> Tuple[str, str]:
+    """Assemble the review payload. Default = working ``git diff HEAD``; with ``paths`` = named files
+    (docs/decisions/plans/artifacts). Returns ``(mode, material)`` where mode is ``diff`` or ``paths``.
+    Material is char-capped. Never raises."""
+    paths = _normalize_review_paths(paths_arg)
+    if paths:
+        parts: List[str] = []
+        usable = 0
+        for rel in paths:
+            p = _resolve_exec_path(rel)
+            if not p.exists():
+                parts.append(f"### {rel}\nERROR: not found\n")
+                continue
+            if p.is_dir():
+                parts.append(f"### {rel}/\n(directory — pass specific files, not a directory)\n")
+                continue
+            try:
+                text = p.read_text(encoding="utf-8", errors="replace")
+            except Exception as e:  # noqa: BLE001
+                parts.append(f"### {rel}\nERROR: read failed: {e!r}\n")
+                continue
+            usable += 1
+            parts.append(f"### {rel}\n```\n{text}\n```\n")
+        if usable == 0:
+            return "paths", "ERROR: no readable files among the given paths."
+        material = "\n".join(parts)
+        mode = "paths"
+    else:
+        cwd = str(_exec_cwd() or Path.cwd())
+        try:
+            proc = subprocess.run(
+                ["git", "-C", cwd, "diff", "HEAD"],
+                capture_output=True, text=True, timeout=30,
+            )
+            material = proc.stdout or ""
+            if proc.returncode != 0 and not material.strip():
+                err = (proc.stderr or "").strip()[:500]
+                return "diff", f"ERROR: git diff failed: {err or f'exit {proc.returncode}'}"
+            if not material.strip():
+                material = "(empty working-tree diff — no uncommitted changes vs HEAD)"
+            mode = "diff"
+        except Exception as e:  # noqa: BLE001
+            return "diff", f"ERROR: git diff failed: {e!r}"
+    if len(material) > _REVIEW_MATERIAL_CAP:
+        material = (material[:_REVIEW_MATERIAL_CAP]
+                    + f"\n\n... [Ironclad: review material truncated at {_REVIEW_MATERIAL_CAP} chars] ...")
+    return mode, material
+
+
+def _review_prompt(focus: str, mode: str, material: str) -> str:
+    """Build the independent-reviewer prompt (structured findings; author-blind)."""
+    focus_line = (focus or "").strip() or "general correctness, risks, missing pieces, and contract fit"
+    return (
+        "You are an independent cross-model reviewer. You did NOT author the material below.\n"
+        "Review it critically and return STRUCTURED findings only — no code rewrites.\n\n"
+        f"Focus: {focus_line}\n"
+        f"Material mode: {mode}\n\n"
+        "Output format (use exactly these headings):\n"
+        "## Summary\n(1-3 sentences)\n"
+        "## Findings\n- [severity: high|medium|low] <finding> — <evidence/location>\n"
+        "## Recommendations\n- <actionable next step>\n"
+        "## Verdict\nAPPROVE | REQUEST_CHANGES | NEEDS_DISCUSSION\n\n"
+        f"--- BEGIN MATERIAL ---\n{material}\n--- END MATERIAL ---\n"
+    )
+
+
 def _forge_labels() -> Optional[set]:
     """create_issue label vocabulary (#1130 follow-up): the repo's ACTUAL labels, for validate→reask on the
     `labels` arg — the model must use existing labels, not invent them. Returns None on any error (fail-soft:
@@ -3498,11 +4983,15 @@ def _effective_tools() -> List[Dict[str, Any]]:
     web = [WEBSEARCH_TOOL] if _web_search_available() else []
     iss = ([CREATE_ISSUE_TOOL, VIEW_ISSUE_TOOL, CREATE_PR_TOOL, COMMENT_ISSUE_TOOL, PR_STATUS_TOOL]
            if _forge_available() else [])   # #1073/#1208/#1215/#1217/#1219: capability-detected forge surface
+    # #1221: cross-model second-opinion review — route through `_tools_with_agent_enum` so the
+    # model-facing `agent` enum is LIVE from the registry (CODEX/KIMI/…), not the static OPUS/SONNET.
+    rev = _tools_with_agent_enum([REVIEW_TOOL]) if _review_available() else []
     fet = [FETCH_URL_TOOL] if _web_search_trust_ok() else []   # #1074: outbound fetch, blocked under sealed
     plug = [t["schema"] for t in _PLUGIN_TOOLS.values()]
     skl = [USE_SKILL_TOOL] if _PLAYBOOKS else []
     prm = [USE_PROMPT_TOOL] if _PROMPTS else []
-    return (_tools_with_agent_enum(TOOLS) + mem + par + web + iss + fet + plug + skl + prm
+    con = [CONSTRAINT_TOOL] if CONSTRAINT_GATE_ENABLED else []
+    return (_tools_with_agent_enum(TOOLS) + con + mem + par + web + iss + rev + fet + plug + skl + prm
             + (ONBOARDING_TOOLS if ONBOARDING_MODE else []))
 
 # ─── Macro tool: deterministic pipeline (HV-A) ─────────────
@@ -3537,6 +5026,82 @@ def _normalize_handover_id(md: str, tid: str) -> str:
     to the ID assigned by the store. count=0 = replace all occurrences, so
     the feedback template in the body doesn't keep KGC-XXX (reconciler fallback)."""
     return re.sub(r"(?m)^(task_id:\s*).*$", rf"\g<1>{tid}", md, count=0)
+
+
+def _normalize_handover_recipient(md: str, agent: str) -> str:
+    """#1311: the frontmatter ``to:`` is the authoritative recipient (the resolved agent, also the
+    handover filename), but the model authors the free-form body Meta block and can name a DIFFERENT
+    agent there (e.g. ``Recipient: CODEX`` on a SONNET handover) — confusing for the coder that reads it.
+    Rewrite a body ``Recipient:`` line to the resolved agent, but ONLY when it names another configured
+    code-agent — NEVER a legitimate payload value (an email/header fixture the task is about, a person),
+    so task content the coder must produce is left untouched. Matches plain / bulleted / bold forms with
+    the colon inside (``**Recipient:**``) or outside (``**Recipient**:``) the bold. No-op with no agent."""
+    if not agent:
+        return md
+    known = {a.upper() for a in _agent_names()} | {agent.upper()}   # configured code-agent tokens
+    pat = re.compile(r"(?i)^(?P<pre>\s*(?:[-*]\s+)?\*{0,2}\s*Recipient\s*\*{0,2}\s*:\s*\*{0,2}\s*)(?P<val>.*)$")
+    # Scope to the FIRST Recipient line OUTSIDE any fenced code block (the Meta recipient) — never rewrite a
+    # Recipient in task payload / a fenced example (a later line, or code), and only when it names another
+    # configured agent. This is the precise `Recipient: CODEX`-on-a-SONNET-handover fix, nothing else.
+    out: List[str] = []
+    in_fence = done = False
+    for line in md.splitlines(keepends=True):
+        s = line.lstrip()
+        if s.startswith("```") or s.startswith("~~~"):
+            in_fence = not in_fence
+            out.append(line)
+            continue
+        if not done and not in_fence:
+            content = line.rstrip("\r\n")
+            m = pat.match(content)
+            if m:
+                done = True   # the FIRST non-fenced Recipient line IS the Meta one — scan no further, so a
+                              # later `Recipient: <agent>` in task payload is never rewritten, whether or
+                              # not this line needed a fix.
+                cur = m.group("val").strip().strip("*").strip().upper()
+                if cur in known and cur != agent.upper():
+                    out.append(f"{m.group('pre')}{agent}{line[len(content):]}")   # keep the line ending
+                    continue
+        out.append(line)
+    return "".join(out)
+
+
+def _inject_code_root_note(md: str) -> str:
+    """#1328: when model-driven execution is rooted below the project, tell the coder that its cwd is
+    already that code root. The orchestrator plans from the project root and can otherwise repeat the
+    configured subdir in the handover, producing ``src/src``-style trees. Insert the note after leading
+    YAML frontmatter when present, keep re-hands idempotent, and fail soft like the other enrichments."""
+    if not CODE_SUBDIR:
+        return md
+    try:
+        marker = "<!-- ironclad-code-root-note -->"
+        if marker in md:
+            return md
+        nl = "\r\n" if "\r\n" in md else "\n"
+        note = nl.join((
+            marker,
+            "> [!IMPORTANT]",
+            f"> **Code root:** Your working directory is already the project's code root (`{CODE_SUBDIR}`).",
+            "> Create the package and `pyproject.toml` directly in this working directory. Do not add another",
+            f"> `{CODE_SUBDIR}/` prefix; that would double-nest the tree.",
+        ))
+        insert_at = 0
+        lines = md.splitlines(keepends=True)
+        if lines and lines[0].strip() == "---":
+            offset = len(lines[0])
+            for line in lines[1:]:
+                offset += len(line)
+                if line.strip() == "---":
+                    insert_at = offset
+                    break
+        if not insert_at:
+            return note + nl + nl + md
+        before, after = md[:insert_at], md[insert_at:]
+        if not before.endswith(("\n", "\r")):
+            before += nl
+        return before + nl + note + nl + nl + after.lstrip("\r\n")
+    except Exception:   # noqa: BLE001 — a staging hint must never break handover enrichment
+        return md
 
 
 # ── #602 SUB-2 (#690): the Loop-Intelligence Hook-Bus publish seam ───────────────────────────────
@@ -3851,13 +5416,44 @@ def _handover_path_warnings(handover_md: str) -> List[str]:
 
 
 # ─── Macro tool: publish a handover (OPT-2, store-backed) ──
-def _enrich_handover(tid: str, handover_md: str, fields: Dict[str, Any], log: List[str]) -> str:
+def _enrich_handover(tid: str, handover_md: str, fields: Dict[str, Any], log: List[str],
+                     agent: str = "",
+                     constraint_snapshot: "Optional[tuple[str, Optional[str]]]" = None) -> str:
     """Shared handover enrichment (#1296 parity — used by BOTH staging paths, create and re-hand):
-    normalize the embedded task id, append the token-budgeted Memory brief (#458 D1, fail-soft) and
-    the advisory ACE/lesson context (#863/#877/#880). ``fields`` supplies title/type (the creation
-    payload on the create path; the STORED task on the re-hand path). Every stage is fail-soft —
-    enrichment never breaks a staging call."""
+    normalize the embedded task id, inject captured constraints (S2 #1339, single-snapshot, idempotent
+    strip-then-add), append the token-budgeted Memory brief (#458 D1, fail-soft) and the advisory
+    ACE/lesson context (#863/#877/#880). ``fields`` supplies title/type (the creation payload on the
+    create path; the STORED task on the re-hand path). Every stage is fail-soft — enrichment never
+    breaks a staging call. ``constraint_snapshot`` is the caller's one status read (C10.7); ``None``
+    is a no-op (gate off / byte-identical)."""
     ho_md = _normalize_handover_id(handover_md, tid)
+    ho_md = _normalize_handover_recipient(ho_md, agent)   # #1311: body Recipient agrees with frontmatter `to:`
+    ho_md = _inject_code_root_note(ho_md)                 # #1328: coder cwd already IS the configured code root
+    # S2 (#1339): verbatim constraint injection — always strip first (idempotent re-hand), then prepend
+    # a single block when the snapshot is CAPTURED. Fail-soft; no second status read (C10.7).
+    if constraint_snapshot is not None:
+        try:
+            open_m, close_m = _CONSTRAINT_MARKERS
+            ho_md = re.sub(
+                rf"{re.escape(open_m)}.*?{re.escape(close_m)}\n*",
+                "",
+                ho_md,
+                flags=re.DOTALL,
+            )
+            status, body = constraint_snapshot
+            if status == CAPTURED and body:
+                ho_md = (
+                    f"{open_m}\n"
+                    f"## Constraints (authoritative — honour verbatim; do not override)\n"
+                    f"\n"
+                    f"{body}\n"
+                    f"{close_m}\n"
+                    f"\n"
+                    f"{ho_md}"
+                )
+                log.append("Constraints injected")
+        except Exception:  # noqa: BLE001 — advisory: a constraint inject must never break staging
+            pass
     # The richer token-budgeted Memory brief from past patterns (#458 D1, fail-soft):
     # body-keyed search + optional relational hits + the shared warm rolling summary.
     if _MEMORY is not None and _MEMORY.is_available():
@@ -4000,10 +5596,31 @@ def _stage_handover_impl(task_id: Optional[str], agent: str, handover_md: str,
             gate_err = _design_gate(task_type, active_slug())
             if gate_err:
                 return gate_err
+            # S2 (#1339): single constraint snapshot drives the presence gate AND injection (C10.7, no TOCTOU).
+            # IMPLEMENTATION types only for the gate; injection runs for every type when on record.
+            # `force` does NOT bypass. Read once, only when the feature is on (byte-identical off).
+            csnap: "Optional[tuple[str, Optional[str]]]" = None
+            if CONSTRAINT_GATE_ENABLED:
+                csnap = _constraint_status(active_slug())
+                if task_type in _IMPLEMENTATION_TASK_TYPES:
+                    c_err = _constraint_gate(active_slug(), snapshot=csnap)
+                    if c_err:
+                        return c_err
+            # #1342 (S6): L3 typed hard-check on the REAL task object (TaskSpec language/network).
+            # IMPLEMENTATION types only; PRE-write; `force` does NOT bypass. Flag off → no-op.
+            if task_type in _IMPLEMENTATION_TASK_TYPES:
+                hc_err = _constraint_hardcheck(
+                    active_slug(), _task_typed_fields(fields), require_present=True)
+                if hc_err:
+                    return hc_err
             # Store: dedup + ID + created_at + schema, writes the pending JSON
             try:
                 task = store.create(fields, force=bool(force))
             except DuplicateTaskError as e:
+                if e.exact:
+                    return (f"ERROR: duplicate — an EXACT-title task already exists as "
+                            f"{e.existing_id}. Re-hand it with `task_id={e.existing_id}` "
+                            f"(no task_json); `force` does NOT create an exact-title duplicate.")
                 return (f"ERROR: duplicate — a task on the same topic already exists as "
                         f"{e.existing_id}. No new task created. Use the existing task "
                         f"or (only when instructed) set force=true.")
@@ -4011,7 +5628,7 @@ def _stage_handover_impl(task_id: Optional[str], agent: str, handover_md: str,
                 return f"ERROR: {e} — no task created."
             tid = task["id"]
             log.append(f"task created: {tid} (pending, created_at={task['created_at']})")
-            ho_md = _enrich_handover(tid, handover_md, fields, log)
+            ho_md = _enrich_handover(tid, handover_md, fields, log, agent, constraint_snapshot=csnap)
             ho = handovers_dir() / f"{tid}_{agent}.md"
             _atomic_write(ho, ho_md)
             log.append(f"handover written: {ho} ({len(ho_md)} chars)")
@@ -4027,10 +5644,25 @@ def _stage_handover_impl(task_id: Optional[str], agent: str, handover_md: str,
             gate_err = _design_gate(str(existing.get("type", "")), active_slug())
             if gate_err:
                 return gate_err
+            # S2 (#1339): same single-snapshot gate+injection as the create path (re-hand of impl-typed
+            # tasks cannot bypass; injection still runs for any type when constraints are on record).
+            csnap = None
+            if CONSTRAINT_GATE_ENABLED:
+                csnap = _constraint_status(active_slug())
+                if str(existing.get("type", "")).strip().lower() in _IMPLEMENTATION_TASK_TYPES:
+                    c_err = _constraint_gate(active_slug(), snapshot=csnap)
+                    if c_err:
+                        return c_err
+            # #1342 (S6): re-hand of an IMPLEMENTATION task still hard-checks the stored typed fields.
+            if str(existing.get("type", "")).strip().lower() in _IMPLEMENTATION_TASK_TYPES:
+                hc_err = _constraint_hardcheck(
+                    active_slug(), _task_typed_fields(existing), require_present=True)
+                if hc_err:
+                    return hc_err
             tid = task_id
             # #1296 parity: the lazily staged unit handover (the continuation's [NEXT-UNIT] path)
             # gets the SAME enrichment as a created one — id normalization, memory brief, lessons.
-            ho_md = _enrich_handover(tid, handover_md, existing, log)
+            ho_md = _enrich_handover(tid, handover_md, existing, log, agent, constraint_snapshot=csnap)
             ho = handovers_dir() / f"{tid}_{agent}.md"
             _atomic_write(ho, ho_md)
             log.append(f"handover written: {ho} ({len(ho_md)} chars)")
@@ -4175,6 +5807,16 @@ def _plan_units_impl(epic_json: "Optional[Any]", units_json: "Optional[Any]",
         gate_err = _design_gate(utype, active_slug())
         if gate_err:
             return gate_err
+        # S2 (#1339): decomposition requires constraints on record (unconditional; atomic pre-write).
+        c_err = _constraint_gate(active_slug())
+        if c_err:
+            return c_err
+        # #1342 (S6): L3 hard-check on IMPLEMENTATION children only (atomic PRE-write; force no-bypass).
+        if utype in _IMPLEMENTATION_TASK_TYPES:
+            hc_err = _constraint_hardcheck(
+                active_slug(), _task_typed_fields(f), require_present=True)
+            if hc_err:
+                return hc_err
         f["__placeholders"] = placeholders
         checked.append(f)
     if existing_epic is None:
@@ -4257,12 +5899,50 @@ def _plan_units_impl(epic_json: "Optional[Any]", units_json: "Optional[Any]",
     _write_board()
     _reconcile_active_soft()
     nxt, _elig, _open = _select_next_unit(store)
+    # #1310: the engine honours declared `dependencies` topologically, but a small model tends to omit them
+    # — then the selector orders by priority (not build order) and can start a module before its scaffolding.
+    _new_unit_ids = {t["id"] for t in created if str(t.get("type", "")).lower() != "epic"}
+    # #1310 (Codex): "no build order" = no NEWLY-MINTED unit depends on ANOTHER newly-minted unit (a real
+    # sibling `unit:<n>` edge). A dependency on a pre-existing task id does not order the new units among
+    # themselves, so it must not suppress the note.
+    _no_dep_multi = len(_new_unit_ids) > 1 and not any(
+        d in _new_unit_ids
+        for t in created if str(t.get("type", "")).lower() != "epic"
+        for d in (t.get("dependencies") or []))
+    _dep_warn = ("\n\nNOTE: no inter-unit dependencies were declared — the units are selected by priority "
+                 "then order, NOT build order. Stage the FOUNDATIONAL unit (the one that must build first, "
+                 "e.g. scaffolding) yourself, and declare build-order `dependencies` (`unit:<n>`: scaffolding "
+                 "before modules, a module after the models/utils it imports, tests after the code) whenever "
+                 "you plan — the loop then runs units in dependency order.") \
+        if _no_dep_multi else ""
     if nxt and AUTOPILOT_AUTOPLAN:
         # Continuation already armed: this same turn is the bootstrap — the model authors the first
-        # unit's handover right away (the post-advance turns take over from there).
-        tail = (f"\nAUTOMATION ARMED — author the FIRST unit's handover NOW: ONE stage_handover call "
-                f"with task_id='{nxt['id']}' ({nxt.get('title')!r}) and NO task_json. The loop "
-                f"advances + continues from there by itself.")
+        # unit's handover right away (the post-advance turns take over from there). #1309: the launch
+        # instruction depends on WHO launches — the loop (defer) only when it actually owns launching;
+        # in an autoplan-only run (continuation without an active launcher) the model must still launch.
+        _launch_note = ("and do NOT call launch_coder — the automation loop launches the staged handover "
+                        "itself" if _auto_owns_launching() else
+                        "then launch it with launch_coder (the continuation advances to the next unit "
+                        "after this one completes)")
+        if _no_dep_multi:
+            # #1310: with NO declared order do NOT auto-point the bootstrap at the priority-selected unit
+            # (it may be a module before its scaffolding) — have the model pick the foundational unit, so
+            # the automation loop never blindly starts a mis-ordered build.
+            tail = (f"\nAUTOMATION ARMED — author the FOUNDATIONAL unit's handover NOW (the one that must "
+                    f"build FIRST, e.g. scaffolding — with no declared dependencies the selector picked "
+                    f"{nxt['id']} by PRIORITY, which may be the wrong order): ONE stage_handover call with "
+                    f"its task_id and NO task_json, {_launch_note}.")
+        else:
+            tail = (f"\nAUTOMATION ARMED — author the FIRST unit's handover NOW: ONE stage_handover call "
+                    f"with task_id='{nxt['id']}' ({nxt.get('title')!r}) and NO task_json, {_launch_note}. "
+                    f"The loop advances + continues from there by itself.")
+    elif nxt and _no_dep_multi:
+        # #1310 (Codex): no declared build order → do NOT point the guided recommendation at the priority
+        # pick either; ask for the foundational unit, matching the armed branch.
+        tail = (f"\nNo build order is declared, so the selector picked {nxt['id']} by PRIORITY — which may "
+                f"not be the right first unit. In guided mode, stage the FOUNDATIONAL unit (the one that "
+                f"must build first, e.g. scaffolding) via stage_handover (no task_json); `/auto on [N]` "
+                f"drains the units once build-order `dependencies` are declared.")
     elif nxt:
         tail = (f"\nNext open unit: {nxt['id']} ({nxt.get('title')!r}) — `/auto on [N]` drains all "
                 f"units automatically; in guided mode, stage its handover via stage_handover "
@@ -4271,7 +5951,7 @@ def _plan_units_impl(epic_json: "Optional[Any]", units_json: "Optional[Any]",
         tail = ""
     return (f"OK: epic {eid} planned with {len(unit_ids)} unit(s) — all pending, handover-less "
             f"(each handover is authored when the unit is selected)\n"
-            + "\n".join(f"  - {l}" for l in log) + tail)
+            + "\n".join(f"  - {l}" for l in log) + _dep_warn + tail)
 
 
 # ─── #1296: pure next-unit selection (the select-unit leg of the contract loop) ──
@@ -4333,9 +6013,10 @@ def _work_in_flight(store: "TaskStore") -> bool:
 
 class DuplicateTaskError(Exception):
     """Raised when a task on the same topic already exists."""
-    def __init__(self, existing_id: str):
+    def __init__(self, existing_id: str, exact: bool = False):
         super().__init__(f"duplicate of {existing_id}")
         self.existing_id = existing_id
+        self.exact = exact
 
 
 class ContextOverflowError(RuntimeError):
@@ -4446,6 +6127,17 @@ class TaskStore:
             return 0.0
         return len(sa & sb) / len(sa | sb)
 
+    def find_exact_duplicate(self, title: str,
+                             exclude_id: Optional[str] = None) -> Optional[str]:
+        with self._lock:
+            key = self._title_key(title)
+            for task in self.list():
+                if exclude_id and task.get("id") == exclude_id:
+                    continue
+                if key and self._title_key(task.get("title", "")) == key:
+                    return task.get("id")
+            return None
+
     def find_duplicate(self, title: str, description: str = "",
                        exclude_id: Optional[str] = None) -> Optional[str]:
         with self._lock:
@@ -4505,15 +6197,19 @@ class TaskStore:
     def create(self, fields: Dict[str, Any], *, force: bool = False,
                now_iso: Optional[str] = None) -> Dict[str, Any]:
         """Creates a pending task. Assigns the ID, stamps created_at,
-        validates, rejects a topic duplicate (unless force). Model-supplied
-        id/created_at/status are IGNORED/overwritten."""
+        validates, rejects an exact-title duplicate, and rejects a fuzzy topic
+        duplicate unless forced. Model-supplied id/created_at/status are
+        IGNORED/overwritten."""
         with self._lock:
             self._validate(fields)
             self._require_base()   # B3: fail-closed — no writing to the root without an active initiative
+            exact = self.find_exact_duplicate(fields["title"])
+            if exact:
+                raise DuplicateTaskError(exact, exact=True)
             if not force:
                 dup = self.find_duplicate(fields["title"], fields.get("description", ""))
                 if dup:
-                    raise DuplicateTaskError(dup)
+                    raise DuplicateTaskError(dup, exact=False)
             tid = self.next_id()
             task = dict(fields)
             task["id"]         = tid
@@ -5014,12 +6710,88 @@ def _steering_state_block() -> str:
             _hd, _ap, _rel = _unit_design_status(unit)
             if not _hd:
                 lines.append("- design gate: no design on record — implementation handovers are BLOCKED "
-                             "(record_design first, then /approve).")
+                             "— if you have just researched/analysed a design, CALL record_design NOW to "
+                             "persist it (a prose proposal is not enough); then wait for /approve.")
             elif not _ap:
                 lines.append(f"- design gate: design recorded ({_display_doc_path(_rel)}) but NOT approved — implementation "
                              f"handovers BLOCKED until /approve.")
             else:
                 lines.append("- design gate: design approved — implementation handovers allowed.")
+        if unit and CONSTRAINT_GATE_ENABLED:
+            # S2 (#1339): gate semantics + C4 next-step (only when the gate is enforced).
+            constraint_status, _constraint_body = _constraint_status(unit)
+            if constraint_status == CAPTURED:
+                hard_typed = _constraint_typed(unit)
+                unresolved_typed = _constraint_typed_unresolved(unit)
+                hard_display = ", ".join(
+                    f"{key}={'allowed' if value is True else 'none' if value is False else value}"
+                    for key, value in hard_typed.items()
+                )
+                unresolved_display = ", ".join(
+                    f"{key}={'allowed' if value is True else 'none' if value is False else value}"
+                    for key, value in unresolved_typed.items()
+                )
+                if hard_typed:
+                    lines.append(f"- constraints: on record — HARD: {hard_display}")
+                    lines.append("- to change a HARD constraint: record a counter-proposal design "
+                                 "(record_design) → a /fork surfaces for the operator to decide "
+                                 "(keep|counter); do NOT re-negotiate in chat or re-call "
+                                 "record_constraints (the engine refuses a silent change).")
+                    pending_hint = _pending_fork_decide_hints(unit)
+                    if pending_hint:
+                        lines.append(pending_hint)
+                if unresolved_typed:
+                    if CONSTRAINT_CONFLICT_DETECT:
+                        lines.append("- constraints: SUGGESTED typed floor (not yet promoted to HARD) "
+                                     "— a deviating/omitting design approval is BLOCKED until you "
+                                     f"resolve: {unresolved_display}. `/approve constraint <id|all>` "
+                                     "makes it HARD; `/dismiss constraint <id|all>` drops it.")
+                    else:
+                        lines.append("- constraints: SUGGESTED (advisory — not enforced; promote with "
+                                     f"`/approve constraint <id|all>`): {unresolved_display}. "
+                                     "`/dismiss constraint <id|all>` drops it.")
+                if not hard_typed and not unresolved_typed:
+                    lines.append("- constraints: on record — OK")
+                try:
+                    design_doc = vault_root() / unit / "decisions" / "design.md"
+                    if design_doc.is_file():
+                        design_fm = _parse_frontmatter(design_doc.read_text(encoding="utf-8"))
+                        from ack.ace.constraint_types import parse_typed  # lazy
+                        design_typed = parse_typed(design_fm)
+                        design_display = ", ".join(
+                            f"{key}={'allowed' if value is True else 'none' if value is False else value}"
+                            for key, value in design_typed.items()
+                        )
+                        if design_display:
+                            design_kind = str(design_fm.get("type") or "proposal").strip().lower()
+                            lines.append(f"- design: {design_display} ({design_kind})")
+                        if unresolved_typed:
+                            from ack.ace.constraint_conflict import detect_conflict  # lazy
+                            conflict = detect_conflict(unresolved_typed, design_typed)
+                            omitted = [key for key in unresolved_typed if key not in design_typed]
+                            deviating = set(omitted)
+                            if conflict:
+                                deviating.add(conflict.category)
+                            blocked_clause = " — BLOCKED until resolved" if CONSTRAINT_CONFLICT_DETECT else ""
+                            for key in unresolved_typed:
+                                if key not in deviating:
+                                    continue
+                                rv = unresolved_typed[key]
+                                dv = design_typed.get(key, "omitted")
+                                rv_display = "allowed" if rv is True else "none" if rv is False else rv
+                                dv_display = "allowed" if dv is True else "none" if dv is False else dv
+                                lines.append(f"- constraints: DEVIATION — design {key}={dv_display} "
+                                             f"contradicts / omits the typed constraint {key}={rv_display} "
+                                             f"(advisory){blocked_clause}. `/approve constraint {key}` "
+                                             f"to enforce, `/dismiss constraint {key}` to drop, or align "
+                                             "the design.")
+                except Exception:  # noqa: BLE001 — advisory state must never break the turn
+                    pass
+            elif constraint_status == CAPTURED_NONE:
+                lines.append("- constraints: none on record — OK")
+            else:
+                lines.append("- constraints: NOT on record — design/decomposition/implementation "
+                             "handovers BLOCKED (call record_constraints)")
         lines.append(f"- tasks: {n_pending} pending · {n_prog} in_progress")
         # #1296: the select-unit recommendation — the SAME deterministic policy the continuation
         # uses, surfaced per turn so guided mode (auto off) can drive the loop by hand.
@@ -6019,11 +7791,27 @@ def _read_file_ranged(text: str, *, start=None, end=None, max_chars=None, patter
         return None
 
 
-def run_tool(name: str, args: Dict[str, Any]) -> str:
+def run_tool(name: str, args: Dict[str, Any], exec_cwd: "Optional[str]" = None) -> str:
     """#1202: the SINGLE structural site that renders a listing's machine ``AnswerData`` into the localized
     ``Answer:`` sentence. It wraps the tool dispatch and is **command-gated**, so EVERY caller (the model
     run loop, ``/tool``, ``/ls``, the API) and EVERY topology (native + bridged client) gets the localized
-    reply, the machine line NEVER leaks to a user, and a non-listing command's output is never rewritten."""
+    reply, the machine line NEVER leaks to a user, and a non-listing command's output is never rewritten.
+
+    #1317: a BRIDGED client (Ink / thin CLI) that runs a passed-through code-tool LOCALLY passes the
+    server-shipped active-project ``exec_cwd`` so its relative-path resolution + ``execute_command`` cwd
+    target the active project, not the client's frozen boot workdir. Honoured only when the path exists on
+    THIS host (mount) — a remote/sealed client or an older server (no cwd) falls back to the process workdir,
+    byte-identical. ``exec_cwd=None`` (every non-bridge caller) is byte-identical."""
+    if exec_cwd and os.path.isdir(exec_cwd):
+        _tok = _EXEC_CWD_OVERRIDE.set(exec_cwd)
+        try:
+            return _run_tool_localized(name, args)
+        finally:
+            _EXEC_CWD_OVERRIDE.reset(_tok)
+    return _run_tool_localized(name, args)
+
+
+def _run_tool_localized(name: str, args: Dict[str, Any]) -> str:
     result = _run_tool_dispatch(name, args)
     if name == "execute_command":
         result = _localize_listing_answer(result, (args or {}).get("command", ""))
@@ -6125,6 +7913,12 @@ def _run_tool_dispatch(name: str, args: Dict[str, Any]) -> str:
                 return (f"ERROR: old_string is not unique in {args['path']} ({hits} occurrences) — add "
                         f"surrounding context to make it unique, or set replace_all=true.")
             updated = text.replace(old, new) if args.get("replace_all") else text.replace(old, new, 1)
+            # #1317: a no-op edit (old_string == new_string, or already applied) must NOT masquerade as a
+            # successful write — surface it as an ERROR the model receives, so "OK: edited" always means the
+            # bytes actually changed (edit_file runs synchronously; the ERROR is returned verbatim).
+            if updated == text:
+                return (f"ERROR: no change to {args['path']} — old_string equals new_string (or the edit "
+                        f"was already applied); nothing written.")
             _atomic_write(p, updated)
             return f"OK: edited {args['path']} ({hits if args.get('replace_all') else 1} replacement(s))"
 
@@ -6310,6 +8104,46 @@ def _run_tool_dispatch(name: str, args: Dict[str, Any]) -> str:
             lines = [f"{str((c or {}).get('bucket', '?')).upper():9} {(c or {}).get('name', '')}" for c in checks]
             return (f"PR #{num} — {verdict} ({len(checks)} checks):\n{merge_line}"
                     + ("\n" + "\n".join(lines) if lines else ""))
+
+        elif name == "review":
+            # #1221: independent cross-model second opinion via a configured code-agent + default_cli_runner.
+            # Capability-detected (offered + accepted only when a reviewer is runnable). A READ of reviewer
+            # text → ingestion-fenced. Bounded synchronous call — never a watch/poll.
+            if not _review_available():
+                return ("ERROR: review is unavailable — no code-agent binary resolves on this box "
+                        "(configure code_agents.pool and install a coder CLI).")
+            agent = _pick_reviewer(args.get("agent"))
+            if agent is None:
+                requested = (args.get("agent") or "").strip()
+                if requested:
+                    return (f"ERROR: review agent {requested!r} is unknown or not runnable "
+                            f"(configured: {', '.join(_agent_names()) or 'none'}).")
+                return ("ERROR: no runnable reviewer agent "
+                        "(configure code_agents.pool and install a coder CLI).")
+            mode, material = _assemble_review_material(args.get("paths"))
+            if material.startswith("ERROR:"):
+                return material
+            spec = _code_agent_registry().resolve(agent)
+            if spec is None:   # belt-and-suspenders (pick already resolved)
+                return f"ERROR: review agent {agent!r} is not in the code-agent registry."
+            prompt = _review_prompt(str(args.get("focus") or ""), mode, material)
+            try:
+                from client import default_cli_runner
+            except Exception as e:  # noqa: BLE001
+                return f"ERROR: review runner import failed: {e!r}"
+            effort = getattr(spec, "effort", None) or "high"
+            try:
+                timeout = float(REVIEW_TIMEOUT_S) if REVIEW_TIMEOUT_S is not None else None
+            except (TypeError, ValueError):
+                timeout = 180.0
+            res = default_cli_runner(spec, prompt, effort=str(effort), timeout=timeout)
+            if not res.get("ok"):
+                err = res.get("error") or "reviewer failed"
+                return f"ERROR: review by {agent} failed: {err}"
+            content = (res.get("content") or "").strip()
+            if not content:
+                return f"ERROR: review by {agent} returned empty output."
+            return f"[review by {agent} · {mode}]\n{content}"
 
         elif name == "fetch_url":
             # #1074: verbatim, size-capped http(s) fetch. Trust-gated (sealed) + SSRF-guarded + byte-capped;
@@ -6584,11 +8418,35 @@ def _run_tool_dispatch(name: str, args: Dict[str, Any]) -> str:
 
         elif name == "record_design":
             try:
-                rel = record_design(args.get("title", ""), args.get("body", ""))
-            except ValueError as e:
+                rel = record_design(
+                    args.get("title", ""),
+                    args.get("body", ""),
+                    language=args.get("language", "") or "",
+                    network=args.get("network", "") or "",
+                )
+            except (GateRefusal, ValueError) as e:
                 return f"ERROR: {e}"
-            return (f"OK: design recorded at {rel} (stage: design, approved: false). STOP — get it approved "
-                    f"(/approve) before an implementation handover; the engine refuses one until then.")
+            fork_hint = _pending_fork_decide_hints(active_slug())
+            return (f"OK: design proposal recorded at {rel} (type: proposal, stage: design, approved: false). "
+                    f"STOP — get it approved "
+                    f"(/approve) before an implementation handover; the engine refuses one until then."
+                    + (f"\n{fork_hint}" if fork_hint else ""))
+
+        elif name == "record_constraints":
+            if not CONSTRAINT_GATE_ENABLED:
+                return "ERROR: constraint gate disabled"
+            try:
+                rel = record_constraints(
+                    args.get("title", ""),
+                    args.get("body", ""),
+                    language=args.get("language", "") or "",
+                    network=args.get("network", "") or "",
+                    source=args.get("source", "") or "",
+                )
+            except (GateRefusal, ValueError) as e:
+                return f"ERROR: {e}"
+            status, _body = _constraint_status(active_slug())
+            return f"OK: constraints recorded at {rel} ({status})."
 
         elif name == "query_memory":
             if _MEMORY is None or not _MEMORY.is_available():
@@ -6745,7 +8603,7 @@ class GX10:
                  thinking_mode: str = "auto", platform: Optional[str] = None,
                  onboarding: Optional[bool] = None):
         self.client        = OpenAI(base_url=base_url, api_key=api_key,
-                                    timeout=LLM_REQUEST_TIMEOUT_S, max_retries=LLM_MAX_RETRIES)   # #1131: fail-soft bound
+                                    timeout=_client_timeout(), max_retries=LLM_MAX_RETRIES)   # #1131: fail-soft bound
         self.model         = model
         self.stream        = stream
         self.max_tokens    = max_tokens
@@ -6761,6 +8619,8 @@ class GX10:
         # #1050 (L3): set when a generation attempt THIS user turn errored → the emergency-rung summarize is
         # skipped (don't hit an already-sick endpoint on the recovery path). Reset at run() entry.
         self._turn_gen_errored = False
+        self._first_token_seen = False
+        self._finalized_this_turn = False
         # #1051 (L3): per-turn summarize counters — the shared rate-limit + telemetry across the steady-state
         # roll, the emergency rung, and the proactive accountant. Reset at run() entry.
         self._summaries_this_turn = 0
@@ -7040,10 +8900,11 @@ class GX10:
             if _CANCEL_EVENT.is_set():
                 raise RuntimeError("cancelled")
             try:
-                return self.client.chat.completions.create(**kwargs)
+                _cli = self.client.with_options(max_retries=0) if _decoupled() else self.client
+                return _cli.chat.completions.create(**kwargs)
             except Exception as e:
                 last_err = e
-                if attempt == 0 and not _CANCEL_EVENT.is_set():
+                if attempt == 0 and not _CANCEL_EVENT.is_set() and not (_decoupled() and _is_timeout_error(e)):
                     time.sleep(RETRY_BACKOFF)
                     continue
                 self._turn_gen_errored = True   # #1050: a generation this turn errored → skip the recovery-path summarize
@@ -7503,6 +9364,7 @@ class GX10:
     def _generate(self, think: bool) -> Tuple[str, List[Dict], bool, Optional[Exception], Dict[str, Any]]:
         """Returns (content, tool_calls, cancelled, err, metrics).
         The streaming path shows content live (thinking filtered out)."""
+        self._first_token_seen = False
         if not self.stream:
             return self._generate_plain(think)
 
@@ -7510,11 +9372,13 @@ class GX10:
         err     = [None]
         usage   = [None]          # OPT-3: usage from the last chunk
         finish  = [None]          # #1048: last finish_reason (=="length" ⇒ generation cut off by the token cap)
+        stream_ref = [None]
         done    = threading.Event()
 
         def _worker():
             try:
                 s = self._make_completion(think, stream=True)
+                stream_ref[0] = s
                 for chunk in s:
                     if _CANCEL_EVENT.is_set():
                         try:
@@ -7568,6 +9432,7 @@ class GX10:
 
             if t_first[0] is None:
                 t_first[0] = time.time()
+                self._first_token_seen = True
 
             if getattr(delta, "content", None):
                 parts.append(delta.content)                       # RAW content — feeds the post-turn tool-call recovery
@@ -7594,6 +9459,15 @@ class GX10:
                         if fn.arguments:
                             slot["arguments"] += fn.arguments
 
+        # The consumer releases the turn on cancel; the daemon worker may linger
+        # until httpx read timeout. close() is only a best-effort wake-up.
+        if _decoupled() and cancelled and stream_ref[0] is not None:
+            try:
+                stream_ref[0].close()
+            except Exception:
+                pass
+
+        reasoning_open = tf.in_think
         renderer.feed(tf_tool.feed(tf.flush()))   # #1266: drain the think filter THROUGH the tool-call filter
         renderer.feed(tf_tool.flush())
         renderer.flush()
@@ -7609,6 +9483,7 @@ class GX10:
             "prompt_tokens":     getattr(usage[0], "prompt_tokens", None) if usage[0] else None,
             "completion_tokens": getattr(usage[0], "completion_tokens", None) if usage[0] else None,
             "finish_reason":     finish[0],                             # #1048: "length" ⇒ output truncated
+            "in_think":          reasoning_open,
         }
         tool_calls = [tool_acc[i] for i in sorted(tool_acc)]
         return "".join(parts), tool_calls, cancelled, err[0], metrics
@@ -7658,6 +9533,7 @@ class GX10:
             "prompt_tokens":     getattr(usage, "prompt_tokens", None) if usage else None,
             "completion_tokens": getattr(usage, "completion_tokens", None) if usage else None,
             "finish_reason":     getattr(res[0].choices[0], "finish_reason", None),   # #1048
+            "in_think":          False,
         }
         disp = clean(content)
         if disp:
@@ -7701,6 +9577,7 @@ class GX10:
         # empty). Set at entry, before any work that could trigger a summarize.
         self._current_user_turn = user_input or ""
         self._turn_gen_errored = False   # #1050 (L3): reset the per-turn generation-error flag (guards the emergency summarize)
+        self._finalized_this_turn = False
         self._summaries_this_turn = 0            # #1051 (L3): reset the shared per-turn summarize counters
         self._summary_tokens_this_turn = 0
         # B2: per-turn retrieval BEFORE the append (query = user message, dedup against the existing
@@ -7739,13 +9616,15 @@ class GX10:
         # generation, a tool result); if nothing progresses for TURN_IDLE_TIMEOUT_S the turn is aborted and
         # surfaced as 'stalled' — never a silent indefinite hold of the agent lock. Off (<=0) ⇒ byte-identical.
         self._last_progress = time.time()
+        self._first_token_seen = False
         self._watchdog_tripped = False
         _wd_stop = threading.Event()
         _wd_thread: Optional[threading.Thread] = None
         if TURN_IDLE_TIMEOUT_S and TURN_IDLE_TIMEOUT_S > 0:
             def _watchdog():
                 while not _wd_stop.wait(min(5.0, TURN_IDLE_TIMEOUT_S / 4.0)):
-                    if time.time() - self._last_progress > TURN_IDLE_TIMEOUT_S:
+                    limit = _idle_limit(self._first_token_seen)
+                    if time.time() - self._last_progress > limit:
                         self._watchdog_tripped = True
                         _CANCEL_EVENT.set()   # break every poll site → the turn ends (abort → relabelled 'stalled')
                         break
@@ -7785,11 +9664,65 @@ class GX10:
                     pass
 
             if cancelled:
+                if _should_persist_partial(
+                    _decoupled(),
+                    self._watchdog_tripped,
+                    self._first_token_seen,
+                    (metrics or {}).get("in_think"),
+                ):
+                    partial = _partial_assistant_message(content)
+                    if partial:
+                        self.last_response = partial["content"]
+                        self.messages.append(partial)
                 outcome = {"kind": "abort"}
                 return
             if err:
-                outcome = {"kind": "error", "detail": f"API: {err}"}
+                outcome = _generation_error_outcome(self.stream, err, self._first_token_seen)
                 return
+            if _should_finalize_truncation(
+                FINALIZE_ON_TRUNCATION,
+                self._finalized_this_turn,
+                tool_calls,
+                (metrics or {}).get("finish_reason"),
+                content,
+            ):
+                self._finalized_this_turn = True
+                _ui_print(col("  [reasoning bound reached -- forcing a final answer]", C.GRAY))
+                gen1_metrics = metrics
+                _accumulate_generation_metrics(self._perf, turn, gen1_metrics)
+                nudge = {"role": "user", "content": _REASONING_FINALIZE_NUDGE}
+                self.messages.append(nudge)
+                finalize_label = "Qwen (finalizing)"
+                finalize_spinner = Spinner(finalize_label)
+                finalize_spinner.start()
+                try:
+                    content, tool_calls, cancelled, err, metrics = self._generate(think=False)
+                finally:
+                    finalize_spinner.stop()
+                    try:
+                        for _i in range(len(self.messages) - 1, -1, -1):
+                            if self.messages[_i] is nudge:
+                                del self.messages[_i]
+                                break
+                    except Exception:  # noqa: BLE001 — nudge cleanup must never break a turn
+                        pass
+                self._last_progress = time.time()   # the finalize generation is progress
+                if cancelled:
+                    outcome = {"kind": "abort"}
+                    return
+                if err:
+                    outcome = _generation_error_outcome(self.stream, err, self._first_token_seen)
+                    return
+                try:
+                    import telemetry as _tel
+                    _m = metrics or {}
+                    _tel.record_turn(latency_s=_m.get("total") or 0.0,
+                                     prompt_tokens=_m.get("prompt_tokens") or 0,
+                                     completion_tokens=_m.get("completion_tokens") or 0,
+                                     ok=True, ts=time.time())
+                except Exception:   # noqa: BLE001 — telemetry must never break a turn
+                    pass
+            self._first_token_seen = True        # post-generation work uses the tight idle limit in stream and non-stream
 
             # Model-agnostic fallback: if the endpoint returned no native tool_calls,
             # try to recover any the model emitted as text (no server-side tool parser).
@@ -7802,15 +9735,8 @@ class GX10:
                     recovered_from_text = True
 
             # OPT-3: perf line + accumulation (session + this turn)
-            if metrics:
-                self._perf["gens"]       += 1
-                self._perf["prompt"]     += metrics.get("prompt_tokens") or 0
-                self._perf["completion"] += metrics.get("completion_tokens") or 0
-                self._perf["wall"]       += metrics.get("total") or 0.0
+            if _accumulate_generation_metrics(self._perf, turn, metrics):
                 self._perf["last"]        = self._fmt_perf(metrics)
-                turn["gens"]       += 1
-                turn["prompt"]     += metrics.get("prompt_tokens") or 0
-                turn["completion"] += metrics.get("completion_tokens") or 0
                 _ui_print(col("  " + self._perf["last"], C.GRAY))
 
             # PERF-02: persist ONLY the cleaned content (no <think>). When the
@@ -7961,8 +9887,7 @@ class GX10:
             _wd_stop.set()                          # S2 (#1132): stop the idle watchdog
             if _wd_thread is not None:
                 _wd_thread.join(timeout=1.0)
-            if self._watchdog_tripped:              # relabel abort→stalled so the surfaced marker names the cause
-                outcome = {"kind": "stalled", "detail": f"no progress for {TURN_IDLE_TIMEOUT_S:.0f}s"}
+            outcome = _finalize_outcome(outcome, self._watchdog_tripped, self._first_token_seen)
             _status["thinking"] = False   # toolbar back to idle (even on crash)
             self._print_turn_end(turn, outcome)
 
@@ -8081,7 +10006,7 @@ HELP = """
                   manage registered, isolated projects (artefact home under vault/<slug>/)
     initiative …  deprecated alias for /project (kept one release)
     switch <project_id>   rebind this engine to a project (own paths + memory partition)
-    watcher on|off        enable / disable the feedback watcher
+    watcher on|off        deprecated alias for /auto on|off
     autopilot on|off      toggle autopilot (auto-launch of Claude)
     autoplan on [N]       autonomous planning (optional: max N tasks, then stop)
     autoplan off          stop autoplan + reset the counter
@@ -8533,6 +10458,8 @@ def _lifecycle_command(arg_str: str) -> str:
     # M5-4 (#885): ACE fork-learn — turn each newly-RESOLVED fork into a fork-decision Trajectory (→ bullet via
     # the reflection worker) so the next comparable fork is pre-informed (gate OFF ⇒ no-op; exactly-once).
     _ace_scan_fork_resolutions(payloads, chain_errors)
+    # #1340 S4: drain pending constraint-fork envelopes (recommendation/matrix fill) under the gate's slug.
+    _ace_scan_constraint_envelopes(slug)
     try:
         result = _lifecycle_projector.project_transitions(
             payloads, slug=slug, tree_sha=tree_sha, required_stages=required_stages,
@@ -9363,8 +11290,8 @@ def _dispatch(agent: GX10, user_input: str):
         # (feedback→advance) + autopilot (launch) + continuation (post-advance next-unit/backlog
         # planning) coherently on, optional N = the max-tasks cap. `auto off` = GUIDED mode — nothing
         # fires by itself; the engine still selects the next unit deterministically and RECOMMENDS it
-        # (steering state / this status), the operator drives each step. The granular toggles
-        # (/watcher /autopilot /autoplan) remain the advanced layer underneath.
+        # (steering state / this status), the operator drives each step. The watcher is a facet of this
+        # meta-switch; /watcher is kept only as a compatibility alias for the same on/off path.
         global _WATCHER_ENABLED, AUTOPILOT_ENABLED, AUTOPILOT_AUTOPLAN, AUTOPILOT_MAX_TASKS, _AUTOPLAN_DONE
         parts = cmd.split()
         arg   = parts[1] if len(parts) > 1 else ""
@@ -9429,16 +11356,14 @@ def _dispatch(agent: GX10, user_input: str):
     elif cmd.startswith("watcher"):
         arg = cmd.split()[-1] if len(cmd.split()) > 1 else ""
         if arg == "on":
-            _WATCHER_ENABLED = True
-            if _EFFECTIVE_CFG: _EFFECTIVE_CFG["watcher"]["enabled"] = True
-            _ui_print(col("[RECONCILER] auto-advance ON — feedback is completed automatically", C.GREEN))
+            _ui_print(col("[WATCHER] /watcher is deprecated; using /auto on instead.", C.YELLOW))
+            _dispatch(agent, "auto on")
         elif arg == "off":
-            _WATCHER_ENABLED = False
-            if _EFFECTIVE_CFG: _EFFECTIVE_CFG["watcher"]["enabled"] = False
-            _ui_print(col("[RECONCILER] auto-advance OFF — complete manually", C.YELLOW))
+            _ui_print(col("[WATCHER] /watcher is deprecated; using /auto off instead.", C.YELLOW))
+            _dispatch(agent, "auto off")
         else:
             state = col("ON", C.GREEN) if _WATCHER_ENABLED else col("OFF", C.YELLOW)
-            _ui_print(f"  auto-advance (reconciler): {state}  |  watcher on / watcher off")
+            _ui_print(f"  auto-driven watcher: {state}  |  use auto on [N] / auto off")
     elif cmd.startswith("autopilot"):
         arg = cmd.split()[-1] if len(cmd.split()) > 1 else ""
         if arg == "on":
@@ -9448,7 +11373,7 @@ def _dispatch(agent: GX10, user_input: str):
                    f"takes effect on the next tick (~{RECONCILER_INTERVAL:.0f}s).")
             if not _WATCHER_ENABLED and not AUTOMATION_DECOUPLED:
                 # S7 (#1229): only true in coupled mode — decoupled autopilot is self-sufficient.
-                msg += "  ⚠ reconciler is OFF — 'watcher on' is required, else nothing happens."
+                msg += "  ⚠ automation is guided — use '/auto on' to arm feedback advance and continuation."
             _ui_print(col(msg, C.GREEN))
             _pipeline_hint = _empty_pipeline_hint()   # #1268: no silent no-op on an empty pipeline
             if _pipeline_hint:
@@ -9547,9 +11472,13 @@ def _dispatch(agent: GX10, user_input: str):
     elif cmd == "switch" or cmd.startswith("switch "):
         _ui_print(col(_switch_command(agent, user_input[len("switch"):].strip()), C.CYAN))
     elif cmd == "approve" or cmd.startswith("approve "):
-        # S5 (#1227): the operator's approval point — stamp `approved: true` on the active (or named) unit's
-        # design doc, unblocking implementation handovers (no blind coding). Deterministic, model-free.
-        _ui_print(col(_approve_design(user_input[len("approve"):].strip() or None), C.CYAN))
+        # S5 (#1227/#1336) + #1340 S4: design approval (bare /approve or /approve design [slug]) OR
+        # /approve constraint <id|all> [--slug]. Deterministic, model-free. Pending constraint forks
+        # block design approval (fail-closed).
+        _ui_print(col(_approve_command(user_input[len("approve"):].strip() or None), C.CYAN))
+    elif cmd == "dismiss" or cmd.startswith("dismiss "):
+        # #1370: drop an unresolved suggested typed constraint so it stops gating design approval.
+        _ui_print(col(_dismiss_command(user_input[len("dismiss"):].strip() or None), C.CYAN))
     elif cmd == "board" or cmd.startswith("board "):
         # S6 (#1228 / R5): render the task board (all units pending/in_progress/done) to BOARD.md + show it.
         _ui_print(col(_board_command(user_input[len("board"):].strip() or None), C.CYAN))
@@ -9558,8 +11487,8 @@ def _dispatch(agent: GX10, user_input: str):
         # data → projects stage-tagged evidence → verifies completeness). Deterministic, model-free.
         _ui_print(col(_lifecycle_command(user_input[len("lifecycle"):].strip()), C.CYAN))
     elif cmd == "fork" or cmd.startswith("fork "):
-        # #903 (M5-3 output leg): surface the MPR architecture-decision proposal(s) at a fork as a
-        # recommendation — the operator sees it here and decides (ACE learns the choice, M5-4). Read-only.
+        # #903 (M5-3) + #1340 S4: list constraint-fork envelopes / M5 unit proposals (read-only) or
+        # `/fork decide <fork-id> --choice keep|counter` (mutating R5 state machine).
         _ui_print(col(_fork_command(user_input[len("fork"):].strip()), C.CYAN))
     elif cmd == "ace" or cmd.startswith("ace "):
         # #915: ACE ops — `/ace warmup --ledger <path>` offline warm-starts the active playbook from a
@@ -9695,6 +11624,54 @@ def _parse_handover_meta(path: Path) -> Tuple[Optional[str], Optional[str]]:
             effort = me.group(1).strip()
     return model, effort
 
+
+def _surface_coder_result(task_id: str, agent: str, rc, logfile) -> None:
+    """Surface a completed local-lane coder run when it produced no usable feedback. Never raises."""
+    try:
+        ok = (rc == 0)
+        _ui_print(col(f"  {'✓' if ok else '⚠'} [AUTO] claude finished: {task_id} "
+                      f"(exit {rc})", C.GREEN if ok else C.YELLOW))
+        fb_dir = feedback_dir(soft=True)
+        found = list(fb_dir.glob(f"{task_id}_*-feedback.md")) if (fb_dir and fb_dir.exists()) else []
+        if ok:
+            for _fb in found:
+                try:
+                    _txt = _fb.read_text(encoding="utf-8")
+                except Exception:   # noqa: BLE001
+                    continue
+                if _txt.strip() and not _feedback_status(_txt):
+                    _fb.write_text("status: done\n" + _txt, encoding="utf-8", newline="\n")
+                    _ui_print(col(f"  [AUTO] {task_id}: stamped `status: done` on {_fb.name} "
+                                  f"(exit 0, capture had no status token)", C.CYAN))
+        has_usable = False
+        for _fb in found:
+            try:
+                if _fb.read_text(encoding="utf-8").strip():
+                    has_usable = True
+                    break
+            except Exception:  # noqa: BLE001
+                continue
+        try:
+            t = _store().get(task_id)
+        except Exception:  # noqa: BLE001
+            t = None
+        if t is not None and t.get("status") == "done":
+            return
+        if has_usable:
+            return
+        try:
+            tail = Path(logfile).read_text(encoding="utf-8", errors="replace")[-2000:]
+        except Exception:  # noqa: BLE001
+            tail = ""
+        snippet = tail.strip()[:400]
+        reason = f"coder exit {rc}, no feedback" + (f" — {snippet}" if snippet else "")
+        kind = "errored"
+        _store().mark_blocked(task_id, reason=reason, kind=kind)
+        _ui_print(col(f"  ⚠ [AUTO] {task_id}: {reason}", C.RED))
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def _do_launch(task_id: str, agent: str):
     """Starts `claude --print` for a handover and moves the task to
     in_progress. The subprocess runs detached; a monitor thread frees the
@@ -9735,6 +11712,21 @@ def _do_launch(task_id: str, agent: str):
     except Exception:  # noqa: BLE001 — effort tiering must never block a launch
         _rec = None
     effort = _resolve_handover_effort(effort, _task_class(_rec) if _rec else None, spec.effort)
+    mm = _cached_model_mismatch(agent)
+    if mm is not None and str(model) == str(mm.configured):
+        available = ", ".join(mm.available) or mm.available_raw.strip()
+        err = f"agent {agent}: model {model!r} not offered by {spec.bin!r} — available: {available}"
+        try:
+            _store().transition(task_id, "in_progress")
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            _store().mark_blocked(task_id, reason=err, kind="errored")
+        except Exception:  # noqa: BLE001
+            pass
+        _autopilot_release()
+        _ui_print(col(f"  ✗ [AUTO] {err}", C.RED))
+        return
     # #1288: the ENGINE — not the handover body — owns the feedback filename+location for EVERY coder. The
     # CODEX branch gets it via `-o {feedback}`; the Claude `--print` shape has no such flag, so state the exact
     # path in the prompt (overriding any divergent name the orchestrator wrote into the handover body), else a
@@ -9768,7 +11760,8 @@ def _do_launch(task_id: str, agent: str):
         extra = list(AUTOPILOT_EXTRA_ARGS)
         if AUTOPILOT_STREAM:
             # Live streaming: stream-json NEEDS --verbose (otherwise claude aborts).
-            # Output still goes to the log FILE (no pipe read) → no deadlock.
+            # Stdout is piped to the line-oriented log drainer below so tailers see live output without
+            # handing the child a block-buffered file handle.
             if "--verbose" not in extra:
                 extra.append("--verbose")
             if "--output-format" not in extra:
@@ -9789,6 +11782,7 @@ def _do_launch(task_id: str, agent: str):
     logdir = _ld if _ld.is_absolute() else state_root() / _ld
     logdir.mkdir(parents=True, exist_ok=True)
     logfile = logdir / f"{task_id}_{agent}.log"
+    lf = None
     try:
         lf = open(logfile, "w", encoding="utf-8")
         # PYTHONIOENCODING=utf-8: prevents a cp1252 crash on non-ASCII characters
@@ -9796,12 +11790,39 @@ def _do_launch(task_id: str, agent: str):
         _launch_env = {**os.environ, "PYTHONIOENCODING": "utf-8"}
         # S9c: the code-agent runs in the active project's root (so its file edits land in that tree); the
         # default project resolves to None → the process workdir, byte-identical to the pre-isolation launch.
-        proc = subprocess.Popen(argv, cwd=(_exec_cwd() or "."), stdout=lf, stderr=subprocess.STDOUT,
-                                stdin=subprocess.DEVNULL, text=True, env=_launch_env)
+        proc = subprocess.Popen(argv, cwd=(_exec_cwd() or "."), stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                stdin=subprocess.DEVNULL, text=True, encoding="utf-8", errors="replace",
+                                env=_launch_env)
     except Exception as e:
+        try:
+            lf.close()
+        except Exception:
+            pass
         _autopilot_release()
         _ui_print(col(f"  ✗ [AUTO] launch {task_id} failed: {e!r}", C.RED))
         return
+
+    def _drain_stdout():
+        try:
+            stream = getattr(proc, "stdout", None)
+            if stream is not None:
+                for line in stream:
+                    lf.write(line)
+                    lf.flush()
+        finally:
+            try:
+                stream = getattr(proc, "stdout", None)
+                if stream is not None:
+                    stream.close()
+            except Exception:
+                pass
+            try:
+                lf.close()
+            except Exception:
+                pass
+
+    threading.Thread(target=_drain_stdout, daemon=True, name=f"coder-log-{task_id}-{agent}").start()
+
     with _AUTOPILOT_LOCK:
         _AUTOPILOT_PROCS[task_id] = proc
     try:
@@ -9846,47 +11867,20 @@ def _do_launch(task_id: str, agent: str):
         try:
             rc = proc.wait()
         finally:
-            try:
-                lf.close()
-            except Exception:
-                pass
             with _AUTOPILOT_LOCK:
                 _AUTOPILOT_PROCS.pop(task_id, None)
             _autopilot_release()
-        ok = (rc == 0)
-        _ui_print(col(f"  {'✓' if ok else '⚠'} [AUTO] claude finished: {task_id} "
-                      f"(exit {rc})", C.GREEN if ok else C.YELLOW))
-        # Feedback check: warn if Claude finished without writing feedback.
-        # No alert if the task is already done (advance ran before _wait → feedback already deleted).
-        try:
-            fb_dir = feedback_dir(soft=True)     # B3: <initiative>/.work/feedback (soft)
-            found = list(fb_dir.glob(f"{task_id}_*-feedback.md")) if (fb_dir and fb_dir.exists()) else []
-            # Dev-loop stab (ingest stamp): a CAPTURE-mode coder (codex/kimi/grok via `-o {feedback}`) dumps its
-            # raw final turn with NO guaranteed `status:` token. If the run exited 0 and wrote a non-empty
-            # feedback carrying no recognized status, STAMP a leading `status: done` — the PROCESS signal
-            # (exit 0 + non-empty content) is the engine-owned completion fact, not model prose.
-            if ok:
-                for _fb in found:
-                    try:
-                        _txt = _fb.read_text(encoding="utf-8")
-                    except Exception:   # noqa: BLE001
-                        continue
-                    if _txt.strip() and not _feedback_status(_txt):
-                        _fb.write_text("status: done\n" + _txt, encoding="utf-8", newline="\n")
-                        _ui_print(col(f"  [AUTO] {task_id}: stamped `status: done` on {_fb.name} "
-                                      f"(exit 0, capture had no status token)", C.CYAN))
-            if not found:
-                # Task already completed? → no alert (advance deleted the feedback correctly)
-                t = _store().get(task_id)
-                already_done = t is not None and t.get("status") == "done"
-                if not already_done:
-                    _ui_print(col(
-                        f"  ⚠ [AUTO] {task_id}: claude finished (exit {rc}) "
-                        f"but NO feedback in .work/feedback/ — the task stays in_progress!",
-                        C.RED))
-        except Exception:
-            pass
+        _surface_coder_result(task_id, agent, rc, logfile)
     threading.Thread(target=_wait, daemon=True).start()
+
+
+def _auto_owns_launching() -> bool:
+    """#1309: True when the automation loop is ACTUALLY driving coder launches — the launcher (autopilot)
+    is on AND the reconciler loop runs (watcher on, or decoupled autopilot). In the mixed states
+    `autopilot on` alone (watcher off + automation.decoupled False) or `autoplan on` alone (continuation
+    without the launcher), the loop never launches, so launching stays a guided/manual action
+    (launch_coder). Both `launch_coder` (defer) and the `plan_units` armed prompt gate on this."""
+    return AUTOPILOT_ENABLED and (_WATCHER_ENABLED or AUTOMATION_DECOUPLED)
 
 
 def _trigger_coder(task_id: "Optional[str]" = None) -> str:
@@ -9923,6 +11917,17 @@ def _trigger_coder(task_id: "Optional[str]" = None) -> str:
             return (f"Nothing to launch here — no coding agent runs on this box (server topology: the coder "
                     f"runs on the client, which polls pending handovers). {tid} stays staged.")
         return f"ERROR: unknown/unconfigured agent for {tid} (configured: {', '.join(names)})."
+    # #1309: the agent is now VALIDATED (an unknown/disabled staged agent surfaced above — the defer must
+    # NOT mask a fail-closed config error, since the reconciler skips unconfigured agents too and the task
+    # would strand). When /auto OWNS the drive the loop launches staged handovers itself (the client polls
+    # `/pending`), so a manual launch_coder here would be a SECOND launcher racing the loop for the single
+    # coder slot (the "BUSY" collision + the contradictory double message). Defer with a clear no-op — but
+    # ONLY when the loop actually drives launches (see _auto_owns_launching); in the autopilot-only /
+    # autoplan-only mixed states nothing else launches, so this verb must still launch it (guided fallback).
+    if _auto_owns_launching():
+        return (f"OK: /auto owns launching — the loop starts {tid} automatically once its handover is "
+                f"staged. No manual launch_coder is needed (a second launch would only collide on the "
+                f"single coder slot).")
     # 4. concurrency cap — the same bound the reconciler honours. The check-then-reserve is not locked as one
     #    atom, but it does not race: tool dispatch runs under _AGENT_LOCK (one turn at a time) and the
     #    orchestrator is the SINGLE steering author, so two launch_coder calls never overlap; the autopilot
@@ -9939,6 +11944,8 @@ def _trigger_coder(task_id: "Optional[str]" = None) -> str:
         _autopilot_release()  # unguarded raise (a bad logdir, or a non-KeyError transition error) would leak it.
         return f"ERROR: launch of {tid} failed to start ({e.__class__.__name__}) — slot released."
     after = store.get(tid)
+    if after and after.get("blocked") and after.get("blocked_kind") in ("errored", "unavailable"):
+        return f"ERROR: {after.get('blocked_reason') or f'launch of {tid} was blocked'}"
     if after and after.get("status") == "in_progress":
         return (f"OK: launched {agent} for {tid} — the coding session is running; its feedback will "
                 f"auto-advance the pipeline.")
@@ -10312,6 +12319,8 @@ def _code_defaults() -> Dict[str, Any]:
             "model":       DEFAULT_MODEL,
             "api_key_env": API_KEY_ENV,
             "request_timeout_s": LLM_REQUEST_TIMEOUT_S,   # #1131: per-request LLM bound (fail-soft)
+            "connect_timeout_s": LLM_CONNECT_TIMEOUT_S,
+            "first_token_timeout_s": LLM_FIRST_TOKEN_TIMEOUT_S,
             "max_retries":       LLM_MAX_RETRIES,         # #1131
         },
         # epic #505 S3: minimal web-search seam selector. The FULL surface — env vars, the
@@ -10329,6 +12338,10 @@ def _code_defaults() -> Dict[str, Any]:
             "repo":      FORGE_REPO,                     # optional owner/repo; empty ⇒ gh's cwd default (required for native)
             "adapter":   FORGE_ADAPTER,                  # #1213: cli (gh) | native (stdlib urllib) | mock
             "token_env": FORGE_TOKEN_ENV,               # #1213: env var NAME holding the native GitHub token (never a literal)
+        },
+        "review": {                                     # #1221: cross-model second-opinion review tool
+            "agent":     REVIEW_AGENT,                  # default reviewer agent_id; empty ⇒ anti-affinity pick
+            "timeout_s": REVIEW_TIMEOUT_S,              # bounded synchronous CLI runner timeout
         },
         "notify": {                                     # #1083: escalation → webhook (default OFF)
             "webhook": NOTIFY_WEBHOOK,                   # deploy secret via GX10_NOTIFY_WEBHOOK; empty ⇒ off
@@ -10348,6 +12361,9 @@ def _code_defaults() -> Dict[str, Any]:
         },
         "safety": {                                     # #1065: autonomy-safety pre-flight gates (default OFF)
             "ambiguity_detect": False,                  # #1066 Variant-B: warn on an ambiguous handover requirement
+            # #1341 (epic #1344 S5): L2 conflict-detect + L3 hard-check enablement. Default OFF →
+            # byte-identical. Detect (S3) and compare (S6) wire on later; MPR worker uses ace.fork_mpr.enabled.
+            "constraint_conflict_detect": False,
         },
         "platform": {
             "mode": PLATFORM_MODE,   # "auto" | "windows" | "linux"
@@ -10498,12 +12514,12 @@ def _code_defaults() -> Dict[str, Any]:
                 {"provider_id": "claude-opus",   "kind": "cli", "agent_id": "OPUS",
                  "display": "Claude Opus 4.8",   "model": "claude-opus-4-8", "bin": "claude",
                  "cmd_template": "{bin} --model {model} --effort {effort} --permission-mode {permission} --print {prompt}",
-                 "effort": "xhigh", "permission_mode": "acceptEdits",
+                 "effort": "xhigh", "permission_mode": "bypassPermissions",  # #1308: autonomous coder must run its own tests
                  "cost_per_1k_in": 0.015, "cost_per_1k_out": 0.075},   # #1287: priciest → complex tier only
                 {"provider_id": "claude-sonnet", "kind": "cli", "agent_id": "SONNET",
                  "display": "Claude Sonnet 5", "model": "claude-sonnet-5", "bin": "claude",
                  "cmd_template": "{bin} --model {model} --effort {effort} --permission-mode {permission} --print {prompt}",
-                 "effort": "high", "permission_mode": "acceptEdits",
+                 "effort": "high", "permission_mode": "bypassPermissions",  # #1308: autonomous coder must run its own tests
                  "cost_per_1k_in": 0.003, "cost_per_1k_out": 0.015},   # #1287: cheaper → standard/routine/analysis
             ],
             # #454: runtime operator OVERRIDE — `/coders use <id>` pins one agent so ALL handovers run
@@ -10570,6 +12586,7 @@ def _code_defaults() -> Dict[str, Any]:
         "generation": {
             "temperature":   TEMPERATURE,
             "max_tokens":    MAX_TOKENS,
+            "finalize_on_truncation": FINALIZE_ON_TRUNCATION,
             "thinking_mode": "auto",
             "stream":        True,
             "retry_backoff": RETRY_BACKOFF,
@@ -10720,13 +12737,17 @@ def _apply_env(cfg: Dict[str, Any]) -> Dict[str, Any]:
                 cfg[section][key] = transform(v)
             except Exception:
                 print(col(f"  [WARN] env {name}={v!r} ignored (invalid)", C.YELLOW))
+    _truthy = lambda v: v.strip().lower() in ("1", "true", "yes", "on")
     setif("GX10_BASE_URL",   "connection", "base_url")
     setif("GX10_MODEL",      "connection", "model")
     setif("GX10_LLM_TIMEOUT_S",   "connection", "request_timeout_s", float)   # #1131: per-request LLM bound
+    setif("GX10_LLM_CONNECT_TIMEOUT_S", "connection", "connect_timeout_s", float)
+    setif("GX10_LLM_FIRST_TOKEN_TIMEOUT_S", "connection", "first_token_timeout_s", float)
     setif("GX10_LLM_MAX_RETRIES", "connection", "max_retries",       int)     # #1131
     setif("GX10_WORKDIR",    "paths",      "workdir")
     setif("GX10_PROMPT",     "paths",      "system_prompt")
     setif("GX10_MAX_TOKENS", "generation", "max_tokens", int)
+    setif("GX10_FINALIZE_ON_TRUNCATION", "generation", "finalize_on_truncation", _truthy)
     setif("GX10_THINKING",   "generation", "thinking_mode")
     setif("GX10_LANGUAGE",   "generation", "language")
     setif("GX10_PLATFORM",   "platform",   "mode")
@@ -10738,7 +12759,6 @@ def _apply_env(cfg: Dict[str, Any]) -> Dict[str, Any]:
     setif("GX10_FANOUT_CONCURRENCY",     "workers", "concurrency",      int)
     setif("GX10_WORKERS_MAX_TOKENS",     "workers", "max_tokens",       int)
     setif("GX10_WORKERS_MAX_BATCH_TOKENS","workers", "max_batch_tokens", int)
-    _truthy = lambda v: v.strip().lower() in ("1", "true", "yes", "on")
     setif("GX10_ONBOARDING", "onboarding", "enabled", _truthy)
     # epic #505 S8: web-search knobs (the secret VALUE GX10_SEARCH_API_KEY is read from env at boot,
     # NOT here — non-secret only). search.web_in_sealed lives under security (S7).
@@ -10747,6 +12767,8 @@ def _apply_env(cfg: Dict[str, Any]) -> Dict[str, Any]:
     setif("GX10_FORGE_REPO",              "forge",  "repo")
     setif("GX10_FORGE_ADAPTER",           "forge",  "adapter")            # #1213: cli | native | mock
     setif("GX10_FORGE_TOKEN_ENV",         "forge",  "token_env")          # #1213: NAME of the native-token env var
+    setif("GX10_REVIEW_AGENT",            "review", "agent")              # #1221: default reviewer agent_id
+    setif("GX10_REVIEW_TIMEOUT_S",        "review", "timeout_s", float)   # #1221: review CLI timeout
     setif("GX10_NOTIFY_WEBHOOK",          "notify", "webhook")            # #1083: escalation webhook (deploy secret)
     setif("GX10_AUDIT_ENABLED",           "audit",  "enabled", _truthy)   # #1084: opt-in per-action audit ledger
     setif("GX10_AUDIT_SCOPE",             "audit",  "scope")              # #1067: mutating | all
@@ -10804,10 +12826,10 @@ def _apply_config(cfg: Dict[str, Any]):
     existing references (run_tool, macros, _trim_context, _classify_thinking,
     watcher, UI …) keep running unchanged."""
     global DEFAULT_BASE_URL, DEFAULT_MODEL, API_KEY_ENV, STATE_ROOT, VAULT_ROOT, SESSION_FILE, CODE_ROOT, CODE_SUBDIR
-    global PLATFORM_MODE, PLATFORM, TASKS_DEDUP_THRESHOLD, ONBOARDING_MODE, TASK_PREFIX, _TASK_ID_RE, ACK_ENABLED, LODESTAR_ENABLED, FORGE_ENABLED, FORGE_REPO, FORGE_ADAPTER, FORGE_TOKEN_ENV, NOTIFY_WEBHOOK, AUDIT_ENABLED, AUDIT_SCOPE, INJECTION_DEFENSE, SANDBOX, MULTI_TENANT, ALERT_ENABLED, LLM_REQUEST_TIMEOUT_S, LLM_MAX_RETRIES
+    global PLATFORM_MODE, PLATFORM, TASKS_DEDUP_THRESHOLD, ONBOARDING_MODE, TASK_PREFIX, _TASK_ID_RE, ACK_ENABLED, LODESTAR_ENABLED, FORGE_ENABLED, FORGE_REPO, FORGE_ADAPTER, FORGE_TOKEN_ENV, REVIEW_AGENT, REVIEW_TIMEOUT_S, NOTIFY_WEBHOOK, AUDIT_ENABLED, AUDIT_SCOPE, INJECTION_DEFENSE, SANDBOX, MULTI_TENANT, ALERT_ENABLED, LLM_REQUEST_TIMEOUT_S, LLM_CONNECT_TIMEOUT_S, LLM_FIRST_TOKEN_TIMEOUT_S, LLM_MAX_RETRIES
     global AUTOPILOT_ENABLED, AUTOPILOT_CLAUDE_BIN, AUTOPILOT_EXTRA_ARGS
     global AUTOPILOT_DEFAULT_EFFORT, AUTOPILOT_LOGS_DIR, AUTOPILOT_MAX_CONCURRENT, AUTOPILOT_STREAM, AUTOPILOT_TERMINATE_ON_ADVANCE, AUTOPILOT_AUTOPLAN, AUTOPILOT_MAX_TASKS, AUTOPILOT_LOG_TERMINAL
-    global TEMPERATURE, MAX_TOKENS, RETRY_BACKOFF, LANGUAGE
+    global TEMPERATURE, MAX_TOKENS, FINALIZE_ON_TRUNCATION, RETRY_BACKOFF, LANGUAGE
     global MAX_ITERATIONS, MAX_CTX_CHARS, TRIM_TARGET_CHARS, MAX_FILE_CHARS, LIST_DIR_HARD_CAP
     global SUMMARIZE_EVICTED, SUMMARY_MAX_TOKENS, RAG_ENABLED, RAG_TOP_K, RAG_MAX_TOKENS, EMERGENCY_SUMMARIZE
     global PROACTIVE_ROLL, INGEST_SOFT_FRAC, MAX_SUMMARIES_PER_TURN
@@ -10826,6 +12848,8 @@ def _apply_config(cfg: Dict[str, Any]):
     DEFAULT_MODEL    = conn["model"]
     API_KEY_ENV      = conn.get("api_key_env", API_KEY_ENV)
     LLM_REQUEST_TIMEOUT_S = float(conn.get("request_timeout_s", LLM_REQUEST_TIMEOUT_S))   # #1131: per-request LLM bound
+    LLM_CONNECT_TIMEOUT_S = _opt_float(conn.get("connect_timeout_s"))
+    LLM_FIRST_TOKEN_TIMEOUT_S = _opt_float(conn.get("first_token_timeout_s"))
     LLM_MAX_RETRIES       = int(conn.get("max_retries", LLM_MAX_RETRIES))                 # #1131
     STATE_ROOT       = paths.get("state_root", STATE_ROOT)
     VAULT_ROOT       = paths.get("vault_root", VAULT_ROOT)
@@ -10850,6 +12874,11 @@ def _apply_config(cfg: Dict[str, Any]):
     FORGE_REPO            = str(cfg.get("forge", {}).get("repo", FORGE_REPO) or "")
     FORGE_ADAPTER         = str(cfg.get("forge", {}).get("adapter", FORGE_ADAPTER) or "cli").strip().lower()  # #1213
     FORGE_TOKEN_ENV       = str(cfg.get("forge", {}).get("token_env", FORGE_TOKEN_ENV) or "GX10_FORGE_TOKEN")  # #1213
+    REVIEW_AGENT          = str(cfg.get("review", {}).get("agent", REVIEW_AGENT) or "").strip().upper()  # #1221
+    try:
+        REVIEW_TIMEOUT_S  = float(cfg.get("review", {}).get("timeout_s", REVIEW_TIMEOUT_S) or 180.0)  # #1221
+    except (TypeError, ValueError):
+        REVIEW_TIMEOUT_S  = 180.0
     NOTIFY_WEBHOOK        = str(cfg.get("notify", {}).get("webhook", NOTIFY_WEBHOOK) or "")   # #1083
     AUDIT_ENABLED         = bool(cfg.get("audit", {}).get("enabled", AUDIT_ENABLED))   # #1084 default OFF
     AUDIT_SCOPE           = str(cfg.get("audit", {}).get("scope", AUDIT_SCOPE) or "mutating").lower()   # #1067
@@ -10875,6 +12904,7 @@ def _apply_config(cfg: Dict[str, Any]):
 
     TEMPERATURE   = float(gen["temperature"])
     MAX_TOKENS    = int(gen["max_tokens"])
+    FINALIZE_ON_TRUNCATION = bool(gen.get("finalize_on_truncation", FINALIZE_ON_TRUNCATION))
     RETRY_BACKOFF = float(gen["retry_backoff"])
     LANGUAGE      = (str(gen.get("language", "en")).strip() or "en")
 
@@ -10960,7 +12990,8 @@ def _apply_config(cfg: Dict[str, Any]):
         _WARM_CONFIG.setdefault("enabled", True)
 
     WATCHER_FEEDBACK_DIR = wa["feedback_dir"]
-    _WATCHER_ENABLED     = bool(wa["enabled"])
+    # Config can no longer independently arm the watcher; it follows the /auto runtime state.
+    _WATCHER_ENABLED     = bool(_WATCHER_ENABLED and AUTOPILOT_ENABLED and AUTOPILOT_AUTOPLAN)
     RECONCILER_INTERVAL  = float(wa.get("interval", RECONCILER_INTERVAL))
 
     SPINNER_FRAMES      = ui["spinner_frames"]
@@ -10969,6 +13000,14 @@ def _apply_config(cfg: Dict[str, Any]):
     if new_max != _UI_MAX_LINES:
         _UI_MAX_LINES = new_max
         _UI_LINES = deque(_UI_LINES, maxlen=new_max)
+
+    if _decoupled():
+        connect_effective = LLM_CONNECT_TIMEOUT_S or LLM_REQUEST_TIMEOUT_S
+        if not (connect_effective <= LLM_REQUEST_TIMEOUT_S <= TURN_IDLE_TIMEOUT_S < LLM_FIRST_TOKEN_TIMEOUT_S):
+            print(col("  [WARN] timeout ordering should be "
+                      f"connect({connect_effective:g}) <= request({LLM_REQUEST_TIMEOUT_S:g}) <= "
+                      f"idle({TURN_IDLE_TIMEOUT_S:g}) < first_token({LLM_FIRST_TOKEN_TIMEOUT_S:g})",
+                      C.YELLOW))
 
     _apply_notify(cfg)             # #1083: (un)register the escalation → webhook notifier (default-off)
     _apply_ace(cfg)                # epic #855 ACE-WIRE (#863): the ALWAYS-ON ACE loop-intelligence core —
@@ -10982,9 +13021,16 @@ def _apply_config(cfg: Dict[str, Any]):
     _apply_quality_consumer(cfg)   # epic #602 SUB-9/2.7: register/clear the post_handover quality consumer
     _apply_strategy(cfg)           # epic #602 SUB-3/2.4: capture strategy.enabled for the failure recorder
     _apply_design_gate(cfg)        # S5 (#1227): capture design_gate.enabled (opt-in; DEV-1 enforces no blind coding)
+    _apply_constraint_gate(cfg)    # #1338/#1339: constraint_gate.enabled (capture + presence gate + injection)
+    _apply_constraint_conflict_detect(cfg)  # #1341: safety.constraint_conflict_detect (L2 detect + L3 compare; default OFF)
     _apply_advance_gate(cfg)       # S2 (#1224): capture advance_gate.enabled (opt-in; DEV-1 no blind advance)
     _apply_automation(cfg)         # S7 (#1229): capture automation.decoupled (watcher/autopilot disentangle)
     _apply_heartbeat(cfg)          # S7 (#1229): capture heartbeat.stall_seconds (task-scoped progress heartbeat)
+
+
+def _as_bool(v: object) -> bool:
+    """Strict config boolean: JSON true or an explicit case-insensitive true string."""
+    return v is True or (isinstance(v, str) and v.strip().lower() in {"true", "1", "yes", "on"})
 
 
 def _apply_design_gate(cfg: Dict[str, Any]) -> None:
@@ -10992,9 +13038,35 @@ def _apply_design_gate(cfg: Dict[str, Any]) -> None:
     byte-identical (the shared engine + every non-DEV-1 flow are unaffected); DEV-1 turns it on. Fail-soft."""
     global DESIGN_GATE_ENABLED
     try:
-        DESIGN_GATE_ENABLED = bool(_cfg_get(cfg, "design_gate.enabled"))
+        DESIGN_GATE_ENABLED = _as_bool(_cfg_get(cfg, "design_gate.enabled"))
     except Exception:   # noqa: BLE001 — advisory wiring: default to off
         DESIGN_GATE_ENABLED = False
+
+
+def _apply_constraint_gate(cfg: Dict[str, Any]) -> None:
+    """Capture ``constraint_gate.enabled`` for opt-in L1 capture, presence gate, and injection.
+    Fail-soft to OFF (byte-identical default)."""
+    global CONSTRAINT_GATE_ENABLED
+    try:
+        CONSTRAINT_GATE_ENABLED = _as_bool(_cfg_get(cfg, "constraint_gate.enabled"))
+    except Exception:  # noqa: BLE001 -- advisory wiring: default to off
+        CONSTRAINT_GATE_ENABLED = False
+
+
+def _apply_constraint_conflict_detect(cfg: Dict[str, Any]) -> None:
+    """#1341/#1337/#1342: capture ``safety.constraint_conflict_detect`` for L2 detect + L3 hard-check.
+
+    Strict ``_as_bool`` (JSON true or explicit true strings only). Default OFF → byte-identical
+    (no detect, no fork-envelope write, no hard-check). When ON, ``record_design`` runs the pure
+    detector and persists a pending ``ForkEnvelope`` (S3); ``/approve design`` + impl
+    ``stage_handover`` / ``plan_units`` run the L3 fail-closed typed hard-check (S6). The MPR
+    worker side is a separate flag (``ace.fork_mpr.enabled`` / ``_ACE_FORK_MPR``). Fail-soft to OFF.
+    """
+    global CONSTRAINT_CONFLICT_DETECT
+    try:
+        CONSTRAINT_CONFLICT_DETECT = _as_bool(_cfg_get(cfg, "safety.constraint_conflict_detect"))
+    except Exception:  # noqa: BLE001 -- advisory wiring: default to off
+        CONSTRAINT_CONFLICT_DETECT = False
 
 
 def _apply_advance_gate(cfg: Dict[str, Any]) -> None:
@@ -11002,7 +13074,7 @@ def _apply_advance_gate(cfg: Dict[str, Any]) -> None:
     byte-identical (the shared engine + every non-DEV-1 flow are unaffected); DEV-1 turns it on. Fail-soft."""
     global ADVANCE_GATE_ENABLED
     try:
-        ADVANCE_GATE_ENABLED = bool(_cfg_get(cfg, "advance_gate.enabled"))
+        ADVANCE_GATE_ENABLED = _as_bool(_cfg_get(cfg, "advance_gate.enabled"))
     except Exception:   # noqa: BLE001 — advisory wiring: default to off
         ADVANCE_GATE_ENABLED = False
 
@@ -11012,7 +13084,7 @@ def _apply_automation(cfg: Dict[str, Any]) -> None:
     identical coupled loop; DEV-1 turns it on. Fail-soft."""
     global AUTOMATION_DECOUPLED
     try:
-        AUTOMATION_DECOUPLED = bool(_cfg_get(cfg, "automation.decoupled"))
+        AUTOMATION_DECOUPLED = _as_bool(_cfg_get(cfg, "automation.decoupled"))
     except Exception:   # noqa: BLE001 — advisory wiring: default to off
         AUTOMATION_DECOUPLED = False
 
@@ -11042,7 +13114,7 @@ def _apply_lessons_provider(cfg: Dict[str, Any]) -> None:
     except Exception:   # noqa: BLE001 — seam/store unavailable ⇒ leave the no-op default
         return
     try:
-        enabled = bool(_cfg_get(cfg, "lessons.enabled"))
+        enabled = _as_bool(_cfg_get(cfg, "lessons.enabled"))
         current = _lessons.get_provider()
         if enabled:
             # Pass the RAW cap straight through — the store's _safe_cap coerces it (bad/overflow/None ⇒
@@ -11148,6 +13220,11 @@ _ACE_FORK_WORKER = None
 #: so a fork is never dispatched twice concurrently, while the DURABLE exactly-once key is committed only AFTER
 #: the MPR run completes (so a queue-drop / worker crash leaves the fork un-committed and it is retried).
 _ACE_FORK_INFLIGHT: "set" = set()
+#: #1340 / #17: process-local run lock for constraint-envelope MPR fills (mirrors ``_ACE_FORK_INFLIGHT``).
+#: Keyed by ``fork_id``. NON-durable — a hard crash leaves the set empty so a ``pending`` +
+#: ``recommendation is None`` envelope is re-drained. Never gate resubmit on a persisted
+#: ``ForkEnvelope.inflight`` field (that field is legacy and ignored for reclaim).
+_ACE_CONSTRAINT_ENVELOPE_INFLIGHT: "set" = set()
 #: M4-0 (#877): which playbook bullet ids were injected into a task's handover (keyed by task_id), so the
 #: post_feedback consumer can populate Trajectory.used_bullet_ids and the Reflector can rate them
 #: helpful/harmful (E-004/H-002). Bounded in-memory map (popped on consume); NOT a ProjectContext-scoped
@@ -11588,29 +13665,382 @@ def _ace_fork_proposal_for(unit: "Any") -> str:
     return "\n\n".join(parts)
 
 
-def _fork_command(arg: str) -> str:
-    """`/fork [unit]` — the operator-facing surface for the M5 MPR-at-fork proposals (#903). With no arg it
-    lists the units that currently have a recorded architecture-decision matrix (or renders the single pending
-    one); `/fork <unit>` renders that unit's full recommendation-only matrix. This is the production caller of
-    the M5-3 propose OUTPUT leg: at an architecture fork, the operator sees the MPR proposal here and decides
-    (ACE then learns the choice, M5-4). Read-only; fail-soft."""
-    arg = (arg or "").strip().lstrip("#").strip()
+def _fork_envelope_mtime(slug: str, fork_id: str) -> float:
+    """File mtime for a ledger envelope (0.0 if missing). Fail-soft."""
     try:
-        from playbook_store import list_fork_proposals   # bare engine-sibling import
-        from project_registry import ironclad_home
-        home = ironclad_home()
-    except Exception:   # noqa: BLE001
-        return "fork: proposal store unavailable"
-    if arg:
-        return _ace_fork_proposal_for(arg) or f"No MPR fork proposal recorded for #{arg}."
-    units = list_fork_proposals(home)
-    if not units:
-        return ("No pending MPR fork proposals. When an architecture fork is declared and the gate "
-                "`ace.fork_mpr.enabled` is on, its decision-matrix appears here as a recommendation.")
-    if len(units) == 1:
-        return _ace_fork_proposal_for(units[0]) or f"No MPR fork proposal recorded for #{units[0]}."
-    return ("\n".join([f"{len(units)} pending MPR fork proposal(s) — `/fork <unit>` for the full matrix:"]
-                      + [f"  - #{u}" for u in units]))
+        p = vault_root() / slug / "proposals" / "forks" / f"{fork_id}.json"
+        return p.stat().st_mtime if p.is_file() else 0.0
+    except Exception:  # noqa: BLE001
+        return 0.0
+
+
+def _visible_pending_fork_envelopes(slug: "Optional[str]", *, fail_closed: bool = False) -> "list":
+    """Pending constraint envelopes for *slug*, latest per ``(slug, category)``.
+
+    Older same-category envelopes are marked ``superseded`` (persisted) and skipped.
+    Opaque ``fork_id`` only — no ``#N``. List/scan paths keep *fail_closed* False (never
+    raises). ``/approve design`` under ``CONSTRAINT_CONFLICT_DETECT`` passes True so a
+    ledger I/O failure propagates (fail-closed).
+    """
+    if not slug:
+        return []
+    try:
+        envs = _load_fork_envelopes(slug, fail_closed=fail_closed)
+        if not envs:
+            return []
+        # Group pending (non-resolved, non-superseded) by category; pick latest by mtime then design_rev.
+        pending: "list" = []
+        by_cat: "Dict[str, list]" = {}
+        for env in envs:
+            st = (getattr(env, "status", "") or "").strip().lower()
+            if st in ("resolved", "superseded"):
+                continue
+            cat = (getattr(env, "category", "") or "").strip() or "_uncategorised"
+            by_cat.setdefault(cat, []).append(env)
+        for cat, items in by_cat.items():
+            items.sort(
+                key=lambda e: (
+                    _fork_envelope_mtime(slug, e.fork_id),
+                    e.design_rev or "",
+                ),
+                reverse=True,
+            )
+            latest = items[0]
+            pending.append(latest)
+            for older in items[1:]:
+                if (getattr(older, "status", "") or "").strip().lower() != "superseded":
+                    older.status = "superseded"
+                    try:
+                        _persist_fork_envelope(older)
+                    except Exception:  # noqa: BLE001
+                        pass
+        # Stable order: newest first overall.
+        pending.sort(
+            key=lambda e: _fork_envelope_mtime(slug, e.fork_id),
+            reverse=True,
+        )
+        return pending
+    except Exception:  # noqa: BLE001
+        if fail_closed:
+            raise
+        return []
+
+
+def _fork_decide_hint(env: "Any") -> str:
+    """Concrete ready-to-run decide commands for one pending constraint fork."""
+    fid = getattr(env, "fork_id", "") or "?"
+    category = getattr(env, "category", "") or "constraint"
+    options = [o for o in (getattr(env, "options", None) or []) if isinstance(o, dict)]
+    keep = next((o for o in options if str(o.get("id", "")).strip().lower() == "keep"), {})
+    counter = next((o for o in options if str(o.get("id", "")).strip().lower() == "counter"), {})
+    keep_val = keep.get("value", "")
+    counter_val = counter.get("value", "")
+    keep_label = str(keep.get("label") or "keep").strip() or "keep"
+    counter_label = str(counter.get("label") or "counter").strip() or "counter"
+    return "\n".join([
+        f"Decision required -- fork {fid} ({category}: {keep_val} vs {counter_val}):",
+        f"  {keep_label}    ->  /fork decide {fid} --choice keep",
+        f"  {counter_label} ->  /fork decide {fid} --choice counter",
+    ])
+
+
+def _pending_fork_decide_hints(slug: "Optional[str]") -> str:
+    """Render concrete decide hints for all visible pending forks. Fail-soft."""
+    try:
+        pending = _pending_constraint_forks(slug)
+    except Exception:  # noqa: BLE001
+        return ""
+    return "\n".join(_fork_decide_hint(env) for env in pending)
+
+
+def _render_fork_envelope(env: "Any") -> str:
+    """Human rendering of one constraint-fork envelope (opaque id, options, recommendation)."""
+    lines = [
+        f"fork_id: {getattr(env, 'fork_id', '')}",
+        f"slug: {getattr(env, 'slug', '')}",
+        f"category: {getattr(env, 'category', '')}",
+        f"question: {getattr(env, 'question', '')}",
+        "options:",
+    ]
+    for opt in (getattr(env, "options", None) or []):
+        if not isinstance(opt, dict):
+            continue
+        oid = opt.get("id", "")
+        label = opt.get("label", oid)
+        val = opt.get("value", "")
+        lines.append(f"  - {oid}: {label} (value={val!r})")
+    rec = getattr(env, "recommendation", None)
+    if isinstance(rec, dict) and rec:
+        text = rec.get("text") or rec.get("top") or rec.get("recommendation") or ""
+        if text:
+            lines.append(f"recommendation: {text}")
+        else:
+            lines.append(f"recommendation: {rec}")
+    elif rec:
+        lines.append(f"recommendation: {rec}")
+    else:
+        lines.append("recommendation: (pending MPR — enable ace.fork_mpr.enabled to fill)")
+    lines.append("status: pending (recommendation only -- choose one concrete command below)")
+    lines.append(_fork_decide_hint(env))
+    return "\n".join(lines)
+
+
+def _fork_list_envelopes(slug: "Optional[str]" = None) -> "Optional[str]":
+    """Render pending constraint envelopes for the active (or *slug*) unit, or None if none."""
+    target = (slug or active_slug() or "").strip()
+    if not target:
+        return None
+    pending = _visible_pending_fork_envelopes(target)
+    if not pending:
+        return None
+    if len(pending) == 1:
+        return _render_fork_envelope(pending[0])
+    header = (f"{len(pending)} pending constraint fork(s) -- "
+              "`/fork list` shows each concrete decide command:")
+    parts = [header]
+    for env in pending:
+        parts.append("")
+        parts.append(_render_fork_envelope(env))
+    return "\n".join(parts)
+
+
+def _find_fork_envelope(fork_id: str, slug: "Optional[str]" = None) -> "Any":
+    """Load one envelope by opaque fork_id under the active (or *slug*) unit. None if missing."""
+    fid = (fork_id or "").strip()
+    if not fid:
+        return None
+    target = (slug or active_slug() or "").strip()
+    if not target:
+        return None
+    for env in _load_fork_envelopes(target):
+        if (getattr(env, "fork_id", "") or "") == fid:
+            return env
+    # Also search other initiatives of the active project if not found under active slug.
+    try:
+        for init in initiative_list():
+            if init.slug == target:
+                continue
+            for env in _load_fork_envelopes(init.slug):
+                if (getattr(env, "fork_id", "") or "") == fid:
+                    return env
+    except Exception:  # noqa: BLE001
+        pass
+    return None
+
+
+def _promote_counter_design(env: "Any") -> str:
+    """Write the envelope's parked counter design body back to decisions/design.md."""
+    counter = getattr(env, "counter_design", None)
+    if not counter:
+        return ""
+    slug = (getattr(env, "slug", "") or "").strip()
+    if not slug:
+        return ""
+    try:
+        with _vault_lock():
+            doc = vault_root() / slug / "decisions" / "design.md"
+            doc.parent.mkdir(parents=True, exist_ok=True)
+            counter = _set_frontmatter_flag(counter, "approved", "false")
+            counter = _set_frontmatter_flag(counter, "type", "proposal")
+            doc.write_text(counter, encoding="utf-8", newline="\n")
+            try:
+                reconcile_vault(slug, links=False)
+            except Exception:  # noqa: BLE001
+                pass
+        return " the counter design was promoted to design.md (approved:false -- /approve to accept);"
+    except Exception:  # noqa: BLE001
+        return " could not promote the counter design to design.md; check the design before /approve."
+
+
+def _reconcile_design_on_keep(env: "Any") -> str:
+    """After keep, clear or restore design.md so approval is not stranded on the rejected counter."""
+    slug = (getattr(env, "slug", "") or "").strip()
+    if not slug:
+        return "design.md left unchanged."
+    try:
+        ct = _constraint_typed(slug)
+        if not ct:
+            return "design.md left unchanged."
+        from ack.ace.constraint_conflict import hardcheck  # lazy
+        from ack.ace.constraint_types import parse_typed  # lazy
+
+        doc = vault_root() / slug / "decisions" / "design.md"
+        cur = None
+        try:
+            if doc.is_file():
+                cur = doc.read_text(encoding="utf-8")
+        except Exception:  # noqa: BLE001
+            cur = None
+        if cur is not None and hardcheck(ct, parse_typed(cur), require_present=True) is None:
+            return "design.md already complies -- left unchanged."
+        restore = getattr(env, "restore_design", None)
+        with _vault_lock():
+            if restore and hardcheck(ct, parse_typed(restore), require_present=True) is None:
+                doc.parent.mkdir(parents=True, exist_ok=True)
+                doc.write_text(restore, encoding="utf-8", newline="\n")
+                try:
+                    reconcile_vault(slug, links=False)
+                except Exception:  # noqa: BLE001
+                    pass
+                return "restored the prior floor-compliant design to design.md -- /approve when ready."
+            try:
+                if doc.is_file():
+                    doc.unlink()
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                reconcile_vault(slug, links=False)
+            except Exception:  # noqa: BLE001
+                pass
+            return ("cleared the rejected counter-proposal from design.md -- record a floor-compliant "
+                    "design (<k=v...>) then /approve. (The counter is preserved in the fork ledger.)")
+    except Exception:  # noqa: BLE001
+        return "could not reconcile design.md; check the design before /approve."
+
+
+def _fork_decide(fork_id: str, choice: str) -> str:
+    """#1340 R5 state machine: resolve a constraint-fork envelope (fail-closed, idempotent).
+
+    - ``keep``: resolved; constraints.md HARD typed value UNCHANGED; design must comply.
+    - ``counter``: override constraints.md typed value via operator-override provenance; resolved.
+    - second identical decide → no-op OK; unknown/already-resolved (other choice) → clear ERROR.
+    """
+    fid = (fork_id or "").strip()
+    ch = (choice or "").strip().lower()
+    if not fid:
+        return "ERROR: usage: /fork decide <fork-id> --choice keep|counter"
+    if ch not in ("keep", "counter"):
+        # Also accept an option id from the envelope if it is keep/counter-shaped; otherwise refuse.
+        return (f"ERROR: --choice must be keep or counter (got {choice!r}). "
+                "Nothing changed.")
+    env = _find_fork_envelope(fid)
+    if env is None:
+        return f"ERROR: unknown fork_id {fid!r} — no envelope on the active project ledger."
+    st = (getattr(env, "status", "") or "").strip().lower()
+    if st == "superseded":
+        return (f"ERROR: fork {fid} is superseded by a newer same-category envelope — "
+                "run /fork list. Nothing changed.")
+    if st == "resolved":
+        prev = (getattr(env, "resolution", None) or {})
+        prev_ch = str(prev.get("choice_id") or prev.get("choice") or "").strip().lower()
+        if prev_ch == ch:
+            return f"OK: fork {fid} already resolved with choice={ch!r} (idempotent no-op)."
+        return (f"ERROR: fork {fid} is already resolved with choice={prev_ch!r} "
+                f"(cannot re-decide as {ch!r}). Nothing changed.")
+    # Validate choice against envelope options.
+    opt_ids = {str(o.get("id", "")).strip().lower() for o in (env.options or []) if isinstance(o, dict)}
+    if opt_ids and ch not in opt_ids:
+        return (f"ERROR: choice {ch!r} is not an option on fork {fid} "
+                f"(options: {sorted(opt_ids)}). Nothing changed.")
+    opt_val = None
+    for o in (env.options or []):
+        if isinstance(o, dict) and str(o.get("id", "")).strip().lower() == ch:
+            opt_val = o.get("value")
+            break
+    reval_warning = ""
+    promote_note = ""
+    if ch == "counter":
+        promote_note = _promote_counter_design(env)
+        ov = _override_constraint_typed(
+            env.slug, env.category, opt_val, provenance="operator-override")
+        if ov and ov.startswith("ERROR"):
+            return ov
+        reval_warning = ov or ""
+    else:
+        keep_note = _reconcile_design_on_keep(env)
+    # Resolve only after the chosen design/constraint mutation has completed; if a future mutation
+    # path raises, the envelope remains pending and a repeated decide can retry.
+    # keep: leave constraints.md unchanged.
+    import time as _time
+    env.resolution = {
+        "choice_id": ch,
+        "value": opt_val,
+        "at": _time.strftime("%Y-%m-%dT%H:%M:%SZ", _time.gmtime()),
+    }
+    env.status = "resolved"
+    env.inflight = False  # clear any legacy durable claim; run lock is process-local
+    _persist_fork_envelope(env)
+    # P5: decide→learn (fail-soft, off hot path).
+    try:
+        _ace_learn_envelope_resolution(env, ch)
+    except Exception:  # noqa: BLE001
+        pass
+    if ch == "keep":
+        return (f"OK: fork {fid} resolved — choice=keep. "
+                f"Constraint HARD floor is UNCHANGED ({env.category} stays {opt_val!r}). "
+                f"{keep_note}")
+    return ((f"OK: fork {fid} resolved — choice=counter. "
+             f"Constraint {env.category!r} overridden to {opt_val!r} "
+             f"(provenance=operator-override). Design may proceed under the new floor."
+             f"{promote_note}")
+            + (f"\n{reval_warning}" if reval_warning else ""))
+
+
+def _fork_command(arg: str) -> str:
+    """`/fork` operator surface (#903 M5 unit proposals + #1340 S4 constraint envelopes).
+
+    - ``/fork`` / ``/fork list`` — pending constraint envelopes for the active unit (opaque ids,
+      supersession, recommendation when present); falls through to M5 unit proposals when the
+      envelope ledger is empty (byte-identical to pre-S4 when no ledger).
+    - ``/fork decide <fork-id> --choice keep|counter`` — mutating R5 resolve (fail-closed, idempotent).
+    - ``/fork <unit>`` — legacy M5 unit proposal render (``#N`` form still accepted for that path only).
+    """
+    raw = (arg or "").strip()
+    parts = raw.split() if raw else []
+    # /fork decide …
+    if parts and parts[0].lower() == "decide":
+        rest = parts[1:]
+        fid = rest[0] if rest else ""
+        choice = ""
+        if "--choice" in rest:
+            i = rest.index("--choice")
+            choice = rest[i + 1] if i + 1 < len(rest) else ""
+        elif len(rest) >= 2:
+            choice = rest[1]
+        return _fork_decide(fid, choice)
+    # /fork list  or bare /fork → envelope list first
+    if not parts or parts[0].lower() == "list":
+        slug_arg = None
+        if len(parts) >= 2 and parts[0].lower() == "list":
+            slug_arg = parts[1]
+        env_out = _fork_list_envelopes(slug_arg)
+        if env_out is not None:
+            return env_out
+        # Fall through to M5 unit-based proposals (byte-identical when no envelope ledger).
+        try:
+            from playbook_store import list_fork_proposals   # bare engine-sibling import
+            from project_registry import ironclad_home
+            home = ironclad_home()
+        except Exception:   # noqa: BLE001
+            return "fork: proposal store unavailable"
+        units = list_fork_proposals(home)
+        if not units:
+            # Pre-S4 empty-path string — byte-identical when CONSTRAINT_CONFLICT_DETECT is off.
+            # The typed-HARD sentence is additive only when the detect flag is on (not when both
+            # flags are off).
+            base = ("No pending MPR fork proposals. When an architecture fork is declared and the gate "
+                    "`ace.fork_mpr.enabled` is on, its decision-matrix appears here as a recommendation.")
+            if CONSTRAINT_CONFLICT_DETECT:
+                return (base + " Typed HARD conflicts (`safety.constraint_conflict_detect`) "
+                        "also surface here.")
+            return base
+        if len(units) == 1:
+            return _ace_fork_proposal_for(units[0]) or f"No MPR fork proposal recorded for #{units[0]}."
+        return ("\n".join([f"{len(units)} pending MPR fork proposal(s) — `/fork <unit>` for the full matrix:"]
+                          + [f"  - #{u}" for u in units]))
+    # /fork <token> — opaque envelope id first, else M5 unit
+    token = parts[0].lstrip("#").strip()
+    env = _find_fork_envelope(token)
+    if env is not None:
+        st = (getattr(env, "status", "") or "").strip().lower()
+        if st == "resolved":
+            res = getattr(env, "resolution", None) or {}
+            return (f"fork_id: {env.fork_id}\nstatus: resolved\n"
+                    f"resolution: {res}\nquestion: {env.question}")
+        if st == "superseded":
+            return f"fork_id: {env.fork_id}\nstatus: superseded (see /fork list for the latest)"
+        return _render_fork_envelope(env)
+    return _ace_fork_proposal_for(token) or f"No MPR fork proposal recorded for #{token}."
 
 
 _ACE_USAGE = "usage: /ace warmup --ledger <path>  |  /ace eval --ledger <path>"
@@ -11720,12 +14150,208 @@ def _ace_mark_fork_done(key: str) -> None:
         pass
 
 
+def _ace_submit_constraint_envelope(env: "Any") -> bool:
+    """#1340: enqueue a pending constraint ``ForkEnvelope`` for off-hot-path MPR fill.
+
+    Captures ``contextvars.copy_context()`` at SUBMIT (not drain-time) so the long-lived
+    ``ReflectionWorker`` daemon processes the item under the envelope's ProjectContext (#15/#16).
+    Returns True when enqueued. Gate OFF / no worker / already filled / process-local
+    inflight → False. Fail-soft.
+
+    The durable "needs MPR" state is ``status==pending`` and ``recommendation is None``.
+    The run lock is the **in-memory** ``_ACE_CONSTRAINT_ENVELOPE_INFLIGHT`` set (keyed by
+    ``fork_id``) — never the persisted ``env.inflight`` field (#17: a hard crash must not
+    leave the envelope permanently claimed).
+    """
+    try:
+        if not _ACE_FORK_MPR or _ACE_FORK_WORKER is None:
+            return False
+        if env is None:
+            return False
+        st = (getattr(env, "status", "") or "").strip().lower()
+        if st != "pending":
+            return False
+        # Never gate on persisted env.inflight — only the process-local set (#17).
+        if getattr(env, "recommendation", None) is not None:
+            return False
+        fid = (getattr(env, "fork_id", "") or "").strip()
+        slug = (getattr(env, "slug", "") or "").strip()
+        if not fid or not slug:
+            return False
+        if fid in _ACE_CONSTRAINT_ENVELOPE_INFLIGHT:
+            return False
+        import contextvars
+        ctx = contextvars.copy_context()
+        # Explicit scope = envelope mem_ns (never _active_mem_ns at drain).
+        scope = (getattr(env, "mem_ns", "") or "").strip()
+        ok = _ACE_FORK_WORKER.submit({
+            "kind": "constraint_envelope",
+            "fork_id": fid,
+            "slug": slug,
+            "scope": scope,
+            "ctx": ctx,
+        })
+        if ok:
+            # Process-local claim only AFTER a successful enqueue (mirrors M5 #904).
+            _ACE_CONSTRAINT_ENVELOPE_INFLIGHT.add(fid)
+        return bool(ok)
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _ace_scan_constraint_envelopes(slug: "Optional[str]" = None) -> int:
+    """#1340: submit every pending unfilled constraint envelope under *slug* (or active).
+
+    Gate OFF ⇒ 0 (byte-identical). Fail-soft. Returns the number enqueued.
+    """
+    try:
+        if not _ACE_FORK_MPR or _ACE_FORK_WORKER is None:
+            return 0
+        target = (slug or active_slug() or "").strip()
+        if not target:
+            return 0
+        n = 0
+        for env in _load_fork_envelopes(target):
+            if _ace_submit_constraint_envelope(env):
+                n += 1
+        return n
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+def _ace_process_constraint_envelope(item: "Any") -> None:
+    """#1340: process one constraint envelope (in-memory run lock → MPR → fill / release).
+
+    Uses the envelope's ``slug`` via the MPR ``artifact_slug`` port (never ``active_slug()``).
+    The run lock is NON-durable (``_ACE_CONSTRAINT_ENVELOPE_INFLIGHT``): it is released in
+    ``finally`` and never written to the ledger. On success: write recommendation+matrix,
+    status stays ``pending``. On exception/empty MPR: leave pending without recommendation
+    (retry later) — never mark failed as done (#17). Scope is explicit from the item
+    (env.mem_ns). Never raises.
+    """
+    fid = ""
+    try:
+        if not isinstance(item, dict):
+            return
+        fid = str(item.get("fork_id") or "").strip()
+        slug = str(item.get("slug") or "").strip()
+        if not fid or not slug:
+            return
+        envs = _load_fork_envelopes(slug)
+        env = next((e for e in envs if (e.fork_id or "") == fid), None)
+        if env is None:
+            return
+        st = (env.status or "").strip().lower()
+        if st != "pending":
+            return
+        if env.recommendation is not None:
+            return  # already filled
+        # Run lock is process-local (set at submit). Never persist inflight to disk (#17).
+        matrix = ""
+        try:
+            query = (
+                f"Constraint conflict fork: {env.question}\n"
+                f"Category: {env.category}\n"
+                f"Options: "
+                + ", ".join(
+                    f"{o.get('id')}={o.get('value')!r}"
+                    for o in (env.options or []) if isinstance(o, dict)
+                )
+                + "\nRecommend keep (comply with constraint) vs counter (adopt design value)."
+            )
+            # Same seam as M5-2 (`_ace_fork_mpr_run`); artifact_slug binds the ENVELOPE initiative (#16).
+            matrix = run_tool("mpr_research", {
+                "query": query,
+                "domain_hint": "architecture-decision",
+                "mode_hint": "decision",
+                "artifact_slug": env.slug,  # P1 port — NEVER active_slug()
+            }) or ""
+        except Exception:  # noqa: BLE001 — release run lock (finally); leave pending for retry
+            return
+        m = (matrix or "").strip()
+        if not m or m.startswith(("ERROR", "MPR declined", "MPR is disabled", "BLOCKED")):
+            # Empty/failed MPR: leave pending without recommendation (retry later).
+            return
+        rec_text = _ace_extract_recommendation(m)
+        env.matrix = m
+        env.recommendation = {"text": rec_text} if rec_text else {"text": ""}
+        env.inflight = False  # clear any legacy durable claim from older ledgers
+        # status stays pending (operator decides via /fork decide)
+        _persist_fork_envelope(env)
+    except Exception:  # noqa: BLE001 — never kill the worker
+        pass
+    finally:
+        # Always release the process-local claim so a retry can re-enqueue (#17).
+        try:
+            if fid:
+                _ACE_CONSTRAINT_ENVELOPE_INFLIGHT.discard(fid)
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _ace_learn_envelope_resolution(env: "Any", choice_id: str) -> None:
+    """#1340 P5: on decide, feed the envelope resolution into ACE (fail-soft, off hot path).
+
+    Mirrors ``_ace_scan_fork_resolutions`` / ``ForkResolution``→learn, but sourced from the
+    durable envelope resolution. Scope is the envelope's ``mem_ns`` (never drain-time active).
+    Gate OFF (`_ACE_FORK_MPR`) or no worker ⇒ no-op.
+    """
+    try:
+        if not _ACE_FORK_MPR or _ACE_WORKER is None:
+            return
+        if env is None:
+            return
+        chosen = (choice_id or "").strip()
+        q = (getattr(env, "question", "") or getattr(env, "category", "") or "").strip()
+        if not (chosen and q):
+            return
+        fid = (getattr(env, "fork_id", "") or "").strip()
+        key = f"env:{fid}|{chosen}"
+        learned = _ace_load_fork_learned()
+        if key in learned:
+            return
+        from ack.ace import Trajectory  # lazy
+        area = (getattr(env, "area", "") or "constraint").strip()
+        cat = (getattr(env, "category", "") or "").strip()
+        steps = [f"decision: {chosen}"]
+        if area:
+            steps.append(f"area: {area}")
+        if cat:
+            steps.append(f"category: {cat}")
+        traj = Trajectory(
+            query=f"constraint fork: {q}",
+            steps=steps,
+            outcome=f"chose '{chosen}'",
+            used_bullet_ids=[],
+        )
+        # Explicit scope from envelope — never _active_mem_ns().
+        scope = (getattr(env, "mem_ns", "") or "").strip() or _active_mem_ns()
+        if not scope:
+            return
+        _ACE_WORKER.submit({"scope": scope, "trajectory": traj})
+        learned.add(key)
+        _ace_save_fork_learned(learned)
+    except Exception:  # noqa: BLE001 — advisory: never break decide
+        return
+
+
 def _ace_fork_run_task(item: "Any") -> None:
     """The `_ACE_FORK_WORKER` task fn: run the MPR panel for one submitted fork, then durably commit its
     exactly-once key (#904 — commit-on-completion, not at dispatch). A worker-level crash leaves the key
-    UN-committed (retried next scan). The in-flight guard is always cleared. Never raises."""
+    UN-committed (retried next scan). The in-flight guard is always cleared. Never raises.
+
+    #1340: also drains constraint-envelope items (``kind=constraint_envelope``) under the
+    submit-time ``contextvars`` context (per-item, not bind-at-start).
+    """
     key = item.get("key") if isinstance(item, dict) else None
     try:
+        if isinstance(item, dict) and item.get("kind") == "constraint_envelope":
+            ctx = item.get("ctx")
+            if ctx is not None and hasattr(ctx, "run"):
+                ctx.run(_ace_process_constraint_envelope, item)
+            else:
+                _ace_process_constraint_envelope(item)
+            return
         if isinstance(item, dict) and item.get("signal") is not None:
             _ace_fork_mpr_run(item.get("signal"), item.get("scope", ""))
             _ace_mark_fork_done(key)          # ran to completion ⇒ commit exactly-once (retry only on crash/drop)
@@ -11733,7 +14359,8 @@ def _ace_fork_run_task(item: "Any") -> None:
         pass
     finally:
         try:
-            _ACE_FORK_INFLIGHT.discard(key)
+            if key is not None:
+                _ACE_FORK_INFLIGHT.discard(key)
         except Exception:   # noqa: BLE001
             pass
 
@@ -11943,6 +14570,7 @@ def _apply_ace(cfg: Dict[str, Any]) -> None:
                     pass
                 _ACE_FORK_WORKER = None
                 _ACE_FORK_INFLIGHT.clear()
+                _ACE_CONSTRAINT_ENVELOPE_INFLIGHT.clear()
         else:                                        # a foreign provider won ⇒ ACE steps back
             _hooks.unregister_hook("post_feedback", _ace_consumer_hook)
         _hooks.unregister_hook("post_feedback", _lessons_consumer_hook)    # superseded (#804)
@@ -11979,7 +14607,7 @@ def _apply_quality_breaker(cfg: Dict[str, Any]) -> None:
     hiccup never breaks config application; default-off keeps it a byte-identical no-op."""
     global _QUALITY_BREAKER
     try:
-        enabled = bool(_cfg_get(cfg, "quality.enabled"))
+        enabled = _as_bool(_cfg_get(cfg, "quality.enabled"))
         if not enabled:
             _QUALITY_BREAKER = None
             return
@@ -12140,7 +14768,7 @@ def _apply_verifier(cfg: Dict[str, Any]) -> None:
     except Exception:   # noqa: BLE001 — bad value → the safe default
         _VERIFY_GROUNDING_THRESHOLD = 0.5
     try:
-        if bool(_cfg_get(cfg, "verify.enabled")):
+        if _as_bool(_cfg_get(cfg, "verify.enabled")):
             _hooks.register_hook("pre_handover", _verifier_hook)
         else:
             _hooks.unregister_hook("pre_handover", _verifier_hook)
@@ -12190,7 +14818,7 @@ def _apply_quality_consumer(cfg: Dict[str, Any]) -> None:
     except Exception:   # noqa: BLE001 — bus unavailable ⇒ leave the no-op default
         return
     try:
-        if bool(_cfg_get(cfg, "quality.enabled")):
+        if _as_bool(_cfg_get(cfg, "quality.enabled")):
             _hooks.register_hook("post_handover", _quality_consumer_hook)
         else:
             _hooks.unregister_hook("post_handover", _quality_consumer_hook)
@@ -12213,7 +14841,7 @@ def _apply_strategy(cfg: Dict[str, Any]) -> None:
     `_apply_config`. Default OFF → byte-identical. Fail-soft — never breaks config application."""
     global _STRATEGY_ENABLED, _STRATEGY_BUDGET
     try:
-        _STRATEGY_ENABLED = bool(_cfg_get(cfg, "strategy.enabled"))
+        _STRATEGY_ENABLED = _as_bool(_cfg_get(cfg, "strategy.enabled"))
         b = _cfg_get(cfg, "strategy.budget")
         _STRATEGY_BUDGET = b if isinstance(b, int) and not isinstance(b, bool) and b >= 1 else 3
     except Exception:   # noqa: BLE001 — advisory wiring: default to off
@@ -12334,7 +14962,7 @@ def _record_process_lesson(existing, agent: str = "") -> None:
     EngineLessonStore is registered (byte-identical). Fail-soft — never raises, never breaks a turn."""
     try:
         cfg = _EFFECTIVE_CFG if _EFFECTIVE_CFG is not None else _code_defaults()
-        if not bool(_cfg_get(cfg, "process.enabled")):
+        if not _as_bool(_cfg_get(cfg, "process.enabled")):
             return
         provider = _concrete_lesson_provider()
         if provider is None:
@@ -12384,7 +15012,7 @@ def _apply_process_consumer(cfg: Dict[str, Any]) -> None:
     except Exception:   # noqa: BLE001 — bus unavailable ⇒ leave the no-op default
         return
     try:
-        if bool(_cfg_get(cfg, "process.enabled")):
+        if _as_bool(_cfg_get(cfg, "process.enabled")):
             _hooks.register_hook("post_feedback", _process_consumer_hook)
         else:
             _hooks.unregister_hook("post_feedback", _process_consumer_hook)
@@ -12397,7 +15025,7 @@ def _process_hint() -> str:
     ``""`` (byte-identical) when ``process.enabled`` is off / no concrete provider / none recorded. Fail-soft."""
     try:
         cfg = _EFFECTIVE_CFG if _EFFECTIVE_CFG is not None else _code_defaults()
-        if not bool(_cfg_get(cfg, "process.enabled")):
+        if not _as_bool(_cfg_get(cfg, "process.enabled")):
             return ""
         provider = _concrete_lesson_provider()
         if provider is None:

@@ -11,6 +11,8 @@ import sys
 import types
 from pathlib import Path
 
+import pytest
+
 sys.modules.setdefault("openai", types.SimpleNamespace(OpenAI=lambda **kw: object()))
 _ENGINE = Path(__file__).resolve().parents[2] / "engine"
 if str(_ENGINE) not in sys.path:
@@ -141,3 +143,48 @@ def test_advance_gate_unit(monkeypatch):
     assert gx10._advance_gate("no status here") is None   # presence-wins: no explicit non-done ⇒ advance
     monkeypatch.setattr(gx10, "ADVANCE_GATE_ENABLED", False)
     assert gx10._advance_gate("---\nstatus: blocked\n---\n") is None  # off → allow (byte-identical)
+
+
+# ── #1346: advance_gate.enabled uses strict _as_bool (string "false" must NOT enable) ──────────────
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (True, True),
+        (False, False),
+        ("true", True),
+        ("false", False),
+        ("0", False),
+        ("garbage", False),
+        ("", False),
+        (1, False),
+    ],
+)
+def test_advance_gate_config_uses_strict_boolean(value, expected):
+    gx10._apply_advance_gate({"advance_gate": {"enabled": value}})
+    assert gx10.ADVANCE_GATE_ENABLED is expected
+
+
+def test_advance_gate_config_fails_soft(monkeypatch):
+    monkeypatch.setattr(gx10, "_cfg_get", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
+    gx10._apply_advance_gate({})
+    assert gx10.ADVANCE_GATE_ENABLED is False
+
+
+@pytest.mark.parametrize(
+    ("fragment", "expected"),
+    [
+        ({"advance_gate": {"enabled": True}}, True),
+        ({"advance_gate": {"enabled": "true"}}, True),
+        ({"advance_gate": {"enabled": "false"}}, False),  # strict _as_bool rejects stringy false
+        ({"advance_gate": {"enabled": "garbage"}}, False),
+        ({"advance_gate": {"enabled": "0"}}, False),
+        ({}, False),  # missing key → public default off
+    ],
+    ids=["json-true", "string-true", "string-false", "garbage", "string-zero", "missing"],
+)
+def test_apply_config_advance_gate_synthetic(fragment, expected):
+    """#1346: synthetic dict only — string config values must not wrongly enable the gate."""
+    cfg = gx10._code_defaults()
+    cfg.update(fragment)
+    gx10._apply_config(cfg)
+    assert gx10.ADVANCE_GATE_ENABLED is expected

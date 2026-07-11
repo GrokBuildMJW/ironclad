@@ -44,7 +44,8 @@ def _project(tmp_path, monkeypatch):
 # ── the batch macro ──────────────────────────────────────────────────────────
 
 def test_plan_units_creates_epic_and_parent_linked_units(tmp_path):
-    out = gx10._plan_units(json.dumps(_EPIC), json.dumps([_u(1), _u(2), _u(3)]))
+    out = gx10._plan_units(json.dumps(_EPIC),
+                           json.dumps([_u(1), _u(2, dependencies=["unit:1"]), _u(3, dependencies=["unit:2"])]))
     assert out.startswith("OK:"), out
     store = gx10._store()
     epics = [t for t in store.list("pending") if t.get("type") == "epic"]
@@ -169,6 +170,30 @@ def test_rehand_normalizes_id_and_stamps_assigned_to():
 
 # ── /auto — the automation meta-switch ───────────────────────────────────────
 
+def test_watcher_defaults_off_and_config_cannot_enable_it_independently():
+    saved = (gx10._WATCHER_ENABLED, gx10.AUTOPILOT_ENABLED, gx10.AUTOPILOT_AUTOPLAN,
+             gx10._EFFECTIVE_CFG)
+    try:
+        cfg = gx10._code_defaults()
+        assert cfg["watcher"]["enabled"] is False
+        gx10._apply_config(cfg)
+        assert gx10._WATCHER_ENABLED is False
+
+        cfg["watcher"]["enabled"] = True
+        cfg["autopilot"]["enabled"] = False
+        cfg["autopilot"]["autoplan"] = False
+        gx10._apply_config(cfg)
+        assert gx10._WATCHER_ENABLED is False
+
+        cfg["autopilot"]["enabled"] = True
+        cfg["autopilot"]["autoplan"] = True
+        gx10._apply_config(cfg)
+        assert gx10._WATCHER_ENABLED is False
+    finally:
+        (gx10._WATCHER_ENABLED, gx10.AUTOPILOT_ENABLED, gx10.AUTOPILOT_AUTOPLAN,
+         gx10._EFFECTIVE_CFG) = saved
+
+
 def test_auto_on_off_flips_the_three_flags():
     saved = (gx10._WATCHER_ENABLED, gx10.AUTOPILOT_ENABLED, gx10.AUTOPILOT_AUTOPLAN,
              gx10.AUTOPILOT_MAX_TASKS, gx10._AUTOPLAN_DONE, gx10._EFFECTIVE_CFG)
@@ -181,6 +206,30 @@ def test_auto_on_off_flips_the_three_flags():
                                                     "autoplan_max_tasks": 5}
         gx10._dispatch(None, "auto off")
         assert not (gx10._WATCHER_ENABLED or gx10.AUTOPILOT_ENABLED or gx10.AUTOPILOT_AUTOPLAN)
+    finally:
+        (gx10._WATCHER_ENABLED, gx10.AUTOPILOT_ENABLED, gx10.AUTOPILOT_AUTOPLAN,
+         gx10.AUTOPILOT_MAX_TASKS, gx10._AUTOPLAN_DONE, gx10._EFFECTIVE_CFG) = saved
+
+
+def test_watcher_command_delegates_to_auto_meta_switch(monkeypatch):
+    saved = (gx10._WATCHER_ENABLED, gx10.AUTOPILOT_ENABLED, gx10.AUTOPILOT_AUTOPLAN,
+             gx10.AUTOPILOT_MAX_TASKS, gx10._AUTOPLAN_DONE, gx10._EFFECTIVE_CFG)
+    try:
+        monkeypatch.setattr(gx10, "_ui_print", lambda *a, **k: None)
+        gx10._EFFECTIVE_CFG = {"watcher": {}, "autopilot": {}, "paths": {}}
+        gx10._WATCHER_ENABLED = False
+        gx10.AUTOPILOT_ENABLED = False
+        gx10.AUTOPILOT_AUTOPLAN = False
+
+        gx10._dispatch(None, "watcher on")
+        assert gx10._WATCHER_ENABLED and gx10.AUTOPILOT_ENABLED and gx10.AUTOPILOT_AUTOPLAN
+        assert gx10._EFFECTIVE_CFG["watcher"]["enabled"] is True
+        assert gx10._EFFECTIVE_CFG["autopilot"]["enabled"] is True
+
+        gx10._dispatch(None, "watcher off")
+        assert not (gx10._WATCHER_ENABLED or gx10.AUTOPILOT_ENABLED or gx10.AUTOPILOT_AUTOPLAN)
+        assert gx10._EFFECTIVE_CFG["watcher"]["enabled"] is False
+        assert gx10._EFFECTIVE_CFG["autopilot"]["enabled"] is False
     finally:
         (gx10._WATCHER_ENABLED, gx10.AUTOPILOT_ENABLED, gx10.AUTOPILOT_AUTOPLAN,
          gx10.AUTOPILOT_MAX_TASKS, gx10._AUTOPLAN_DONE, gx10._EFFECTIVE_CFG) = saved
@@ -210,9 +259,58 @@ def test_plan_units_result_bootstraps_when_armed(monkeypatch):
     monkeypatch.setattr(gx10, "AUTOPILOT_AUTOPLAN", True)
     out = gx10._plan_units(json.dumps(_EPIC), json.dumps([_u(1)]))
     assert "AUTOMATION ARMED" in out and "stage_handover" in out
+    # #1309: autoplan-only (no active launcher) must still tell the model to launch — never strand it
+    assert "launch it with launch_coder" in out and "do NOT call launch_coder" not in out
+
+
+def test_plan_units_armed_defers_launch_when_auto_owns_launching(monkeypatch):
+    # #1309: when the loop actually owns launching (autopilot + watcher = the /auto meta-switch), the armed
+    # prompt tells the model NOT to call launch_coder — the loop launches, so no double-drive.
+    monkeypatch.setattr(gx10, "AUTOPILOT_AUTOPLAN", True)
+    monkeypatch.setattr(gx10, "AUTOPILOT_ENABLED", True, raising=False)
+    monkeypatch.setattr(gx10, "_WATCHER_ENABLED", True, raising=False)
+    out = gx10._plan_units(json.dumps(_EPIC), json.dumps([_u(1)]))
+    assert "AUTOMATION ARMED" in out and "do NOT call launch_coder" in out
 
 
 def test_plan_units_result_recommends_auto_when_disarmed(monkeypatch):
     monkeypatch.setattr(gx10, "AUTOPILOT_AUTOPLAN", False)
     out = gx10._plan_units(json.dumps(_EPIC), json.dumps([_u(1)]))
     assert "/auto on" in out and "AUTOMATION ARMED" not in out
+
+
+def test_plan_units_warns_when_multi_unit_plan_declares_no_dependencies():
+    # #1310: the engine honours declared dependencies topologically, but a small model often omits them —
+    # a multi-unit plan with ZERO declared deps gets a steering NOTE (else the units are ordered by
+    # priority, not build order → e.g. a module before its scaffolding).
+    out = gx10._plan_units(json.dumps(_EPIC), json.dumps([_u(1), _u(2), _u(3)]))
+    assert out.startswith("OK:")
+    assert "no inter-unit dependencies were declared" in out
+
+
+def test_plan_units_no_dep_warning_when_dependencies_declared():
+    # #1310: a plan that DOES declare a build-order dependency (unit:<n>) is silent — no nudge.
+    out = gx10._plan_units(json.dumps(_EPIC), json.dumps([_u(1), _u(2, dependencies=["unit:1"])]))
+    assert out.startswith("OK:")
+    assert "no inter-unit dependencies were declared" not in out
+
+
+def test_plan_units_armed_zero_deps_asks_for_the_foundational_unit(monkeypatch):
+    # #1310 (Codex review): under /auto (armed) with a multi-unit plan and NO declared deps, the bootstrap
+    # must NOT auto-point at the priority-selected unit (it may be a module before its scaffolding) — it
+    # asks the model to author the FOUNDATIONAL unit, so automation never blindly starts a mis-ordered build.
+    monkeypatch.setattr(gx10, "AUTOPILOT_AUTOPLAN", True)
+    out = gx10._plan_units(json.dumps(_EPIC), json.dumps([_u(1), _u(2), _u(3)]))
+    assert "AUTOMATION ARMED" in out and "FOUNDATIONAL" in out
+    assert "no inter-unit dependencies were declared" in out
+
+
+def test_plan_units_warns_when_only_external_deps_no_sibling_order():
+    # #1310 (Codex review): a unit depending on an EXISTING task id (not a sibling `unit:<n>`) does not
+    # order the NEW units among themselves — the build-order note must still fire (no sibling edges).
+    prior = gx10._store().create({"type": "implementation", "priority": "low",
+                                  "title": "some prior thing", "description": "x"}, force=True)["id"]
+    out = gx10._plan_units(json.dumps(_EPIC),
+                           json.dumps([_u(1, dependencies=[prior]), _u(2, dependencies=[prior])]))
+    assert out.startswith("OK:")
+    assert "no inter-unit dependencies were declared" in out

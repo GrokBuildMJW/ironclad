@@ -3,8 +3,8 @@
 A minimal, dependency-free **stdio MCP server** (JSON-RPC 2.0, newline-delimited) that exposes the
 project memory to an external coding CLI (Codex/Claude) as **read-only** tools, so the agent can query the
 same knowledge the orchestrator has during a handover. Spawned as a subprocess by the MCP-capable CLI; the
-code-agent registry injects the per-CLI MCP config (and this script's memory connection) at launch — and
-ONLY under the ``sealed`` trust profile (operator 2026-06-25).
+code-agent registry injects the per-CLI MCP config (and this script's memory connection) at launch whenever
+a memory service is configured and the agent ships an ``mcp_template``, regardless of trust profile.
 
 Design:
 - **secret-free wire**: the memory connection (base_url + the PROJECT namespace agent_id) is read from the

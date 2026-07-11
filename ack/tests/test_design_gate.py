@@ -1,7 +1,7 @@
 """#1227 (S5) — the fail-closed design→impl approval gate (no blind coding, R2/R3).
 
 An IMPLEMENTATION stage_handover is REFUSED until the active unit has a recorded + APPROVED design; design/
-analysis handovers pass through. `record_design` persists the design (approved:false); `/approve` stamps it.
+analysis handovers pass through. `record_design` persists a proposal; `/approve` promotes it to a decision.
 These tests drive the real `_stage_handover` path + the record_design→approve round-trip.
 """
 from __future__ import annotations
@@ -10,6 +10,8 @@ import json
 import sys
 import types
 from pathlib import Path
+
+import pytest
 
 sys.modules.setdefault("openai", types.SimpleNamespace(OpenAI=lambda **kw: object()))
 _ENGINE = Path(__file__).resolve().parents[2] / "engine"
@@ -48,6 +50,11 @@ def _pending():
     return gx10._store().list("pending")
 
 
+def _design_frontmatter():
+    doc = gx10.vault_root() / gx10.active_slug() / "decisions" / "design.md"
+    return gx10._parse_frontmatter(doc.read_text(encoding="utf-8"))
+
+
 def test_impl_refused_without_design(monkeypatch, tmp_path):
     _setup(monkeypatch, tmp_path)
     out = _stage(_impl_json())
@@ -60,6 +67,7 @@ def test_impl_refused_with_unapproved_design(monkeypatch, tmp_path):
     gx10.record_design("Approach", "use Rust")
     out = _stage(_impl_json())
     assert "NOT approved" in out
+    assert "/approve" in out and "approved: true" not in out
     assert _pending() == []
 
 
@@ -103,18 +111,41 @@ def test_record_design_approve_roundtrip(monkeypatch, tmp_path):
     assert gx10._unit_design_status(slug) == (False, False, None)
     rel = gx10.record_design("Approach", "use Rust")
     assert rel.endswith("decisions/design.md")               # single canonical design doc
+    assert _design_frontmatter()["type"] == "proposal"
+    assert _design_frontmatter()["approved"] == "false"
     hd, ap, ref = gx10._unit_design_status(slug)
     assert hd and not ap
     msg = gx10._approve_design()
     assert msg.startswith("OK")
+    assert _design_frontmatter()["type"] == "decision"
+    assert _design_frontmatter()["approved"] == "true"
     hd, ap, _ = gx10._unit_design_status(slug)
     assert hd and ap
 
 
 def test_approve_without_design(monkeypatch, tmp_path):
     _setup(monkeypatch, tmp_path)
-    out = gx10._approve_design()
-    assert out.startswith("ERROR") and "no design" in out.lower()
+    expected = (f"ERROR: unit {gx10.active_slug()!r} has no design to approve — record one first "
+                f"(record_design). Nothing changed.")
+    assert gx10._approve_design() == expected
+
+    surfaced = []
+    monkeypatch.setattr(gx10, "_ui_print", lambda message, *a, **k: surfaced.append(message))
+    gx10._dispatch(None, "approve")
+    assert len(surfaced) == 1 and expected in surfaced[0]       # `/approve` does not swallow the error
+
+
+def test_steering_no_design_calls_record_design_now(monkeypatch, tmp_path):
+    _setup(monkeypatch, tmp_path)
+    block = gx10._steering_state_block()
+    assert ("design gate: no design on record — implementation handovers are BLOCKED — if you have just "
+            "researched/analysed a design, CALL record_design NOW to persist it (a prose proposal is not "
+            "enough); then wait for /approve." in block)
+
+
+def test_steering_gate_off_has_no_design_gate_line(monkeypatch, tmp_path):
+    _setup(monkeypatch, tmp_path, gate=False)
+    assert "design gate:" not in gx10._steering_state_block()   # default-off steering remains byte-identical
 
 
 def test_record_design_resets_approval(monkeypatch, tmp_path):
@@ -123,10 +154,29 @@ def test_record_design_resets_approval(monkeypatch, tmp_path):
     _setup(monkeypatch, tmp_path)
     gx10.record_design("Approach", "use Rust")
     gx10._approve_design()
+    assert _design_frontmatter()["type"] == "decision"
+    assert _design_frontmatter()["approved"] == "true"
     assert gx10._unit_design_status(gx10.active_slug())[1] is True
     gx10.record_design("Auth redesign", "use Go instead")     # a new/changed design must be re-approved
+    assert _design_frontmatter()["type"] == "proposal"
+    assert _design_frontmatter()["approved"] == "false"
     assert gx10._unit_design_status(gx10.active_slug())[1] is False
     assert gx10._design_gate("implementation", gx10.active_slug()).startswith("ERROR")  # gate re-closed
+
+
+def test_legacy_unapproved_decision_remains_pending(monkeypatch, tmp_path):
+    _setup(monkeypatch, tmp_path)
+    gx10.record_design("Legacy approach", "not approved yet")
+    doc = gx10.vault_root() / gx10.active_slug() / "decisions" / "design.md"
+    text = doc.read_text(encoding="utf-8")
+    doc.write_text(gx10._set_frontmatter_flag(text, "type", "decision"), encoding="utf-8", newline="\n")
+
+    assert _design_frontmatter()["type"] == "decision"
+    assert _design_frontmatter()["approved"] == "false"
+    assert gx10._unit_design_status(gx10.active_slug())[1] is False
+    out = _stage(_impl_json())
+    assert "NOT approved" in out
+    assert _pending() == []
 
 
 def test_rehandover_of_impl_task_gated_when_unapproved(monkeypatch, tmp_path):
@@ -153,6 +203,51 @@ def test_design_gate_unit(monkeypatch, tmp_path):
     assert gx10._design_gate("documentation", slug) is None                  # non-impl ungated
     assert gx10._design_gate("implementation", slug).startswith("ERROR")     # no design
     assert gx10._design_gate("implementation", None).startswith("ERROR")     # no unit
+
+
+# ── #1346: design_gate.enabled uses strict _as_bool (string "false" must NOT enable) ───────────────
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (True, True),
+        (False, False),
+        ("true", True),
+        ("false", False),
+        ("0", False),
+        ("garbage", False),
+        ("", False),
+        (1, False),
+    ],
+)
+def test_design_gate_config_uses_strict_boolean(value, expected):
+    gx10._apply_design_gate({"design_gate": {"enabled": value}})
+    assert gx10.DESIGN_GATE_ENABLED is expected
+
+
+def test_design_gate_config_fails_soft(monkeypatch):
+    monkeypatch.setattr(gx10, "_cfg_get", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
+    gx10._apply_design_gate({})
+    assert gx10.DESIGN_GATE_ENABLED is False
+
+
+@pytest.mark.parametrize(
+    ("fragment", "expected"),
+    [
+        ({"design_gate": {"enabled": True}}, True),
+        ({"design_gate": {"enabled": "true"}}, True),
+        ({"design_gate": {"enabled": "false"}}, False),  # strict _as_bool rejects stringy false
+        ({"design_gate": {"enabled": "garbage"}}, False),
+        ({"design_gate": {"enabled": "0"}}, False),
+        ({}, False),  # missing key → public default off
+    ],
+    ids=["json-true", "string-true", "string-false", "garbage", "string-zero", "missing"],
+)
+def test_apply_config_design_gate_synthetic(fragment, expected):
+    """#1346: synthetic dict only — string config values must not wrongly enable the gate."""
+    cfg = gx10._code_defaults()
+    cfg.update(fragment)
+    gx10._apply_config(cfg)
+    assert gx10.DESIGN_GATE_ENABLED is expected
 
 
 # ── #1267: no duplicate H1 in the recorded design doc ───────────────────────────────────────────────

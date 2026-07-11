@@ -19,6 +19,7 @@ mechanism without baking a specific private backend into the public suite (the r
 from __future__ import annotations
 
 import sys
+import time
 import types
 from pathlib import Path
 
@@ -60,6 +61,15 @@ def test_default_registry_has_opus_and_sonnet():
     opus = reg.resolve("OPUS")
     assert opus.model == "claude-opus-4-8" and opus.bin == "claude"
     assert reg.resolve("sonnet").model == "claude-sonnet-5"   # case-insensitive lookup
+
+
+def test_default_coder_permission_allows_commands():
+    # #1308: the autonomous headless coder must run the tests it writes, so the built-in coder default
+    # permission mode is bypassPermissions — acceptEdits (edits only) silently skips every command in a
+    # `claude --print` run, so a coder could never self-verify.
+    reg = load_code_agents(gx10._code_defaults())
+    assert reg.resolve("OPUS").permission_mode == "bypassPermissions"
+    assert reg.resolve("SONNET").permission_mode == "bypassPermissions"
 
 
 def test_config_pool_adds_a_third_agent():
@@ -238,6 +248,44 @@ def _capture_launch_argv(monkeypatch, tmp_path, agent, *, frontmatter, reg_cfg=N
     return captured.get("argv"), tid
 
 
+def _launch_python_log_child(monkeypatch, tmp_path, code: str):
+    gx10._apply_config(gx10._code_defaults())
+    gx10.STORE = None
+    monkeypatch.setattr(gx10, "_ui_print", lambda *a, **k: None)
+    monkeypatch.chdir(tmp_path)
+    gx10.initiative_new("Auto", "software")
+    cfg = {**gx10._code_defaults(), "code_agents": {"pool": [
+        {"provider_id": "pylog", "kind": "cli", "agent_id": "PYLOG",
+         "model": code, "bin": sys.executable, "cmd_template": "{bin} -c {model}"},
+    ]}}
+    monkeypatch.setattr(gx10, "_EFFECTIVE_CFG", cfg, raising=False)
+    tid = gx10._store().create(dict(_TASK), force=True)["id"]
+    (gx10.handovers_dir() / f"{tid}_PYLOG.md").write_text("---\nto: PYLOG\n---\nho", encoding="utf-8")
+    gx10._autopilot_reserve()
+    gx10._do_launch(tid, "PYLOG")
+    proc = gx10._AUTOPILOT_PROCS[tid]
+    return tid, proc, tmp_path / ".ironclad" / "logs" / f"{tid}_PYLOG.log"
+
+
+def _eventually(predicate, timeout=2.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.02)
+    return predicate()
+
+
+def _stop_proc(proc):
+    if proc.poll() is None:
+        proc.terminate()
+        try:
+            proc.wait(timeout=1)
+        except Exception:
+            proc.kill()
+            proc.wait(timeout=1)
+
+
 def test_do_launch_default_claude_keeps_stream_plumbing(tmp_path, monkeypatch):
     # review B-1: the default OPUS/SONNET launch must stay byte-identical — the Claude `--print` shape
     # keeps --verbose + --output-format stream-json even though the defaults now carry a cmd_template.
@@ -246,6 +294,41 @@ def test_do_launch_default_claude_keeps_stream_plumbing(tmp_path, monkeypatch):
                                    frontmatter="---\nto: claude-opus-4-8\n---\nho")
     assert "--print" in argv and "--verbose" in argv
     assert "--output-format" in argv and "stream-json" in argv
+
+
+def test_do_launch_streams_log_before_child_exits(tmp_path, monkeypatch):
+    code = "import time; print('coder-live-line', flush=True); time.sleep(5)"
+    _tid, proc, logfile = _launch_python_log_child(monkeypatch, tmp_path, code)
+    try:
+        assert _eventually(lambda: logfile.exists() and "coder-live-line" in logfile.read_text(encoding="utf-8"))
+        assert proc.poll() is None
+    finally:
+        _stop_proc(proc)
+
+
+def test_do_launch_keeps_partial_log_after_killed_child(tmp_path, monkeypatch):
+    ready = tmp_path / "child-ready"
+    code = (f"import pathlib,sys,time; sys.stdout.write('partial-output'); sys.stdout.flush(); "
+            f"pathlib.Path({str(ready)!r}).write_text('1'); time.sleep(5)")
+    _tid, proc, logfile = _launch_python_log_child(monkeypatch, tmp_path, code)
+    try:
+        assert _eventually(lambda: ready.exists())
+        assert proc.poll() is None
+        proc.kill()
+        proc.wait(timeout=1)
+        assert _eventually(lambda: "partial-output" in logfile.read_text(encoding="utf-8"))
+    finally:
+        _stop_proc(proc)
+
+
+def test_do_launch_drainer_survives_invalid_stdout_bytes(tmp_path, monkeypatch):
+    code = "import sys; sys.stdout.buffer.write(b'\\xff\\xfe partial'); sys.stdout.buffer.flush()"
+    _tid, proc, logfile = _launch_python_log_child(monkeypatch, tmp_path, code)
+    try:
+        assert proc.wait(timeout=2) == 0
+        assert _eventually(lambda: logfile.exists() and "\ufffd\ufffd partial" in logfile.read_text(encoding="utf-8"))
+    finally:
+        _stop_proc(proc)
 
 
 def test_do_launch_templated_agent_renders_feedback_path(tmp_path, monkeypatch):
@@ -308,7 +391,7 @@ def test_pending_handover_embeds_full_spec(tmp_path, monkeypatch):
     assert item["model"] == "claude-opus-4-8"          # from the registry spec
     assert item["bin"] == "claude"                     # spec.bin fallback (no resolved bin mocked)
     assert item["cmd_template"] and "{prompt}" in item["cmd_template"]
-    assert item["permission"] == "acceptEdits"
+    assert item["permission"] == "bypassPermissions"   # #1308: coder default allows running its own tests
 
 
 def test_pending_handover_frontmatter_overrides_spec_model(tmp_path, monkeypatch):

@@ -34,8 +34,9 @@ def build_agent_argv(template: str, *, bin: str, model: str, effort: str,
     ``{prompt}`` (which contains spaces) stays exactly one argument. Unknown ``{x}`` are left as-is.
     ``{feedback}`` (#443) is the agent's deterministic result-capture path (e.g. Codex
     ``-o {feedback}``); a template that omits it (the Claude default) ignores it. ``{mcp}`` (#480) is a
-    MULTI-token placeholder — it expands (via shlex) to 0+ args (the gated read-only Memory MCP config, or
-    nothing when not under the sealed profile), so a template can carry it at the right position."""
+    MULTI-token placeholder — it expands (via shlex) to 0+ args (the read-only Memory MCP config when
+    memory is configured and the agent ships an mcp_template, or nothing otherwise), so a template can carry
+    it at the right position."""
     subs = {"bin": bin, "model": model, "effort": effort,
             "permission": permission, "prompt": prompt, "feedback": feedback}
     argv: List[str] = []
@@ -75,7 +76,7 @@ LOCAL_COMMANDS = {"tasks", "pending", "coders", "work", "auto", "health", "docto
 SERVER_COMMANDS = {
     "status", "config", "clear", "read", "write", "cat", "ls",
     "watcher", "autopilot", "autoplan", "log-terminal", "initiative",
-    "project", "switch", "prompts", "skills",
+    "project", "switch", "prompts", "skills", "dismiss",
     "rag", "context", "tool", "generate",
 }
 
@@ -89,7 +90,7 @@ Commands (with a / prefix) — plain text without / is sent to the orchestrator 
     /coders            which coding agents are bound/active (registry + boot probe) + providers
     /coders use <id>   pin all handovers to a coding agent at runtime (use auto to clear)
     /work              run all open handovers ONCE locally (in parallel)
-    /auto on|off       background poller for handovers
+    /auto on|off       full automation (watcher + autopilot + continuation)
     /health            server status
     /doctor            read-only preflight report (GET /doctor)
     exit               quit
@@ -106,13 +107,16 @@ Commands (with a / prefix) — plain text without / is sent to the orchestrator 
     /clear             clear the orchestrator's context
     /read <path>       read a file in the server workdir
     /ls [path]         list a directory in the server workdir
-    /watcher on|off    auto-advance (reconciler)
+    /watcher on|off    deprecated alias for /auto on|off
     /autopilot on|off  autopilot
     /autoplan on|off [N]
     /project new <name> [--path <dir>]   create + activate a project (the guided setup command)
     /project list | use <slug> | active | track new|use|list | delete <id> [--purge] | archive|unarchive <id>
     /initiative …   deprecated alias for /project (kept one release)
     /switch <project_id>   rebind the engine to a project (own paths + memory partition)
+    /approve design [slug] | constraint <id|all> [--slug <s>]   approve a design or promote constraints
+    /dismiss constraint <id|all> [--slug <s>]   dismiss a suggested typed constraint so it stops gating
+    /fork list | decide <fork-id> --choice keep|counter   inspect or resolve constraint forks
     /generate <args>   scaffold a paved-road capability into the active project library
     /tool <name> <args>   run a tool directly/deterministically (no model election, no RAG)
     /rag on|off        toggle per-turn retrieval (RAG)

@@ -55,3 +55,19 @@ def test_mpr_research_run_passes_gate_with_initiative(tmp_path):
     gx10.initiative_new("Decide", "software")
     out = mpr_research_run("Soll X auf Postgres laufen?")
     assert "kein aktives Initiative" not in out
+
+
+def test_artifact_slug_port_routes_away_from_active(tmp_path):
+    """#1340 P1: artifact_slug binds runs_dir to the given initiative, not the active one."""
+    a = gx10.initiative_new("Envelope-A", "software")
+    b = gx10.initiative_new("Active-B", "software")
+    assert gx10.active_slug() == b.slug
+    deps = _engine_deps(artifact_slug=a.slug)
+    assert deps.runs_dir.replace("\\", "/").endswith(f"vault/{a.slug}/runs")
+    assert f"/{b.slug}/" not in deps.runs_dir.replace("\\", "/")
+
+
+def test_artifact_slug_none_matches_no_arg(tmp_path):
+    v = gx10.initiative_new("Same", "software")
+    assert _engine_deps().runs_dir == _engine_deps(artifact_slug=None).runs_dir
+    assert _engine_deps().runs_dir.replace("\\", "/").endswith(f"vault/{v.slug}/runs")

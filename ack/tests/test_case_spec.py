@@ -48,6 +48,27 @@ def test_schema_generates_with_required_and_defs():
     assert {"TaskType", "Priority", "TaskStatus"} <= set(schema["$defs"])
     # Closed object → grammar can fully constrain it.
     assert schema["additionalProperties"] is False
+    # #1341: optional typed constraint fields are declared (extra=forbid) but not required.
+    props = schema["properties"]
+    assert "language" in props and "network" in props
+    assert "language" not in schema["required"]
+    assert "network" not in schema["required"]
+
+
+def test_task_spec_optional_language_network_accept():
+    """#1341: optional typed fields validate; absent task_json stays identical to pre-typed."""
+    base = {
+        "type": "implementation",
+        "priority": "high",
+        "title": "build it",
+        "description": "x",
+    }
+    plain = validate_task_json(base)
+    assert plain.language is None and plain.network is None
+    typed = validate_task_json({**base, "language": "python", "network": False})
+    assert typed.language == "python" and typed.network is False
+    # EXAMPLE_TASK_JSON (no typed keys) still validates — absent-is-identical.
+    assert validate_task_json(EXAMPLE_TASK_JSON).language is None
 
 
 # --------------------------------------------------------------------------- #

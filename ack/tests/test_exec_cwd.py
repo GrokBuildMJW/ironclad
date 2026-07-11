@@ -69,6 +69,30 @@ def test_resolve_exec_path_relative_no_context_is_unchanged() -> None:
     assert gx10._resolve_exec_path("sub/file.txt") == Path("sub/file.txt")
 
 
+def test_run_tool_exec_cwd_override_resolves_under_it(tmp_path) -> None:
+    # #1317: a bridged client passes the server-shipped active-project exec cwd; run_tool resolves relative
+    # file ops there even with NO project bound in the client process (the passthrough case) — not the
+    # client's boot workdir.
+    gx10._LOCAL_TOOL_BRIDGE = None
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    assert pc.current() is None
+    assert "OK" in gx10.run_tool("write_file", {"path": "sub/f.txt", "content": "hi"}, exec_cwd=str(proj))
+    assert (proj / "sub" / "f.txt").read_text(encoding="utf-8") == "hi"
+    assert gx10.run_tool("read_file", {"path": "sub/f.txt"}, exec_cwd=str(proj)) == "hi"
+    assert gx10._exec_cwd() is None                              # the override never leaks past the call
+
+
+def test_run_tool_exec_cwd_nonexistent_falls_back(monkeypatch, tmp_path) -> None:
+    # #1317: an exec cwd that does not exist on THIS host (remote/sealed / older engine) is ignored →
+    # byte-identical (a relative path resolves at the process workdir).
+    gx10._LOCAL_TOOL_BRIDGE = None
+    monkeypatch.chdir(tmp_path)
+    assert "OK" in gx10.run_tool("write_file", {"path": "f.txt", "content": "hi"},
+                                 exec_cwd=str(tmp_path / "ghost"))
+    assert (tmp_path / "f.txt").read_text(encoding="utf-8") == "hi"
+
+
 def test_run_tool_write_and_read_file_under_project_root(monkeypatch, tmp_path) -> None:
     monkeypatch.setattr(gx10, "_BOOT_WORKDIR", Path(str(tmp_path / "boot")))
     with pc.use(ProjectContext("p", str(tmp_path), "")):

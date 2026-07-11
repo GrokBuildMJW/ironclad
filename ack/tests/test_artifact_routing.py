@@ -63,6 +63,54 @@ def test_stage_handover_lands_in_work_inbox(tmp_path):
     assert not (tmp_path / "summaries").exists()    # old inbox location gone
 
 
+def test_stage_handover_normalizes_body_recipient_to_the_agent(tmp_path):
+    # #1311: the model can name a DIFFERENT agent in the free-form body Meta block than the frontmatter
+    # `to:` (e.g. `Recipient: CODEX` on a SONNET handover). The engine rewrites the body `Recipient:` line
+    # to the resolved agent so the coder reads a consistent recipient.
+    gx10.initiative_new("Recip", "software")
+    tid = gx10._store().create(dict(_TASK), force=True)["id"]
+    body = "---\nto: SONNET\n---\n## Meta\n- **Recipient:** OPUS\n\n## Steps\ndo it"   # OPUS = a wrong (configured) agent
+    out = gx10._stage_handover(tid, "SONNET", body)
+    assert "ERROR" not in out
+    ho = (tmp_path / "vault" / "recip" / ".work" / "handovers" / f"{tid}_SONNET.md").read_text(encoding="utf-8")
+    assert "**Recipient:** SONNET" in ho and "Recipient:** OPUS" not in ho
+
+
+def test_normalize_handover_recipient_forms_and_noop():
+    # #1311: rewrite a body Recipient naming a (different) configured AGENT to the resolved agent — plain,
+    # bulleted, and bold with the colon inside (`**Recipient:**`) or outside (`**Recipient**:`) the bold —
+    # but NEVER a non-agent payload value, and a no-op with no agent or no such line.
+    gx10._apply_config(gx10._code_defaults())                                    # OPUS/SONNET are configured
+    assert "Recipient: SONNET" in gx10._normalize_handover_recipient("Recipient: OPUS\n", "SONNET")
+    assert "**Recipient:** SONNET" in gx10._normalize_handover_recipient("- **Recipient:** OPUS\n", "SONNET")
+    assert "**Recipient**: SONNET" in gx10._normalize_handover_recipient("**Recipient**: OPUS\n", "SONNET")
+    # a non-agent Recipient value (task PAYLOAD — e.g. an email fixture) is left untouched (Codex review)
+    assert gx10._normalize_handover_recipient("Recipient: user@example.com\n", "SONNET") == "Recipient: user@example.com\n"
+    # a Recipient line inside a fenced code block (payload/example) is NOT rewritten, only the Meta line is
+    fenced = "## Meta\n**Recipient**: OPUS\n\n```\nRecipient: OPUS\n```\n"
+    fixed = gx10._normalize_handover_recipient(fenced, "SONNET")
+    assert "**Recipient**: SONNET" in fixed and "```\nRecipient: OPUS\n```" in fixed
+    # only the FIRST (Meta) Recipient line is in scope — a correct Meta recipient followed by a later
+    # `Recipient: <agent>` payload line leaves the payload untouched (#1311 Codex review)
+    two = "**Recipient**: SONNET\n\nExample:\nRecipient: OPUS\n"
+    assert gx10._normalize_handover_recipient(two, "SONNET") == two
+    assert gx10._normalize_handover_recipient("Recipient: OPUS\n", "") == "Recipient: OPUS\n"   # no agent → no-op
+    assert gx10._normalize_handover_recipient("no meta here\n", "SONNET") == "no meta here\n"    # no line → no-op
+
+
+def test_inject_code_root_note_enabled_and_disabled(monkeypatch):
+    original = "---\nto: SONNET\n---\n\n## Task\nBuild it.\n"
+    monkeypatch.setattr(gx10, "CODE_SUBDIR", "src")
+    enriched = gx10._inject_code_root_note(original)
+    assert enriched.startswith("---\nto: SONNET\n---\n\n<!-- ironclad-code-root-note -->")
+    assert "working directory is already the project's code root (`src`)" in enriched
+    assert "Create the package and `pyproject.toml` directly in this working directory" in enriched
+    assert "Do not add another\n> `src/` prefix" in enriched
+    assert gx10._inject_code_root_note(enriched) == enriched                 # re-hand is idempotent
+    monkeypatch.setattr(gx10, "CODE_SUBDIR", "")
+    assert gx10._inject_code_root_note(original) == original                # disabled is byte-identical
+
+
 def test_stage_handover_failclosed_without_active(tmp_path):
     out = gx10._stage_handover("KGC-1", "OPUS", "## Handover\nbody")
     assert out.startswith("ERROR")                  # fail-closed, clear message

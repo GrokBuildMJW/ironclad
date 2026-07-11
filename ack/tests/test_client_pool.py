@@ -123,6 +123,74 @@ def test_run_handover_passes_permission_mode(tmp_path, monkeypatch):
     assert "--print" in argv and "--model" in argv
 
 
+def test_run_handover_launches_in_shipped_project_cwd(tmp_path, monkeypatch):
+    # #1307: the coder builds PRODUCT CODE in the active project's code root shipped by /pending (`cwd`),
+    # NOT the client's static startup codedir — else a coder launched after an in-session /switch writes
+    # one project's code into another project's tree.
+    captured = {}
+
+    class _R:
+        returncode = 0
+
+    proj = tmp_path / "proj_code_root"
+    proj.mkdir()
+
+    def _fake_run(argv, **kw):
+        captured["argv"] = argv
+        captured["cwd"] = kw.get("cwd")
+        return _R()
+
+    monkeypatch.setattr(client.subprocess, "run", _fake_run)
+    item = {"id": "KGC-7", "agent": "OPUS", "handover_file": "KGC-7_OPUS.md",
+            "handover": "do the thing", "cwd": str(proj)}
+    client._run_handover(item, tmp_path, log=lambda *_: None)
+    assert captured["cwd"] == str(proj)                     # launched in the shipped project code root…
+    assert captured["cwd"] != str(tmp_path)                 # …NOT the client codedir
+    # the scratch stays under the client codedir and the coder is handed ABSOLUTE paths, so the feedback
+    # round-trip is independent of the coder's cwd (the product tree).
+    scratch_ho = tmp_path / ".ironclad" / "agent" / "handovers" / "KGC-7_OPUS.md"
+    assert scratch_ho.exists()
+    prompt_tok = [a for a in captured["argv"] if "KGC-7_OPUS.md" in a]
+    assert prompt_tok and str(scratch_ho) in prompt_tok[0]  # the prompt names the ABSOLUTE scratch path
+
+
+def test_run_handover_cwd_falls_back_to_codedir(tmp_path, monkeypatch):
+    # #1307 back-compat: an older engine ships no `cwd` → the client launches in its own codedir (byte-identical).
+    captured = {}
+
+    class _R:
+        returncode = 0
+
+    def _fake_run(argv, **kw):
+        captured["cwd"] = kw.get("cwd")
+        return _R()
+
+    monkeypatch.setattr(client.subprocess, "run", _fake_run)
+    item = {"id": "KGC-7", "agent": "OPUS", "handover_file": "KGC-7_OPUS.md", "handover": "x"}
+    client._run_handover(item, tmp_path, log=lambda *_: None)
+    assert captured["cwd"] == str(tmp_path)
+
+
+def test_run_handover_unusable_shipped_cwd_falls_back_to_codedir(tmp_path, monkeypatch):
+    # #1307 (Codex review): a remote/sealed client does not share the server's filesystem, so an absolute
+    # shipped cwd may not exist on THIS host — the client must fall back to its own codedir, not fail the
+    # launch by spawning in a nonexistent directory.
+    captured = {}
+
+    class _R:
+        returncode = 0
+
+    def _fake_run(argv, **kw):
+        captured["cwd"] = kw.get("cwd")
+        return _R()
+
+    monkeypatch.setattr(client.subprocess, "run", _fake_run)
+    ghost = str(tmp_path / "does_not_exist_on_this_host")
+    item = {"id": "KGC-7", "agent": "OPUS", "handover_file": "KGC-7_OPUS.md", "handover": "x", "cwd": ghost}
+    client._run_handover(item, tmp_path, log=lambda *_: None)
+    assert captured["cwd"] == str(tmp_path)     # fell back to codedir; did NOT spawn in the missing path
+
+
 def test_build_argv_feedback_token_substitutes():
     # #443: the {feedback} token renders the result-capture path (e.g. Codex `-o {feedback}`); a template
     # that omits it (the Claude default) ignores the new optional arg.
@@ -135,8 +203,8 @@ def test_build_argv_feedback_token_substitutes():
 
 
 def test_build_argv_mcp_is_a_multi_token_placeholder():
-    # #480: {mcp} expands (via shlex) to 0+ args — the gated read-only Memory MCP config, or NOTHING when
-    # not under the sealed profile (then the launch is byte-identical to today).
+    # #480/#994-S10: {mcp} expands (via shlex) to 0+ args — the read-only Memory MCP config when
+    # memory is configured and the agent ships an mcp_template, or NOTHING otherwise.
     t = "{bin} exec {mcp} --print {prompt}"
     assert client.build_agent_argv(t, bin="codex", model="m", effort="e", permission="p", prompt="go",
                                    mcp='-c a=1 -c b=2') == ["codex", "exec", "-c", "a=1", "-c", "b=2", "--print", "go"]

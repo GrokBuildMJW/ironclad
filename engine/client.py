@@ -64,12 +64,13 @@ SERVER_TOKEN = os.environ.get("GX10_SERVER_TOKEN") or None
 TUNNEL_CMD = os.environ.get("GX10_TUNNEL_CMD") or None
 CLAUDE_BIN = os.environ.get("GX10_CLAUDE_BIN", "claude")
 DEFAULT_EFFORT = os.environ.get("GX10_CLAUDE_EFFORT", "high")
-#: The local code-agent runs HEADLESS (`--print`), so it cannot answer permission
-#: prompts. Without a non-interactive permission mode it silently does nothing (claude
-#: exits 0 having written no files). ``acceptEdits`` auto-accepts file edits/writes — the
-#: core need (apply the change + write the feedback file). Operators wanting full autonomy
-#: (commands too) set ``bypassPermissions`` via GX10_CLAUDE_PERMISSION_MODE.
-CLAUDE_PERMISSION_MODE = os.environ.get("GX10_CLAUDE_PERMISSION_MODE", "acceptEdits")
+#: The local code-agent runs HEADLESS (`--print`), so it cannot answer permission prompts.
+#: It must both WRITE FILES and RUN COMMANDS — a real handover implies running the tests it
+#: writes (#1308) — so the default is ``bypassPermissions`` (parity with the server-side
+#: autopilot launch, which uses ``--dangerously-skip-permissions``). ``acceptEdits`` (edits
+#: only, no commands) silently skips every command in a `--print` run, so a coder can't
+#: self-verify. An operator wanting a more restrictive mode sets GX10_CLAUDE_PERMISSION_MODE.
+CLAUDE_PERMISSION_MODE = os.environ.get("GX10_CLAUDE_PERMISSION_MODE", "bypassPermissions")
 #: The command that runs a local code-agent on a handover — a TEMPLATE so ANY headless
 #: coding CLI (not only Claude Code) can be wired with **no code change**. Placeholders:
 #: ``{bin} {model} {effort} {permission} {prompt}`` (use only the ones your CLI needs;
@@ -336,7 +337,10 @@ class Server:
             return
         try:
             import gx10  # importable without openai; run_tool acts on the local cwd
-            result = gx10.run_tool(name, args)
+            # #1317: honour the server-shipped active-project exec cwd so a bridged tool resolves relative
+            # paths + runs execute_command THERE, not in the client's boot workdir (fail-soft: run_tool
+            # ignores a cwd that doesn't exist on this host — remote/sealed → byte-identical fallback).
+            result = gx10.run_tool(name, args, exec_cwd=payload.get("exec_cwd"))
         except Exception as e:  # noqa: BLE001 — never break the stream on a tool error
             result = f"ERROR: {e!r}"
         try:
@@ -495,11 +499,12 @@ def _run_handover(item: Dict[str, Any], codedir: Path, log=print) -> Tuple[Optio
     ho_name = item.get("handover_file") or f"{tid}_{agent}.md"
     ho_text = item.get("handover") or ""
 
-    # Local agent scratch is kept OUT of the project root: a hidden .ironclad/agent/ drop zone
-    # (the handover round-trip is HTTP-mediated, so this path is independent of the server's initiative).
+    # Local agent scratch is kept OUT of the product tree: a hidden .ironclad/agent/ drop zone under the
+    # client codedir (the handover round-trip is HTTP-mediated, independent of the server's initiative).
     ho_dir = codedir / ".ironclad" / "agent" / "handovers"
     ho_dir.mkdir(parents=True, exist_ok=True)
-    (ho_dir / ho_name).write_text(ho_text, encoding="utf-8")
+    ho_path = ho_dir / ho_name
+    ho_path.write_text(ho_text, encoding="utf-8")
 
     # #449 (C0R-9): the SERVER resolves the agent's full spec from the config-driven registry and
     # ships it in the item — the client is a THIN RENDERER (no client-side registry, no agent→model
@@ -511,35 +516,37 @@ def _run_handover(item: Dict[str, Any], codedir: Path, log=print) -> Tuple[Optio
     bin_ = CLAUDE_BIN_OVERRIDE or item.get("bin") or CLAUDE_BIN
     template = AGENT_CMD_OVERRIDE or item.get("cmd_template") or DEFAULT_AGENT_CMD
     permission = item.get("permission") or CLAUDE_PERMISSION_MODE
-    # CLI-agnostic prompt: the feedback-file convention is stated HERE (not via a
-    # Claude-only .claude/CLAUDE.md), so any headless code-agent can fulfil the contract.
-    fb_name = f"{tid}_{agent}-feedback.md"
-    prompt = (f"Autonomously read and complete the handover at "
-              f".ironclad/agent/handovers/{ho_name}. Follow any agent guide in this repo "
-              f"(e.g. AGENTS.md / CLAUDE.md). When done, write a short result summary to "
-              f".ironclad/agent/feedback/{fb_name}.")
-
-    # #443 (FORK-A2=C, hybrid): a deterministic result-capture path for the {feedback} token. An agent
-    # whose template uses it (e.g. Codex `-o {feedback}`) writes its FINAL message here; if the agent
-    # never writes the in-prompt feedback file, we fall back to this capture. Relative to codedir (the
-    # agent's cwd); Claude's default template omits {feedback} and is unaffected.
-    cap_rel = f".ironclad/agent/feedback/{tid}_{agent}-output.md"
-    # #480: the server resolves the gated read-only Memory MCP (sealed profile only) into `mcp` (the
-    # {mcp} placeholder args) + `mcp_env` (the memory connection for the spawned MCP). Empty under
-    # open/token ⇒ the launch is byte-identical to today; the client only renders what the server sent.
-    argv = build_agent_argv(template, bin=bin_, model=str(model),
-                            effort=str(effort), permission=permission,
-                            prompt=prompt, feedback=cap_rel, mcp=str(item.get("mcp") or ""))
-    # #443 (review F-1): the result paths are deterministic per (tid, agent) and the codedir persists
-    # across re-runs (a no-feedback handover is unclaimed + retried). Unlink BOTH before launching so a
-    # stale file from a prior failed attempt can never be read as THIS run's result.
+    # #1307: BUILD PRODUCT CODE in the active project's code root — the server ships it per /pending item
+    # (`cwd` = the engine's exec cwd for the active project = <project-root>/<code_subdir>). Honour it ONLY
+    # when it is a real directory on THIS host — a remote/sealed client does not share the server's
+    # filesystem, so that absolute path won't exist; fall back to the client codedir (today's behaviour,
+    # byte-identical for that topology), as we also do when no cwd is shipped (older engine). Closes the
+    # isolation escape where a coder launched after an in-session /switch spawned in the stale codedir.
+    shipped_cwd = item.get("cwd")
+    launch_cwd = shipped_cwd if (shipped_cwd and Path(shipped_cwd).is_dir()) else str(codedir)
+    # #443 (review F-1): the scratch (handover in / feedback out) stays under codedir; the paths handed to
+    # the coder are ABSOLUTE so the feedback round-trip is independent of the coder's cwd (the product
+    # tree). The result paths are deterministic per (tid, agent) and the scratch persists across re-runs —
+    # unlink BOTH before launching so a stale file from a prior failed attempt is never read as THIS run's.
     fb_dir = codedir / ".ironclad" / "agent" / "feedback"
     fb_dir.mkdir(parents=True, exist_ok=True)
     fb_path = fb_dir / f"{tid}_{agent}-feedback.md"
     cap_path = fb_dir / f"{tid}_{agent}-output.md"
     fb_path.unlink(missing_ok=True)
     cap_path.unlink(missing_ok=True)
-    log(f"  → code-agent (local): {tid} ({agent}, {model}, effort={effort})  cwd={codedir}")
+    # CLI-agnostic prompt: the feedback-file convention is stated HERE (not via a
+    # Claude-only .claude/CLAUDE.md), so any headless code-agent can fulfil the contract.
+    prompt = (f"Autonomously read and complete the handover at {ho_path}. "
+              f"Follow any agent guide in this repo (e.g. AGENTS.md / CLAUDE.md). When done, write a "
+              f"short result summary to {fb_path}.")
+    # #480/#994-S10: the server resolves the read-only Memory MCP whenever a memory service is
+    # configured and the agent ships an mcp_template. Empty when memory is unconfigured or the agent
+    # has no mcp_template; the client only renders what the server sent.
+    # #1307: the {feedback} capture path is ABSOLUTE so it is independent of the coder's cwd.
+    argv = build_agent_argv(template, bin=bin_, model=str(model),
+                            effort=str(effort), permission=permission,
+                            prompt=prompt, feedback=str(cap_path), mcp=str(item.get("mcp") or ""))
+    log(f"  → code-agent (local): {tid} ({agent}, {model}, effort={effort})  cwd={launch_cwd}")
     # #480: the spawned MCP (a sub-subprocess of the agent CLI) inherits the memory connection from the
     # agent's env — the connection travels here, NEVER on the MCP JSON-RPC wire (secret-free).
     env = {**os.environ, "PYTHONIOENCODING": "utf-8"}
@@ -549,7 +556,7 @@ def _run_handover(item: Dict[str, Any], codedir: Path, log=print) -> Tuple[Optio
     try:
         # #455: capture stderr (and still surface it) so the server can classify a budget/quota
         # exhausted run as `agent-unavailable` and fail over instead of retrying forever.
-        proc = subprocess.run(argv, cwd=str(codedir), env=env, stdin=subprocess.DEVNULL,
+        proc = subprocess.run(argv, cwd=str(launch_cwd), env=env, stdin=subprocess.DEVNULL,
                               text=True, stderr=subprocess.PIPE)
     except FileNotFoundError:
         log(f"  ✗ code-agent binary '{argv[0] if argv else CLAUDE_BIN}' not found "
