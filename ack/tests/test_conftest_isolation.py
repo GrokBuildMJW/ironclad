@@ -1,12 +1,19 @@
 """Rot guards for the ACK gx10 isolation fixture."""
 
 import ast
+import importlib.util as _ilu
 import sys
 import types
 from types import SimpleNamespace
 from pathlib import Path
 
-from conftest import _GX10_STATE_ATTRS, _ace_isolation
+_ackconf_spec = _ilu.spec_from_file_location(
+    "ack_tests_conftest", Path(__file__).with_name("conftest.py")
+)
+_ackconf = _ilu.module_from_spec(_ackconf_spec)
+_ackconf_spec.loader.exec_module(_ackconf)
+_GX10_STATE_ATTRS = _ackconf._GX10_STATE_ATTRS
+_ace_isolation = _ackconf._ace_isolation
 
 sys.modules.setdefault("openai", types.SimpleNamespace(OpenAI=lambda **kw: object()))
 
