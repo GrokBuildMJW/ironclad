@@ -39,6 +39,7 @@ def test_worst_offender_tiers_are_pinned():
     assert cs.by_verb("project").tier == cs.DESTRUCTIVE      # has delete --purge
     assert cs.by_verb("autoplan").tier == cs.COSTLY          # uncapped model loop (RED warning)
     assert cs.by_verb("ace").tier == cs.COSTLY               # eval/warmup call the model
+    assert cs.by_verb("design").tier == cs.COSTLY            # spends a model turn for proposals
     assert cs.by_verb("generate").tier == cs.COSTLY          # scaffolds files
     assert cs.by_verb("tool").tier == cs.COSTLY              # runs an arbitrary tool
     assert cs.by_verb("help").tier == cs.READ_ONLY
@@ -124,6 +125,8 @@ def test_guided_usage_covers_the_worst_offenders():
     # usage returns now call guided_usage(verb), so this pins what the operator is guided with.
     assert "<dotted.key>" in cs.guided_usage("config set") and "<value>" in cs.guided_usage("config set")
     assert "warmup|eval" in cs.guided_usage("ace")
+    assert cs.guided_usage("design").startswith("usage: /design --options [N]")
+    assert "range 2..8, default 2" in cs.by_verb("design").flags[0].summary
     assert "new <name>" in cs.guided_usage("project") and "delete <id>" in cs.guided_usage("project")
     assert "--domain" in cs.guided_usage("generate")
     assert cs.by_verb("project").usage           # the override is the single source for the multi-form verb

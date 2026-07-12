@@ -186,9 +186,20 @@ def default_cli_runner(spec, prompt: str, *, effort: str, max_tokens: Optional[i
     Returns the same result shape as ``workers._one`` so aggregation is uniform. Never raises.
     ``permission_mode`` has one source: ``spec.permission_mode`` or ``CLAUDE_PERMISSION_MODE``.
     """
+    try:
+        from providers import canonical_launch_tuple
+        bin_, template = canonical_launch_tuple(spec)
+    except Exception:
+        template = getattr(spec, "cmd_template", None) or AGENT_CMD
+        bin_ = getattr(spec, "bin", None) or CLAUDE_BIN
+    from tooling_envelope_runtime import _envelope_authorize
+    refused = _envelope_authorize(bin_, template)
+    if refused:
+        return {"ok": False, "content": None, "error": refused,
+                "completion_tokens": None, "latency": 0.0, "tooling_envelope_refused": True}
     argv = build_agent_argv(
-        getattr(spec, "cmd_template", None) or AGENT_CMD,
-        bin=getattr(spec, "bin", None) or CLAUDE_BIN,
+        template,
+        bin=bin_,
         model=spec.model,
         effort=str(effort),
         permission=getattr(spec, "permission_mode", None) or CLAUDE_PERMISSION_MODE,
@@ -546,6 +557,16 @@ def _run_handover(item: Dict[str, Any], codedir: Path, log=print) -> Tuple[Optio
     argv = build_agent_argv(template, bin=bin_, model=str(model),
                             effort=str(effort), permission=permission,
                             prompt=prompt, feedback=str(cap_path), mcp=str(item.get("mcp") or ""))
+    from ack.tooling_envelope import assert_authorized
+    if "tooling_envelope" in item:
+        verdict = assert_authorized(bin_, template, item["tooling_envelope"])
+        refused = None if verdict else (verdict.reason or "tooling envelope refused malformed coder command")
+    else:
+        from tooling_envelope_runtime import _envelope_authorize
+        refused = _envelope_authorize(bin_, template)
+    if refused:
+        log(f"  ✗ {refused} — handover {tid} skipped")
+        return None, {"exit_code": None, "stderr_tail": refused}
     log(f"  → code-agent (local): {tid} ({agent}, {model}, effort={effort})  cwd={launch_cwd}")
     # #480: the spawned MCP (a sub-subprocess of the agent CLI) inherits the memory connection from the
     # agent's env — the connection travels here, NEVER on the MCP JSON-RPC wire (secret-free).

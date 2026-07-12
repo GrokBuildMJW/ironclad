@@ -191,6 +191,87 @@ def test_run_handover_unusable_shipped_cwd_falls_back_to_codedir(tmp_path, monke
     assert captured["cwd"] == str(tmp_path)     # fell back to codedir; did NOT spawn in the missing path
 
 
+def test_run_handover_uses_server_shipped_tooling_envelope_without_global_config(tmp_path, monkeypatch):
+    calls = []
+
+    def _fake_run(*args, **kwargs):
+        calls.append((args, kwargs))
+        raise AssertionError("subprocess must not be reached")
+
+    monkeypatch.setattr(client.subprocess, "run", _fake_run)
+    item = {
+        "id": "KGC-7",
+        "agent": "OPUS",
+        "handover_file": "KGC-7_OPUS.md",
+        "handover": "x",
+        "bin": "claude",
+        "cmd_template": client.DEFAULT_AGENT_CMD,
+        "tooling_envelope": {
+            "enabled": True,
+            "allow_list": [{"bin": "other", "cmd_template": client.DEFAULT_AGENT_CMD}],
+        },
+    }
+    out, meta = client._run_handover(item, tmp_path, log=lambda *_: None)
+    assert out is None
+    assert calls == []
+    assert meta["exit_code"] is None
+    assert meta["stderr_tail"] == "tooling envelope refused unauthorized coder command"
+
+
+def test_run_handover_server_shipped_tooling_envelope_authorized_spawns(tmp_path, monkeypatch):
+    captured = {}
+
+    class _R:
+        returncode = 0
+        stderr = ""
+
+    def _fake_run(argv, **kw):
+        captured["argv"] = argv
+        return _R()
+
+    monkeypatch.setattr(client.subprocess, "run", _fake_run)
+    item = {
+        "id": "KGC-7",
+        "agent": "OPUS",
+        "handover_file": "KGC-7_OPUS.md",
+        "handover": "x",
+        "bin": "claude",
+        "cmd_template": "{bin} --print {prompt}",
+        "tooling_envelope": {
+            "enabled": True,
+            "allow_list": [{"bin": "claude", "cmd_template": "{bin} --print {prompt}"}],
+        },
+    }
+    _out, meta = client._run_handover(item, tmp_path, log=lambda *_: None)
+    assert captured["argv"][0:2] == ["claude", "--print"]
+    assert meta["exit_code"] == 0
+
+
+def test_run_handover_without_server_policy_uses_global_default_off(tmp_path, monkeypatch):
+    captured = {}
+
+    class _R:
+        returncode = 0
+        stderr = ""
+
+    def _fake_run(argv, **kw):
+        captured["argv"] = argv
+        return _R()
+
+    monkeypatch.setattr(client.subprocess, "run", _fake_run)
+    item = {
+        "id": "KGC-7",
+        "agent": "OPUS",
+        "handover_file": "KGC-7_OPUS.md",
+        "handover": "x",
+        "bin": "python",
+        "cmd_template": "{bin} wrapper.py {prompt}",
+    }
+    _out, meta = client._run_handover(item, tmp_path, log=lambda *_: None)
+    assert captured["argv"][0:2] == ["python", "wrapper.py"]
+    assert meta["exit_code"] == 0
+
+
 def test_build_argv_feedback_token_substitutes():
     # #443: the {feedback} token renders the result-capture path (e.g. Codex `-o {feedback}`); a template
     # that omits it (the Claude default) ignores the new optional arg.

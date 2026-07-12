@@ -10,6 +10,7 @@ Modelled on ``test_code_agent_registry.py`` (the ``_do_launch`` Popen-fake patte
 from __future__ import annotations
 
 import sys
+import threading
 import types
 from pathlib import Path
 
@@ -26,12 +27,22 @@ _TASK = {"type": "feature", "priority": "high", "title": "wire", "description": 
 
 
 class _FakeProc:
+    """A just-spawned coder: still running (``poll``→None) and ``wait`` PARKS. A real coder runs for
+    seconds; an instant exit is a test artefact that let the detached ``_wait`` monitor thread race
+    ``_trigger_coder``'s synchronous status read and ``mark_blocked(errored)`` before it — flipping the
+    ``OK:`` return to ``ERROR: coder exit 0, no feedback`` on unlucky scheduling (the pre-existing ±1
+    count flake, #1432). Parking ``wait`` keeps the monitor from ever surfacing during the launch, so the
+    return is deterministic; the daemon thread dies at interpreter exit."""
     pid = 1
 
+    def __init__(self):
+        self._parked = threading.Event()   # never set → the detached monitor blocks (daemon → dies at exit)
+
     def poll(self):
-        return 0
+        return None                        # in-flight during the synchronous launch (not yet exited)
 
     def wait(self, *a, **k):
+        self._parked.wait()                # block so `_surface_coder_result` never races the launch return
         return 0
 
 
@@ -70,6 +81,41 @@ def test_launch_coder_launches_staged_and_flips_in_progress(monkeypatch, tmp_pat
     out = _launch()
     assert out.startswith("OK:")
     assert len(popen) == 1                              # the coder was actually spawned
+    assert gx10._store().get(tid)["status"] == "in_progress"
+
+
+def test_launch_coder_refuses_unauthorized_envelope_without_popen(monkeypatch, tmp_path):
+    from ack.tooling_envelope import load_tooling_envelope_policy
+    tid, popen = _setup(monkeypatch, tmp_path)
+    monkeypatch.setattr(gx10, "TOOLING_ENVELOPE_POLICY", load_tooling_envelope_policy({
+        "security": {"tooling_envelope": {
+            "enabled": True,
+            "allow_list": [{"bin": "other", "cmd_template": "{bin} --print {prompt}"}],
+        }}
+    }))
+    out = _launch()
+    assert out.startswith("OK:") or "launch" in out
+    assert popen == []
+    assert gx10._store().get(tid)["status"] == "pending"
+
+
+def test_launch_coder_default_non_stream_autopilot_shape_authorized(monkeypatch, tmp_path):
+    from ack.tooling_envelope import autopilot_claude_print_template, load_tooling_envelope_policy
+    tid, popen = _setup(monkeypatch, tmp_path)
+    monkeypatch.setattr(gx10, "AUTOPILOT_STREAM", False, raising=False)
+    monkeypatch.setattr(gx10, "TOOLING_ENVELOPE_POLICY", load_tooling_envelope_policy({
+        "security": {"tooling_envelope": {
+            "enabled": True,
+            "allow_list": [{"bin": "claude", "cmd_template": autopilot_claude_print_template(stream=False)}],
+        }}
+    }))
+    out = _launch()
+    assert out.startswith("OK:")
+    assert len(popen) == 1
+    assert popen[0][:7] == [
+        "claude", "--model", "claude-opus-4-8", "--effort", "high",
+        "--dangerously-skip-permissions", "--print",
+    ]
     assert gx10._store().get(tid)["status"] == "in_progress"
 
 

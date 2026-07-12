@@ -4,6 +4,11 @@
 
 Accepted — delivered incrementally, default off.
 
+**Status: Superseded (in part) by ADR-0006 (#1414)** — the product presence gate / L2 conflict-fork /
+L3 typed HARD-floor described here was retired in S1; `record_constraints` is now optional non-gating
+framing-note capture; build enforcement is the approved-design anti-drift. The build-boundary hard-check
+and verbatim injection survive.
+
 ## Context
 
 Design quality depends on constraints that are easy to lose between discovery, design, and implementation:
@@ -71,4 +76,3 @@ never repaired implicitly.
 - L2/L3 compliance (typed fields, hard/soft provenance, conflict fork, structured hard-check) is specified
   in ADR-0016 / epic #1344; L1 stores and injects the authored body and remains the presence floor those
   layers build on.
-

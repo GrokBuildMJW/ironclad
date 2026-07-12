@@ -13,6 +13,7 @@ if str(_ENGINE) not in sys.path:
     sys.path.insert(0, str(_ENGINE))
 
 import pytest  # noqa: E402
+import providers  # noqa: E402
 from pydantic import ValidationError  # noqa: E402
 from providers import (  # noqa: E402
     ProviderKind,
@@ -79,6 +80,53 @@ def test_by_id_excludes_disabled():
     reg = load_registry({"providers": {"pool": [SPARK, {**SONNET, "enabled": False}]}})
     assert reg is not None
     assert set(reg.by_id()) == {"spark-vllm"}  # disabled provider filtered out
+
+
+def test_tooling_envelope_filter_authorizes_inherited_default_template():
+    spec = {"provider_id": "claude-default", "kind": "cli", "model": "sonnet", "bin": "claude"}
+    reg = load_registry({
+        "security": {"tooling_envelope": {
+            "enabled": True,
+            "allow_list": [{
+                "bin": "claude",
+                "cmd_template": "{bin} --model {model} --effort {effort} --permission-mode {permission} --print {prompt}",
+            }],
+        }},
+        "providers": {"pool": [spec]},
+    })
+    assert reg is not None
+    assert set(reg.by_id()) == {"claude-default"}
+
+
+def test_tooling_envelope_filter_authorizes_inherited_default_bin(monkeypatch):
+    monkeypatch.setattr(providers, "CLAUDE_BIN", "claude")
+    spec = {
+        "provider_id": "claude-default-bin",
+        "kind": "cli",
+        "model": "sonnet",
+        "cmd_template": "{bin} --model {model} --effort {effort} --permission-mode {permission} --print {prompt}",
+    }
+    reg = load_registry({
+        "security": {"tooling_envelope": {
+            "enabled": True,
+            "allow_list": [{
+                "bin": "claude",
+                "cmd_template": "{bin} --model {model} --effort {effort} --permission-mode {permission} --print {prompt}",
+            }],
+        }},
+        "providers": {"pool": [spec]},
+    })
+    assert reg is not None
+    assert set(reg.by_id()) == {"claude-default-bin"}
+
+
+def test_canonical_launch_tuple_applies_inherited_defaults(monkeypatch):
+    monkeypatch.setattr(providers, "CLAUDE_BIN", "claude")
+    spec = ProviderSpec(provider_id="claude-defaults", kind="cli", model="sonnet")
+    assert providers.canonical_launch_tuple(spec) == (
+        "claude",
+        providers.DEFAULT_CLAUDE_CMD_TEMPLATE,
+    )
 
 
 def test_endpoint_value_comes_from_env_name_not_config():

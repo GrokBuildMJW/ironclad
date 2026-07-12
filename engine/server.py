@@ -470,6 +470,9 @@ def _pending_handovers() -> list[Dict[str, Any]]:
             # and sets `mcp_env` on the agent subprocess (the spawned MCP inherits the memory connection).
             # ("",{}) when memory is unconfigured or the agent has no mcp_template.
             **dict(zip(("mcp", "mcp_env"), gx10._mcp_for_launch(spec))),
+            # ADR-0007 D1d: local clients spawn on their own host, so ship only the non-secret effective
+            # allow-list metadata they need to fail closed before spawn.
+            "tooling_envelope": __import__("tooling_envelope_runtime").envelope_policy_public(),
         })
     return out
 
@@ -542,6 +545,14 @@ def _set_coder_pin(agent: Optional[str]) -> Dict[str, Any]:
     if raw in ("", "AUTO", "NONE", "OFF"):
         target = None
     elif gx10._code_agent_registry().has(raw):
+        spec = gx10._code_agent_registry().resolve(raw)
+        try:
+            from tooling_envelope_runtime import _envelope_authorize_spec
+            refused = _envelope_authorize_spec(spec)
+        except Exception:
+            refused = "tooling envelope refused malformed coder command"
+        if refused:
+            raise ValueError(f"agent {raw!r} is not authorized by the tooling envelope: {refused}")
         target = raw
         gx10._breaker_reset(raw)   # #455: explicitly choosing an agent clears its budget breaker (recovery)
     else:

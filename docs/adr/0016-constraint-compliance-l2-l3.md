@@ -7,6 +7,11 @@ Accepted — foundational plumbing (#1341 / epic #1344 S5), L2 detect + durable 
 (#1340 / S4), L3 fail-closed typed hard-check at the implementation boundary
 (#1342 / S6), **and** the L2/L3 real-dispatch E2E capstone (#1359 / S7). Default off.
 
+**Status: Superseded (in part) by ADR-0006 (#1414)** — the product presence gate / L2 conflict-fork /
+L3 typed HARD-floor described here was retired in S1; `record_constraints` is now optional non-gating
+framing-note capture; build enforcement is the approved-design anti-drift. The build-boundary hard-check
+and verbatim injection survive.
+
 ## Context
 
 L1 (#1319 / ADR-0015) makes constraints **present**: a single canonical `decisions/constraints.md`, a

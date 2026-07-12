@@ -286,13 +286,6 @@ the design — **completely, in ONE `plan_units` call** (one epic +
 ALL implementation units; §2). Design/analysis/documentation handovers (`type`
 architecture/concept/research/documentation/verification) are NOT gated — they PRODUCE the design. The
 steering-state block tells you the gate state each turn.
-If the operator asks to deviate from a recorded HARD constraint (for example, change the required language),
-your next action is to record the counter-proposal via `record_design` with the new value — the engine surfaces
-a `/fork` for the operator to decide (`keep|counter`). Do NOT re-negotiate the requirement in prose, and do NOT
-re-call `record_constraints` to change a HARD floor (the engine refuses a silent change; only `/fork decide
-counter` or an operator override may change it). An operator-stated technical constraint such as an explicit
-language or network requirement is HARD: omit `source`; use `suggested` only for a value you inferred that the
-operator did not state.
 
 **2. Decomposition (after design approval) — the WHOLE design, one `plan_units` call.** Break the approved
 design into ALL its implementation units and publish them at once via **`plan_units`** (`epic_json` = the

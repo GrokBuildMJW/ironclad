@@ -104,7 +104,9 @@ implementation), declare them in the **code-agent registry** — a config block,
   is not advertised, and caches the result; a later launch of that exact mismatching model is refused with
   a named board-visible error instead of spawning a coder that stalls silently. CLIs without a stable
   models-list subcommand simply omit `models_probe`, which keeps validation off and preserves the launch
-  path. Failed or empty coder runs are also surfaced on the board as `⚠ ERRORED` or `⚠ UNAVAILABLE` with
+  path. `models_probe` is intentionally outside tooling-envelope spawn enforcement: it is a diagnostic,
+  prompt-free model-list command on an already authorized/resolved registry entry, not a coder handover
+  launch. Failed or empty coder runs are also surfaced on the board as `⚠ ERRORED` or `⚠ UNAVAILABLE` with
   captured stderr in both the local lane and the client `/feedback` lane.
 - **Read-only Memory MCP (`mcp_template`, #480).** An MCP-capable CLI can LIVE-query the project memory
   during a handover. Put a `{mcp}` placeholder in the agent's `cmd_template` and an `mcp_template` (the
@@ -119,6 +121,43 @@ implementation), declare them in the **code-agent registry** — a config block,
 spec**, else the built-in Claude default. So setting `GX10_AGENT_CMD` on the client always takes effect —
 even against a default server that ships OPUS/SONNET — while a deployment that configures the registry and
 sets no client override gets each agent's own command shape.
+
+## Tooling envelope (opt-in launch allow-list)
+
+`GX10_AGENT_CMD`, `GX10_CLAUDE_BIN`, and each `code_agents.pool[*].cmd_template` decide which local
+program a coder handover may spawn. ADR-0007's tooling envelope can constrain exactly that launch surface:
+
+```jsonc
+"security": {
+  "tooling_envelope": {
+    "enabled": true,
+    "allow_list": [
+      {
+        "bin": "claude",
+        "cmd_template": "{bin} --model {model} --effort {effort} --permission-mode {permission} --print {prompt}"
+      }
+    ]
+  }
+}
+```
+
+When `security.tooling_envelope.enabled` is `false` (the default), coder launches are byte-identical to the
+existing BYO behavior. When it is `true`, every coder-spawn lane authorizes the final executable and command
+template immediately before spawn. A mismatch is refused fail-closed and no process is started.
+
+The allow-list is intentionally small and non-secret:
+
+- `bin` names the authorized executable identity. A bare command name may match by basename after normal
+  resolution; a path-shaped value pins the executable by realpath identity. `$VAR`/`${VAR}` and a leading
+  bare `~` are expanded; undefined env references remain literal. Only `*` and `?` globs are portable.
+- `cmd_template` is the authorized template shape, not the rendered prompt. The guard normalizes variable
+  fields like model/effort/prompt, but extra flags or a different template refuse.
+- The policy applies only to coder invocation surfaces: provider CLI runner, Python/Ink handover clients,
+  autopilot launch/reconciler launches, the `review` tool, and `/coders use`. It does not enforce a network
+  egress policy; egress controls are separate and deferred.
+
+Keep concrete private paths, wrapper names, and deployment-specific templates in your own config. Public core
+docs show only anonymized shapes.
 
 ## Examples
 

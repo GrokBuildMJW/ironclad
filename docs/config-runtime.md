@@ -117,12 +117,37 @@ for the lesson provider API.
 
 | Key | Default | Meaning |
 |---|---|---|
-| `constraint_gate.enabled` | `false` | L1 capture tool + presence gate + verbatim handover injection (ADR-0015); off ⇒ byte-identical |
-| `safety.constraint_conflict_detect` | `false` | L2 structured conflict detect + durable fork-envelope emission at `record_design` (#1337) **and** L3 fail-closed typed hard-check at `/approve design` + impl `stage_handover` / `plan_units` (#1342 / ADR-0016). Off ⇒ byte-identical (no detect, no ledger write, no hard-check) |
-| `ace.fork_mpr.enabled` | `false` | MPR worker at a recognized fork **and** the S4 constraint-envelope worker (`/fork` recommendation fill + decide→learn) (#1340); **separate** from conflict-detect (flag split: detect vs MPR worker). Off ⇒ no worker, no learn |
+| `constraint_gate.enabled` | `false` | Optional non-gating framing-note capture tool. `record_constraints` writes `notes/framing.md`; when `design_gate.enabled` is on those notes are capture-only and are not auto-injected into coder handovers. Off ⇒ byte-identical |
+| `safety.constraint_conflict_detect` | `false` | Retired/config-compatible no-op kept for older config files. Product constraint-conflict detection, product constraint forks, and constraint hard-checks are removed. |
+| `design_gate.enabled` | `false` | Design-variant lifecycle + implementation approval gate. When on, `record_design` uses retained proposal variants, `/design --options [N]` requests 2..8 trade-off variants (default 2) and warns if fewer proposal files are recorded, `/approve design [<id>]` promotes one approved decision, build-boundary anti-drift at impl `stage_handover` / `plan_units` compares task typed `language` to the approved design standard, and coder handovers inject the approved standard plus `## Build policy`. Off ⇒ byte-identical legacy single-doc design flow |
+| `ace.fork_mpr.enabled` | `false` | M5 architecture-fork worker at a recognized fork (`/fork` recommendation fill + decide→learn). The retired constraint-envelope leg is gone. Off ⇒ no worker, no learn |
 
 Gate/feature flags use **strict** boolean coercion (`_as_bool`): only JSON `true` or the true strings
 `true` / `1` / `yes` / `on` enable a flag; `"false"` / garbage fail soft to off.
+
+## Tooling envelope (`security.tooling_envelope.*`)
+
+ADR-0007 adds a default-off policy surface for authorizing coder CLI substrate commands. When enabled,
+every coder-spawn path authorizes the post-override executable and command-template shape immediately
+before spawn and refuses fail-closed on a mismatch.
+
+| Key | Default | Meaning |
+|---|---|---|
+| `security.tooling_envelope.enabled` | `false` | opt-in master switch; off means existing coder/provider behavior is byte-identical |
+| `security.tooling_envelope.allow_list` | `[]` | entries shaped as `{bin, cmd_template}` for authorized coder CLI commands |
+
+The exported schema is generic. Concrete binary names, globs, and command templates belong in deployment
+config, not in public core. Matching uses executable identity (real path when available, otherwise basename)
+plus a normalized command-template shape; a path-shaped allow-list entry pins the exact realpath while bare
+command names may match by basename. Portable expansion is deliberately narrow and shared with the
+TypeScript client: `$VAR`/`${VAR}` and a leading bare `~` are expanded, undefined environment references
+stay literal, and only `*`/`?` glob wildcards are recognized. Bracket classes, `%VAR%`, and `~user` are
+literal. Malformed inputs refuse fail-closed when the policy is enabled. The server also ships the
+non-secret effective allow-list on `/pending` so the TypeScript client and standalone Python client can
+apply the same local-spawn guard before running a handover. A refused CLI is terminal for that route: it is
+not silently spilled to an in-engine/API substrate. The Claude autopilot path authorizes only the two
+canonical argv shapes (default non-stream and stream-json); model, effort, and prompt are normalized as
+variable slots and extra flags still refuse.
 
 ## Provider router (`providers.*`)
 

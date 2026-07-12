@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import {promises as fs} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
-import {shlexSplit, buildAgentArgv, resolveLaunch, processOne, Pool, type HandoverCfg} from '../src/agent/handover.js';
+import {shlexSplit, buildAgentArgv, resolveLaunch, processOne, Pool, authorizeLaunch, type HandoverCfg} from '../src/agent/handover.js';
 import type {Server, Json} from '../src/net/server.js';
 
 const baseCfg: HandoverCfg = {
@@ -12,6 +12,7 @@ const baseCfg: HandoverCfg = {
   claudeEffort: 'high',
   claudePermissionMode: 'acceptEdits',
 };
+const envelopeOff = {enabled: false, allow_list: []};
 
 test('shlexSplit — whitespace splits; single/double quotes group', () => {
   assert.deepEqual(shlexSplit('a b  c'), ['a', 'b', 'c']);
@@ -81,6 +82,89 @@ test('resolveLaunch — an explicit client override beats the item; defaults fil
   assert.deepEqual(spec.mcpEnv, {});
 });
 
+test('authorizeLaunch — off allows byte-identical spawn tuple', () => {
+  assert.equal(authorizeLaunch('anything', '{bin} {prompt}', {enabled: false, allow_list: []}), null);
+});
+
+test('authorizeLaunch — absent policy matches Python default-off handover parity', () => {
+  assert.equal(authorizeLaunch('anything', '{bin} {prompt}', undefined), null);
+  assert.match(authorizeLaunch('anything', '{bin} {prompt}', null) ?? '', /malformed policy/);
+  assert.match(authorizeLaunch('anything', '{bin} {prompt}', {}) ?? '', /malformed policy/);
+});
+
+test('authorizeLaunch — exact template and basename authorize', () => {
+  assert.equal(authorizeLaunch('/opt/bin/claude', '{bin} --print {prompt}', {
+    enabled: true,
+    allow_list: [{bin: 'claude', cmd_template: '{bin} --print {prompt}'}],
+  }), null);
+});
+
+test('authorizeLaunch — pinned path refuses same-named impostor', async () => {
+  const dir = await fs.mkdtemp(join(tmpdir(), 'ink-pin-'));
+  const trustedDir = join(dir, 'trusted');
+  const attackerDir = join(dir, 'attacker');
+  await fs.mkdir(trustedDir);
+  await fs.mkdir(attackerDir);
+  const trusted = join(trustedDir, process.platform === 'win32' ? 'claude.cmd' : 'claude');
+  const attacker = join(attackerDir, process.platform === 'win32' ? 'claude.cmd' : 'claude');
+  await fs.writeFile(trusted, '', 'utf8');
+  await fs.writeFile(attacker, '', 'utf8');
+  assert.equal(authorizeLaunch(trusted, '{bin} --print {prompt}', {
+    enabled: true,
+    allow_list: [{bin: trusted, cmd_template: '{bin} --print {prompt}'}],
+  }), null);
+  assert.match(authorizeLaunch(attacker, '{bin} --print {prompt}', {
+    enabled: true,
+    allow_list: [{bin: trusted, cmd_template: '{bin} --print {prompt}'}],
+  }) ?? '', /unauthorized coder command/);
+});
+
+test('authorizeLaunch — expands portable environment paths and treats brackets literally', async () => {
+  const dir = await fs.mkdtemp(join(tmpdir(), 'ink-glob-'));
+  const trusted = join(dir, 'claude-a');
+  await fs.writeFile(trusted, '', 'utf8');
+  process.env.INK_TE_DIR = dir;
+  assert.equal(authorizeLaunch(trusted, '{bin} --print {prompt}', {
+    enabled: true,
+    allow_list: [{bin: '$INK_TE_DIR/claude-a', cmd_template: '{bin} --print {prompt}'}],
+  }), null);
+  assert.match(authorizeLaunch(trusted, '{bin} --print {prompt}', {
+    enabled: true,
+    allow_list: [{bin: '*claude-[ab]', cmd_template: '{bin} --print {prompt}'}],
+  }) ?? '', /unauthorized coder command/);
+  assert.match(authorizeLaunch(trusted, '{bin} --print {prompt}', {
+    enabled: true,
+    allow_list: [{bin: '*claude-[!a]', cmd_template: '{bin} --print {prompt}'}],
+  }) ?? '', /unauthorized coder command/);
+});
+
+test('authorizeLaunch — undefined environment variables stay literal and refuse like Python expandvars', async () => {
+  const dir = await fs.mkdtemp(join(tmpdir(), 'ink-env-lit-'));
+  const trusted = join(dir, 'claude-a');
+  await fs.writeFile(trusted, '', 'utf8');
+  delete process.env.INK_TE_UNDEFINED_BIN_DIR;
+
+  assert.match(authorizeLaunch(trusted, '{bin} --print {prompt}', {
+    enabled: true,
+    allow_list: [{bin: '$INK_TE_UNDEFINED_BIN_DIR/claude-a', cmd_template: '{bin} --print {prompt}'}],
+  }) ?? '', /unauthorized coder command/);
+  assert.match(authorizeLaunch(trusted, '{bin} --print {prompt}', {
+    enabled: true,
+    allow_list: [{bin: '${INK_TE_UNDEFINED_BIN_DIR}/claude-a', cmd_template: '{bin} --print {prompt}'}],
+  }) ?? '', /unauthorized coder command/);
+  assert.match(authorizeLaunch(trusted, '{bin} --print {prompt}', {
+    enabled: true,
+    allow_list: [{bin: '%INK_TE_UNDEFINED_BIN_DIR%/claude-a', cmd_template: '{bin} --print {prompt}'}],
+  }) ?? '', /unauthorized coder command/);
+});
+
+test('authorizeLaunch — unauthorized template is refused fail-closed', () => {
+  assert.match(authorizeLaunch('python', '{bin} wrapper.py {prompt}', {
+    enabled: true,
+    allow_list: [{bin: 'claude', cmd_template: '{bin} --print {prompt}'}],
+  }) ?? '', /unauthorized coder command/);
+});
+
 test('processOne — ALWAYS reports the run signal even when the binary is missing (INK-HANDOVER-2)', async () => {
   const dir = await fs.mkdtemp(join(tmpdir(), 'ink-ho-'));
   const calls: Json[] = [];
@@ -91,7 +175,7 @@ test('processOne — ALWAYS reports the run signal even when the binary is missi
     },
   } as unknown as Server;
   const cfg: HandoverCfg = {...baseCfg, agentCmdOverride: '{bin} {prompt}'};
-  const item = {id: 'T1', agent: 'OPUS', handover: 'do x', bin: 'definitely-no-such-binary-xyz123'};
+  const item = {id: 'T1', agent: 'OPUS', handover: 'do x', bin: 'definitely-no-such-binary-xyz123', tooling_envelope: envelopeOff};
   const claimed = new Set(['T1']);
   const ok = await processOne(srv, item, dir, cfg, claimed, () => {});
   assert.equal(ok, false);
@@ -115,7 +199,7 @@ test('processOne — a nonzero exit with stderr and no feedback still reports th
   } as unknown as Server;
   const cfg: HandoverCfg = {...baseCfg, claudeBinOverride: process.execPath, agentCmdOverride: `{bin} ${failer.replace(/\\/g, '/')}`};
   const claimed = new Set(['T3']);
-  const ok = await processOne(srv, {id: 'T3', agent: 'OPUS', handover: 'do z'}, dir, cfg, claimed, () => {});
+  const ok = await processOne(srv, {id: 'T3', agent: 'OPUS', handover: 'do z', tooling_envelope: envelopeOff}, dir, cfg, claimed, () => {});
   assert.equal(ok, false);
   assert.equal(calls.length, 1); // the #455 breaker path: budget-exhausted run is reported, not silently retried
   assert.equal(calls[0]?.['content'], '');
@@ -138,7 +222,7 @@ test('processOne — uploads the captured final message via the {feedback} fallb
   // bin = this node; template runs the writer with the {feedback} capture path as its arg
   const cfg: HandoverCfg = {...baseCfg, claudeBinOverride: process.execPath, agentCmdOverride: `{bin} ${writer.replace(/\\/g, '/')} {feedback}`};
   const claimed = new Set(['T2']);
-  const ok = await processOne(srv, {id: 'T2', agent: 'OPUS', handover: 'do y'}, dir, cfg, claimed, () => {});
+  const ok = await processOne(srv, {id: 'T2', agent: 'OPUS', handover: 'do y', tooling_envelope: envelopeOff}, dir, cfg, claimed, () => {});
   assert.equal(ok, true);
   assert.equal(calls.length, 1);
   assert.equal(calls[0]?.['content'], 'CAPTURED'); // the {feedback} capture is read when no feedback file is written
@@ -172,7 +256,7 @@ test('processOne — a coder that emits its result ONLY to stdout is CAPTURED (n
     return true;
   }) as typeof process.stdout.write;
   try {
-    const ok = await processOne(srv, {id: 'T1406', agent: 'OPUS', handover: 'do stdout'}, dir, cfg, claimed, () => {});
+    const ok = await processOne(srv, {id: 'T1406', agent: 'OPUS', handover: 'do stdout', tooling_envelope: envelopeOff}, dir, cfg, claimed, () => {});
     assert.equal(ok, true);
   } finally {
     process.stdout.write = originalWrite;
@@ -201,7 +285,7 @@ test('processOne — coder stdout and stderr are written to a per-task log; clie
   } as unknown as Server;
   const logs: string[] = [];
   const cfg: HandoverCfg = {...baseCfg, claudeBinOverride: process.execPath, agentCmdOverride: `{bin} ${writer.replace(/\\/g, '/')}`};
-  const ok = await processOne(srv, {id: 'T1406LOG', agent: 'OPUS', handover: 'do noisy'}, dir, cfg, new Set(['T1406LOG']), (m) => logs.push(m));
+  const ok = await processOne(srv, {id: 'T1406LOG', agent: 'OPUS', handover: 'do noisy', tooling_envelope: envelopeOff}, dir, cfg, new Set(['T1406LOG']), (m) => logs.push(m));
   assert.equal(ok, false);
 
   const coderLog = join(dir, '.ironclad', 'agent', 'logs', 'T1406LOG_OPUS.log');
@@ -227,7 +311,7 @@ test('processOne — a FAILED run keeps its scratch for diagnosis + retry (#1300
     },
   } as unknown as Server;
   const cfg: HandoverCfg = {...baseCfg, claudeBinOverride: process.execPath, agentCmdOverride: `{bin} ${failer.replace(/\\/g, '/')}`};
-  const ok = await processOne(srv, {id: 'T4', agent: 'OPUS', handover: 'do w'}, dir, cfg, new Set(['T4']), () => {});
+  const ok = await processOne(srv, {id: 'T4', agent: 'OPUS', handover: 'do w', tooling_envelope: envelopeOff}, dir, cfg, new Set(['T4']), () => {});
   assert.equal(ok, false);
   // the handover drop survives a failed run — the retry re-reads it and the operator can inspect it
   await fs.access(join(dir, '.ironclad', 'agent', 'handovers', 'T4_OPUS.md'));
@@ -248,7 +332,7 @@ test('runHandover — the coder is launched in the server-shipped project cwd, n
   } as unknown as Server;
   const cfg: HandoverCfg = {...baseCfg, claudeBinOverride: process.execPath,
     agentCmdOverride: `{bin} ${writer.replace(/\\/g, '/')} {feedback}`};
-  const item = {id: 'P1', agent: 'OPUS', handover: 'build it', cwd: projDir};
+  const item = {id: 'P1', agent: 'OPUS', handover: 'build it', cwd: projDir, tooling_envelope: envelopeOff};
   const ok = await processOne(srv, item, codedir, cfg, new Set(['P1']), () => {});
   assert.equal(ok, true);
   const reported = await fs.realpath(String(calls[0]?.['content']).trim());
@@ -271,7 +355,7 @@ test('runHandover — falls back to the client codedir when the server ships no 
   } as unknown as Server;
   const cfg: HandoverCfg = {...baseCfg, claudeBinOverride: process.execPath,
     agentCmdOverride: `{bin} ${writer.replace(/\\/g, '/')} {feedback}`};
-  const ok = await processOne(srv, {id: 'P2', agent: 'OPUS', handover: 'x'}, codedir, cfg, new Set(['P2']), () => {});
+  const ok = await processOne(srv, {id: 'P2', agent: 'OPUS', handover: 'x', tooling_envelope: envelopeOff}, codedir, cfg, new Set(['P2']), () => {});
   assert.equal(ok, true);
   assert.equal(await fs.realpath(String(calls[0]?.['content']).trim()), await fs.realpath(codedir));
 });
@@ -290,7 +374,7 @@ test('runHandover — falls back to codedir when the shipped cwd does not exist 
   const cfg: HandoverCfg = {...baseCfg, claudeBinOverride: process.execPath,
     agentCmdOverride: `{bin} ${writer.replace(/\\/g, '/')} {feedback}`};
   const ghost = join(codedir, 'does-not-exist-on-this-host'); // shipped by the server but absent here
-  const item = {id: 'P3', agent: 'OPUS', handover: 'x', cwd: ghost};
+  const item = {id: 'P3', agent: 'OPUS', handover: 'x', cwd: ghost, tooling_envelope: envelopeOff};
   const ok = await processOne(srv, item, codedir, cfg, new Set(['P3']), () => {});
   assert.equal(ok, true);
   assert.equal(await fs.realpath(String(calls[0]?.['content']).trim()), await fs.realpath(codedir));

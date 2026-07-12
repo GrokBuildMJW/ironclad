@@ -10,6 +10,7 @@
  */
 import {spawn} from 'node:child_process';
 import {promises as fs} from 'node:fs';
+import * as fsSync from 'node:fs';
 import path from 'node:path';
 import type {Server, Json} from '../net/server.js';
 
@@ -52,6 +53,75 @@ export interface LaunchSpec {
   template: string;
   mcp: string;
   mcpEnv: Record<string, string>;
+}
+
+type ToolingEnvelopePolicy = {enabled?: boolean; allow_list?: Array<{bin?: string; cmd_template?: string}>};
+
+function normalizeTemplate(v: unknown): string {
+  return str(v).replaceAll('{mcp}', '').replace(/[ \t\n\r\f\v]+/g, ' ').replace(/^[ \t\n\r\f\v]+|[ \t\n\r\f\v]+$/g, '');
+}
+
+function isBareCommand(v: string): boolean {
+  return !!v && !v.includes('/') && !v.includes('\\');
+}
+
+function binIdentity(v: unknown): string {
+  const s = str(v).trim();
+  if (!s) return '';
+  if (isBareCommand(s)) return path.basename(s);
+  const expanded = expandPath(s);
+  try {
+    return fsSync.realpathSync.native(expanded);
+  } catch {
+    return path.resolve(expanded);
+  }
+}
+
+function expandPath(s: string): string {
+  let out = s.replace(/^~(?=$|[/\\])/, process.env.HOME || process.env.USERPROFILE || '~');
+  out = out.replace(/\$([A-Za-z_][A-Za-z0-9_]*)|\$\{([^}]+)\}/g, (m, a, b) => {
+    const key = a || b;
+    return process.env[key] ?? m;
+  });
+  return out;
+}
+
+function globMatch(text: string, pat: string): boolean {
+  let rx = '^';
+  for (let i = 0; i < pat.length; i++) {
+    const c = pat[i] as string;
+    if (c === '*') rx += '.*';
+    else if (c === '?') rx += '.';
+    else rx += c.replace(/[.[\]+^${}()|\\]/g, '\\$&');
+  }
+  rx += '$';
+  return new RegExp(rx).test(text);
+}
+
+function binMatches(candidate: string, allowed: string): boolean {
+  const a = expandPath(allowed.trim());
+  if (!candidate || !a) return false;
+  if (/[?*]/.test(a)) return globMatch(candidate, a);
+  if (!isBareCommand(a)) return candidate === binIdentity(a);
+  const aid = binIdentity(a);
+  return candidate === aid || path.basename(candidate) === path.basename(aid);
+}
+
+export function authorizeLaunch(bin: string, template: string, policy: ToolingEnvelopePolicy | null | undefined): string | null {
+  if (policy === undefined) return null;
+  if (policy === null) return 'tooling envelope refused malformed policy';
+  if (policy.enabled !== true) {
+    if (policy.enabled === false) return null;
+    return 'tooling envelope refused malformed policy';
+  }
+  if (!Array.isArray(policy.allow_list)) return 'tooling envelope refused malformed policy';
+  const candidateBin = binIdentity(bin);
+  const candidateTemplate = normalizeTemplate(template);
+  if (!candidateBin || !candidateTemplate) return 'tooling envelope refused malformed coder command';
+  for (const e of policy.allow_list) {
+    if (binMatches(candidateBin, str(e.bin)) && candidateTemplate === normalizeTemplate(e.cmd_template)) return null;
+  }
+  return 'tooling envelope refused unauthorized coder command';
 }
 
 export function resolveLaunch(item: Item, cfg: HandoverCfg): LaunchSpec {
@@ -275,6 +345,11 @@ export async function runHandover(
     feedback: capPath, // #443 capture; absolute so it is independent of the coder's cwd (#1307)
     mcp: spec.mcp,
   });
+  const refusal = authorizeLaunch(spec.bin, spec.template, item['tooling_envelope'] as ToolingEnvelopePolicy | undefined);
+  if (refusal) {
+    log(`  ✗ ${refusal} — handover ${tid} skipped`);
+    return {fb: null, meta: {exit_code: null, stderr: refusal}};
+  }
 
   log(`  → code-agent (local): ${tid} (${agent}, ${spec.model}, effort=${spec.effort})  cwd=${launchCwd}`);
   // #480: the spawned MCP inherits the memory connection from the agent's env — it travels here, NEVER

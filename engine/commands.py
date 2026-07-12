@@ -76,8 +76,8 @@ LOCAL_COMMANDS = {"tasks", "pending", "coders", "work", "auto", "health", "docto
 SERVER_COMMANDS = {
     "status", "config", "clear", "read", "write", "cat", "ls",
     "watcher", "autopilot", "autoplan", "log-terminal", "initiative",
-    "project", "switch", "prompts", "skills", "dismiss",
-    "rag", "context", "tool", "generate",
+    "project", "switch", "prompts", "skills",
+    "rag", "context", "tool", "generate", "design",
 }
 
 HELP_TEXT = """\
@@ -114,9 +114,9 @@ Commands (with a / prefix) — plain text without / is sent to the orchestrator 
     /project list | use <slug> | active | track new|use|list | delete <id> [--purge] | archive|unarchive <id>
     /initiative …   deprecated alias for /project (kept one release)
     /switch <project_id>   rebind the engine to a project (own paths + memory partition)
-    /approve design [slug] | constraint <id|all> [--slug <s>]   approve a design or promote constraints
-    /dismiss constraint <id|all> [--slug <s>]   dismiss a suggested typed constraint so it stops gating
-    /fork list | decide <fork-id> --choice keep|counter   inspect or resolve constraint forks
+    /design --options [N]   ask for N design proposal variants with explicit pros/cons (design_gate only)
+    /approve design [<slug>|<id>]   approve a design (design_gate: promote proposal variant <id>)
+    /fork list | <unit>   inspect M5 architecture-fork proposals
     /generate <args>   scaffold a paved-road capability into the active project library
     /tool <name> <args>   run a tool directly/deterministically (no model election, no RAG)
     /rag on|off        toggle per-turn retrieval (RAG)

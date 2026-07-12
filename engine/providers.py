@@ -23,6 +23,10 @@ from enum import Enum
 from typing import Dict, List, Optional
 
 from pydantic import BaseModel, Field, field_validator
+from ack.tooling_envelope import assert_authorized, load_tooling_envelope_policy
+
+DEFAULT_CLAUDE_CMD_TEMPLATE = "{bin} --model {model} --effort {effort} --permission-mode {permission} --print {prompt}"
+CLAUDE_BIN = os.environ.get("GX10_CLAUDE_BIN", "claude")
 
 # #449 (review B): the agent_id is a filename token matched by the ASCII-only regexes
 # _HO_AGENT_RE/_FB_RE (r"_([A-Za-z]+)…"). Validate against the SAME ASCII class — `str.isalpha()`
@@ -150,7 +154,7 @@ def load_registry(cfg: Dict) -> Optional["ProviderRegistry"]:
     if not pool:
         return None
     reg = ProviderRegistry(
-        providers=[ProviderSpec(**p) for p in pool],
+        providers=_filter_authorized_specs([ProviderSpec(**p) for p in pool], cfg),
         default_id=block.get("default_id"),
     )
     return reg.validate_loud()
@@ -237,8 +241,31 @@ def load_code_agents(cfg: Dict) -> "CodeAgentRegistry":
     config merge, so ``conf/`` re-lists the agents it wants (OPUS/SONNET/CODEX/…)."""
     block = (cfg or {}).get("code_agents") or {}
     pool = block.get("pool") or []
-    reg = CodeAgentRegistry(agents=[ProviderSpec(**p) for p in pool])
+    reg = CodeAgentRegistry(agents=_filter_authorized_specs([ProviderSpec(**p) for p in pool], cfg))
     return reg.validate_loud()
+
+
+def canonical_launch_tuple(spec: Optional[ProviderSpec]) -> tuple[str, str]:
+    """Return the effective launch tuple used by every tooling-envelope gate."""
+    return (
+        (spec.bin if spec and spec.bin else CLAUDE_BIN),
+        (spec.cmd_template if spec and spec.cmd_template else DEFAULT_CLAUDE_CMD_TEMPLATE),
+    )
+
+
+def _filter_authorized_specs(specs: List[ProviderSpec], cfg: Dict) -> List[ProviderSpec]:
+    policy = load_tooling_envelope_policy(cfg)
+    if not policy.enabled:
+        return specs
+    out: List[ProviderSpec] = []
+    for spec in specs:
+        if spec.kind != ProviderKind.CLI:
+            out.append(spec)
+            continue
+        candidate_bin, candidate_template = canonical_launch_tuple(spec)
+        if assert_authorized(candidate_bin, candidate_template, policy):
+            out.append(spec)
+    return out
 
 
 # --------------------------------------------------------------------------- #

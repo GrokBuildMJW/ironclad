@@ -1,0 +1,233 @@
+[
+  {
+    "name": "exact bare bin and template",
+    "bin": "claude",
+    "cmd_template": "{bin} --print {prompt}",
+    "allow_list": [{"bin": "claude", "cmd_template": "{bin} --print {prompt}"}],
+    "expected_authorized": true
+  },
+  {
+    "name": "bare bin matches path basename",
+    "bin": "/opt/ironclad/bin/claude",
+    "cmd_template": "{bin} --print {prompt}",
+    "allow_list": [{"bin": "claude", "cmd_template": "{bin} --print {prompt}"}],
+    "expected_authorized": true
+  },
+  {
+    "name": "pinned path refuses same named impostor",
+    "bin": "/tmp/attacker/claude",
+    "cmd_template": "{bin} --print {prompt}",
+    "allow_list": [{"bin": "/tmp/trusted/claude", "cmd_template": "{bin} --print {prompt}"}],
+    "expected_authorized": false
+  },
+  {
+    "name": "star glob matches basename suffix",
+    "bin": "claude-opus",
+    "cmd_template": "{bin} --print {prompt}",
+    "allow_list": [{"bin": "claude-*", "cmd_template": "{bin} --print {prompt}"}],
+    "expected_authorized": true
+  },
+  {
+    "name": "question glob matches one character",
+    "bin": "claude-a",
+    "cmd_template": "{bin} --print {prompt}",
+    "allow_list": [{"bin": "claude-?", "cmd_template": "{bin} --print {prompt}"}],
+    "expected_authorized": true
+  },
+  {
+    "name": "question glob refuses two characters",
+    "bin": "claude-ab",
+    "cmd_template": "{bin} --print {prompt}",
+    "allow_list": [{"bin": "claude-?", "cmd_template": "{bin} --print {prompt}"}],
+    "expected_authorized": false
+  },
+  {
+    "name": "bracket negation is literal not a class",
+    "bin": "claude-c",
+    "cmd_template": "{bin} --print {prompt}",
+    "allow_list": [{"bin": "claude-[^ab]", "cmd_template": "{bin} --print {prompt}"}],
+    "expected_authorized": false
+  },
+  {
+    "name": "dot in glob pattern stays literal for adjacent characters",
+    "bin": "claudexbar",
+    "cmd_template": "{bin} --print {prompt}",
+    "allow_list": [{"bin": "claude.*", "cmd_template": "{bin} --print {prompt}"}],
+    "expected_authorized": false
+  },
+  {
+    "name": "dot in glob pattern matches literal dot",
+    "bin": "claude.bar",
+    "cmd_template": "{bin} --print {prompt}",
+    "allow_list": [{"bin": "claude.*", "cmd_template": "{bin} --print {prompt}"}],
+    "expected_authorized": true
+  },
+  {
+    "name": "plus in glob pattern stays literal",
+    "bin": "a+b",
+    "cmd_template": "{bin} --print {prompt}",
+    "allow_list": [{"bin": "a+*", "cmd_template": "{bin} --print {prompt}"}],
+    "expected_authorized": true
+  },
+  {
+    "name": "braces in glob pattern stay literal",
+    "bin": "a{2}b",
+    "cmd_template": "{bin} --print {prompt}",
+    "allow_list": [{"bin": "a{2}*", "cmd_template": "{bin} --print {prompt}"}],
+    "expected_authorized": true
+  },
+  {
+    "name": "open paren in glob pattern stays literal",
+    "bin": "claude(x",
+    "cmd_template": "{bin} --print {prompt}",
+    "allow_list": [{"bin": "claude(*", "cmd_template": "{bin} --print {prompt}"}],
+    "expected_authorized": true
+  },
+  {
+    "name": "pipe in glob pattern stays literal",
+    "bin": "a|b",
+    "cmd_template": "{bin} --print {prompt}",
+    "allow_list": [{"bin": "a|*", "cmd_template": "{bin} --print {prompt}"}],
+    "expected_authorized": true
+  },
+  {
+    "name": "literal bracket string matches itself",
+    "bin": "claude-[^ab]",
+    "cmd_template": "{bin} --print {prompt}",
+    "allow_list": [{"bin": "claude-[^ab]", "cmd_template": "{bin} --print {prompt}"}],
+    "expected_authorized": true
+  },
+  {
+    "name": "literal bang bracket string matches itself",
+    "bin": "claude-[!a]",
+    "cmd_template": "{bin} --print {prompt}",
+    "allow_list": [{"bin": "claude-[!a]", "cmd_template": "{bin} --print {prompt}"}],
+    "expected_authorized": true
+  },
+  {
+    "name": "defined dollar variable expands",
+    "bin": "claude",
+    "cmd_template": "{bin} --print {prompt}",
+    "allow_list": [{"bin": "$IRONCLAD_TE_BIN", "cmd_template": "{bin} --print {prompt}"}],
+    "expected_authorized": true
+  },
+  {
+    "name": "defined braced variable expands",
+    "bin": "claude",
+    "cmd_template": "{bin} --print {prompt}",
+    "allow_list": [{"bin": "${IRONCLAD_TE_BIN}", "cmd_template": "{bin} --print {prompt}"}],
+    "expected_authorized": true
+  },
+  {
+    "name": "undefined dollar variable stays literal",
+    "bin": "claude",
+    "cmd_template": "{bin} --print {prompt}",
+    "allow_list": [{"bin": "$IRONCLAD_TE_UNDEFINED", "cmd_template": "{bin} --print {prompt}"}],
+    "expected_authorized": false
+  },
+  {
+    "name": "nested variable syntax is not recursively expanded",
+    "bin": "claude",
+    "cmd_template": "{bin} --print {prompt}",
+    "allow_list": [{"bin": "${IRONCLAD_TE_NESTED}", "cmd_template": "{bin} --print {prompt}"}],
+    "expected_authorized": false
+  },
+  {
+    "name": "bare tilde expands to self home",
+    "bin": "~/",
+    "cmd_template": "{bin} --print {prompt}",
+    "allow_list": [{"bin": "~", "cmd_template": "{bin} --print {prompt}"}],
+    "expected_authorized": true
+  },
+  {
+    "name": "tilde user stays literal",
+    "bin": "claude",
+    "cmd_template": "{bin} --print {prompt}",
+    "allow_list": [{"bin": "~root/claude", "cmd_template": "{bin} --print {prompt}"}],
+    "expected_authorized": false
+  },
+  {
+    "name": "percent variable stays literal",
+    "bin": "claude",
+    "cmd_template": "{bin} --print {prompt}",
+    "allow_list": [{"bin": "%IRONCLAD_TE_BIN%/claude", "cmd_template": "{bin} --print {prompt}"}],
+    "expected_authorized": false
+  },
+  {
+    "name": "ascii whitespace collapses",
+    "bin": "claude",
+    "cmd_template": "{bin}\t--print\n{prompt}",
+    "allow_list": [{"bin": "claude", "cmd_template": "{bin} --print {prompt}"}],
+    "expected_authorized": true
+  },
+  {
+    "name": "bom whitespace is not normalized",
+    "bin": "claude",
+    "cmd_template": "{bin}\uFEFF--print {prompt}",
+    "allow_list": [{"bin": "claude", "cmd_template": "{bin} --print {prompt}"}],
+    "expected_authorized": false
+  },
+  {
+    "name": "nel whitespace is not normalized",
+    "bin": "claude",
+    "cmd_template": "{bin}\u0085--print {prompt}",
+    "allow_list": [{"bin": "claude", "cmd_template": "{bin} --print {prompt}"}],
+    "expected_authorized": false
+  },
+  {
+    "name": "extra token refuses",
+    "bin": "claude",
+    "cmd_template": "{bin} --print {prompt} --mcp-config evil.json",
+    "allow_list": [{"bin": "claude", "cmd_template": "{bin} --print {prompt}"}],
+    "expected_authorized": false
+  },
+  {
+    "name": "missing token refuses",
+    "bin": "claude",
+    "cmd_template": "{bin} --print",
+    "allow_list": [{"bin": "claude", "cmd_template": "{bin} --print {prompt}"}],
+    "expected_authorized": false
+  },
+  {
+    "name": "empty bin refuses",
+    "bin": "",
+    "cmd_template": "{bin} --print {prompt}",
+    "allow_list": [{"bin": "claude", "cmd_template": "{bin} --print {prompt}"}],
+    "expected_authorized": false
+  },
+  {
+    "name": "empty template refuses",
+    "bin": "claude",
+    "cmd_template": "",
+    "allow_list": [{"bin": "claude", "cmd_template": "{bin} --print {prompt}"}],
+    "expected_authorized": false
+  },
+  {
+    "name": "null policy refuses",
+    "bin": "claude",
+    "cmd_template": "{bin} --print {prompt}",
+    "policy": null,
+    "expected_authorized": false
+  },
+  {
+    "name": "enabled non bool refuses",
+    "bin": "claude",
+    "cmd_template": "{bin} --print {prompt}",
+    "policy": {"enabled": "true", "allow_list": [{"bin": "claude", "cmd_template": "{bin} --print {prompt}"}]},
+    "expected_authorized": false
+  },
+  {
+    "name": "non array allow list refuses",
+    "bin": "claude",
+    "cmd_template": "{bin} --print {prompt}",
+    "policy": {"enabled": true, "allow_list": "claude"},
+    "expected_authorized": false
+  },
+  {
+    "name": "disabled policy allows byte identical off path",
+    "bin": "python",
+    "cmd_template": "anything",
+    "policy": {"enabled": false, "allow_list": []},
+    "expected_authorized": true
+  }
+]

@@ -4,6 +4,60 @@ All notable changes to Ironclad are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/); the project is **pre-release** (0.0.x).
 Released versions are listed below.
 
+## [0.0.29]
+### Fixed
+
+- Proposals-with-trade-offs S5 follow-up (#1418): `/design --options [N]` now warns when the model records
+  fewer proposal files than requested, no longer claims trade-offs were validated in the confirmation text,
+  and has negative coverage for fail-closed argument, active-unit, and missing-agent paths.
+- Tooling envelope FA follow-up (#1420): DEV-1 now authorizes every configured CLI provider/code-agent
+  launch tuple plus the default non-stream autopilot tuple, runtime gates share the same inherited-default
+  canonical launch tuple as registry filtering, and Ink treats an absent server-shipped policy as
+  default-off to match Python handover parity.
+- Constraint reframe follow-up (#1413): fixed the M5 `/fork` proposal list call after the product
+  constraint-fork retirement, removed stale ink `/approve constraint`, `/dismiss constraint`, and
+  `/fork decide` help/autocomplete surface, and hardened the ink parity guard against stale server verbs
+  and retired usage tokens.
+
+### Changed
+
+- Constraint reframe S1 (#1414/#1413): retired the product operator constraint gate, typed HARD-floor
+  readers, product constraint-fork ledger, `/approve constraint`, `/dismiss constraint`, and the
+  constraint-envelope ACE leg. `record_constraints` now writes optional non-gating framing notes under
+  `notes/framing.md`; it no longer writes `decisions/constraints.md` or revokes/blocks approved designs.
+- Design lifecycle S3 (#1416/#1413): `record_design` now retains non-destructive
+  `proposals/design-<n>.md` variants, `/approve design [<id>]` promotes one approved decision, later
+  re-records no longer auto-revoke the approved decision, and `## Build policy` is carried on promote and
+  injected with the approved design standard.
+- Build enforcement now rests on the approved design standard: `_design_build_check` remains, reads
+  `_design_typed`, and uses `ack.ace.constraint_conflict.hardcheck`; `normalize_language` is retained for
+  design metadata. The shared `_ACE_FORK_WORKER` and M5 architecture-fork `/fork` proposal surface remain.
+- DEV-1 config now leaves `constraint_gate.enabled` and `safety.constraint_conflict_detect` off by default
+  for the retired product paths while keeping `design_gate.enabled` and the M5-only
+  `ace.fork_mpr.enabled` on.
+
+### Added
+
+- Proposals-with-trade-offs S5 (#1418/#1413): `/design --options [N]` is a deterministic
+  operator-triggered design fan-out behind `design_gate.enabled`. It accepts N in the enforced 2..8 range
+  and defaults to 2, then asks the model to record N `proposals/design-<n>.md` variants through the existing
+  `record_design` path, each with a `## Trade-offs` pros/cons section; the operator promotes the chosen
+  proposal with `/approve design <id>`. With the gate off, the command refuses before a model turn or file
+  write.
+- #1420 completes the ADR-0007 tooling-envelope FA: a default-off
+  `security.tooling_envelope.enabled` policy with `{bin, cmd_template}` allow-list loading, the pure
+  `ack.tooling_envelope.assert_authorized` helper, strict fail-closed malformed-input handling, exact
+  realpath identity for pinned executables, basename-only matching for bare commands, portable `*`/`?`
+  globbing, ASCII-whitespace command-template normalization, and shared Python/Ink parity vectors for
+  `$VAR`/`${VAR}` plus bare-`~` expansion while leaving undefined env references, `%VAR%`, `~user`, and
+  bracket classes literal. Enforcement is wired at every coder-spawn lane: provider CLI fan-out/web-search
+  runner, Python handover using the server-shipped policy, autopilot `launch_coder`, reconciler launch
+  queue, `review`, `/coders use`, provider/code-agent registry filtering, and the TypeScript handover
+  client. `/pending` carries only the non-secret effective allow-list for local client spawn checks,
+  envelope-on CLI refusal is terminal instead of spilling to in-engine fan-out, and FA-S3 adds the
+  per-lane test matrix plus docs for BYO code-agent operators. Public installs remain byte-identical while
+  the policy is off; `GX10_TOOLING_ENVELOPE_ENABLED` mirrors the nested config toggle.
+
 ## [0.0.28]
 ### Fixed
 

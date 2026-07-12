@@ -35,6 +35,7 @@ test('classify — local slash commands', () => {
 test('classify — server slash commands (forwarded, slash already stripped in payload)', () => {
   assert.deepEqual(classify('/status'), {kind: 'server', name: 'status', payload: 'status'});
   assert.deepEqual(classify('/ls src'), {kind: 'server', name: 'ls', payload: 'ls src'});
+  assert.deepEqual(classify('/design --options 2'), {kind: 'server', name: 'design', payload: 'design --options 2'});
 });
 
 test('MEM-16: registry derives LOCAL_COMMANDS + powers completions', () => {
@@ -47,6 +48,7 @@ test('MEM-16: registry derives LOCAL_COMMANDS + powers completions', () => {
   assert.deepEqual(res, ['reset', 'resume']);
   assert.equal(completions('').length, COMMANDS.filter((c) => !c.hidden).length); // empty → all visible (#1264: hidden excluded)
   assert.ok(completions('stat').some((c) => c.name === 'status' && c.scope === 'server'));
+  assert.ok(completions('des').some((c) => c.name === 'design' && c.scope === 'server'));
   assert.equal(completions('zzz').length, 0); // no match
 });
 

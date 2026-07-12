@@ -794,6 +794,41 @@ def test_pending_handover_carries_mcp_fields(tmp_path, monkeypatch):
     assert "mcp" in item and item["mcp"] == "" and item["mcp_env"] == {}   # present + empty under open
 
 
+def test_coders_use_refuses_unauthorized_pin_when_envelope_on(monkeypatch):
+    from ack.tooling_envelope import load_tooling_envelope_policy
+    gx10._EFFECTIVE_CFG = gx10._code_defaults()
+    monkeypatch.setattr(gx10, "TOOLING_ENVELOPE_POLICY", load_tooling_envelope_policy({
+        "security": {"tooling_envelope": {
+            "enabled": True,
+            "allow_list": [{"bin": "other", "cmd_template": "{bin} --print {prompt}"}],
+        }}
+    }))
+    with pytest.raises(ValueError, match="not authorized by the tooling envelope"):
+        server._set_coder_pin("OPUS")
+
+
+def test_coders_use_authorized_pin_when_envelope_on(monkeypatch):
+    from ack.tooling_envelope import load_tooling_envelope_policy
+    gx10._EFFECTIVE_CFG = gx10._code_defaults()
+    monkeypatch.setattr(gx10, "TOOLING_ENVELOPE_POLICY", load_tooling_envelope_policy({
+        "security": {"tooling_envelope": {
+            "enabled": True,
+            "allow_list": [{
+                "bin": "claude",
+                "cmd_template": "{bin} --model {model} --effort {effort} --permission-mode {permission} --print {prompt}",
+            }],
+        }}
+    }))
+    assert server._set_coder_pin("OPUS") == {"pinned": "OPUS"}
+
+
+def test_coders_use_default_off_allows_existing_pin_behavior(monkeypatch):
+    from ack.tooling_envelope import load_tooling_envelope_policy
+    gx10._EFFECTIVE_CFG = gx10._code_defaults()
+    monkeypatch.setattr(gx10, "TOOLING_ENVELOPE_POLICY", load_tooling_envelope_policy({}))
+    assert server._set_coder_pin("OPUS") == {"pinned": "OPUS"}
+
+
 # ── #935: server-side confirm-before-execute gate (destructive only) ─────────────────────────────────
 def test_confirm_required_gates_only_destructive_project_delete():
     assert server._confirm_required("/project delete demo")["command"] == "project delete"

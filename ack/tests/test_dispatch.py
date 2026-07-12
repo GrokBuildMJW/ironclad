@@ -67,6 +67,8 @@ from types import SimpleNamespace  # noqa: E402
 from dispatch import PROVENANCE_FIELDS, DispatchPolicy, ProviderDispatcher  # noqa: E402
 from providers import load_registry  # noqa: E402
 from router import Budget, LoadSignal, ProviderPolicy, RouteRequest, Sensitivity  # noqa: E402
+import client  # noqa: E402
+import gx10  # noqa: E402
 
 SPARK = {"provider_id": "spark-vllm", "kind": "in-engine", "model": "qwen3.6-35b",
          "endpoint_env": "GX10_BASE_URL", "capabilities": {"local": True, "max_effort": "xhigh"}}
@@ -119,6 +121,89 @@ def test_inactive_delegates_byte_identical():
     # enabled but empty pool is also inactive
     disp2 = ProviderDispatcher(load_registry({"providers": {"pool": []}}), workers=FakeWorkers(), enabled=True)
     assert disp2.active() is False
+
+
+def test_inactive_does_not_spill_to_workers_when_envelope_on(monkeypatch):
+    from ack.tooling_envelope import load_tooling_envelope_policy
+    monkeypatch.setattr(gx10, "TOOLING_ENVELOPE_POLICY", load_tooling_envelope_policy({
+        "security": {"tooling_envelope": {"enabled": True, "allow_list": []}}
+    }))
+    workers = FakeWorkers()
+    disp = ProviderDispatcher(None, workers=workers, enabled=False)
+    res = disp.dispatch(["a"])
+    assert res[0]["ok"] is False
+    assert "tooling-envelope" in res[0]["error"]
+    assert workers.calls == []
+
+
+def test_default_cli_runner_refuses_unauthorized_without_spawn(monkeypatch):
+    from ack.tooling_envelope import load_tooling_envelope_policy
+    monkeypatch.setattr(gx10, "TOOLING_ENVELOPE_POLICY", load_tooling_envelope_policy({
+        "security": {"tooling_envelope": {
+            "enabled": True,
+            "allow_list": [{"bin": "claude", "cmd_template": "{bin} --print {prompt}"}],
+        }}
+    }))
+    called = False
+
+    def _run(*a, **k):
+        nonlocal called
+        called = True
+
+    monkeypatch.setattr(client.subprocess, "run", _run)
+    spec = SimpleNamespace(provider_id="bad", model="m", bin="python", cmd_template="{bin} wrapper.py {prompt}",
+                           permission_mode=None)
+    res = client.default_cli_runner(spec, "hello", effort="high")
+    assert res["ok"] is False
+    assert "unauthorized coder command" in res["error"]
+    assert res["tooling_envelope_refused"] is True
+    assert called is False
+
+
+def test_default_cli_runner_authorized_envelope_spawns(monkeypatch):
+    from ack.tooling_envelope import load_tooling_envelope_policy
+    monkeypatch.setattr(gx10, "TOOLING_ENVELOPE_POLICY", load_tooling_envelope_policy({
+        "security": {"tooling_envelope": {
+            "enabled": True,
+            "allow_list": [{"bin": "claude", "cmd_template": "{bin} --print {prompt}"}],
+        }}
+    }))
+    captured = {}
+
+    def _run(argv, **kw):
+        captured["argv"] = argv
+        return SimpleNamespace(returncode=0, stdout="ok", stderr="")
+
+    monkeypatch.setattr(client.subprocess, "run", _run)
+    spec = SimpleNamespace(provider_id="ok", model="m", bin="claude", cmd_template="{bin} --print {prompt}",
+                           permission_mode=None)
+    res = client.default_cli_runner(spec, "hello", effort="high")
+    assert res["ok"] is True
+    assert res["content"] == "ok"
+    assert captured["argv"] == ["claude", "--print", "hello"]
+
+
+def test_run_handover_refuses_unauthorized_without_spawn(monkeypatch, tmp_path):
+    from ack.tooling_envelope import load_tooling_envelope_policy
+    monkeypatch.setattr(gx10, "TOOLING_ENVELOPE_POLICY", load_tooling_envelope_policy({
+        "security": {"tooling_envelope": {
+            "enabled": True,
+            "allow_list": [{"bin": "claude", "cmd_template": "{bin} --print {prompt}"}],
+        }}
+    }))
+    called = False
+
+    def _run(*a, **k):
+        nonlocal called
+        called = True
+
+    monkeypatch.setattr(client.subprocess, "run", _run)
+    item = {"id": "T1", "agent": "OPUS", "handover": "do it", "bin": "python",
+            "cmd_template": "{bin} wrapper.py {prompt}", "model": "m", "effort": "high"}
+    fb, meta = client._run_handover(item, tmp_path, log=lambda *_: None)
+    assert fb is None
+    assert "unauthorized coder command" in meta["stderr_tail"]
+    assert called is False
 
 
 def test_all_disabled_pool_is_inactive_falls_back_to_fanout():

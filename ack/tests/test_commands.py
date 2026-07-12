@@ -44,6 +44,7 @@ def test_server_commands_forwarded_without_slash():
     assert classify("/status") == ("server", "status", "status")
     assert classify("/watcher on") == ("server", "watcher", "watcher on")
     assert classify("/read foo.md") == ("server", "read", "read foo.md")
+    assert classify("/design --options 2") == ("server", "design", "design --options 2")
 
 
 def test_unknown_slash_is_forwarded_to_server():

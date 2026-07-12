@@ -121,6 +121,19 @@ def test_plan_units_design_gate_blocks_impl_units(monkeypatch):
     assert gx10._store().list() == []
 
 
+def test_plan_units_refuses_language_drift_before_creating_anything(monkeypatch):
+    monkeypatch.setattr(gx10, "DESIGN_GATE_ENABLED", True)
+    gx10.record_design("Approach", "Use Python.", language="python")
+    assert gx10._approve_design().startswith("OK")
+
+    out = gx10._plan_units(json.dumps(_EPIC), json.dumps([_u(1, language="rust")]))
+
+    assert out.startswith("ERROR")
+    assert "approved design requires language='python'" in out
+    assert "task provides 'rust'" in out
+    assert gx10._store().list() == []
+
+
 # ── epic auto-complete on the last child's advance ───────────────────────────
 
 def _advance(tid: str) -> str:

@@ -224,6 +224,12 @@ class ProviderDispatcher:
 
         # 4) inactive → byte-identical whole-batch fanout (additive-key-free passthrough)
         if not self.active():
+            try:
+                from tooling_envelope_runtime import envelope_enabled
+                if envelope_enabled():
+                    return [self._unroutable(i, "tooling-envelope-no-authorized-substrate") for i in range(n)]
+            except Exception:
+                return [self._unroutable(i, "tooling-envelope-no-authorized-substrate") for i in range(n)]
             if self._workers is None:
                 return [self._unroutable(i, "no-substrate") for i in range(n)]
             return [DispatchResult(r) for r in self._workers.fanout(
@@ -350,6 +356,12 @@ class ProviderDispatcher:
                 results[idx] = res
 
     def _spill_failed_to_local(self, results, decisions, reqs, items, ctxs, by_id, system, temperature, think) -> None:
+        try:
+            from tooling_envelope_runtime import envelope_enabled
+            if envelope_enabled():
+                return
+        except Exception:
+            return
         if self._workers is None:
             return
         local_spec = next((p for p in self._registry.by_id().values() if p.capabilities.local), None)
