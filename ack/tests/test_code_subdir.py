@@ -10,6 +10,8 @@ import sys
 import types
 from pathlib import Path
 
+import pytest
+
 sys.modules.setdefault("openai", types.SimpleNamespace(OpenAI=lambda **kw: object()))
 _ENGINE = Path(__file__).resolve().parents[2] / "engine"
 if str(_ENGINE) not in sys.path:
@@ -57,7 +59,7 @@ def test_control_plane_not_under_code_subdir(monkeypatch, tmp_path):
 def test_apply_config_reads_and_normalizes_code_subdir(monkeypatch):
     monkeypatch.setattr(gx10, "CODE_SUBDIR", "")
     cfg = gx10._code_defaults()
-    cfg["paths"]["code_subdir"] = "/src/"                 # leading/trailing slashes stripped
+    cfg["paths"]["code_subdir"] = "src/"                  # trailing slash stripped
     gx10._apply_config(cfg)
     assert gx10.CODE_SUBDIR == "src"
 
@@ -69,12 +71,13 @@ def test_apply_config_default_is_empty(monkeypatch):
 
 
 def test_code_subdir_rejects_traversal_and_absolute(monkeypatch):
-    # Sonnet defect 1: an escaping code_subdir is rejected (containment) → off, never redirecting ops outside.
-    for bad in ("../../etc", "..", "a/../../b", "D:/evil", "C:\\Windows"):
+    # An escaping code_subdir is refused before apply, never redirecting operations outside the project.
+    for bad in ("/src/", "../../etc", "..", "a/../../b", "D:/evil", "C:\\Windows"):
         monkeypatch.setattr(gx10, "CODE_SUBDIR", "sentinel")
         cfg = gx10._code_defaults(); cfg["paths"]["code_subdir"] = bad
-        gx10._apply_config(cfg)
-        assert gx10.CODE_SUBDIR == "", f"{bad!r} should be rejected"
+        with pytest.raises(ValueError, match="relative path"):
+            gx10._apply_config(cfg)
+        assert gx10.CODE_SUBDIR == "sentinel", f"{bad!r} must not be applied"
 
 
 def test_code_subdir_accepts_nested(monkeypatch):

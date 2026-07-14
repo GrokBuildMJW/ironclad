@@ -7,6 +7,8 @@ Also asserts the **byte-identical default**: with no hook registered the lifecyc
 """
 from __future__ import annotations
 
+from design_test_support import approve_active_design
+
 import sys
 import types
 from pathlib import Path
@@ -52,13 +54,15 @@ def _lifecycle_full(tmp_path, monkeypatch):
     gx10._dispatch(types.SimpleNamespace(run=lambda t: None, save_session=lambda: None,
                                          status=lambda: "ok"),
                    "initiative new Order Service --type software")
+    approve_active_design(gx10)
     stage_out = gx10._stage_handover(
         None, "OPUS", "## Handover\nbuild it",
-        task_json='{"type":"feature","priority":"high","title":"Build X","description":"do it"}',
+        task_json='{"type":"feature","priority":"high","title":"Build the hooked feature","description":"Build the hooked feature through the complete validated staging pipeline."}',
         force=True,
     )
     tid = gx10._store().list("pending")[0]["id"]
-    (gx10.feedback_dir() / f"{tid}_OPUS-feedback.md").write_text("LESSON: x", encoding="utf-8")
+    (gx10.feedback_dir() / f"{tid}_OPUS-feedback.md").write_text(
+        "status: done\n\nLESSON: x", encoding="utf-8")
     advance_out = gx10._advance_pipeline(tid, "OPUS")
     return stage_out, advance_out, tid
 

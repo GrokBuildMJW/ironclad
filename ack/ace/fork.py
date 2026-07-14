@@ -15,8 +15,10 @@ Variant-B auto-detector reuses this exact schema. No engine wiring / no MPR call
 M5-2..M5-5).
 
 **Pure / stdlib-only** — imports nothing from the engine / gx10 / the private `scripts/devloop` /
-`scripts/devprocess`. **Drift-tolerant + never raises**: a partial / extra-field / garbage payload degrades to
-a thinner `ForkSignal` (or is skipped), matching `devtraj`'s conservative parse.
+`scripts/devprocess`. Ledger parsing is **drift-tolerant + never raises**: a partial / extra-field / garbage
+payload degrades to a thinner `ForkSignal` (or is skipped), matching `devtraj`'s conservative parse. The
+auto-detector preserves the clean no-ambiguity → ``None`` contract but lets internal detector errors propagate
+so the engine's protected staging boundary can refuse fail-closed.
 """
 from __future__ import annotations
 
@@ -124,12 +126,9 @@ def ambiguity_signals(text: str) -> "List[str]":
 
 def detect_ambiguity(text: str, *, unit: str = "", area: str = "requirements") -> "Optional[ForkSignal]":
     """Variant-B auto-detector: if *text* carries ambiguity/underspecification signals, return a ForkSignal
-    (halt-to-ask) reusing the Variant-A schema; else None. Never raises. The engine gates whether a positive
-    result HALTS or merely warns (default-off) — this function only detects."""
-    try:
-        signals = ambiguity_signals(text)
-    except Exception:   # noqa: BLE001 — detection must never raise into the loop
-        return None
+    (halt-to-ask) reusing the Variant-A schema; else None. Internal detector errors propagate so the engine's
+    protected boundary can distinguish an unavailable detector from a clean no-ambiguity result."""
+    signals = ambiguity_signals(text)
     if not signals:
         return None
     question = "Ambiguity detected — clarify before building: " + "; ".join(signals[:4])

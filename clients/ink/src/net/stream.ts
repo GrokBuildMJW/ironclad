@@ -18,6 +18,7 @@ export interface ToolFrame {
   name: string;
   args: Record<string, unknown>;
   execCwd?: string; // #1317: server-shipped active-project exec cwd (mount) — where the bridged tool runs
+  sandbox?: string; // F3b: mandatory server-validated backend preference for the versioned exec wire tool
 }
 
 export interface StreamHandlers {
@@ -27,7 +28,7 @@ export interface StreamHandlers {
 
 async function dispatchFrame(seg: string, onTool?: StreamHandlers['onTool']): Promise<void> {
   const json = seg.startsWith('TR') ? seg.slice(2) : seg;
-  let payload: {id?: string; name?: string; args?: Record<string, unknown>; exec_cwd?: string};
+  let payload: {id?: string; name?: string; args?: Record<string, unknown>; exec_cwd?: string; sandbox?: string};
   try {
     payload = JSON.parse(json) as typeof payload;
   } catch {
@@ -39,6 +40,7 @@ async function dispatchFrame(seg: string, onTool?: StreamHandlers['onTool']): Pr
     // without it stays byte-identical to {id, name, args} (parity with the pre-#1317 stream).
     const toolFrame: ToolFrame = {id: payload.id, name: payload.name, args: payload.args ?? {}};
     if (payload.exec_cwd) toolFrame.execCwd = payload.exec_cwd;
+    if (payload.sandbox) toolFrame.sandbox = payload.sandbox;
     await onTool(toolFrame);
   }
 }

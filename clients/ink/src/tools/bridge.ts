@@ -17,7 +17,8 @@ import type {ToolFrame} from '../net/stream.js';
 
 const _results = new ToolResultBuffer();
 
-/** Resend any tool-results buffered from an earlier transient failure (call on reconnect). */
+/** Resend any tool-results buffered from an earlier transient failure. Called on every connected status
+ *  poll (#1490 — not only on a reconnect edge), so a buffered result drains within one poll interval. */
 export function flushToolResults(srv: Server): Promise<void> {
   return _results.flush(srv);
 }
@@ -27,10 +28,10 @@ export function pendingToolResults(): number {
   return _results.size;
 }
 
-export async function runPassthroughTool(srv: Server, frame: ToolFrame): Promise<void> {
+export async function runPassthroughTool(srv: Server, frame: ToolFrame, signal?: AbortSignal): Promise<void> {
   let result: string;
   try {
-    result = await runTool(frame.name, frame.args, frame.execCwd);
+    result = await runTool(frame.name, frame.args, frame.execCwd, frame.sandbox, signal);
   } catch (e) {
     result = `ERROR: ${e instanceof Error ? e.message : String(e)}`;
   }

@@ -30,9 +30,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import re
 import threading
+import time
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
@@ -118,8 +120,7 @@ class PlaybookStore:
         self._max = _safe_cap(max_bullets, 200)
         self._config = config or AdaptConfig(max_bullets=self._max)
         self._top_k = 8                                # #905: the context_for injection cap (`ace.top_k`); live-configurable
-        self._safe_promote = False                     # #1070: snapshot-before-adapt + eval-gate (default OFF)
-        self._eval_fn: "Optional[Callable[[Playbook], Any]]" = None   # #1070: injected quality scorer (higher=better)
+        self._eval_fn: "Optional[Callable[[Playbook], Any]]" = None   # injected quality scorer (higher=better)
         self._lock = threading.Lock()
 
     # ─── transport injection (the engine wires these after building the /embed + chat adapters) ───────
@@ -127,8 +128,8 @@ class PlaybookStore:
                        eval_fn: Any = None) -> None:
         """Inject (or replace) the online-adaptation transports on the live store. ``None`` leaves a
         transport unchanged (pass an explicit sentinel only via the kwargs you mean to set). *eval_fn*
-        (#1070) is the injected quality scorer (a playbook → a numeric score, higher=better) the safe-promote
-        eval-gate uses; a deployment wires it (a held-out eval / a telemetry-derived signal)."""
+        is the injected quality scorer (a playbook → a numeric score, higher=better) the transactional
+        promotion gate uses; a deployment wires it (a held-out eval / a telemetry-derived signal)."""
         if chat is not None:
             self._chat = chat
         if embed is not None:
@@ -138,8 +139,8 @@ class PlaybookStore:
         if eval_fn is not None:
             self._eval_fn = eval_fn
 
-    def configure(self, *, max_bullets: Any = None, max_per_scope: Any = None, top_k: Any = None,
-                  safe_promote: Any = None) -> None:
+    def configure(self, *, max_bullets: Any = None, max_per_scope: Any = None,
+                  top_k: Any = None) -> None:
         """Live cap change (so a runtime ``/config set`` takes effect on the registered store). Accepts
         ``max_per_scope`` as a back-compat alias for the EngineLessonStore key. ``top_k`` sets the
         ``context_for`` injection cap (`ace.top_k`, #905). Malformed values ⇒ kept."""
@@ -153,8 +154,6 @@ class PlaybookStore:
                 self._top_k = max(0, int(top_k))
             except (TypeError, ValueError):           # a malformed top_k is kept (no silent 0)
                 pass
-        if safe_promote is not None:
-            self._safe_promote = bool(safe_promote)    # #1070: snapshot-before-adapt + eval-gate toggle
 
     # ─── persistence (scope → one JSON file; opaque scope hashed to a safe name) ──────────────────────
     def _path(self, scope: str) -> Path:
@@ -173,7 +172,7 @@ class PlaybookStore:
         except Exception:   # noqa: BLE001 — corrupt / newer-schema → empty (advisory store, never raises)
             return Playbook()
 
-    def _save(self, scope: str, pb: Playbook) -> None:
+    def _save(self, scope: str, pb: Playbook) -> bool:
         """Atomically persist *pb* (temp + ``os.replace``); fail-soft on any I/O / serialization error."""
         tmp = None
         try:
@@ -182,12 +181,14 @@ class PlaybookStore:
             tmp = path.parent / f"{path.name}.{os.getpid()}.tmp"
             tmp.write_text(pb.to_json(), encoding="utf-8")
             os.replace(tmp, path)
+            return True
         except Exception:   # noqa: BLE001 — I/O / serialization / inert store → no-op, never raises
             if tmp is not None:
                 try:
                     tmp.unlink()
                 except OSError:
                     pass
+            return False
 
     # ─── #1082: operator-facing playbook safety — versioning (M-002) + selective forget (Q-001) ───────
     # The learned playbook adapts silently; these give an operator a rollback net (snapshot/rollback) and a
@@ -204,7 +205,7 @@ class PlaybookStore:
         except Exception:   # noqa: BLE001 — missing / corrupt → empty history, never raises
             return PlaybookHistory()
 
-    def _save_history(self, scope: str, hist) -> None:
+    def _save_history(self, scope: str, hist) -> bool:
         tmp = None
         try:
             path = self._history_path(scope)
@@ -213,12 +214,61 @@ class PlaybookStore:
             tmp = path.parent / f"{path.name}.{os.getpid()}.tmp"
             tmp.write_text(json.dumps(log), encoding="utf-8")
             os.replace(tmp, path)
+            return True
         except Exception:   # noqa: BLE001 — advisory, never raises
             if tmp is not None:
                 try:
                     tmp.unlink()
                 except OSError:
                     pass
+            return False
+
+    def _quarantine_path(self, scope: str) -> Path:
+        return self._path(scope).with_suffix(".quarantine.json")
+
+    def _quarantine(self, scope: str, candidate: Playbook, source_version: str, *,
+                    state: str, reason: str, scores: "Optional[dict]" = None) -> bool:
+        """Atomically retain a bounded candidate record without changing the active playbook."""
+        tmp = None
+        try:
+            path = self._quarantine_path(scope)
+            self._base.mkdir(parents=True, exist_ok=True)
+            try:
+                log = json.loads(path.read_text(encoding="utf-8"))
+                if not isinstance(log, list):
+                    log = []
+            except Exception:   # noqa: BLE001 — missing/corrupt quarantine starts a fresh bounded log
+                log = []
+            log.append({
+                "scope_hash": hashlib.sha256(scope.encode("utf-8")).hexdigest()[:32],
+                "source_version": source_version,
+                "candidate": json.loads(candidate.to_json()),
+                "state": state,
+                "reason": reason,
+                "scores": scores,
+                "timestamp": time.time(),
+            })
+            tmp = path.parent / f"{path.name}.{os.getpid()}.tmp"
+            tmp.write_text(json.dumps(log[-_HISTORY_MAX:]), encoding="utf-8")
+            os.replace(tmp, path)
+            return True
+        except Exception:   # noqa: BLE001 — quarantine is advisory; active state remains untouched
+            if tmp is not None:
+                try:
+                    tmp.unlink()
+                except OSError:
+                    pass
+            return False
+
+    def quarantined(self, scope: str) -> list:
+        """Return retained candidate records for *scope* (oldest→newest); fail-soft → ``[]``."""
+        if not _scoped(scope):
+            return []
+        try:
+            log = json.loads(self._quarantine_path(scope).read_text(encoding="utf-8"))
+            return log if isinstance(log, list) else []
+        except Exception:   # noqa: BLE001 — missing/corrupt quarantine is an empty operator view
+            return []
 
     def snapshot(self, scope: str) -> dict:
         """Record the current scope playbook as a named rollback point. Returns ``{version, versions}`` or
@@ -389,46 +439,74 @@ class PlaybookStore:
 
     def adapt(self, trajectory: "Trajectory", *, scope: str) -> dict:
         """One online adaptation step over *scope*'s playbook (reflect→curate→apply→refine, budget-gated),
-        persisted. Run OFF the hot path by the engine's ReflectionWorker. No-op (no charge, no mutation) when
-        no ``chat`` transport is injected or nothing is learned. Fail-soft — never raises; returns a summary."""
+        transactionally promoted or quarantined. Run OFF the hot path by the engine's ReflectionWorker. No-op
+        (no charge, no mutation) when no ``chat`` transport is injected or nothing is learned. Fail-soft —
+        never raises; returns a summary."""
         from ack.ace import adapt_once   # local import keeps the per-method surface tidy
         base = {"skipped": True, "added": 0, "rated": 0, "merged": 0, "pruned": 0}
         if self._chat is None or not _scoped(scope):
             return base
         try:
             with self._lock:
-                pb = self._load(scope)
-                # #1070 learned-state safety (safe_promote ON): snapshot the PRE-adapt state as an
-                # operator/auto rollback point, and measure it if an eval scorer is wired — so a bad learned
-                # delta can be reverted instead of silently degrading behavior.
-                before_score = None
-                if self._safe_promote:
+                active = self._load(scope)
+                try:
                     hist = self._load_history(scope)
-                    hist.snapshot(pb)
-                    self._save_history(scope, hist)
-                    if self._eval_fn is not None:
-                        try:
-                            before_score = self._eval_fn(pb)
-                        except Exception:   # noqa: BLE001 — a scorer hiccup ⇒ no gate (keep the change)
-                            before_score = None
-                summary = adapt_once(trajectory, pb, chat=self._chat, embed=self._embed,
+                    source_version = hist.snapshot(active)
+                    if not self._save_history(scope, hist):
+                        return {**base, "snapshot_failed": True}
+                except Exception:   # noqa: BLE001 — no durable rollback point ⇒ refuse before adaptation
+                    return {**base, "snapshot_failed": True}
+
+                candidate = Playbook.from_json(active.to_json())
+                summary = adapt_once(trajectory, candidate, chat=self._chat, embed=self._embed,
                                      budget=self._budget, config=self._config)
-                if not summary.get("skipped"):
-                    # #1070: eval-gate — on a MEASURED regression, DON'T persist the delta (auto-revert: the
-                    # on-disk playbook stays at the pre-adapt state). Fail-open: a broken measurement keeps it.
-                    if self._safe_promote and self._eval_fn is not None and before_score is not None:
-                        try:
-                            after_score = self._eval_fn(pb)
-                        except Exception:   # noqa: BLE001
-                            after_score = None
-                        if after_score is not None:
-                            from ack.ace.robust import regression_verdict
-                            v = regression_verdict(before_score, after_score)
-                            summary["scores"] = {"before": v["before"], "after": v["after"]}
-                            if v["revert"]:
-                                summary["reverted"] = True          # discard: never persist a regression
-                                return summary
-                    self._save(scope, pb)
+                if summary.get("skipped"):
+                    return summary
+
+                if self._eval_fn is not None:
+                    try:
+                        from ack.ace.robust import regression_verdict
+                        before_score = self._eval_fn(active)
+                        after_score = self._eval_fn(candidate)
+                        if (isinstance(before_score, bool) or not isinstance(before_score, (int, float))
+                                or isinstance(after_score, bool) or not isinstance(after_score, (int, float))
+                                or not math.isfinite(before_score) or not math.isfinite(after_score)):
+                            raise TypeError("evaluator returned a non-numeric or non-finite score")
+                    except Exception:   # noqa: BLE001 — unavailable evaluation never authorizes promotion
+                        self._quarantine(scope, candidate, source_version, state="unpromoted",
+                                         reason="evaluation unavailable")
+                        summary["promoted"] = False
+                        summary["quarantined"] = True
+                        return summary
+
+                    verdict = regression_verdict(before_score, after_score)
+                    scores = {"before": verdict["before"], "after": verdict["after"]}
+                    summary["scores"] = scores
+                    if verdict["revert"]:
+                        self._quarantine(scope, candidate, source_version, state="regression",
+                                         reason="measured regression", scores=scores)
+                        summary["promoted"] = False
+                        summary["quarantined"] = True
+                        return summary
+                else:
+                    active_n = len(active)
+                    cand_n = len(candidate)
+                    destructive = ((cand_n == 0 and active_n > 0)
+                                   or (active_n > 0 and cand_n < active_n * 0.5))
+                    if destructive:
+                        self._quarantine(
+                            scope, candidate, source_version, state="destructive",
+                            reason="catastrophic playbook loss under a non-evaluated adaptation",
+                        )
+                        summary["promoted"] = False
+                        summary["quarantined"] = True
+                        return summary
+
+                if not self._save(scope, candidate):
+                    return {**summary, "skipped": True, "promoted": False, "promotion_failed": True}
+                hist.snapshot(candidate)
+                self._save_history(scope, hist)
+                summary["promoted"] = True
                 return summary
         except Exception:   # noqa: BLE001 — an adaptation hiccup must never kill the worker
             return base

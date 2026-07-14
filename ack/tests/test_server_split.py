@@ -50,7 +50,7 @@ def test_capture_collects_this_threads_output():
 
 
 def test_strip_chat_chrome_removes_status_markers_keeps_answer():
-    # #921 (fachtest): the captured /chat output must not carry the [GX10]/[Qwen (planning)] pane chrome
+    # #921 (desktop functional test): the captured /chat output must not carry the [GX10]/[Qwen (planning)] pane chrome
     raw = "  [Qwen (planning)]\n\n[GX10]\n\n\n391\n\n  [perf] TTFT 1.6s\n\n  ==== DONE ====\n"
     out = server._strip_chat_chrome(raw)
     assert "391" in out and "[perf]" in out and "DONE" in out            # answer + status kept
@@ -95,6 +95,25 @@ def test_write_feedback_creates_reconciler_file(tmp_path, monkeypatch):
     assert "## Result" in p.read_text(encoding="utf-8")
 
 
+def test_local_and_server_feedback_lanes_share_identical_done_stamp(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(gx10, "_ui_print", lambda *a, **k: None)
+    gx10.initiative_new("Demo", "software")
+    raw = "## Result\nall checks passed"
+    fb = gx10.feedback_dir() / "KGC-7_OPUS-feedback.md"
+    fb.write_text(raw, encoding="utf-8")
+
+    gx10._surface_coder_result("KGC-7", "OPUS", 0, tmp_path / "missing.log")
+    local_text = fb.read_text(encoding="utf-8")
+    server_text = Path(server._write_feedback("KGC-7", "OPUS", raw, exit_code=0)).read_text(encoding="utf-8")
+
+    assert local_text == server_text == gx10._stamp_done_if_clean(raw, 0)
+    # hardening: bool `False` (`False == 0` in Python) and non-int exit codes must NEVER stamp done
+    assert gx10._stamp_done_if_clean(raw, False) == raw
+    assert gx10._stamp_done_if_clean(raw, "0") == raw
+    assert gx10._stamp_done_if_clean(raw, None) == raw
+
+
 def test_pending_handovers_surfaces_staged_task(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     gx10.initiative_new("Demo", "software")          # B3: routing target
@@ -114,6 +133,60 @@ def test_pending_handovers_surfaces_staged_task(tmp_path, monkeypatch):
     assert "body" in item["handover"]
     assert item["model"] == "claude-opus-4-8"
     assert item["effort"] == "high"
+    assert item["timeout_s"] == 1800.0
+
+
+def test_pending_handover_ships_live_coder_timeout(tmp_path, monkeypatch):
+    monkeypatch.setattr(gx10, "_EFFECTIVE_CFG", gx10._code_defaults())
+    _stage_opus(tmp_path, monkeypatch)
+    gx10._dispatch(None, "config set code_agents.timeout_s 42.5")
+
+    assert server._pending_handovers()[0]["timeout_s"] == 42.5
+
+
+def _task(store, title):
+    return store.create({"type": "feature", "priority": "high", "title": title,
+                         "description": f"implement {title}"}, force=True)["id"]
+
+
+def test_claim_task_moves_only_pending_and_validates_agent(tmp_path, monkeypatch):
+    store = gx10.TaskStore(str(tmp_path))
+    monkeypatch.setattr(gx10, "STORE", store)
+    pending = _task(store, "pending claim")
+    in_progress = _task(store, "existing progress")
+    done = _task(store, "completed task")
+    store.transition(in_progress, "in_progress")
+    store.transition(done, "done")
+
+    assert gx10.claim_task(pending, "opus") == "in_progress"
+    assert store.get(pending)["status"] == "in_progress"
+    assert store._path(pending, "in_progress").exists()
+    assert not store._path(pending, "pending").exists()
+    assert gx10.claim_task(in_progress, "OPUS") == "in_progress"
+    assert gx10.claim_task(done, "OPUS") == "done"
+    assert store.get(done)["status"] == "done"
+    assert gx10.claim_task("KGC-999", "OPUS") == "not_found"
+    with pytest.raises(ValueError, match="unknown agent"):
+        gx10.claim_task(pending, "BOGUS")
+
+
+def test_unclaim_task_moves_only_in_progress(tmp_path, monkeypatch):
+    store = gx10.TaskStore(str(tmp_path))
+    monkeypatch.setattr(gx10, "STORE", store)
+    in_progress = _task(store, "failed client run")
+    pending = _task(store, "waiting task")
+    done = _task(store, "finished task")
+    store.transition(in_progress, "in_progress")
+    store.transition(done, "done")
+
+    assert gx10.unclaim_task(in_progress) == "pending"
+    assert store.get(in_progress)["status"] == "pending"
+    assert store._path(in_progress, "pending").exists()
+    assert not store._path(in_progress, "in_progress").exists()
+    assert gx10.unclaim_task(pending) == "pending"
+    assert gx10.unclaim_task(done) == "done"
+    assert store.get(done)["status"] == "done"
+    assert gx10.unclaim_task("KGC-999") == "not_found"
 
 
 def test_pending_handover_agent_name_in_to_is_not_the_model(tmp_path, monkeypatch):
@@ -150,9 +223,12 @@ def test_pending_handover_ships_the_resolved_bin_path(tmp_path, monkeypatch):
     # #1279: /pending must ship the boot-probe RESOLVED bin path (the exact executable /coders shows), NOT the
     # logical `spec.bin` — else the client spawns a bare `codex` and node's PATH picks the wrong install.
     _stage_opus(tmp_path, monkeypatch)
-    monkeypatch.setattr(server, "_probe_cached", lambda: {"OPUS": r"C:\resolved\claude.EXE"})
+    resolved = str(tmp_path / "resolved" / "claude.exe")
+    monkeypatch.setattr(server, "_probe_cached", lambda: {"OPUS": resolved})
     item = server._pending_handovers()[0]
-    assert item["bin"] == r"C:\resolved\claude.EXE"   # the resolved path, not the logical bin
+    assert item["bin"] == resolved                     # the resolved path, not the logical bin
+    from ack.tooling_envelope import assert_authorized
+    assert assert_authorized(item["bin"], item["cmd_template"], item["tooling_envelope"])
 
 
 def test_pending_handover_bin_falls_back_to_spec_when_unresolved(tmp_path, monkeypatch):
@@ -254,6 +330,62 @@ def test_http_health_and_chat_capture(tmp_path, monkeypatch):
         assert fo["ok"]
         assert [r["content"] for r in fo["results"]] == ["r:x", "r:y"]
         assert fo["results"][0]["think"] is False
+    finally:
+        httpd.shutdown()
+
+
+def test_http_claim_and_unclaim_move_client_run_task(tmp_path, monkeypatch):
+    httpd, port = _start_server(monkeypatch, tmp_path)
+    try:
+        store = gx10._store()
+        tid = _task(store, "client-run lifecycle")
+        claimed = _post(port, "/claim", {"task_id": tid, "agent": "OPUS"})
+        assert claimed == {"ok": True, "status": "in_progress"}
+        assert store.get(tid)["status"] == "in_progress"
+
+        released = _post(port, "/unclaim", {"task_id": tid})
+        assert released == {"ok": True, "status": "pending"}
+        assert store.get(tid)["status"] == "pending"
+
+        absent = _post(port, "/unclaim", {"task_id": "KGC-999"})
+        assert absent == {"ok": True, "status": "not_found"}
+        with pytest.raises(urllib.error.HTTPError) as exc:
+            _post(port, "/claim", {"task_id": tid, "agent": "BOGUS"})
+        assert exc.value.code == 400
+    finally:
+        httpd.shutdown()
+
+
+@pytest.mark.parametrize(
+    ("content", "exit_code", "stored_content", "expected_status"),
+    [
+        ("## Result\nall checks passed", 0, "status: done\n## Result\nall checks passed", "done"),
+        ("## Result\npartial output", 1, "## Result\npartial output", "in_progress"),
+        ("## Result\nunknown exit", None, "## Result\nunknown exit", "in_progress"),
+        ("status: blocked\nneeds credentials", 0, "status: blocked\nneeds credentials", "in_progress"),
+        ("status: clarification_needed\nwhich target?", 0,
+         "status: clarification_needed\nwhich target?", "in_progress"),
+        ("status: done\nimplemented", 0, "status: done\nimplemented", "done"),
+    ],
+    ids=["exit-zero-prose", "nonzero-prose", "unknown-exit-prose", "blocked", "clarification", "explicit-done"],
+)
+def test_http_feedback_completion_authority_end_to_end(
+        tmp_path, monkeypatch, content, exit_code, stored_content, expected_status):
+    httpd, port = _start_server(monkeypatch, tmp_path)
+    try:
+        store = gx10._store()
+        tid = _task(store, "remote completion authority")
+        store.transition(tid, "in_progress")
+
+        response = _post(port, "/feedback", {
+            "task_id": tid, "agent": "OPUS", "content": content, "exit_code": exit_code,
+        })
+        assert response["classification"] == "ok-feedback"
+        assert Path(response["feedback_file"]).read_text(encoding="utf-8") == stored_content
+
+        gx10._advance_pipeline(tid, "OPUS")
+
+        assert store.get(tid)["status"] == expected_status
     finally:
         httpd.shutdown()
 
@@ -630,6 +762,69 @@ def test_http_feedback_classifies_exhausted_trips_breaker(tmp_path, monkeypatch,
         httpd.shutdown()
 
 
+def test_feedback_spent_budget_is_durable_terminal_and_not_redriven(
+        tmp_path, monkeypatch, _clean_breaker):
+    httpd, port = _start_server(monkeypatch, tmp_path)
+    try:
+        cfg = gx10._code_defaults()
+        cfg["strategy"]["budget"] = 1
+        monkeypatch.setattr(gx10, "_EFFECTIVE_CFG", cfg, raising=False)
+        gx10._apply_config(cfg)
+        gx10._FAILURE_ATTEMPTS.clear()
+        store = gx10._store()
+        handovers = gx10.handovers_dir()
+        handovers.mkdir(parents=True, exist_ok=True)
+
+        cases = [
+            ("failed terminal", 2, "compile error", "task-failed"),
+            ("unavailable terminal", 1, "rate limit exceeded", "agent-unavailable"),
+        ]
+        terminal_ids = []
+        for title, exit_code, stderr, classification in cases:
+            tid = store.create({"type": "bugfix", "priority": "high", "title": title,
+                                "description": "exercise terminal strategy"}, force=True)["id"]
+            terminal_ids.append(tid)
+            (handovers / f"{tid}_OPUS.md").write_text("body", encoding="utf-8")
+            assert _post(port, "/claim", {"task_id": tid, "agent": "OPUS"})["status"] == "in_progress"
+
+            result = _post(port, "/feedback", {
+                "task_id": tid, "agent": "OPUS", "content": "",
+                "exit_code": exit_code, "stderr": stderr,
+            })
+
+            assert result["classification"] == classification
+            assert result["action"] == "escalated"
+            assert result["strategy"] == "human_escalation"
+            task = store.get(tid)
+            assert task["status"] == "in_progress"
+            assert task["blocked_kind"] == "escalated"
+            assert task["blocked_reason"] == f"retry budget spent after 1 attempts ({classification})"
+            assert not gx10._breaker_tripped("OPUS")
+
+            # Both clients unclaim after a failed run. The server must preserve the terminal annotation.
+            assert _post(port, "/unclaim", {"task_id": tid})["status"] == "in_progress"
+            assert store.get(tid)["blocked_kind"] == "escalated"
+
+        # Exercise the pending-state consumers directly: a durable escalated pending task is neither exposed,
+        # claimed, nor queued by the reconciler even though its handover remains present.
+        pending_tid = terminal_ids[0]
+        reason = store.get(pending_tid)["blocked_reason"]
+        store.transition(pending_tid, "pending")
+        store.mark_blocked(pending_tid, kind="escalated", reason=reason)
+        assert all(item["id"] != pending_tid for item in server._pending_handovers())
+        assert _post(port, "/claim", {"task_id": pending_tid, "agent": "OPUS"})["status"] == "pending"
+
+        monkeypatch.setattr(gx10, "AUTOPILOT_ENABLED", True, raising=False)
+        monkeypatch.setattr(gx10, "AUTOPILOT_MAX_CONCURRENT", 16, raising=False)
+        launches = []
+        gx10._reconcile_once(store, lambda *a: None, {}, set(),
+                             launch_enqueue=lambda tid, agent: launches.append((tid, agent)), launched=set())
+        assert launches == []
+        assert store.get(pending_tid)["blocked_kind"] == "escalated"
+    finally:
+        httpd.shutdown()
+
+
 def test_http_feedback_failed_no_feedback_marks_task_blocked(tmp_path, monkeypatch, _clean_breaker):
     httpd, port = _start_server(monkeypatch, tmp_path)
     try:
@@ -743,7 +938,7 @@ def test_autopilot_launch_path_failover_is_task_class_scoped(tmp_path, monkeypat
     (ho_dir / f"{tid}_OPUS.md").write_text("body", encoding="utf-8")    # staged OPUS for a security task
     monkeypatch.setattr(gx10, "_EFFECTIVE_CFG", gx10._code_defaults(), raising=False)
     monkeypatch.setattr(gx10, "AUTOPILOT_ENABLED", True, raising=False)
-    monkeypatch.setattr(gx10, "AUTOPILOT_MAX_CONCURRENT", 0, raising=False)
+    monkeypatch.setattr(gx10, "AUTOPILOT_MAX_CONCURRENT", 16, raising=False)
     gx10._breaker_trip("OPUS")
     launched_cmds: list = []
     gx10._reconcile_once(store, lambda *a: None, {}, set(),
@@ -792,6 +987,10 @@ def test_pending_handover_carries_mcp_fields(tmp_path, monkeypatch):
     monkeypatch.setattr(gx10, "_EFFECTIVE_CFG", gx10._code_defaults(), raising=False)  # open profile default
     item = server._pending_handovers()[0]
     assert "mcp" in item and item["mcp"] == "" and item["mcp_env"] == {}   # present + empty under open
+    policy = item["tooling_envelope"]
+    assert policy["enabled"] is True and policy["allow_list"]
+    assert any(e["bin"] == item["bin"] or Path(str(item["bin"])).name.lower().startswith(e["bin"])
+               for e in policy["allow_list"])
 
 
 def test_coders_use_refuses_unauthorized_pin_when_envelope_on(monkeypatch):
@@ -822,10 +1021,11 @@ def test_coders_use_authorized_pin_when_envelope_on(monkeypatch):
     assert server._set_coder_pin("OPUS") == {"pinned": "OPUS"}
 
 
-def test_coders_use_default_off_allows_existing_pin_behavior(monkeypatch):
+def test_coders_use_derived_policy_allows_configured_pin(monkeypatch):
     from ack.tooling_envelope import load_tooling_envelope_policy
     gx10._EFFECTIVE_CFG = gx10._code_defaults()
-    monkeypatch.setattr(gx10, "TOOLING_ENVELOPE_POLICY", load_tooling_envelope_policy({}))
+    monkeypatch.setattr(gx10, "TOOLING_ENVELOPE_POLICY",
+                        load_tooling_envelope_policy(gx10._EFFECTIVE_CFG))
     assert server._set_coder_pin("OPUS") == {"pinned": "OPUS"}
 
 

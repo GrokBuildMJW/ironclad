@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """MPR A/B harness — "MPR on/off" over a curated query set (Spec 08 §3).
 
-In the style of ``deploy/spark/ctx_harness.py``: **stdlib-only** (urllib/json/argparse/re/pathlib), drives
+A **stdlib-only** harness (urllib/json/argparse/re/pathlib) that drives
 REAL ``/chat`` turns against the orchestrator (:8100) and reads perf from the ``[perf]`` line of the response
 (``TTFT {s}s · {ct} tok/{gt}s = {rate} tok/s · prompt {n}`` — verified gx10.py:2206-2213). The
 **pure** functions (extract_perf/estimate_cost/diff_arms/assert_off_byte_identical/load_*/write_report)

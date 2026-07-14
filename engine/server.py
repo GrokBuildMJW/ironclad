@@ -31,6 +31,8 @@ Endpoints (all JSON; trust model = the configured security.profile — see secur
   POST /chat/stream   → streamed turn; passes local code-tool calls back over the wire as
                         ``\x00TR\x00`` frames (+ ``\x00HB\x00`` heartbeats) for the client tool-bridge
   POST /tool-result   → ``{"id","result"}`` → the client returns a passed-through code-tool result
+  POST /claim         → ``{"task_id","agent"}`` → pending → in_progress for a client-run coder
+  POST /unclaim       → ``{"task_id"}`` → in_progress → pending after a failed client-run coder
   POST /feedback      → ``{"task_id","agent","content"}`` → drop the feedback file the reconciler advances on
   POST /coders        → ``{"agent": <id>|"auto"|null}`` → pin/clear the runtime code-agent (#454)
   POST /cancel        → set the engine cancel event; the running turn aborts at its next iteration
@@ -243,6 +245,7 @@ class _Streamed:
 # --------------------------------------------------------------------------- #
 _TR_PREFIX = "\x00TR"        # frame = \x00TR{json}\x00 — no internal \x00 (single delimiter)
 _TR_SUFFIX = "\x00"
+_SANDBOXED_EXEC_WIRE_TOOL = "execute_command_sandboxed_v1"
 _ACTIVE_BRIDGE: Dict[str, Any] = {"b": None}
 
 
@@ -267,7 +270,12 @@ class ToolBridge:
         # and server on the same fs launched from DIFFERENT directories must not be yanked to the server's
         # cwd). bind_active already ran on this request thread, so _exec_cwd() resolves the active project.
         # Additive/optional: an older client ignores the field.
-        frame: Dict[str, Any] = {"id": rid, "name": name, "args": args}
+        # F3b: use a versioned wire-only name for model command execution. An older client does not know
+        # this name and returns an error instead of running `execute_command` through its legacy direct shell.
+        wire_name = _SANDBOXED_EXEC_WIRE_TOOL if name == "execute_command" else name
+        frame: Dict[str, Any] = {"id": rid, "name": wire_name, "args": args}
+        if name == "execute_command":
+            frame["sandbox"] = gx10.SANDBOX
         _ecwd = gx10._exec_cwd()
         if _ecwd:
             frame["exec_cwd"] = _ecwd
@@ -303,7 +311,8 @@ def bootstrap(config_path: Optional[str] = None) -> Tuple[gx10.GX10, Dict[str, A
     gx10._apply_config(cfg)
     gx10._EFFECTIVE_CFG = cfg
     # S5b: a PRISTINE snapshot of the deployment base — a /switch re-overlays a project's config from this.
-    # Must NOT alias _EFFECTIVE_CFG (which `/config set`, `/coders`, … mutate in place at runtime).
+    # Must NOT alias _EFFECTIVE_CFG (which `/config set` transactionally REBINDS, and `/coders`, … mutate,
+    # at runtime).
     gx10._BASE_CFG = copy.deepcopy(cfg)
     gx10._load_skills(cfg["paths"].get("plugins_dir"))    # core built-ins (always) + 3rd-party (plugins_dir)
     gx10._CFG_SOURCE = cfg_path
@@ -415,6 +424,8 @@ def _pending_handovers() -> list[Dict[str, Any]]:
     exec_cwd = str(gx10._exec_cwd() or os.getcwd())   # str(): the /pending item is JSON — never a Path
     out: list[Dict[str, Any]] = []
     for task in store.list("pending"):
+        if gx10._task_is_escalated(task):
+            continue
         tid = task.get("id") or ""
         ho = gx10._find_handover(tid)
         if not ho:
@@ -452,6 +463,8 @@ def _pending_handovers() -> list[Dict[str, Any]]:
             "type": task.get("type"),
             # #1307: the code root the client must launch the coder IN (the active project's exec cwd).
             "cwd": exec_cwd,
+            # #1491: live per-launch wall-clock; `/config set` affects the next `/pending` response.
+            "timeout_s": gx10._code_agent_timeout_s(),
             "handover_file": ho.name,
             "handover": content,
             # #449 (C0R-9): the SERVER resolves the FULL agent spec from the registry; the client is a
@@ -465,6 +478,7 @@ def _pending_handovers() -> list[Dict[str, Any]]:
             "bin": probe.get(agent) or spec.bin,
             "cmd_template": spec.cmd_template,
             "permission": spec.permission_mode,
+            "permission_bypass": bool(spec.capabilities.permission_bypass),
             # #480/#994-S10: the read-only Memory MCP is always on when a memory service is configured
             # and the agent ships an mcp_template. The client fills the {mcp} placeholder with `mcp`
             # and sets `mcp_env` on the agent subprocess (the spawned MCP inherits the memory connection).
@@ -594,7 +608,7 @@ def _doctor_report() -> Dict[str, Any]:
     }
 
 
-def _write_feedback(task_id: str, agent: str, content: str) -> str:
+def _write_feedback(task_id: str, agent: str, content: str, exit_code=None) -> str:
     """Drop ``{task_id}_{AGENT}-feedback.md`` into the active initiative's feedback inbox
     (``<initiative>/.work/feedback``). The server-side reconciler detects it (mtime-stable)
     and advances the task. Fail-closed: requires an active initiative (B3)."""
@@ -602,7 +616,7 @@ def _write_feedback(task_id: str, agent: str, content: str) -> str:
     d.mkdir(parents=True, exist_ok=True)
     agent_u = (agent or "").upper()            # #449: the /feedback handler validates the agent first
     fb = d / f"{task_id}_{agent_u}-feedback.md"
-    fb.write_text(content, encoding="utf-8")
+    fb.write_text(gx10._stamp_done_if_clean(content, exit_code), encoding="utf-8")
     return str(fb)
 
 
@@ -875,6 +889,27 @@ class _Handler(BaseHTTPRequestHandler):
                 if not self._guard():
                     return
                 self._send(200, gx10._receive_alert(self._read_json()))
+            elif self.path == "/claim":
+                gx10.bind_active()
+                data = self._read_json()
+                tid = (data.get("task_id") or "").strip()
+                if not tid:
+                    self._send(400, {"ok": False, "error": "need 'task_id'"})
+                    return
+                try:
+                    status = gx10.claim_task(tid, data.get("agent") or "")
+                except ValueError as e:
+                    self._send(400, {"ok": False, "error": str(e)})
+                    return
+                self._send(200, {"ok": True, "status": status})
+            elif self.path == "/unclaim":
+                gx10.bind_active()
+                data = self._read_json()
+                tid = (data.get("task_id") or "").strip()
+                if not tid:
+                    self._send(400, {"ok": False, "error": "need 'task_id'"})
+                    return
+                self._send(200, {"ok": True, "status": gx10.unclaim_task(tid)})
             elif self.path == "/feedback":
                 gx10.bind_active()          # S5b: this request thread → the active project's ctx
                 data = self._read_json()
@@ -900,12 +935,21 @@ class _Handler(BaseHTTPRequestHandler):
                 cls = providers.classify_agent_result(
                     exit_code=data.get("exit_code"), stderr=data.get("stderr") or "",
                     has_feedback=bool(content.strip()), patterns=patterns)
-                # #602 2.4/#805: opt-in (strategy.enabled) — classify WHY the run failed into the shared
-                # FailureClass + record it for the Strategy consumer (2.5/#806); None + no field when off.
+                # #602 2.4/#805: always classify WHY the run failed into the shared FailureClass and record
+                # it for the finite Strategy consumer (2.5/#806).
                 fc = gx10._record_failure_class(cls)
                 # #602 2.5/#806: per-task Strategy on the run result — HUMAN_ESCALATION when the attempt
                 # budget is spent (instead of an endless silent failover); a success (OK) resets the counter.
                 strat = gx10._revise_on_failure(tid, cls)
+                if gx10._strategy_escalated(strat):
+                    try:
+                        gx10._mark_strategy_escalated(tid, cls)   # idempotent persistence at the consumer
+                    except Exception:  # noqa: BLE001 — terminal response still stops automatic failover
+                        pass
+                    self._send(200, {"ok": True, "classification": cls, "action": "escalated",
+                                     **({"failure_class": fc} if fc else {}),
+                                     **({"strategy": strat} if strat else {})})
+                    return
                 if cls == providers.RESULT_UNAVAILABLE:
                     gx10._breaker_trip(agent, "budget/quota exhausted")
                     try:
@@ -936,7 +980,7 @@ class _Handler(BaseHTTPRequestHandler):
                                      **({"failure_class": fc} if fc else {}),
                                      **({"strategy": strat} if strat else {})})
                     return
-                path = _write_feedback(tid, agent, content)
+                path = _write_feedback(tid, agent, content, exit_code=data.get("exit_code"))
                 self._send(200, {"ok": True, "classification": cls, "feedback_file": path})
             elif self.path == "/coders":
                 # #454: `/coders use <id>` pins the coding agent at runtime (`auto`/null clears it).
@@ -983,17 +1027,19 @@ def _alert_scanner_loop(stop: "threading.Event", interval: float) -> None:
             pass
 
 
-def serve(host: str = "0.0.0.0", port: int = 8100,
+def serve(host: Optional[str] = None, port: int = 8100,
           config_path: Optional[str] = None) -> None:
     # UTF-8 stdout + color decision. Headless server stdout is not a TTY → color is
     # dropped, so no ANSI escape codes leak into the captured /chat HTTP payload.
     gx10._setup_output()
     agent, cfg, cfg_path, workdir = bootstrap(config_path)
+    host = host if host is not None else str(cfg["server"]["host"])
 
     # Phase-d trust policy (single-tenant). Fail-closed: a profile that demands a
-    # deployment secret refuses to boot without one. ``sealed`` forces a loopback bind.
+    # deployment secret refuses to boot without one, and unauthenticated non-loopback
+    # binds require the named dangerous override.
     policy = SecurityPolicy.from_config(cfg)
-    err = policy.startup_error()
+    err = policy.startup_error(host)
     if err:
         print(f"  [SECURITY] refusing to start: {err}", flush=True)
         raise SystemExit(2)
@@ -1092,7 +1138,7 @@ def serve(host: str = "0.0.0.0", port: int = 8100,
         # boot when its adapter is unusable (e.g. the native adapter on a local setup with no key) —
         # the fail-closed posture of SecurityPolicy, minus refusing to boot (search is optional).
         _scfg = (cfg or {}).get("search") or {}
-        if _scfg.get("enabled", True) and gx10._WEBSEARCH is not None and not gx10._WEBSEARCH.available():
+        if _scfg.get("enabled", False) and gx10._WEBSEARCH is not None and not gx10._WEBSEARCH.available():
             print(f"  [search] web_search OFF — adapter {_scfg.get('adapter', 'cli')!r} is not usable "
                   f"(for the native adapter on a local setup, set ${_scfg.get('api_key_env', 'GX10_SEARCH_API_KEY')}).",
                   flush=True)
@@ -1121,7 +1167,7 @@ def serve(host: str = "0.0.0.0", port: int = 8100,
         print(f"  Doctor : self-check skipped ({e!r})", flush=True)
     print(f"  Listen : http://{host}:{port}  "
           f"(GET /health /tasks /pending /coders /doctor /metrics · POST /chat /chat/stream /coders /cancel "
-          f"/alert /feedback /fanout /session/open|heartbeat|close)",
+          f"/alert /claim /unclaim /feedback /fanout /session/open|heartbeat|close)",
           flush=True)
     try:
         httpd.serve_forever()
@@ -1136,7 +1182,8 @@ def main() -> None:
     import argparse
 
     p = argparse.ArgumentParser(description="Ironclad headless orchestrator server")
-    p.add_argument("--host", default=os.environ.get("GX10_SERVER_HOST", "0.0.0.0"))
+    p.add_argument("--host", default=None,
+                   help="bind host (overrides GX10_SERVER_HOST/config server.host)")
     p.add_argument("--port", type=int, default=int(os.environ.get("GX10_SERVER_PORT", "8100")))
     p.add_argument("--config", default=None)
     args = p.parse_args()

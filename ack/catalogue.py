@@ -12,7 +12,9 @@ Zero external dependencies (stdlib only).
 """
 from __future__ import annotations
 
+import os
 import shutil
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -127,7 +129,8 @@ def install(entry: SkillEntry, dest_root: str | Path, *, overwrite: bool = False
     """Install (copy) *entry* into *dest_root*/skills/. Returns the installed path.
 
     Refuses to overwrite an existing skill unless *overwrite*. File-first: a tool is a single
-    `.py`; a playbook is its directory (copied whole).
+    `.py`; a playbook is its directory (copied whole). Replacements are staged beside the live
+    skill and swapped into place only after the copy completes.
     """
     dest_skills = Path(dest_root) / "skills"
     dest_skills.mkdir(parents=True, exist_ok=True)
@@ -136,14 +139,57 @@ def install(entry: SkillEntry, dest_root: str | Path, *, overwrite: bool = False
         target = dest_skills / src.name
         if target.exists() and not overwrite:
             raise FileExistsError(f"{target} exists (use overwrite=True)")
-        shutil.copy2(src, target)
+        fd, staging_name = tempfile.mkstemp(
+            prefix=f".{src.name}.", suffix=".staging", dir=dest_skills,
+        )
+        os.close(fd)
+        staging = Path(staging_name)
+        try:
+            shutil.copy2(src, staging)
+            os.replace(staging, target)
+        except Exception:  # noqa: BLE001 — cleanup must preserve the original install error
+            try:
+                staging.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise
         return target
     target = dest_skills / src.name          # playbook dir name
-    if target.exists():
-        if not overwrite:
-            raise FileExistsError(f"{target} exists (use overwrite=True)")
-        shutil.rmtree(target)
-    shutil.copytree(src, target)
+    if target.exists() and not overwrite:
+        raise FileExistsError(f"{target} exists (use overwrite=True)")
+    staging_dir = Path(tempfile.mkdtemp(
+        prefix=f".{src.name}.", suffix=".staging", dir=dest_skills,
+    ))
+    backup_dir = staging_dir.with_name(
+        f"{staging_dir.name.removesuffix('.staging')}.backup"
+    )
+    old_moved = False
+    try:
+        shutil.copytree(src, staging_dir, dirs_exist_ok=True)
+        if target.exists():
+            os.replace(target, backup_dir)
+            old_moved = True
+        try:
+            os.replace(staging_dir, target)
+        except Exception:  # noqa: BLE001 — rollback must run for any failed swap
+            if old_moved:
+                try:
+                    os.replace(backup_dir, target)
+                    old_moved = False
+                except Exception:  # noqa: BLE001 — best-effort rollback preserves the swap error
+                    pass
+            raise
+        if old_moved:
+            # the swap succeeded — the old copy in backup is now obsolete. Best-effort: a lock on the backup
+            # (Windows AV/indexer) must NOT turn a completed install into a reported failure (#1493 review).
+            shutil.rmtree(backup_dir, ignore_errors=True)
+            old_moved = False
+    finally:
+        shutil.rmtree(staging_dir, ignore_errors=True)
+        # old_moved still True here ⇒ the swap failed AND the restore did not complete, so backup_dir holds the
+        # ONLY surviving copy of the original install: keep it for recovery, never delete it (#1493 data-safety).
+        if not old_moved:
+            shutil.rmtree(backup_dir, ignore_errors=True)
     return target
 
 

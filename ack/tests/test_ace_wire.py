@@ -14,6 +14,8 @@ Proves through the real `_apply_config` + `_advance_pipeline` wrapper that:
 """
 from __future__ import annotations
 
+from design_test_support import approve_active_design
+
 import json
 import sys
 import types
@@ -35,7 +37,8 @@ from ack import hooks
 from ack import lessons as L
 from playbook_store import PlaybookStore
 
-_TASK = '{"type":"feature","priority":"high","title":"Build X","description":"do it"}'
+_TASK = ('{"type":"feature","priority":"high","title":"Build the wired feature",'
+         '"description":"Build the complete wired feature through the validated staging pipeline."}')
 
 
 class _FakeAgent:
@@ -80,7 +83,7 @@ def _reset(tmp_path, monkeypatch):
     gx10._EFFECTIVE_CFG = saved
 
 
-def _drive_full(tmp_path, monkeypatch, *, feedback="done feedback"):
+def _drive_full(tmp_path, monkeypatch, *, feedback="status: done\n\ndone feedback"):
     """stage → feedback → advance through the real wrapper inside a bound scope ("ns"). Quiesces the worker
     daemon first so a submitted Trajectory stays queued for a deterministic synchronous drain. Returns
     (advance_out, tid)."""
@@ -90,6 +93,7 @@ def _drive_full(tmp_path, monkeypatch, *, feedback="done feedback"):
     gx10.STORE = None
     monkeypatch.chdir(tmp_path)
     gx10._dispatch(_FakeAgent(), "initiative new Order Service --type software")
+    approve_active_design(gx10)
     gx10._stage_handover(None, "OPUS", "## Handover\nbuild it", task_json=_TASK, force=True)
     tid = gx10._store().list("pending")[0]["id"]
     (gx10.feedback_dir() / f"{tid}_OPUS-feedback.md").write_text(feedback, encoding="utf-8")
@@ -161,7 +165,7 @@ def test_apply_ace_threads_ace_top_k(tmp_path, monkeypatch):
 
 
 def test_reflector_chat_adapter_disables_thinking_with_budget(monkeypatch):
-    # #922 (fachtest finding): the Reflector call must run thinking-OFF with a real budget — else a reasoning
+    # #922 (desktop functional test finding): the Reflector call must run thinking-OFF with a real budget — else a reasoning
     # model (qwen3.6-35b) burns the cap on <think>, returns empty content, and the always-on loop learns
     # NOTHING. Assert the adapter sends enable_thinking:False + a >=2048 budget + returns the content.
     cap = {}

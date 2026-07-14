@@ -13,6 +13,7 @@ import {promises as fs} from 'node:fs';
 import * as fsSync from 'node:fs';
 import path from 'node:path';
 import type {Server, Json} from '../net/server.js';
+import {killProcessTree} from '../tools/procTree.js';
 
 type Item = Record<string, unknown>;
 const str = (v: unknown, d = ''): string => (v === undefined || v === null ? d : String(v));
@@ -22,8 +23,12 @@ const str = (v: unknown, d = ''): string => (v === undefined || v === null ? d :
 export const DEFAULT_AGENT_CMD =
   '{bin} --model {model} --effort {effort} --permission-mode {permission} --print {prompt}';
 const DEFAULT_BIN = 'claude';
+const WINDOWS_EXECUTABLE_EXTENSIONS = new Set(['.exe', '.cmd', '.bat', '.com', '.ps1']);
 /** #455: how much of a code-agent's stderr to upload for the server-side exhausted classifier. */
 const STDERR_TAIL_CHARS = 4000;
+const CODER_TIMEOUT_DEFAULT_S = 1800;
+export const MAX_CAPTURE_BYTES = 256 * 1024;
+const TRUNCATED_MARKER = Buffer.from('…(truncated)…', 'utf-8');
 
 export interface HandoverCfg {
   // #449/INK-HANDOVER-1 (#503): an EXPLICIT client-side override (GX10_CLAUDE_BIN / GX10_AGENT_CMD or
@@ -50,6 +55,7 @@ export interface LaunchSpec {
   model: string;
   effort: string;
   permission: string;
+  permissionBypass: boolean;
   template: string;
   mcp: string;
   mcpEnv: Record<string, string>;
@@ -104,16 +110,20 @@ function binMatches(candidate: string, allowed: string): boolean {
   if (/[?*]/.test(a)) return globMatch(candidate, a);
   if (!isBareCommand(a)) return candidate === binIdentity(a);
   const aid = binIdentity(a);
-  return candidate === aid || path.basename(candidate) === path.basename(aid);
+  const candidateBasename = path.basename(candidate);
+  const allowedBasename = path.basename(aid);
+  return candidate === aid || candidateBasename === allowedBasename ||
+    windowsExecutableStem(candidateBasename).toLowerCase() === allowedBasename.toLowerCase();
+}
+
+function windowsExecutableStem(v: string): string {
+  const extension = path.extname(v);
+  return WINDOWS_EXECUTABLE_EXTENSIONS.has(extension.toLowerCase()) ? v.slice(0, -extension.length) : v;
 }
 
 export function authorizeLaunch(bin: string, template: string, policy: ToolingEnvelopePolicy | null | undefined): string | null {
-  if (policy === undefined) return null;
-  if (policy === null) return 'tooling envelope refused malformed policy';
-  if (policy.enabled !== true) {
-    if (policy.enabled === false) return null;
-    return 'tooling envelope refused malformed policy';
-  }
+  if (policy === undefined || policy === null) return 'tooling envelope refused malformed policy';
+  if (policy.enabled !== true) return 'tooling envelope refused malformed policy';
   if (!Array.isArray(policy.allow_list)) return 'tooling envelope refused malformed policy';
   const candidateBin = binIdentity(bin);
   const candidateTemplate = normalizeTemplate(template);
@@ -137,6 +147,7 @@ export function resolveLaunch(item: Item, cfg: HandoverCfg): LaunchSpec {
     model: firstNonEmpty(str(item['model']), 'claude-opus-4-8'),
     effort: firstNonEmpty(str(item['effort']), cfg.claudeEffort),
     permission: firstNonEmpty(str(item['permission']), cfg.claudePermissionMode),
+    permissionBypass: item['permission_bypass'] === true,
     template: firstNonEmpty(cfg.agentCmdOverride, str(item['cmd_template']), DEFAULT_AGENT_CMD),
     mcp: str(item['mcp']),
     mcpEnv,
@@ -233,17 +244,52 @@ export class Pool {
 /** The run signal reported back to the server (#455 / INK-HANDOVER-2): exit code + a stderr tail so a
  *  budget/quota-exhausted run is classified `agent-unavailable` (trip the breaker + fail over) instead
  *  of retrying the same agent forever. `enoent` ⇒ the binary was missing (exit_code null). */
-type SpawnResult = {enoent: true} | {rc: number | null; stdout: string; stderr: string};
+type SpawnResult = {enoent: true} | {
+  rc: number | null;
+  stdout: string;
+  stderr: string;
+  timedOut?: boolean;
+};
+
+class BoundedTail {
+  private tail: Buffer = Buffer.alloc(0);
+  private truncated = false;
+
+  append(chunk: Buffer): void {
+    if (chunk.length >= MAX_CAPTURE_BYTES) {
+      this.tail = chunk.subarray(chunk.length - MAX_CAPTURE_BYTES);
+      this.truncated = true;
+      return;
+    }
+    const overflow = this.tail.length + chunk.length - MAX_CAPTURE_BYTES;
+    if (overflow > 0) {
+      this.tail = Buffer.concat([this.tail.subarray(overflow), chunk], MAX_CAPTURE_BYTES);
+      this.truncated = true;
+    } else {
+      this.tail = Buffer.concat([this.tail, chunk], this.tail.length + chunk.length);
+    }
+  }
+
+  text(): string {
+    const retained = this.truncated ? Buffer.concat([TRUNCATED_MARKER, this.tail]) : this.tail;
+    return retained.toString('utf-8');
+  }
+}
 
 /** Spawn the code-agent; capture stdout/stderr so output stays under the Ink renderer's control. */
-function spawnAgent(argv: string[], codedir: string, env: NodeJS.ProcessEnv): Promise<SpawnResult> {
+export function spawnAgent(
+  argv: string[], codedir: string, env: NodeJS.ProcessEnv, timeoutMs: number,
+): Promise<SpawnResult> {
   return new Promise((resolve) => {
     let done = false;
-    const outChunks: Buffer[] = [];
-    const errChunks: Buffer[] = [];
+    let terminating = false;
+    const stdoutTail = new BoundedTail();
+    const stderrTail = new BoundedTail();
+    let timer: NodeJS.Timeout | undefined;
     const fin = (r: SpawnResult): void => {
       if (!done) {
         done = true;
+        if (timer) clearTimeout(timer);
         resolve(r);
       }
     };
@@ -252,23 +298,37 @@ function spawnAgent(argv: string[], codedir: string, env: NodeJS.ProcessEnv): Pr
       cwd: codedir,
       stdio: ['ignore', 'pipe', 'pipe'],
       env,
+      detached: process.platform !== 'win32',
     });
     child.stdout?.on('data', (d: Buffer) => {
-      outChunks.push(d);
+      stdoutTail.append(d);
     });
     child.stderr?.on('data', (d: Buffer) => {
-      errChunks.push(d);
+      stderrTail.append(d);
     });
     child.on('error', (e) => {
-      const stdout = Buffer.concat(outChunks).toString('utf-8');
-      const stderr = Buffer.concat(errChunks).toString('utf-8');
+      if (terminating) return;
+      const stdout = stdoutTail.text();
+      const stderr = stderrTail.text();
       fin((e as NodeJS.ErrnoException).code === 'ENOENT' ? {enoent: true} : {rc: 1, stdout, stderr});
     });
     child.on('close', (code) => {
-      const stdout = Buffer.concat(outChunks).toString('utf-8');
-      const stderr = Buffer.concat(errChunks).toString('utf-8');
-      fin({rc: code, stdout, stderr});
+      if (terminating) return;
+      fin({rc: code, stdout: stdoutTail.text(), stderr: stderrTail.text()});
     });
+    timer = setTimeout(() => {
+      // #1491 (Grok review): if the coder already exited this tick (`exitCode` set) but its `close` event
+      // hasn't been delivered yet, do NOT declare a timeout — step aside and let `close` resolve with the
+      // real result, so a just-finished run whose feedback file is written is never discarded by the timer.
+      if (done || terminating || child.exitCode !== null) return;
+      terminating = true;
+      void killProcessTree(child).finally(() => fin({
+        rc: null,
+        stdout: stdoutTail.text(),
+        stderr: stderrTail.text(),
+        timedOut: true,
+      }));
+    }, timeoutMs);
   });
 }
 
@@ -300,6 +360,12 @@ export async function runHandover(
   await fs.writeFile(hoPath, hoText, 'utf-8');
 
   const spec = resolveLaunch(item, cfg); // INK-HANDOVER-1 (#503): bin/template/model/effort/permission/mcp
+  const bypassRequested = spec.permission === 'bypassPermissions' || spec.template.includes('--dangerously-skip-permissions');
+  if (bypassRequested && !spec.permissionBypass) {
+    const refusal = "permission bypass requires the agent's capabilities.permission_bypass=true opt-in";
+    log(`  ✗ ${refusal} — handover ${tid} skipped`);
+    return {fb: null, meta: {exit_code: null, stderr: refusal}};
+  }
   const fbName = `${tid}_${agent}-feedback.md`;
   const capName = `${tid}_${agent}-output.md`; // #443: deterministic {feedback} capture path
   // #1307: BUILD PRODUCT CODE in the active project's code root — the server ships it per `/pending`
@@ -334,7 +400,9 @@ export async function runHandover(
   const prompt =
     `Autonomously read and complete the handover at ${hoPath}. ` +
     `Follow any agent guide in this repo (e.g. AGENTS.md / CLAUDE.md). When done, write a ` +
-    `short result summary to ${fbPath}.`;
+    `short result summary to ${fbPath}. The FIRST line of that file must be \`status: done\` when ` +
+    `complete (the pipeline advances ONLY on \`status: done\`), otherwise \`status: blocked\` or ` +
+    `\`status: clarification_needed\`.`;
 
   const argv = buildAgentArgv(spec.template, {
     bin: spec.bin,
@@ -355,7 +423,14 @@ export async function runHandover(
   // #480: the spawned MCP inherits the memory connection from the agent's env — it travels here, NEVER
   // on the MCP JSON-RPC wire (secret-free). Empty mcp_env under open/token ⇒ byte-identical launch.
   const env: NodeJS.ProcessEnv = {...process.env, PYTHONIOENCODING: 'utf-8', ...spec.mcpEnv};
-  const res = await spawnAgent(argv, launchCwd, env);
+  // Defense-in-depth: a malformed /pending payload (<=0 fires an immediate kill; NaN/Infinity/overflow break
+  // setTimeout) must not be trusted blindly — an out-of-sane-range value falls back to the default. 86400s
+  // (24h) is a generous ceiling above the schema's 7200s max, so no valid value is ever rejected.
+  const rawTimeoutS = Number(item['timeout_s']);
+  const timeoutS = Number.isFinite(rawTimeoutS) && rawTimeoutS > 0 && rawTimeoutS <= 86400
+    ? rawTimeoutS : CODER_TIMEOUT_DEFAULT_S;
+  const timeoutMs = Math.round(timeoutS * 1000);
+  const res = await spawnAgent(argv, launchCwd, env, timeoutMs);
   if ('enoent' in res) {
     log(`  ✗ code-agent binary '${argv[0] ?? spec.bin}' not found (set GX10_CLAUDE_BIN / GX10_AGENT_CMD) — handover ${tid} skipped`);
     return {fb: null, meta: {exit_code: null, stderr: 'binary-not-found'}};
@@ -376,6 +451,14 @@ export async function runHandover(
     log(`  ⓘ ${agent} stderr (${res.stderr.length} chars) -> ${logPath}`);
     const tail = res.stderr.trim().split(/\r?\n/).slice(-2).join(' | ').slice(-200);
     if (tail) log(`     ${tail}`);
+  }
+  if (res.timedOut) {
+    // A hung coder held its pool claim forever (#1491). The tree was killed; report a plain failure so the
+    // server releases the claim and retries to budget (a `timeout` stderr matches no exhausted pattern →
+    // `task-failed`, not `agent-unavailable`: no breaker trip / no peer failover). Any feedback file the
+    // coder wrote in its last instant is intentionally ignored — a killed coder's result is not trusted.
+    log(`  ✗ code-agent ${tid} timed out after ${Math.round(timeoutMs / 1000)}s — killed`);
+    return {fb: null, meta: {exit_code: null, stderr: 'timeout'}};
   }
   const meta = {exit_code: res.rc, stderr: res.stderr.slice(-STDERR_TAIL_CHARS)};
 
@@ -437,6 +520,11 @@ export async function processOne(
   const tid = str(item['id']);
   const agent = str(item['agent'], 'OPUS').toUpperCase();
   try {
+    await srv.claim(tid, agent);
+  } catch (e) {
+    log(`  ⚠ ${tid}: /claim failed (continuing): ${e instanceof Error ? e.message : String(e)}`);
+  }
+  try {
     const {fb, meta} = await runHandover(item, codedir, cfg, log);
     // INK-HANDOVER-2 (#503): ALWAYS report the run signal (even with no feedback) so the server can
     // classify a budget-exhausted run → trip the #455 breaker + fail over on the next poll, instead of
@@ -462,6 +550,11 @@ export async function processOne(
     }
   } catch (e) {
     log(`  ✗ ${tid}: upload/code-agent failed: ${e instanceof Error ? e.message : String(e)}`);
+  }
+  try {
+    await srv.unclaim(tid);
+  } catch (e) {
+    log(`  ⚠ ${tid}: /unclaim failed (continuing): ${e instanceof Error ? e.message : String(e)}`);
   }
   claimed.delete(tid);
   return false;

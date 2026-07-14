@@ -51,8 +51,8 @@ silently degrading when the mode can't be honored:
 - An unknown value → fails closed.
 
 **`setup.type` is the single boot control for dispatcher activation.** Whether the provider dispatcher
-runs is derived from `setup.type` alone (`server` → inactive, `local` → active); a `providers.enabled` /
-`GX10_PROVIDERS` flag does **not** gate activation and is not consulted at this level. Configure the
+runs is derived from `setup.type` alone (`server` → inactive, `local` → active). The retired
+`providers.enabled` / `GX10_PROVIDERS` inputs are warning-only tombstones, not a second gate. Configure the
 topology with `setup.type`, not with a separate provider on/off switch.
 
 **Security override:** with `security.profile = sealed` (no egress) the engine is forced to `server`

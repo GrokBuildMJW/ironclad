@@ -4,6 +4,208 @@ All notable changes to Ironclad are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/); the project is **pre-release** (0.0.x).
 Released versions are listed below.
 
+## [0.0.30]
+### Security
+
+- **Secure deployment defaults (#1469 F8):** fresh servers bind loopback under the unauthenticated `open`
+  profile and refuse non-loopback exposure unless token/sealed auth or the named
+  `security.allow_unauthenticated_bind` override is explicit. Search and forge now require explicit enablement;
+  Claude coders no longer default to `bypassPermissions` or `--dangerously-skip-permissions`, with bypass
+  restored only by a per-agent capability opt-in. Connection, first-token, and provider-CLI timeouts now have
+  finite defaults and hard ceilings; worker/autopilot concurrency, retry, and autoplan task budgets are bounded
+  and autonomous writers reject zero-as-unlimited. Existing private deployments retain their prior behavior via
+  explicit private config rather than weaker public defaults.
+
+### Added
+
+- **Generated configuration reference and switch parity guard (#1470 F9):** `config-runtime.md` now derives
+  every effective leaf, tombstone/alias, external memory/warm seam, and operational-switch inventory from
+  the typed schema. Private CI rejects byte drift, requires schema/documented/AST-read switch equality,
+  flags raw hidden boolean gates, and proves the complete schema boot-only set matches both runtime and
+  command-spec frozen metadata, including against the staged public export.
+
+### Fixed
+
+- **Release hygiene:** raised the build-system `setuptools` floor to `>=77` to match the PEP 639 SPDX
+  `license` metadata the package uses, and corrected public documentation — the MPR README now reflects MPR as
+  an always-on core built-in (default on; no separate deploy step) instead of the retired loadable-plugin flow.
+
+- **Fail-closed MPR retention (M19, #1495):** the reserved §9 `prune_runs` utility now protects a run
+  whose provenance is unreadable, missing, or incomplete (a provenance object without a `violations` key)
+  exactly like a violation, because its violation status cannot be proven clear. A directory deletion must also be verified complete before its TaskStore index entry is
+  dropped or the run is reported deleted; a failed deletion is no longer reported as success.
+
+- **Serialized Ink session heartbeats (M26, #1492):** the Phase-d heartbeat is now a serial,
+  self-scheduling loop that rechecks shutdown state after each network wait. Heartbeats and session reopens
+  cannot overlap, a heartbeat that resolves after `stop()` cannot reopen the channel, and a reopen already
+  in flight at shutdown is closed instead of leaving the sealed server session live until its TTL expires —
+  `stop()` awaits the in-flight tick, so the server is sealed by the time it returns (robust even if the caller
+  exits immediately afterwards). A surprise error in a heartbeat can no longer permanently kill the loop.
+
+- **Shell-safe client updates (M28, #1496):** `/update` no longer interpolates the configured source path
+  into shell command strings. Update steps are executable-plus-argv launches, run without a shell on POSIX
+  and through an argv-only `cmd.exe` wrapper for Windows npm compatibility, while source paths containing
+  shell/cmd metacharacters are refused before any process starts.
+
+- **Transactional multi-file generator updates (M22, #1494):** the paved-road generator now renders and
+  decides every target before committing all changed files and the merge-baseline state in one
+  rollback-protected phase. A target or state write failure restores prior file/state bytes (and removes
+  newly created targets), so a partial upgrade can no longer leave the on-disk tree ahead of stale state.
+
+- **Atomic catalogue install and update (M21, #1493):** tools and playbooks are now copied to a
+  same-filesystem sibling staging path before an atomic swap. The working version remains live until the
+  replacement is complete, failures roll back and clean staging/backup paths, and playbook overwrite no
+  longer deletes the installed directory before `copytree` succeeds. Backup removal after a successful swap is
+  best-effort (a lock can no longer turn a completed install into a reported failure), a double fault where the
+  swap and the restore both fail preserves the original in the backup instead of deleting it, and skill
+  discovery skips hidden (`.`-prefixed) directories so a leftover staging/backup copy can never shadow the real
+  skill with a stale version.
+
+- **Prompt tool-result delivery after transient transport failures (#1490 M27):** Ink now drains its
+  buffered `/tool-result` queue on every connected status poll instead of waiting for a reconnect edge,
+  while the Python client retries network, timeout, and HTTP 5xx failures with bounded backoff. Both clients
+  still drop permanent HTTP 4xx rejections, preventing a brief result-post blip from stalling `ToolBridge`.
+
+- **Bounded code-agent execution (#1491):** Python and Ink handover clients now enforce the live
+  `code_agents.timeout_s` wall-clock, launch each coder in a dedicated process group, and kill its complete
+  process tree on timeout so a hung agent cannot retain a worker claim forever. Ink also retains only bounded
+  stdout/stderr tails, preventing an unbounded coder stream from growing client memory or its diagnostic log.
+
+- **Whole-tree model command termination (#1489):** Python and Ink now launch `execute_command` in a dedicated
+  process group and kill and reap every descendant on timeout or cancellation. Bubblewrap also uses
+  `--die-with-parent --unshare-pid`, preventing a sandboxed descendant from surviving its parent.
+
+- **Bounded model-tool filesystem I/O (#1488):** Python and Ink `read_file`, `list_directory`, and
+  `search_files` now enforce byte, entry, file-scan, and hit ceilings before allocating or decoding input.
+  Oversized reads are refused, directory iteration stops after the cap-plus-one overflow probe, and search
+  short-circuits with an explicit truncation marker instead of walking or loading an unbounded file/tree.
+
+- **Atomic runtime configuration application (F6b, #1467):** `/config set` now deep-clones and validates
+  the complete candidate, derives unpublished runtime state, commits globals and reversible integrations
+  under a config lock, and publishes the candidate only after total success. Validation, derivation, commit,
+  and hook/store/thread failures restore the prior runtime snapshot, retain the original config tree, and
+  emit one red refusal without a green success; startup validates the final merged multi-profile projection
+  before publishing config or runtime state.
+
+- **Typed configuration control plane (F6a, #1467):** derive complete code defaults and boot-only metadata
+  from one stdlib-only leaf schema; strictly reject ambiguous file/dict booleans, invalid enums/ranges and
+  relationships, unsupported worker write modes, and incomplete multi-tenant enablement while using one
+  explicit environment boolean parser.
+
+- **Dead and contradictory runtime switches are retired or renamed (#1468 F7).** Provider enablement now
+  derives only from `setup.type`; dead provider-scoring, legacy-lesson, product-conflict, and watcher config
+  leaves are warning-only tombstones. `framing_notes.enabled` and `process.hints_enabled` replace their legacy
+  names through one-release aliases, with the former scoped only to framing capture and the latter only to
+  ACE-backed pre-turn hints. `/auto on|off` owns watcher state without a config mirror, and live quality tuning
+  atomically rebuilds the always-on breaker while retaining bounded score history, preserving a live latch or
+  recovered state, and recognizing only a newly sustained trailing low-score streak.
+
+- **Finite failure strategy and progress heartbeat are always on (#1466 F5b).** The retired
+  `strategy.enabled` switch is now a warning-only tombstone; every failed coder run is classified and charged
+  to a positive bounded per-task attempt budget. Spending that budget durably marks the task
+  `blocked_kind="escalated"`, emits the human-escalation hook, stops `/feedback` before breaker/no-feedback
+  retry handling, and excludes the terminal task from pending clients, claim/unclaim reopening, and manual or
+  reconciler launches. The heartbeat now defaults to a finite 900 seconds and refuses zero, negative, or
+  non-finite tuning, while deliberately preserving the no-false-positive rule for manually managed tasks that
+  have never produced a coder-log or feedback signal.
+
+- **Mandatory validation and anti-guessing at staging (#1466 F5a).** ACK task validation, required
+  deterministic verifier rules, ambiguity detection, and the output-quality breaker are now always on.
+  Create and re-hand staging share one ordered pre-write boundary; validation/verifier/detector failures and
+  latched quality trips refuse before `TaskStore.create()` or handover writes. Legacy enable keys are
+  warning-only tombstones, while grounding remains advisory and quality/grounding thresholds remain tuning.
+  Stored blocked-state annotations no longer invalidate recovery re-hands, and an at/above-threshold verifier
+  score now resets a latched quality hold so a passing submission can resume staging. An available memory tier
+  with no grounding hits is now recorded as unavailable instead of a false `0.0` grounding failure, while
+  partial evidence remains a real degradation signal. Detector-internal ambiguity errors refuse staging, and
+  the new `/quality reset` operator command guarantees recovery from any latched hold and threshold setting.
+
+- Learned-state adaptation is always a snapshot + deep-candidate + atomic-promote-or-quarantine transaction
+  (#1465 F4). An injected evaluator promotes only a measured non-regression and quarantines regressions or
+  unavailable scores. Without one, the default structural gate promotes success- and failure-learning unless
+  the candidate empties or loses more than 50% of a non-empty playbook; catastrophic loss is quarantined and
+  the snapshot remains the rollback net. The retired `ace.safe_promote` key is a warning-only tombstone.
+- Egress enforcement is always on and fail-closed (#1464 F3c). The retired
+  `security.egress_analysis.enabled` / `GX10_EGRESS_ANALYSIS_ENABLED` controls are warning-only tombstones;
+  posture is declared solely by `network: none|declared|open` in the approved design `## Build policy`.
+  Designs with no build-policy section advance without analysis, while a present section with a
+  missing/invalid posture and restrictive-posture no-root or analyzer failures refuse advance.
+- Model command isolation and untrusted-result fencing are mandatory and fail closed (#1464). `security.sandbox`
+  now accepts only `auto|bwrap|firejail` (default `auto`); legacy `off`/`none` values warn and are ignored.
+  Missing/failed backends and Windows refuse before any subprocess, including the versioned client-bridge lane,
+  while Ink `/sh` remains a separate explicit operator channel. Production Linux must provide `bwrap` or
+  `firejail`. Every untrusted serialized result—including web search, parallel/provider reasoning, memory,
+  MPR, and dynamic plugins—now crosses one mandatory fence without destructively capping structured payloads;
+  wrapper failure withholds raw bytes. The former injection-defense config/env controls are tombstones.
+- Coder execution protections are mandatory and fail closed (#1464): tooling authorization now derives exact
+  enabled CLI launch tuples when its boot-only allow-list is omitted, denies explicit-empty/malformed policy,
+  and is enforced in Python and Ink launch lanes. Bare logical commands now authorize probe-resolved Windows
+  executables by a shared known-extension stem fallback without weakening byte-exact absolute-path pins.
+  Mutating tools require a durable audit intent before dispatch and append a result afterward; ledger failure
+  blocks pre-action or surfaces latched degraded audit health through refusal until an intent append recovers.
+  The former tooling-envelope and audit enable controls are warning-only tombstones. Engine-owned in-process
+  reasoning fan-out and CLI-to-local spill remain available; external coder processes are still authorized at
+  their actual spawn sites and refused fail-closed on a mismatch.
+- Completion authority is always on (#1463): only a selected, readable, non-empty feedback artifact with
+  normalized `status: done` can advance a task; all other signals fail closed before egress and transition.
+  Local and remote autonomous lanes share the exit-zero compatibility stamp, both client prompts require the
+  first-line status contract, and quoted or trailing-punctuation `done` tokens normalize safely. The former
+  `advance_gate.enabled` switch is now a warning-only tombstone that cannot be set at runtime.
+- Design lifecycle protection is always on (#1462): removed the destructive single-document overwrite and
+  approval bypass, made proposal promotion and legacy-vault migration atomic and non-destructive, made
+  approved-standard injection fail closed before task/handover writes, and retired `design_gate.enabled` as
+  a warning-only tombstone that cannot be set at runtime.
+- Client-run task lifecycle (#1455): added idempotent `/claim` and `/unclaim` transitions and wired both
+  Python and TypeScript clients to show locally executed work as `in_progress`, release failed runs for
+  retry, reject unknown claiming agents, and keep signal transport failures from aborting coder runs.
+
+### Added
+
+- F-B Rust R5 (#1450): consolidated the public docs for the completed Rust egress lane, documenting
+  the Python and Rust analyzer matrix, Rust probe limitations, ADR cross-links, and the default-off
+  best-effort tripwire framing.
+- F-B Rust R4 (#1449): wired Rust dependency, source-scan, and hermetic build probes into the public
+  egress dispatch paths with per-ecosystem fail-soft isolation, Rust-only ecosystem-tagged findings,
+  unchanged Python-only result shapes, and an engine-side offline Cargo metadata feature resolver that
+  reuses the Rust probe-safety gate and neutralized Cargo environment.
+- F-B Rust R3 (#1448): added the security-critical two-phase Rust hermetic build probe with
+  probe-safe Cargo config gating, neutralized Cargo/Rust environment, ephemeral Cargo state,
+  network-allowed `cargo fetch --locked`, sandboxed offline compile-only build/test phases, and
+  block-only attribution for clear sandbox network-denial signatures under `network:none`. The
+  probe-safe gate rejects legacy `.cargo/config`, credential providers, `rustflags`,
+  linker/runner target overrides, path toolchains, unreadable/odd Cargo config, and pins
+  `RUSTUP_TOOLCHAIN=stable` during fetch.
+- F-B Rust R2 (#1447): added a pure, fail-soft Rust static source egress scanner for advisory-only
+  findings on `std::net` imports/calls, known egress-capable crate uses via the shared Rust crate set
+  with identifier folding, and literal `Command::new` shell-outs to network tools.
+- F-B Rust R1 (#1446): added a pure, fail-soft Cargo dependency-closure egress analyzer
+  with a versioned concrete Rust known-egress crate set, feature-gated crate handling via
+  injected active feature data, and ecosystem-namespaced allow/deny policy selection.
+- F-B S6 (#1439): docs consistency pass for the shipped egress tripwire, correcting stale
+  "future", "deferred", and "guidance-only" claims while preserving that `_design_build_check` never
+  compares `network`.
+- F-B S5 (#1438): added the post-coder advance-time egress enforcement hook. The advance path reads the
+  approved design build policy, refuses `severity: block` analyzer findings and restrictive-posture failures
+  while leaving the task in progress, and surfaces advisory findings in the advance log (hardened to always-on
+  and fail-closed in F3c, #1464).
+- F-B S4 (#1437): added an engine-side Python build/test hermeticity runner that discovers pytest and
+  import-checkable wheel-build commands, resolves its ADR-0013 sandbox backend independently of
+  `security.sandbox`, runs contained probes with network isolation for `network:none`, and degrades
+  platform-honestly to advisory findings when no backend can enforce egress containment.
+- F-B S3 (#1436): added a pure, fail-soft Python static egress capability scanner for advisory-only
+  findings on network imports, raw socket/URL opener calls, literal shell-outs to network tools, and
+  best-effort third-party egress import names, with deterministic output and vendor/build directory skips.
+- F-B S2 (#1435): added a pure Python dependency-closure egress analyzer with a bundled
+  versioned known-egress distribution set. The resolver treats fully pinned requirements files as
+  full closure inputs only when every requirement line is a plain pin, falls back to direct manifest
+  dependencies when requirements files contain no package names, ships as `ack.egress`, and reports
+  blocking versus advisory findings from the S1 egress policy shape.
+- F-B S1 (#1434): added a pure, fail-soft `_design_egress_policy(slug)` reader for optional
+  `## Build policy` egress lines (`network: none|declared|open`, `allow`, `deny`) on the approved design.
+  The reader defaults to open/no lists on missing, unapproved, malformed, oversized, unreadable, or unknown
+  policy input and stays separate from `_design_typed` / `_design_build_check`, so `network` is not a
+  build-boundary typed comparison.
+
 ## [0.0.29]
 ### Fixed
 

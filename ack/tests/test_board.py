@@ -96,8 +96,9 @@ def test_board_survives_malformed_task(monkeypatch, tmp_path):
 
 
 def test_board_autoregen_on_stage_handover(monkeypatch, tmp_path):
-    _setup(monkeypatch, tmp_path)                          # design_gate off by default → feature not blocked
-    tj = json.dumps({"type": "feature", "priority": "high", "title": "wired task", "description": "y"})
+    _setup(monkeypatch, tmp_path)
+    tj = json.dumps({"type": "documentation", "priority": "high", "title": "Render the wired task",
+                     "description": "Render the staged task on the generated project board after handover."})
     gx10._stage_handover(None, "OPUS", "handover", tj)     # → _reconcile_active_soft → _write_board (backstop)
     board = gx10.vault_root() / gx10.active_slug() / gx10.BOARD_FILENAME
     assert board.is_file() and "wired task" in board.read_text(encoding="utf-8")

@@ -79,6 +79,14 @@ export class Server {
     return (r['pending'] as Json[]) ?? [];
   }
 
+  claim(taskId: string, agent: string): Promise<Json> {
+    return this.req('POST', '/claim', {task_id: taskId, agent});
+  }
+
+  unclaim(taskId: string): Promise<Json> {
+    return this.req('POST', '/unclaim', {task_id: taskId});
+  }
+
   /** #452: which coding agents are bound (registry + boot probe) + the fan-out provider lane. */
   async coders(): Promise<Json> {
     return this.req('GET', '/coders');

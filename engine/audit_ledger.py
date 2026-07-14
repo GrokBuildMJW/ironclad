@@ -5,7 +5,7 @@ An append-only, **tamper-evident** record of the orchestrator's mutating tool ac
 the same proven scheme the dev-process transition ledger uses), so any edit, reorder, or truncation of the
 audit trail is detectable by :func:`verify_chain` — even though the file itself is writable. Core-owned +
 stdlib-only (the dev-process ledger is private substrate this must not import); pure/deterministic apart from
-the caller-supplied timestamp. Default-off at the call site (opt-in `audit.enabled`).
+the caller-supplied timestamp. Mutating actions use it as a mandatory pre-dispatch gate.
 """
 from __future__ import annotations
 
@@ -64,10 +64,10 @@ def verify_chain(path: "str | Path") -> "List[str]":
 
 
 def record_action(path: "str | Path", action: str, detail: str, *, ok: bool, ts: float,
-                  actor: str = "orchestrator", reason: str = "") -> dict:
+                  actor: str = "orchestrator", reason: str = "", phase: str = "result") -> dict:
     """Append a per-action audit record capturing WHO (*actor*) did WHAT (*action* on *detail*), WHEN (*ts*),
     WHY (*reason* — the context the action served), and whether it succeeded (*ok*). *detail* / *reason* are
     truncated so a huge argument can't bloat the trail. Never the file/command CONTENT (an audit trail records
     the action, not the payload)."""
-    return append(path, {"actor": actor, "action": action, "detail": (detail or "")[:512],
+    return append(path, {"actor": actor, "action": action, "phase": phase, "detail": (detail or "")[:512],
                          "reason": (reason or "")[:200], "ok": bool(ok), "ts": float(ts)})

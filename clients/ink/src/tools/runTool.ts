@@ -17,15 +17,25 @@
  * else (rglob traversal order, move/copy-into-existing-dir, code-point lengths, splitlines,
  * int() coercion incl. bool, required-arg guards) is matched to the source.
  */
-import {promises as fs} from 'node:fs';
+import {promises as fs, type Dirent} from 'node:fs';
 import path from 'node:path';
-import {spawn} from 'node:child_process';
+import {spawn, type ChildProcess} from 'node:child_process';
 import {detectShell, gitBash} from './shell.js';
-import {classifyEntries, directoryEntryNames, fmtCount, listingTargetForCommand} from './listingCount.js';
+import {directoryEntryNames, fmtCount, listingTargetForCommand} from './listingCount.js';
 import {rglob} from './glob.js';
+import {killProcessTree} from './procTree.js';
 
 const MAX_FILE_CHARS = 24000; // gx10.py:102
 const LIST_DIR_HARD_CAP = 200; // gx10.py:103
+// #1488: cap bytes before decoding/allocation. MAX_FILE_BYTES is the ALLOCATION ceiling (OOM protection),
+// NOT the model-output cap (that stays MAX_FILE_CHARS) — high enough to load a normal repo file so #1047
+// ranged/pattern reads of large files keep working, low enough to refuse a multi-GB file. Search is
+// decoupled: it scans many files one-at-a-time, so its per-file cap is kept small. Kept in sync with
+// gx10.py (_MAX_FILE_BYTES / _SEARCH_MAX_FILE_BYTES) so a file refused server-side is refused client-side.
+const MAX_FILE_BYTES = 16 * 1024 * 1024;
+const SEARCH_MAX_FILES = LIST_DIR_HARD_CAP * 5;
+const SEARCH_MAX_FILE_BYTES = 1024 * 1024;
+const SEARCH_HIT_CAP = 50;
 
 type Args = Record<string, unknown>;
 
@@ -71,6 +81,31 @@ async function mkdirp(dir: string): Promise<void> {
   if (dir) await fs.mkdir(dir, {recursive: true});
 }
 
+/** Stat first (so a sparse/known-large file is rejected without reading), then protect the stat/open race
+ * with a byte-limited fd read. The single allocation is fixed and never scales with the source file. */
+async function readBoundedFile(
+  p: string,
+  maxBytes: number,
+  rejectKnownOversize = true,
+): Promise<{buf: Buffer; size: number; over: boolean}> {
+  const fh = await fs.open(p, 'r');
+  try {
+    let size = Number((await fh.stat()).size);
+    if (size > maxBytes && rejectKnownOversize) return {buf: Buffer.alloc(0), size, over: true};
+    const buf = Buffer.allocUnsafe(maxBytes + 1);
+    let offset = 0;
+    while (offset < buf.length) {
+      const {bytesRead} = await fh.read(buf, offset, buf.length - offset, offset);
+      if (bytesRead === 0) break;
+      offset += bytesRead;
+    }
+    if (offset > maxBytes) size = Math.max(size, Number((await fh.stat()).size), offset);
+    return {buf: buf.subarray(0, Math.min(offset, maxBytes)), size, over: size > maxBytes || offset > maxBytes};
+  } finally {
+    await fh.close();
+  }
+}
+
 /** ≙ subprocess.run with DEVNULL stdin, UTF-8-lossy capture, timeout. */
 // #459: harden the PowerShell invocation — prepend $ProgressPreference='SilentlyContinue' so WriteProgress
 // can never draw a progress bar into the renderer-owned conhost (the verified scaling break). Mirrors the
@@ -105,42 +140,109 @@ export function shellGuard(command: string): string | null {
 // code null → spawn error / timeout / signal-kill (text carries the ERROR string or raw output);
 // the caller needs the exit code to gate the #1193 listing-count prepend on real success.
 type ExecResult = {text: string; code: number | null};
+type SandboxPolicy = 'auto' | 'bwrap' | 'firejail';
+const SANDBOXED_EXEC_WIRE_TOOL = 'execute_command_sandboxed_v1';
 
-function execCommand(command: string, timeoutS: number, cwd: string): Promise<ExecResult> {
+async function terminateProcessTree(child: ChildProcess): Promise<void> {
+  await killProcessTree(child);
+}
+
+function collectChild(
+  child: ChildProcess, timeoutS: number, spawnError: string | null, signal?: AbortSignal,
+): Promise<ExecResult> {
   return new Promise((resolve) => {
-    let child;
-    if (process.platform === 'win32') {
-      // #1177: route per command so BOTH shells work — a bash command runs in Git Bash (when installed),
-      // a PowerShell cmdlet in PowerShell; neither is forced. Falls back to PowerShell without Git Bash.
-      const bash = gitBash();
-      child =
-        bash && detectShell(command) === 'bash'
-          ? spawn(bash, ['-lc', command], {cwd, stdio: ['ignore', 'pipe', 'pipe']})
-          : spawn('powershell', winPowershellArgs(command), {cwd, stdio: ['ignore', 'pipe', 'pipe']});
-    } else {
-      child = spawn(command, {shell: true, cwd, stdio: ['ignore', 'pipe', 'pipe']});
-    }
     const out: Buffer[] = [];
     const err: Buffer[] = [];
     let done = false;
+    let terminating = false;
+    let timer: NodeJS.Timeout | undefined;
     const finish = (r: ExecResult): void => {
       if (done) return;
       done = true;
-      clearTimeout(timer);
+      if (timer) clearTimeout(timer);
+      signal?.removeEventListener('abort', abort);
       resolve(r);
     };
-    const timer = setTimeout(() => {
-      child.kill();
-      finish({text: `ERROR: Timeout after ${timeoutS}s`, code: null});
-    }, timeoutS * 1000);
+    const stop = (r: ExecResult): void => {
+      if (done || terminating) return;
+      terminating = true;
+      void terminateProcessTree(child).finally(() => finish(r));
+    };
+    const abort = (): void => stop({text: 'ERROR: cancelled', code: null});
+    timer = setTimeout(
+      () => stop({text: `ERROR: Timeout after ${timeoutS}s`, code: null}),
+      timeoutS * 1000,
+    );
     child.stdout?.on('data', (d: Buffer) => out.push(d));
     child.stderr?.on('data', (d: Buffer) => err.push(d));
-    child.on('error', (e) => finish({text: `ERROR: ${e.message}`, code: null}));
+    child.on('error', (e) => {
+      if (!terminating) finish({text: spawnError ?? `ERROR: ${e.message}`, code: null});
+    });
     child.on('close', (code) => {
+      if (terminating) return;
       const combined = (Buffer.concat(out).toString('utf-8') + Buffer.concat(err).toString('utf-8')).trim();
       finish({text: combined, code});
     });
+    signal?.addEventListener('abort', abort, {once: true});
+    if (signal?.aborted) abort();
   });
+}
+
+function execCommand(command: string, timeoutS: number, cwd: string): Promise<ExecResult> {
+  let child: ChildProcess;
+  if (process.platform === 'win32') {
+    // #1177: route per command so BOTH shells work — a bash command runs in Git Bash (when installed),
+    // a PowerShell cmdlet in PowerShell; neither is forced. Falls back to PowerShell without Git Bash.
+    const bash = gitBash();
+    child = bash && detectShell(command) === 'bash'
+      ? spawn(bash, ['-lc', command], {cwd, detached: false, stdio: ['ignore', 'pipe', 'pipe']})
+      : spawn('powershell', winPowershellArgs(command), {cwd, detached: false, stdio: ['ignore', 'pipe', 'pipe']});
+  } else {
+    child = spawn(command, {shell: true, cwd, detached: true, stdio: ['ignore', 'pipe', 'pipe']});
+  }
+  return collectChild(child, timeoutS, null);
+}
+
+async function findSandboxBackend(policy: SandboxPolicy): Promise<'bwrap' | 'firejail' | null> {
+  if (process.platform === 'win32') return null;
+  const candidates: Array<'bwrap' | 'firejail'> = policy === 'auto' ? ['bwrap', 'firejail'] : [policy];
+  const dirs = (process.env.PATH ?? '').split(path.delimiter).filter(Boolean);
+  for (const candidate of candidates) {
+    for (const dir of dirs) {
+      try {
+        await fs.access(path.join(dir, candidate));
+        return candidate;
+      } catch {
+        /* keep searching PATH */
+      }
+    }
+  }
+  return null;
+}
+
+function execSandboxed(
+  backend: 'bwrap' | 'firejail', command: string, timeoutS: number, cwd: string, signal?: AbortSignal,
+): Promise<ExecResult> {
+  const argv = backend === 'bwrap'
+    ? ['--die-with-parent', '--unshare-pid', '--dev-bind', '/', '/', '--proc', '/proc', '--unshare-net', '--', 'sh', '-c', command]
+    : ['--quiet', '--net=none', '--', 'sh', '-c', command];
+  const child = spawn(backend, argv, {
+    cwd, detached: process.platform !== 'win32', stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  return collectChild(
+    child, timeoutS,
+    'ERROR: execute_command refused: mandatory sandbox backend failed to start; Ironclad fails closed.',
+    signal,
+  );
+}
+
+/** Explicit operator channel. It is intentionally separate from model `execute_command` and never used by
+ * the tool bridge. The renderer-safety deny-list remains, but no model sandbox policy is applied. */
+export async function runOperatorShell(command: string, baseCwd = process.cwd()): Promise<string> {
+  const blocked = shellGuard(command);
+  if (blocked !== null) return `BLOCKED: operator /sh refuses ${blocked} — it can corrupt the display or hang the session (#459).`;
+  const r = await execCommand(command, 30, baseCwd);
+  return r.text || `(exit ${r.code ?? 0}, no output)`;
 }
 
 /** ≙ Python str.splitlines() (no keepends) for the common separators: split on \r\n / \r / \n and drop the
@@ -209,7 +311,9 @@ function rangedRead(text: string, args: Args): string | null {
 }
 
 // ── dispatch ─────────────────────────────────────────────────────────────────
-export async function runTool(name: string, args: Args, baseCwd?: string): Promise<string> {
+export async function runTool(
+  name: string, args: Args, baseCwd?: string, sandboxPolicy = 'auto', signal?: AbortSignal,
+): Promise<string> {
   // #1317: run the bridged tool in the server-shipped active-project cwd (`baseCwd`) when it exists on THIS
   // host (code_locality=mount); otherwise the client's own process.cwd() (remote/sealed / an older engine
   // that ships no cwd) — byte-identical fallback. Every relative path arg + execute_command resolves
@@ -232,17 +336,21 @@ export async function runTool(name: string, args: Args, baseCwd?: string): Promi
   // arg for display and use R(arg) only for the actual fs operation target.
   const R = (v: string): string => (override && !path.isAbsolute(v) ? path.resolve(base, v) : v);
   try {
-    switch (name) {
+    const toolName = name === SANDBOXED_EXEC_WIRE_TOOL ? 'execute_command' : name;
+    switch (toolName) {
       case 'read_file': {
         const p = R(reqStr(args, 'path'));
-        let buf: Buffer;
+        let bounded: {buf: Buffer; size: number; over: boolean};
         try {
-          buf = await fs.readFile(p);
+          bounded = await readBoundedFile(p, MAX_FILE_BYTES);
         } catch (e) {
           if (errCode(e) === 'ENOENT') return `ERROR: Not found: ${args['path']}`;
           throw e;
         }
-        const text = buf.toString('utf-8');
+        if (bounded.over) {
+          return `ERROR: read_file refused: file too large — ${bounded.size} bytes, cap ${MAX_FILE_BYTES} bytes`;
+        }
+        const text = bounded.buf.toString('utf-8');
         // #1047: a targeted ranged/pattern read returns only the relevant slice; a bad range/pattern
         // falls through to the head+tail cap below (≙ gx10.py `_read_file_ranged`).
         const ranged = rangedRead(text, args);
@@ -277,20 +385,30 @@ export async function runTool(name: string, args: Args, baseCwd?: string): Promi
       case 'list_directory': {
         const rawArg = args['path'] === undefined ? '.' : String(args['path']);
         const raw = R(rawArg);                                   // resolved target for readdir/classify/stat
-        let entries;
+        const entries: Dirent[] = [];
+        let overflow = false;
         try {
-          entries = await fs.readdir(raw, {withFileTypes: true});
+          const dir = await fs.opendir(raw);
+          for await (const entry of dir) {
+            entries.push(entry);
+            if (entries.length > LIST_DIR_HARD_CAP) {
+              overflow = true;
+              break;
+            }
+          }
         } catch (e) {
           if (errCode(e) === 'ENOENT') return `ERROR: Not found: ${pyPathStr(rawArg)}`;   // #1317: raw path, parity
           throw e;
         }
         const total = entries.length;
-        // #1202: ONE readdir snapshot feeds the count, the [D]/[F] markers AND the sort — no TOCTOU pair
-        // (a second readdir could desync the count from the listed items, even negative). Classify the
-        // ALREADY-READ dirents with the shared symlink-FOLLOWING helper (≙ Python Path.is_dir()), so a
-        // symlink-to-dir is a directory here exactly as in the engine and the listing-header path.
-        const classified = await classifyEntries(raw, entries);
-        const dirSet = new Set(classified.dirs);
+        // Classify only the bounded snapshot, following symlinks like Python Path.is_dir().
+        const dirSet = new Set((await Promise.all(entries.map(async (e) => {
+          try {
+            return (await fs.stat(path.join(raw, e.name))).isDirectory() ? e.name : null;
+          } catch {
+            return null;
+          }
+        }))).filter((name): name is string => name !== null));
         let items = entries.map((e) => ({e, isDir: dirSet.has(e.name)}));
         if (args['sort'] === 'time') {
           const withM = await Promise.all(
@@ -319,11 +437,19 @@ export async function runTool(name: string, args: Args, baseCwd?: string): Promi
         // #1183: a deterministic count header of the FULL set — LLMs miscount a list (the orchestrator, and
         // me); state the exact numbers so the model reports them verbatim instead of re-counting.
         const nDirs = dirSet.size; // from the SAME snapshot as total → 0 ≤ nDirs ≤ total always
-        const count = fmtCount(nDirs, total - nDirs); // ≙ gx10._fmt_count, shared with the listing header
+        const count = `${overflow ? 'At least ' : ''}${fmtCount(nDirs, total - nDirs)}`;
 
         let out = lines.length ? `${count}\n${lines.join('\n')}` : '(empty)';
         const shown = lines.length;
-        if (shown < total) {
+        if (overflow) {
+          // #1488 M1: an overflowing dir samples the first LIST_DIR_HARD_CAP entries in filesystem order,
+          // so a sort/limit ranks only this partial sample, NOT the true newest across the dir (that needs a
+          // full walk — the DoS this cap avoids). Steer to narrowing the path, not to sort='time'.
+          const suffix = capped
+            ? `; hard cap ${LIST_DIR_HARD_CAP} — narrow the path for a complete listing`
+            : ` (limit=${lim === null ? 'None' : lim})`;
+          out += `\n... [GX10v3: first ${shown} entries (filesystem order) of many${suffix}; a sort/limit ranks only this partial sample, not the whole directory]`;
+        } else if (shown < total) {
           const suffix = capped
             ? ` (hard cap ${LIST_DIR_HARD_CAP} — use sort='time'+limit)`
             : ` (limit=${lim === null ? 'None' : lim})`;
@@ -350,11 +476,23 @@ export async function runTool(name: string, args: Args, baseCwd?: string): Promi
           if (t === null) throw new Error(`invalid timeout: ${JSON.stringify(args['timeout'])}`);
           timeoutS = t;
         }
-        let r = await execCommand(command, timeoutS, base);
+        if (!['auto', 'bwrap', 'firejail'].includes(sandboxPolicy)) {
+          return 'ERROR: execute_command refused: sandbox policy must be auto, bwrap, or firejail; Ironclad fails closed.';
+        }
+        if (process.platform === 'win32') {
+          return ('ERROR: execute_command refused: no supported model-command sandbox backend is available on '
+            + 'Windows. Ironclad fails closed; use Linux with bwrap/firejail or the separate operator /sh channel.');
+        }
+        const backend = await findSandboxBackend(sandboxPolicy as SandboxPolicy);
+        if (backend === null) {
+          return (`ERROR: execute_command refused: no supported sandbox backend is available for policy '${sandboxPolicy}'. `
+            + 'Ironclad fails closed; install bwrap or firejail on this Linux host.');
+        }
+        let r = await execSandboxed(backend, command, timeoutS, base, signal);
         // #1196 ≙ gx10.py: BSD/macOS `ls` rejects the GNU-only `--color=always` (exit != 0), which would
         // drop the fs-computed header/Answer (gated on exit 0). Retry the LISTING without the colour flag.
         if (r.code !== 0 && command.includes('--color=always') && listingTargetForCommand(command) !== null) {
-          r = await execCommand(command.replace(/\s*--color=always\b/g, ''), timeoutS, base);
+          r = await execSandboxed(backend, command.replace(/\s*--color=always\b/g, ''), timeoutS, base, signal);
         }
         let out = r.text;
         // #1193/#1195 ≙ gx10.py: a successful simple listing is prepended with the deterministic
@@ -456,20 +594,41 @@ export async function runTool(name: string, args: Args, baseCwd?: string): Promi
           } else throw e;
         }
         const hits: string[] = [];
-        for (const fp of await rglob(directory, filePattern)) {
-          let content: string;
+        let filesScanned = 0;
+        let byteTruncated = false;
+        let budgetTruncated = false;
+        for await (const fp of rglob(directory, filePattern)) {
+          if (filesScanned >= SEARCH_MAX_FILES) {
+            budgetTruncated = true;
+            break;
+          }
+          filesScanned++;
+          let bounded: {buf: Buffer; size: number; over: boolean};
           try {
-            content = (await fs.readFile(fp)).toString('utf-8');
+            bounded = await readBoundedFile(fp, SEARCH_MAX_FILE_BYTES, false);
           } catch {
             continue;
           }
-          const lines = pySplitlines(content);
+          if (bounded.over) byteTruncated = true;
+          const lines = pySplitlines(bounded.buf.toString('utf-8'));
           for (let i = 0; i < lines.length; i++) {
             const line = lines[i] as string;
-            if (hit(line)) hits.push(`${fp}:${i + 1}: ${line.trim()}`);
+            if (hit(line)) {
+              hits.push(`${fp}:${i + 1}: ${line.trim()}`);
+              if (hits.length >= SEARCH_HIT_CAP) {
+                const notes = [`stopped at the ${SEARCH_HIT_CAP}-hit cap`];
+                if (byteTruncated) notes.push(`one or more files exceeded the ${SEARCH_MAX_FILE_BYTES}-byte read cap`);
+                return `${hits.join('\n')}\n... [Ironclad: search truncated — ${notes.join('; ')}] ...`;
+              }
+            }
           }
         }
-        return hits.length ? hits.slice(0, 50).join('\n') : 'No matches';
+        const notes: string[] = [];
+        if (budgetTruncated) notes.push(`stopped after the ${SEARCH_MAX_FILES}-file scan budget`);
+        if (byteTruncated) notes.push(`one or more files exceeded the ${SEARCH_MAX_FILE_BYTES}-byte read cap`);
+        let out = hits.length ? hits.join('\n') : 'No matches';
+        if (notes.length) out += `\n... [Ironclad: search truncated — ${notes.join('; ')}] ...`;
+        return out;
       }
 
       case 'create_directory': {

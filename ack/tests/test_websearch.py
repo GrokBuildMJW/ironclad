@@ -245,14 +245,11 @@ def test_guard_fires_before_the_local_tool_bridge(monkeypatch):
     assert out2 == "BRIDGED" and calls == [("execute_command", {"command": "Get-Date"})]  # allowed → bridged
 
 
-def test_execute_command_hardens_powershell_progress(monkeypatch):
-    captured = {}
-    def fake_run(argv, **kw):
-        captured["argv"] = argv
-        return types.SimpleNamespace(stdout="ok", stderr="", returncode=0)
+def test_execute_command_windows_refuses_before_powershell(monkeypatch):
+    calls = []
     monkeypatch.setattr(gx10, "PLATFORM", "windows")
-    monkeypatch.setattr(gx10.subprocess, "run", fake_run)
+    monkeypatch.setattr(gx10.subprocess, "run", lambda *a, **k: calls.append((a, k)))
     monkeypatch.setattr(gx10, "_DISPATCHER", _FakeDispatcher(web=True))
-    gx10.run_tool("execute_command", {"command": "Get-Date"})
-    joined = " ".join(captured["argv"])
-    assert "$ProgressPreference='SilentlyContinue';" in joined and "Get-Date" in joined
+    out = gx10.run_tool("execute_command", {"command": "Get-Date"})
+    assert out.startswith("ERROR: execute_command refused") and "Windows" in out and "fails closed" in out
+    assert calls == []

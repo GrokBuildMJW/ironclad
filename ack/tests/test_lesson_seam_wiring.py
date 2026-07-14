@@ -12,6 +12,8 @@ file pins the SEAM contract that survives the ACE supersede:
 """
 from __future__ import annotations
 
+from design_test_support import approve_active_design
+
 import sys
 import types
 from pathlib import Path
@@ -32,7 +34,8 @@ from ack import hooks
 from ack import lessons as L
 from playbook_store import PlaybookStore
 
-_TASK = '{"type":"feature","priority":"high","title":"Build X","description":"do it"}'
+_TASK = ('{"type":"feature","priority":"high","title":"Build the lesson feature",'
+         '"description":"Build the complete lesson feature through the validated staging pipeline."}')
 
 
 class _FakeAgent:
@@ -86,6 +89,7 @@ def _stage_only(tmp_path, monkeypatch):
     gx10.STORE = None
     monkeypatch.chdir(tmp_path)
     gx10._dispatch(_FakeAgent(), "initiative new Order Service --type software")
+    approve_active_design(gx10)
     gx10._stage_handover(None, "OPUS", "## Handover\nbuild it", task_json=_TASK, force=True)
     return gx10._store().list("pending")[0]["id"]
 
@@ -93,7 +97,7 @@ def _stage_only(tmp_path, monkeypatch):
 def _advance_full(tmp_path, monkeypatch):
     tid = _stage_only(tmp_path, monkeypatch)
     (gx10.feedback_dir() / f"{tid}_OPUS-feedback.md").write_text(
-        "LESSON: always run the parser check", encoding="utf-8")
+        "status: done\n\nLESSON: always run the parser check", encoding="utf-8")
     return tid, gx10._advance_pipeline(tid, "OPUS")
 
 
@@ -151,6 +155,7 @@ def test_sites_failsoft_on_raising_foreign_provider(tmp_path, monkeypatch):
     with pc.use(ProjectContext("p", str(tmp_path), "ns")):
         tid = _stage_only(tmp_path, monkeypatch)
         ho = (gx10.handovers_dir() / f"{tid}_OPUS.md").read_text(encoding="utf-8")
-        (gx10.feedback_dir() / f"{tid}_OPUS-feedback.md").write_text("LESSON: x", encoding="utf-8")
+        (gx10.feedback_dir() / f"{tid}_OPUS-feedback.md").write_text(
+            "status: done\n\nLESSON: x", encoding="utf-8")
         advance_out = gx10._advance_pipeline(tid, "OPUS")
     assert advance_out.startswith("OK") and "## Lessons" not in ho

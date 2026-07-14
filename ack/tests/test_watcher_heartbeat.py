@@ -1,8 +1,9 @@
 """#1229 (S7) — disentangle /watcher vs /autopilot + a detect-progress heartbeat + an explicit BLOCKED state.
 
-Three opt-in/default-off mechanisms (byte-identical when off):
+The automation split remains optional, while the task heartbeat is an always-on protection:
   A automation.decoupled — autopilot is self-sufficient, the contradictory "watcher on required" message is gone
-  B heartbeat.stall_seconds — an in_progress task with no log/feedback progress for N s is flagged stalled
+  B heartbeat.stall_seconds — a task that had log/feedback progress then goes silent for N s is flagged stalled;
+    a manually managed task with no signal ever is deliberately not auto-stalled
   C blocked task-flag — mark_blocked/clear_blocked annotate a stuck task in place (no 4th directory state)
 """
 from __future__ import annotations
@@ -11,6 +12,8 @@ import os
 import sys
 import types
 from pathlib import Path
+
+import pytest
 
 sys.modules.setdefault("openai", types.SimpleNamespace(OpenAI=lambda **kw: object()))
 _ENGINE = Path(__file__).resolve().parents[2] / "engine"
@@ -88,7 +91,6 @@ def test_board_byte_identical_without_blocked(monkeypatch, tmp_path):
 
 def test_advance_gate_marks_blocked(monkeypatch, tmp_path):
     _setup(monkeypatch, tmp_path)
-    monkeypatch.setattr(gx10, "ADVANCE_GATE_ENABLED", True)
     tid = _mk_inprogress()
     _feedback(tid, status="blocked")
     out = gx10._advance_pipeline(tid, "OPUS")
@@ -139,11 +141,36 @@ def test_autopilot_double_message_only_when_coupled(monkeypatch, tmp_path):
 
 
 # ── Slice B: detect-progress heartbeat ────────────────────────────────────────
-def test_heartbeat_off_no_stall(monkeypatch, tmp_path):
+def test_heartbeat_default_is_finite_and_always_on(monkeypatch, tmp_path):
     _setup(monkeypatch, tmp_path)
-    monkeypatch.setattr(gx10, "HEARTBEAT_STALL_S", 0.0)       # off (default)
+    assert gx10._code_defaults()["heartbeat"]["stall_seconds"] == 900
+    assert gx10.HEARTBEAT_STALL_S == 900.0
     tid = _mk_inprogress()
     _stale_log(tid, age=1000)
+    gx10._reconcile_once(gx10._store(), lambda *a: None, {}, set())
+    assert gx10._store().get(tid).get("blocked_kind") == "stalled"
+
+
+@pytest.mark.parametrize("invalid", [0, -1, float("nan"), float("inf"), float("-inf")])
+def test_heartbeat_rejects_non_positive_or_non_finite_tuning(invalid):
+    cfg = gx10._code_defaults()
+    cfg["heartbeat"]["stall_seconds"] = invalid
+    with pytest.raises(ValueError, match="heartbeat.stall_seconds"):
+        gx10._apply_config(cfg)
+    assert gx10.HEARTBEAT_STALL_S == 900.0
+
+
+def test_heartbeat_honors_positive_finite_tuning():
+    cfg = gx10._code_defaults()
+    cfg["heartbeat"]["stall_seconds"] = 123.5
+    gx10._apply_heartbeat(cfg)
+    assert gx10.HEARTBEAT_STALL_S == 123.5
+
+
+def test_heartbeat_no_signal_ever_is_not_auto_stalled(monkeypatch, tmp_path):
+    _setup(monkeypatch, tmp_path)
+    tid = _mk_inprogress()
+    assert gx10._task_progress_mtime(gx10._store(), tid) is None
     gx10._reconcile_once(gx10._store(), lambda *a: None, {}, set())
     assert "blocked" not in gx10._store().get(tid)
 

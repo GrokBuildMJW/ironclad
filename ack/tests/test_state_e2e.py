@@ -21,6 +21,7 @@ if str(_ENGINE) not in sys.path:
     sys.path.insert(0, str(_ENGINE))
 
 import gx10  # noqa: E402
+from design_test_support import approve_active_design  # noqa: E402
 
 
 class _FakeAgent:
@@ -46,15 +47,17 @@ def test_e2e_full_lifecycle_keeps_project_root_clean(tmp_path, monkeypatch):
     gx10._dispatch(fake, "initiative new Order Service --type software")
     assert fake.ran is None                       # handled as a command, not a model turn
     assert gx10.active_slug() == "order-service"
+    approve_active_design(gx10)
 
     # 3. the orchestrator stages a task+handover (macro), feedback arrives, pipeline advances
     out = gx10._stage_handover(
         None, "OPUS", "## Handover\nbuild it",
-        task_json='{"type":"feature","priority":"high","title":"Build X","description":"do it"}',
+        task_json='{"type":"feature","priority":"high","title":"Build the state feature","description":"Build the complete state feature through the validated staging pipeline."}',
         force=True)
     assert out.startswith("OK")
     tid = gx10._store().list("pending")[0]["id"]
-    (gx10.feedback_dir() / f"{tid}_OPUS-feedback.md").write_text("## Result\ndone", encoding="utf-8")
+    (gx10.feedback_dir() / f"{tid}_OPUS-feedback.md").write_text(
+        "status: done\n\n## Result\ndone", encoding="utf-8")
     out = gx10._advance_pipeline(tid, "OPUS")
     assert out.startswith("OK")
 

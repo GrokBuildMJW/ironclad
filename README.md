@@ -104,8 +104,8 @@ needed.
 - **Secure, session-gated channel** — selectable trust profiles (`open` / `token` /
   `sealed`) with an explicit session that seals on disconnect (single-operator).
 - **An open extension surface** — a versioned **[plugin API](docs/plugin-api.md)** (no core
-  fork) and a **[bring-your-own code-agent CLI](docs/code-agents.md)**: extend the platform
-  without forking the core.
+  fork) and a **[bring-your-own code-agent CLI](docs/code-agents.md)** with a live hard launch timeout,
+  whole-tree termination, and bounded client-side output capture: extend the platform without forking the core.
 
 It's a natural reliability layer for **regional open models** too — point it at Falcon,
 Jais or K2 Think via vLLM ([running on other models](docs/models/)) and get fail-closed
@@ -117,11 +117,11 @@ Ironclad's engine comes from a **proven, in-production orchestrator**, now **reb
 the server + client architecture above and **wired and tested**. It is still
 **pre-release** (0.0.x, alpha): single-tenant by design (no multi-user auth yet) and
 APIs/layout/config may change. Tagged releases ship on **PyPI** (`ironclad-ai`) and as
-**GitHub Releases** (currently `v0.0.29`) — treat them as early previews and `main` as a
+**GitHub Releases** (currently `v0.0.30`) — treat them as early previews and `main` as a
 development snapshot. The internal DEV → Prod → Public **promote pipeline** that hardens our
 releases is in development (today a manual gated path).
 
-Verified by **3134 Python tests** (3125 offline + 9 live) plus **440 TypeScript client
+Verified by **3471 Python tests** (3462 offline + 9 live) plus **462 TypeScript client
 tests**, and a **full end-to-end run with a real code-agent**. Read these before relying on
 anything:
 

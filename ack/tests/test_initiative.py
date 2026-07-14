@@ -7,6 +7,8 @@ the type-dependent skeleton, all workdir-relative (chdir to a tmp project root p
 """
 from __future__ import annotations
 
+from design_test_support import approve_active_design
+
 import sys
 import types
 from pathlib import Path
@@ -265,8 +267,10 @@ def test_dispatch_initiative_new_routes_to_command(tmp_path):
 # ── #984: MPR is embedded (not a project type) — the software task pipeline just works ──
 def test_software_initiative_allows_task_pipeline(tmp_path):
     gx10.initiative_new("Order Svc", "software")
+    approve_active_design(gx10)
     tid = gx10._store().create(
-        {"type": "feature", "priority": "high", "title": "x", "description": "y"}, force=True)["id"]
+        {"type": "feature", "priority": "high", "title": "Build the initiative feature",
+         "description": "Build the complete initiative feature through the validated staging pipeline."}, force=True)["id"]
     out = gx10._stage_handover(tid, "OPUS", "## Handover\nbody")
     assert not out.startswith("ERROR")
 
@@ -279,7 +283,7 @@ def test_internal_target_blocks_the_normal_pipeline(tmp_path):
         '{"project_id":"default","exec_mode":"github","tier":3,"plugin_required":true,"plugin_id":"x"}',
         encoding="utf-8")
     s = gx10._stage_handover(None, "OPUS", "## Handover\nbody",
-                             task_json='{"type":"feature","priority":"high","title":"x","description":"y"}')
+                             task_json='{"type":"feature","priority":"high","title":"Build the initiative feature","description":"Build the complete initiative feature through the validated staging pipeline."}')
     assert s.startswith("ERROR") and "INTERNAL" in s
     a = gx10._advance_pipeline(f"{gx10.TASK_PREFIX}-1", "OPUS")
     assert a.startswith("ERROR") and "INTERNAL" in a

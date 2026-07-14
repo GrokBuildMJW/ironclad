@@ -6,8 +6,8 @@
  *  - **Coalescing:** a failed/missed poll keeps the last-known model/memory/tasks and only flips
  *    `connected:false` (the footer greys out instead of flickering/resetting). `pollStatus`
  *    returns `null` on any error to signal "keep previous state".
- *  - **Reconnect flush:** on a disconnected→connected transition, drain the tool-result retry
- *    buffer (a result dropped during a blip is delivered once the channel is back).
+ *  - **Connected flush:** on every connected poll, drain the tool-result retry buffer (a result
+ *    dropped during a blip is delivered within one poll interval even without a reconnect edge).
  */
 import {useEffect, useRef, useState} from 'react';
 import {flushToolResults} from '../tools/bridge.js';
@@ -70,8 +70,8 @@ export async function pollStatus(srv: Server): Promise<StatusFields | null> {
   }
 }
 
-/** Resolve the next connected flag + whether this poll is a reconnect (disconnected→connected),
- *  which is the signal to flush the tool-result buffer. `null` upd = a failed poll → disconnected. */
+/** Resolve the next connected flag + whether this poll is a reconnect (disconnected→connected).
+ *  `null` upd = a failed poll → disconnected. */
 export function nextConnState(prev: boolean, upd: StatusFields | null): {connected: boolean; reconnected: boolean} {
   const now = upd === null ? false : Boolean(upd.connected);
   return {connected: now, reconnected: now && !prev};
@@ -93,11 +93,11 @@ export function useStatusPoller(
     const poll = async (): Promise<void> => {
       const upd = await pollStatus(srv);
       if (!live) return;
-      const {connected, reconnected} = nextConnState(wasConnected.current, upd);
+      const {connected} = nextConnState(wasConnected.current, upd);
       wasConnected.current = connected;
       // coalesce: on a failed poll keep model/memory/tasks, just drop `connected`.
       setSt((s) => (upd === null ? {...s, connected: false} : {...s, ...upd}));
-      if (reconnected) void flushToolResults(srv).catch(() => {}); // channel back → resend buffered results
+      if (connected) void flushToolResults(srv).catch(() => {}); // channel up → drain buffered results; the 2s poll is the bounded retry timer
     };
     void poll();
     const id = setInterval(() => void poll(), intervalMs);

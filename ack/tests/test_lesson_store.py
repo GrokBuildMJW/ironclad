@@ -6,9 +6,8 @@ Proves, offline (no model, no live store):
     real semantics the #601 seam delegates to — scope-isolated persistence, recency + query ranking,
     typed categories, compaction, a scope-priority `brief`, and the optional `forget` purge;
   * it is robust (a corrupt / missing scope file reads as empty; weird opaque scopes get safe filenames);
-  * the engine wiring is OPT-IN: `gx10._apply_lessons_provider` registers the store only when
-    `lessons.enabled` is on, clears only our own store when off, never clobbers a foreign provider, and the
-    shipped default (`_code_defaults`) leaves NO provider wired — byte-identical to the pre-#602 seam.
+  * the retired `lessons.enabled` / `lessons.max_per_scope` inputs warn and cannot rewire the always-on ACE
+    `PlaybookStore`; `EngineLessonStore` remains covered as a persistence backend and migration source.
 
     python -m pytest ack/tests/test_lesson_store.py -q
 """
@@ -328,7 +327,7 @@ def test_empty_scope_or_lesson_is_noop(tmp_path):
     assert s.get_lessons("") == []
 
 
-# ─── engine wiring — OPT-IN registration via gx10._apply_lessons_provider ───────────────────────────
+# ─── retired engine wiring — ACE is the provider authority ─────────────────────────────────────────
 @pytest.fixture
 def _clean_provider():
     """Pin ack.lessons to no-provider before+after, so the gating tests are hermetic."""
@@ -338,69 +337,52 @@ def _clean_provider():
     L.set_provider(None)
 
 
-def test_apply_registers_store_when_enabled(tmp_path, monkeypatch, _clean_provider):
-    monkeypatch.setenv("GX10_HOME", str(tmp_path))
+@pytest.mark.parametrize(
+    ("dotted", "value"),
+    [("lessons.enabled", False), ("lessons.enabled", True),
+     ("lessons.max_per_scope", 5), ("lessons.max_per_scope", "anything")],
+)
+def test_retired_lesson_config_warns_is_ignored_and_runtime_set_is_refused(
+        monkeypatch, capsys, dotted, value, _clean_provider):
     import gx10
-    gx10._apply_lessons_provider({"lessons": {"enabled": True, "max_per_scope": 5}})
-    prov = _clean_provider.get_provider()
-    assert isinstance(prov, EngineLessonStore)
+    gx10._apply_config(gx10._code_defaults())
+    provider = _clean_provider.get_provider()
+    assert provider is not None
+
+    cfg = gx10._code_defaults()
+    gx10._cfg_set(cfg, dotted, value)
+    gx10._apply_config(cfg)
+    assert dotted in capsys.readouterr().out
+    assert "lessons" not in cfg
+    assert _clean_provider.get_provider() is provider
+
+    monkeypatch.setattr(gx10, "_EFFECTIVE_CFG", cfg)
+    surfaced = []
+    monkeypatch.setattr(gx10, "_ui_print", lambda message, *a, **k: surfaced.append(str(message)))
+    gx10._dispatch(None, f"config set {dotted} {value}")
+    assert len(surfaced) == 1 and "retired and cannot be set" in surfaced[0]
+    assert _clean_provider.get_provider() is provider
 
 
 def test_apply_default_config_wires_no_provider(tmp_path, monkeypatch, _clean_provider):
-    """The shipped default (lessons.enabled False) leaves the seam a byte-identical no-op."""
+    """The retired compatibility seam cannot replace ACE's provider authority."""
     monkeypatch.setenv("GX10_HOME", str(tmp_path))
     import gx10
     gx10._apply_lessons_provider(gx10._code_defaults())
     assert _clean_provider.get_provider() is None
 
 
-def test_apply_clears_only_our_store_when_disabled(tmp_path, monkeypatch, _clean_provider):
+def test_legacy_lesson_false_cannot_disable_always_on_ace(tmp_path, monkeypatch, _clean_provider):
     monkeypatch.setenv("GX10_HOME", str(tmp_path))
     import gx10
-    gx10._apply_lessons_provider({"lessons": {"enabled": True}})
-    assert isinstance(_clean_provider.get_provider(), EngineLessonStore)
-    gx10._apply_lessons_provider({"lessons": {"enabled": False}})
-    assert _clean_provider.get_provider() is None
+    from playbook_store import PlaybookStore
 
+    cfg = gx10._code_defaults()
+    cfg["lessons"] = {"enabled": False, "max_per_scope": 1}
+    gx10._apply_config(cfg)
 
-def test_apply_resizes_live_store_cap(tmp_path, monkeypatch, _clean_provider):
-    """A runtime `/config set lessons.max_per_scope` re-applies config → the SAME live store is resized
-    (not re-registered), so the new cap takes effect immediately."""
-    monkeypatch.setenv("GX10_HOME", str(tmp_path))
-    import gx10
-    gx10._apply_lessons_provider({"lessons": {"enabled": True, "max_per_scope": 10}})
-    store = _clean_provider.get_provider()
-    assert isinstance(store, EngineLessonStore)
-    gx10._apply_lessons_provider({"lessons": {"enabled": True, "max_per_scope": 2}})
-    assert _clean_provider.get_provider() is store            # same instance, not re-registered
-    for i in range(5):
-        store.report_lesson(SCOPE, f"l{i}")
-    assert store.get_lessons(SCOPE, limit=99) == ["l4", "l3"]  # cap=2 applied live
-
-
-def test_apply_disable_clears_even_with_malformed_cap(tmp_path, monkeypatch, _clean_provider):
-    """A malformed `max_per_scope` must NOT derail the disable branch — `lessons.enabled=false` always
-    clears our store (else lesson persistence could stay on while reported off)."""
-    monkeypatch.setenv("GX10_HOME", str(tmp_path))
-    import gx10
-    gx10._apply_lessons_provider({"lessons": {"enabled": True}})
-    assert isinstance(_clean_provider.get_provider(), EngineLessonStore)
-    gx10._apply_lessons_provider({"lessons": {"enabled": False, "max_per_scope": "bad"}})
-    assert _clean_provider.get_provider() is None
-
-
-def test_apply_enable_with_malformed_cap_still_registers(tmp_path, monkeypatch, _clean_provider):
-    monkeypatch.setenv("GX10_HOME", str(tmp_path))
-    import gx10
-    gx10._apply_lessons_provider({"lessons": {"enabled": True, "max_per_scope": "bad"}})
-    assert isinstance(_clean_provider.get_provider(), EngineLessonStore)   # bad cap → default, still on
-
-
-def test_apply_enable_with_overflow_cap_still_registers(tmp_path, monkeypatch, _clean_provider):
-    monkeypatch.setenv("GX10_HOME", str(tmp_path))
-    import gx10
-    gx10._apply_lessons_provider({"lessons": {"enabled": True, "max_per_scope": float("inf")}})
-    assert isinstance(_clean_provider.get_provider(), EngineLessonStore)   # overflow cap → default, still on
+    assert isinstance(_clean_provider.get_provider(), PlaybookStore)
+    assert "lessons" not in cfg
 
 
 def test_apply_does_not_clobber_a_foreign_provider(tmp_path, monkeypatch, _clean_provider):
@@ -414,7 +396,7 @@ def test_apply_does_not_clobber_a_foreign_provider(tmp_path, monkeypatch, _clean
 
     foreign = _Foreign()
     _clean_provider.set_provider(foreign)
-    gx10._apply_lessons_provider({"lessons": {"enabled": True}})    # enabled, but a provider exists → leave it
+    gx10._apply_lessons_provider(gx10._code_defaults())
     assert _clean_provider.get_provider() is foreign
-    gx10._apply_lessons_provider({"lessons": {"enabled": False}})   # off, foreign is not our store → leave it
+    gx10._apply_lessons_provider(gx10._code_defaults())
     assert _clean_provider.get_provider() is foreign

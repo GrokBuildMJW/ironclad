@@ -1,12 +1,8 @@
-"""Generic runtime config control — `/config get|set <dotted.key> <value>` (core, plugin-agnostic).
-
-Covers the value coercion, the dotted-path read/write helpers, and the `_dispatch` branches:
-set mutates the live `_EFFECTIVE_CFG` + re-derives core globals via `_apply_config`; a non-core key
-(e.g. a plugin section) still stores even when `_apply_config` can't apply it; get reads a dotted key;
-set with no live config is a friendly no-op. No plugin-specific knowledge lives in core.
-"""
+"""Atomic, plugin-agnostic runtime config control for `/config get|set`."""
 from __future__ import annotations
 
+import copy
+import math
 import sys
 import types
 from pathlib import Path
@@ -31,6 +27,27 @@ def captured(monkeypatch):
     return lines
 
 
+def _complete_live_config(monkeypatch, **extra):
+    cfg = gx10._code_defaults()
+    cfg.update(copy.deepcopy(extra))
+    monkeypatch.setattr(gx10, "_EFFECTIVE_CFG", cfg)
+    return cfg
+
+
+def _runtime_globals():
+    names = gx10._CONFIG_DERIVED_GLOBALS + gx10._CONFIG_RECONFIG_GLOBALS
+    return {name: getattr(gx10, name) for name in names}
+
+
+def _assert_atomic_refusal(captured, original, tree_before, globals_before):
+    assert gx10._EFFECTIVE_CFG is original
+    assert gx10._EFFECTIVE_CFG == tree_before
+    assert all(getattr(gx10, name) is value for name, value in globals_before.items())
+    refusals = [line for line in captured if "[config] refused:" in line]
+    assert len(refusals) == 1
+    assert not any("[config] set " in line for line in captured)
+
+
 # ── value coercion ────────────────────────────────────────────────────────────────────────────────
 @pytest.mark.parametrize("raw,expected", [
     ("on", True), ("ON", True), ("true", True), ("yes", True),
@@ -50,6 +67,172 @@ def test_cfg_set_creates_nested_sections():
     assert cfg == {"mpr": {"enabled": True, "panel_mode": "deep"}}
 
 
+@pytest.mark.parametrize("key,raw,original", [
+    ("context.rag_enabled", "1", True),
+    ("context.rag_enabled", "maybe", True),
+    ("workers.write_mode", "shared", "reducer"),
+    ("security.multi_tenant", "on", False),
+])
+def test_dispatch_config_set_refuses_schema_invalid_typed_value(
+        monkeypatch, captured, key, raw, original):
+    cfg = gx10._code_defaults()
+    monkeypatch.setattr(gx10, "_EFFECTIVE_CFG", cfg)
+    gx10._dispatch(types.SimpleNamespace(), f"config set {key} {raw}")
+    assert gx10._cfg_get(cfg, key) == original
+    assert any("refused" in line for line in captured)
+    assert not any(f"set {key}" in line for line in captured)
+
+
+@pytest.mark.parametrize("key,value", [
+    ("context.rag_enabled", "false"),
+    ("context.rag_enabled", "true"),
+    ("context.rag_enabled", 0),
+    ("context.rag_enabled", 1),
+    ("context.rag_enabled", None),
+    ("quality.threshold", []),
+    ("quality.threshold", math.nan),
+    ("quality.threshold", math.inf),
+    ("quality.threshold", -math.inf),
+    ("quality.threshold", 2.0),
+])
+def test_runtime_set_refuses_invalid_candidate_without_any_mutation(
+        monkeypatch, captured, key, value):
+    original = _complete_live_config(monkeypatch)
+    tree_before = copy.deepcopy(original)
+    globals_before = _runtime_globals()
+    monkeypatch.setattr(gx10, "_coerce_cfg_value", lambda _raw: value)
+    gx10._dispatch(types.SimpleNamespace(), f"config set {key} candidate")
+    _assert_atomic_refusal(captured, original, tree_before, globals_before)
+
+
+def test_runtime_set_refuses_relationship_violation_atomically(monkeypatch, captured):
+    original = _complete_live_config(monkeypatch)
+    tree_before = copy.deepcopy(original)
+    globals_before = _runtime_globals()
+    raw = str(original["context"]["max_ctx_chars"])
+    gx10._dispatch(types.SimpleNamespace(), f"config set context.trim_target_chars {raw}")
+    _assert_atomic_refusal(captured, original, tree_before, globals_before)
+
+
+def test_runtime_set_refuses_missing_required_root_atomically(monkeypatch, captured):
+    original = gx10._code_defaults()
+    original.pop("automation")
+    monkeypatch.setattr(gx10, "_EFFECTIVE_CFG", original)
+    tree_before = copy.deepcopy(original)
+    globals_before = _runtime_globals()
+    gx10._dispatch(types.SimpleNamespace(), "config set verify.grounding_threshold 0.6")
+    _assert_atomic_refusal(captured, original, tree_before, globals_before)
+
+
+def test_runtime_set_refuses_unknown_core_leaf_atomically(monkeypatch, captured):
+    original = _complete_live_config(monkeypatch)
+    tree_before = copy.deepcopy(original)
+    globals_before = _runtime_globals()
+    gx10._dispatch(types.SimpleNamespace(), "config set context.unknown 1")
+    _assert_atomic_refusal(captured, original, tree_before, globals_before)
+
+
+@pytest.mark.parametrize("stage", ["early", "middle", "late"])
+def test_runtime_set_derivation_exception_rolls_back_everything(
+        monkeypatch, captured, stage):
+    original = _complete_live_config(monkeypatch)
+    tree_before = copy.deepcopy(original)
+    globals_before = _runtime_globals()
+
+    def boom(*_args, **_kwargs):
+        raise RuntimeError(f"{stage} derivation")
+
+    if stage == "early":
+        monkeypatch.setattr(gx10, "_resolve_platform", boom)
+    elif stage == "middle":
+        from ack import tooling_envelope
+        monkeypatch.setattr(tooling_envelope, "load_tooling_envelope_policy", boom)
+    else:
+        monkeypatch.setattr(gx10, "_derive_quality_breaker_state", boom)
+    gx10._dispatch(types.SimpleNamespace(), "config set verify.grounding_threshold 0.6")
+    _assert_atomic_refusal(captured, original, tree_before, globals_before)
+
+
+def test_runtime_set_partial_commit_exception_restores_every_global(monkeypatch, captured):
+    original = _complete_live_config(monkeypatch)
+    tree_before = copy.deepcopy(original)
+    globals_before = _runtime_globals()
+
+    def partial_commit(derived):
+        gx10.DEFAULT_MODEL = derived.values["DEFAULT_MODEL"]
+        gx10._VERIFY_GROUNDING_THRESHOLD = derived.values["_VERIFY_GROUNDING_THRESHOLD"]
+        raise RuntimeError("commit interrupted")
+
+    monkeypatch.setattr(gx10, "_commit_config_state", partial_commit)
+    gx10._dispatch(types.SimpleNamespace(), "config set verify.grounding_threshold 0.6")
+    _assert_atomic_refusal(captured, original, tree_before, globals_before)
+
+
+def test_runtime_set_hook_exception_restores_hooks_store_and_globals(monkeypatch, captured):
+    from ack import hooks
+
+    original = _complete_live_config(monkeypatch)
+    tree_before = copy.deepcopy(original)
+    globals_before = _runtime_globals()
+    hooks_before = dict(hooks._HOOKS)
+    marker = lambda _ctx: None
+
+    def fail_after_hook(_cfg, *, strict=False):
+        hooks.register_hook("post_handover", marker)
+        raise RuntimeError("hook reconfiguration interrupted")
+
+    monkeypatch.setattr(gx10, "_apply_quality_consumer", fail_after_hook)
+    gx10._dispatch(types.SimpleNamespace(), "config set verify.grounding_threshold 0.6")
+    _assert_atomic_refusal(captured, original, tree_before, globals_before)
+    assert hooks._HOOKS == hooks_before
+
+
+def test_runtime_set_ace_reconfig_exception_stops_new_worker_and_restores(monkeypatch, captured):
+    # Contract §1 "no thread left half-reconfigured": _apply_ace is the LAST reconfiguration step and the
+    # only one that may start a worker, so its failure AFTER a worker start must stop that worker and
+    # restore _ACE_WORKER on rollback (gx10._restore_config_runtime).
+    original = _complete_live_config(monkeypatch)
+    tree_before = copy.deepcopy(original)
+    monkeypatch.setattr(gx10, "_ACE_WORKER", None, raising=False)   # pre-transaction: no live worker
+    globals_before = _runtime_globals()
+    stopped: list[bool] = []
+
+    class _FakeWorker:
+        def stop(self):
+            stopped.append(True)
+
+    def start_then_fail(_cfg, *, strict=False):
+        gx10._ACE_WORKER = _FakeWorker()                           # a worker "starts" mid-reconfiguration
+        raise RuntimeError("ace reconfiguration interrupted after worker start")
+
+    monkeypatch.setattr(gx10, "_apply_ace", start_then_fail)
+    gx10._dispatch(types.SimpleNamespace(), "config set verify.grounding_threshold 0.6")
+    _assert_atomic_refusal(captured, original, tree_before, globals_before)
+    assert stopped == [True]                                       # the newly-started worker was stopped
+    assert gx10._ACE_WORKER is None                                # and the global restored to pre-set
+
+
+def test_valid_runtime_sets_publish_candidate_and_globals_once(monkeypatch, captured):
+    original = _complete_live_config(monkeypatch)
+    gx10._dispatch(types.SimpleNamespace(), "config set quality.threshold 0.7")
+    assert gx10._EFFECTIVE_CFG is not original
+    assert original["quality"]["threshold"] == 0.5
+    assert gx10._EFFECTIVE_CFG["quality"]["threshold"] == 0.7
+    assert gx10._QUALITY_BREAKER.snapshot().threshold == 0.7
+    assert sum("[config] set quality.threshold = 0.7" in line for line in captured) == 1
+    assert not any("refused" in line for line in captured)
+
+    captured.clear()
+    previous = gx10._EFFECTIVE_CFG
+    gx10._dispatch(types.SimpleNamespace(), "config set verify.grounding_threshold 0.6")
+    assert gx10._EFFECTIVE_CFG is not previous
+    assert previous["verify"]["grounding_threshold"] == 0.5
+    assert gx10._EFFECTIVE_CFG["verify"]["grounding_threshold"] == 0.6
+    assert gx10._VERIFY_GROUNDING_THRESHOLD == 0.6
+    assert sum("[config] set verify.grounding_threshold = 0.6" in line for line in captured) == 1
+    assert not any("refused" in line for line in captured)
+
+
 def test_cfg_set_overwrites_non_dict_intermediate():
     cfg = {"mpr": 1}                       # a scalar where we need to descend
     gx10._cfg_set(cfg, "mpr.enabled", True)
@@ -64,26 +247,22 @@ def test_cfg_get_reads_and_misses():
 
 
 # ── _dispatch branches ──────────────────────────────────────────────────────────────────────────────
-def test_dispatch_config_set_mutates_and_reapplies(monkeypatch, captured):
-    monkeypatch.setattr(gx10, "_EFFECTIVE_CFG", {"mpr": {}})
-    applied: list = []
-    monkeypatch.setattr(gx10, "_apply_config", lambda cfg: applied.append(cfg))
+def test_dispatch_config_set_commits_plugin_candidate_atomically(monkeypatch, captured):
+    original = _complete_live_config(monkeypatch, mpr={})
     gx10._dispatch(types.SimpleNamespace(), "config set mpr.enabled on")
-    assert gx10._EFFECTIVE_CFG["mpr"]["enabled"] is True       # live tree mutated
-    assert applied and applied[0] is gx10._EFFECTIVE_CFG        # core globals re-derived
-    assert any("set mpr.enabled = True" in s for s in captured)
+    assert gx10._EFFECTIVE_CFG is not original
+    assert "enabled" not in original["mpr"]
+    assert gx10._EFFECTIVE_CFG["mpr"]["enabled"] is True
+    assert sum("[config] set mpr.enabled = True" in line for line in captured) == 1
 
 
-def test_dispatch_config_set_stores_even_when_apply_raises(monkeypatch, captured):
-    # A plugin/non-core LEAF under a live root: _apply_config may raise — the dict write must still stand
-    # (#932 gap-2: the root 'mpr' exists, so it is a known namespace, not a rejected unknown-root typo).
-    monkeypatch.setattr(gx10, "_EFFECTIVE_CFG", {"mpr": {}})
-    def _boom(cfg):
-        raise KeyError("connection")
-    monkeypatch.setattr(gx10, "_apply_config", _boom)
+def test_dispatch_config_set_rolls_back_plugin_candidate_when_derivation_raises(monkeypatch, captured):
+    original = _complete_live_config(monkeypatch, mpr={})
+    tree_before = copy.deepcopy(original)
+    globals_before = _runtime_globals()
+    monkeypatch.setattr(gx10, "_derive_config_state", lambda _cfg: (_ for _ in ()).throw(KeyError("connection")))
     gx10._dispatch(types.SimpleNamespace(), "config set mpr.panel_mode deep")
-    assert gx10._EFFECTIVE_CFG["mpr"]["panel_mode"] == "deep"
-    assert any("stored" in s for s in captured)               # graceful note, no crash
+    _assert_atomic_refusal(captured, original, tree_before, globals_before)
 
 
 def test_dispatch_config_set_no_live_config(monkeypatch, captured):
@@ -164,10 +343,12 @@ def test_dispatch_config_get_trailing_space_no_indexerror(monkeypatch, captured)
 
 # ── ST-1: frozen (boot-only) keys ───────────────────────────────────────────────────────────────────
 def test_config_set_frozen_key_refused(monkeypatch, captured):
-    monkeypatch.setattr(gx10, "_EFFECTIVE_CFG", {"setup": {"type": "solo"}})
-    gx10._dispatch(types.SimpleNamespace(), "config set setup.type pull")
-    assert any("boot-only" in s for s in captured)               # refused with a clear message
-    assert gx10._EFFECTIVE_CFG["setup"]["type"] == "solo"        # value unchanged
+    original = _complete_live_config(monkeypatch)
+    tree_before = copy.deepcopy(original)
+    globals_before = _runtime_globals()
+    gx10._dispatch(types.SimpleNamespace(), "config set setup.type local")
+    _assert_atomic_refusal(captured, original, tree_before, globals_before)
+    assert any("boot-only" in line for line in captured)
 
 
 def test_config_get_frozen_key_allowed(monkeypatch, captured):

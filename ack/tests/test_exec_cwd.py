@@ -139,20 +139,15 @@ def test_run_tool_absolute_path_writes_outside_project_root(monkeypatch, tmp_pat
     assert pc.current() is None
 
 
-def test_run_tool_execute_command_cwd_is_project_root(monkeypatch, tmp_path) -> None:
+def test_run_tool_execute_command_cwd_is_project_root(monkeypatch, tmp_path, model_sandbox_backend) -> None:
     recorded: dict[str, object] = {}
 
-    class FakeResult:
-        stdout = ""
-        stderr = ""
-        returncode = 0
-
-    def fake_run(*args, **kwargs) -> FakeResult:
-        recorded["cwd"] = kwargs.get("cwd")
-        return FakeResult()
+    def fake_run(command, timeout, cwd):
+        recorded["cwd"] = cwd
+        return gx10.subprocess.CompletedProcess(command, 0, "", "")
 
     monkeypatch.setattr(gx10, "_BOOT_WORKDIR", Path(str(tmp_path / "boot")))
-    monkeypatch.setattr(gx10.subprocess, "run", fake_run)
+    monkeypatch.setattr(gx10, "_run_model_command_process", fake_run)
 
     with pc.use(ProjectContext("p", str(tmp_path), "")):
         gx10.run_tool("execute_command", {"command": "x"})
@@ -160,20 +155,15 @@ def test_run_tool_execute_command_cwd_is_project_root(monkeypatch, tmp_path) -> 
     assert pc.current() is None
 
 
-def test_run_tool_execute_command_cwd_none_without_context(monkeypatch, tmp_path) -> None:
+def test_run_tool_execute_command_cwd_none_without_context(monkeypatch, tmp_path, model_sandbox_backend) -> None:
     recorded: dict[str, object] = {}
 
-    class FakeResult:
-        stdout = ""
-        stderr = ""
-        returncode = 0
-
-    def fake_run(*args, **kwargs) -> FakeResult:
-        recorded["cwd"] = kwargs.get("cwd")
-        return FakeResult()
+    def fake_run(command, timeout, cwd):
+        recorded["cwd"] = cwd
+        return gx10.subprocess.CompletedProcess(command, 0, "", "")
 
     monkeypatch.setattr(gx10, "_BOOT_WORKDIR", Path(str(tmp_path / "boot")))
-    monkeypatch.setattr(gx10.subprocess, "run", fake_run)
+    monkeypatch.setattr(gx10, "_run_model_command_process", fake_run)
 
     assert pc.current() is None
     gx10.run_tool("execute_command", {"command": "x"})

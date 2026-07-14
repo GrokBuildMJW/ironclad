@@ -423,9 +423,10 @@ def prune_runs(runs_root: Any, *, keep_runs: int = 500, keep_days: Optional[int]
     """Prune old run-dirs (+ their TaskStore entry via injected ``store_delete``). Idempotent + fail-soft.
 
     LRU by run_id prefix (= time) past ``keep_runs``; also drop dirs older than ``keep_days`` (by
-    ``created_at``). ``protect_violations`` keeps any run with ``provenance.violations != []`` forever
-    (proof obligation, §9). Returns the deleted run_ids. TaskStore has no delete → ``store_delete`` is
-    injected (run()/1f binds a locked delete or a named TaskStore.delete core-change).
+    ``created_at``). ``protect_violations`` keeps any run with ``provenance.violations != []`` or
+    unreadable/missing provenance forever (proof obligation, §9). Returns only run_ids whose directories
+    were verified removed; their TaskStore entry is then dropped via injected ``store_delete`` (run()/1f
+    binds a locked delete or a named TaskStore.delete core-change).
 
     Reserved (#503 MPR-DEAD-3): a complete, unit-tested §9 retention utility that is not yet wired into
     run() — auto-pruning is an operator policy decision (which runs to keep, the proof-obligation carve-out
@@ -437,20 +438,25 @@ def prune_runs(runs_root: Any, *, keep_runs: int = 500, keep_days: Optional[int]
     dirs = sorted(d for d in root.iterdir() if d.is_dir() and d.name.startswith("mpr-"))
     infos: List[dict] = []
     for d in dirs:
-        created_at, violated, task_id = None, False, None
+        created_at, violated, readable, task_id = None, False, False, None
         mf = d / "manifest.json"
         if mf.is_file():
             try:
                 m = json.loads(mf.read_text(encoding="utf-8"))
                 created_at = m.get("created_at")
-                violated = bool((m.get("provenance") or {}).get("violations"))
+                provenance = m.get("provenance")
+                # fail-closed: trust the violation status ONLY when provenance is a dict that actually carries
+                # the `violations` key — a dict without it (schema drift / tampering) is unprovable → protect.
+                readable = isinstance(provenance, dict) and "violations" in provenance
+                violated = bool(provenance.get("violations")) if readable else False
                 task_id = m.get("task_id")
             except Exception:  # noqa: BLE001 — a broken manifest never aborts the prune
                 pass
         infos.append({"dir": d, "name": d.name, "created_at": created_at,
-                      "violated": violated, "task_id": task_id})
+                      "violated": violated, "readable": readable, "task_id": task_id})
 
-    deletable = [i for i in infos if not (protect_violations and i["violated"])]
+    deletable = [i for i in infos
+                 if not (protect_violations and (i["violated"] or not i["readable"]))]
     to_delete: set = set()
     if keep_days is not None:
         cutoff = _iso_minus_days(now or now_iso(), keep_days)
@@ -467,13 +473,15 @@ def prune_runs(runs_root: Any, *, keep_runs: int = 500, keep_days: Optional[int]
         if i["name"] not in to_delete:
             continue
         try:
-            shutil.rmtree(i["dir"], ignore_errors=True)
-            if store_delete and i["task_id"]:
-                try:
-                    store_delete(i["task_id"])
-                except Exception:  # noqa: BLE001 — store delete is best-effort
-                    pass
-            deleted.append(i["name"])
-        except Exception:  # noqa: BLE001 — per-dir fail-soft
+            shutil.rmtree(i["dir"])
+        except Exception:  # noqa: BLE001 — per-dir fail-soft: a failed delete is not reported
             continue
+        if i["dir"].exists():
+            continue
+        if store_delete and i["task_id"]:
+            try:
+                store_delete(i["task_id"])
+            except Exception:  # noqa: BLE001 — store delete is best-effort
+                pass
+        deleted.append(i["name"])
     return deleted

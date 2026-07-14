@@ -39,6 +39,10 @@ def _capture_outcome(monkeypatch, g):
 
 def test_watchdog_trips_on_idle_stall_and_surfaces_stalled(monkeypatch, tmp_path):
     monkeypatch.setattr(gx10, "TURN_IDLE_TIMEOUT_S", 0.3)
+    # F8 gives connection.first_token_timeout_s a finite default (600s), so the first-token-decoupled
+    # watchdog is now on by default and the pre-first-token idle limit is first_token+idle (~600s). Shrink
+    # it too so the no-progress stall trips inside the deadline (the phase-aware watchdog, not a fixed wait).
+    monkeypatch.setattr(gx10, "LLM_FIRST_TOKEN_TIMEOUT_S", 0.3, raising=False)
     g = _bare_agent(monkeypatch, tmp_path)
     seen = _capture_outcome(monkeypatch, g)
 
@@ -107,7 +111,9 @@ def test_turn_idle_timeout_config_default_and_env_override(monkeypatch):
     saved = gx10.TURN_IDLE_TIMEOUT_S
     try:
         monkeypatch.setenv("GX10_TURN_IDLE_TIMEOUT_S", "17.5")
-        gx10._apply_config(gx10._apply_env(gx10._code_defaults()))
+        cfg = gx10._code_defaults()
+        cfg["connection"]["request_timeout_s"] = 10.0
+        gx10._apply_config(gx10._apply_env(cfg))
         assert gx10.TURN_IDLE_TIMEOUT_S == 17.5
     finally:
         gx10.TURN_IDLE_TIMEOUT_S = saved                  # no cross-test bleed of the module global

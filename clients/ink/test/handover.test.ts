@@ -3,8 +3,9 @@ import assert from 'node:assert/strict';
 import {promises as fs} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
-import {shlexSplit, buildAgentArgv, resolveLaunch, processOne, Pool, authorizeLaunch, type HandoverCfg} from '../src/agent/handover.js';
-import type {Server, Json} from '../src/net/server.js';
+import {setTimeout as delay} from 'node:timers/promises';
+import {shlexSplit, buildAgentArgv, resolveLaunch, runHandover, processOne, Pool, authorizeLaunch, DEFAULT_AGENT_CMD, MAX_CAPTURE_BYTES, spawnAgent, type HandoverCfg} from '../src/agent/handover.js';
+import {Server, type Json} from '../src/net/server.js';
 
 const baseCfg: HandoverCfg = {
   claudeBinOverride: null,
@@ -12,7 +13,75 @@ const baseCfg: HandoverCfg = {
   claudeEffort: 'high',
   claudePermissionMode: 'acceptEdits',
 };
-const envelopeOff = {enabled: false, allow_list: []};
+const envelopeFor = (template: string) => ({
+  enabled: true,
+  allow_list: [{bin: '*', cmd_template: template}],
+});
+
+test('spawnAgent — retains only bounded stdout and stderr tails', async () => {
+  const dir = await fs.mkdtemp(join(tmpdir(), 'ink-ho-tail-'));
+  const bytes = MAX_CAPTURE_BYTES + 128 * 1024;
+  const res = await spawnAgent(
+    [process.execPath, '-e', `process.stdout.write('x'.repeat(${bytes})); process.stderr.write('y'.repeat(${bytes}))`],
+    dir,
+    process.env,
+    5000,
+  );
+
+  assert.equal('enoent' in res, false);
+  if ('enoent' in res) return;
+  assert.match(res.stdout, /^…\(truncated\)…/);
+  assert.ok(Buffer.byteLength(res.stdout, 'utf8') <= MAX_CAPTURE_BYTES + Buffer.byteLength('…(truncated)…'));
+  assert.ok(res.stdout.endsWith('x'.repeat(100)));
+  assert.match(res.stderr, /^…\(truncated\)…/);
+  assert.ok(Buffer.byteLength(res.stderr, 'utf8') <= MAX_CAPTURE_BYTES + Buffer.byteLength('…(truncated)…'));
+  assert.ok(res.stderr.endsWith('y'.repeat(100)));
+});
+
+test('runHandover — a sleeping coder times out with a plain task-failed signal (not agent-unavailable)', async () => {
+  const dir = await fs.mkdtemp(join(tmpdir(), 'ink-ho-timeout-'));
+  const sleeper = join(dir, 'sleep.cjs');
+  await fs.writeFile(sleeper, 'setTimeout(() => {}, 10_000);', 'utf8');
+  const template = `{bin} ${sleeper.replace(/\\/g, '/')}`;
+  const logs: string[] = [];
+
+  const result = await runHandover({
+    id: 'TIMEOUT1', agent: 'OPUS', handover: 'wait', timeout_s: 0.2,
+    bin: process.execPath, cmd_template: template, tooling_envelope: envelopeFor(template),
+  }, dir, baseCfg, (m) => logs.push(m));
+
+  assert.deepEqual(result, {fb: null, meta: {exit_code: null, stderr: 'timeout'}});
+  assert.ok(logs.some((m) => m.includes('code-agent TIMEOUT1 timed out after 0s — killed')));
+});
+
+test('runHandover — timeout kills a spawned descendant tree', {
+  skip: process.platform === 'win32' ? 'POSIX process-group proof' : false,
+}, async () => {
+  const dir = await fs.mkdtemp(join(tmpdir(), 'ink-ho-tree-'));
+  const sentinel = join(dir, 'descendant-wrote');
+  const ready = join(dir, 'descendant-started');
+  const writer = join(dir, 'writer.cjs');
+  const parent = join(dir, 'parent.cjs');
+  await fs.writeFile(writer,
+    "const fs=require('fs'); setTimeout(() => fs.writeFileSync(process.argv[2], 'survived'), 1800);",
+    'utf8');
+  await fs.writeFile(parent, [
+    "const {spawn}=require('child_process'); const fs=require('fs');",
+    "spawn(process.execPath, [process.argv[2], process.argv[3]], {stdio:'ignore'});",
+    "fs.writeFileSync(process.argv[4], 'ready'); setTimeout(() => {}, 10_000);",
+  ].join(''), 'utf8');
+  const template = `{bin} ${parent.replace(/\\/g, '/')} ${writer.replace(/\\/g, '/')} ${sentinel.replace(/\\/g, '/')} ${ready.replace(/\\/g, '/')}`;
+
+  const result = await runHandover({
+    id: 'TIMEOUTTREE', agent: 'OPUS', handover: 'wait', timeout_s: 1,
+    bin: process.execPath, cmd_template: template, tooling_envelope: envelopeFor(template),
+  }, dir, baseCfg, () => {});
+
+  assert.deepEqual(result, {fb: null, meta: {exit_code: null, stderr: 'timeout'}});
+  await fs.access(ready);
+  await delay(1000);
+  await assert.rejects(fs.access(sentinel));
+});
 
 test('shlexSplit — whitespace splits; single/double quotes group', () => {
   assert.deepEqual(shlexSplit('a b  c'), ['a', 'b', 'c']);
@@ -59,7 +128,7 @@ test('buildAgentArgv — empty {mcp} contributes no args (INK-HANDOVER-1)', () =
 test('resolveLaunch — the server per-agent spec drives bin/template/model/effort/permission/mcp (INK-HANDOVER-1)', () => {
   const spec = resolveLaunch(
     {agent: 'SONNET', bin: '/srv/bin/codex', cmd_template: '{bin} run {prompt}', model: 'srv-model',
-     effort: 'low', permission: 'plan', mcp: '--mcp x', mcp_env: {TOK: 'v'}},
+     effort: 'low', permission: 'plan', permission_bypass: true, mcp: '--mcp x', mcp_env: {TOK: 'v'}},
     baseCfg,
   );
   assert.equal(spec.bin, '/srv/bin/codex');
@@ -67,6 +136,7 @@ test('resolveLaunch — the server per-agent spec drives bin/template/model/effo
   assert.equal(spec.model, 'srv-model');
   assert.equal(spec.effort, 'low');
   assert.equal(spec.permission, 'plan');
+  assert.equal(spec.permissionBypass, true);
   assert.equal(spec.mcp, '--mcp x');
   assert.deepEqual(spec.mcpEnv, {TOK: 'v'});
 });
@@ -79,15 +149,46 @@ test('resolveLaunch — an explicit client override beats the item; defaults fil
   assert.equal(spec.model, 'claude-opus-4-8'); // item omits model → OPUS default
   assert.equal(spec.effort, 'high'); // cfg default
   assert.equal(spec.permission, 'acceptEdits'); // cfg default
+  assert.equal(spec.permissionBypass, false);
   assert.deepEqual(spec.mcpEnv, {});
 });
 
-test('authorizeLaunch — off allows byte-identical spawn tuple', () => {
-  assert.equal(authorizeLaunch('anything', '{bin} {prompt}', {enabled: false, allow_list: []}), null);
+test('runHandover — permission bypass without per-agent capability is refused before spawn', async () => {
+  const dir = await fs.mkdtemp(join(tmpdir(), 'ink-ho-permission-'));
+  const result = await runHandover(
+    {id: 'TPERM', agent: 'OPUS', handover: 'do x', permission: 'bypassPermissions'},
+    dir, baseCfg, () => {},
+  );
+  assert.equal(result.fb, null);
+  assert.match(result.meta.stderr ?? '', /capabilities\.permission_bypass=true/);
 });
 
-test('authorizeLaunch — absent policy matches Python default-off handover parity', () => {
-  assert.equal(authorizeLaunch('anything', '{bin} {prompt}', undefined), null);
+test('runHandover — coder prompt requires the first-line completion status contract', async () => {
+  const dir = await fs.mkdtemp(join(tmpdir(), 'ink-ho-prompt-'));
+  const writer = join(dir, 'capture-prompt.cjs');
+  await fs.writeFile(writer, "require('fs').writeFileSync(process.argv[2], process.argv[3]);", 'utf8');
+  const cfg: HandoverCfg = {
+    ...baseCfg,
+    claudeBinOverride: process.execPath,
+    agentCmdOverride: `{bin} ${writer.replace(/\\/g, '/')} {feedback} {prompt}`,
+  };
+
+  const result = await runHandover(
+    {id: 'TSTATUS', agent: 'OPUS', handover: 'do x', tooling_envelope: envelopeFor(cfg.agentCmdOverride ?? DEFAULT_AGENT_CMD)},
+    dir, cfg, () => {},
+  );
+
+  assert.match(result.fb ?? '', /The FIRST line of that file must be `status: done`/);
+  assert.match(result.fb ?? '', /`status: blocked`/);
+  assert.match(result.fb ?? '', /`status: clarification_needed`/);
+});
+
+test('authorizeLaunch — legacy disabled policy refuses', () => {
+  assert.match(authorizeLaunch('anything', '{bin} {prompt}', {enabled: false, allow_list: []}) ?? '', /malformed policy/);
+});
+
+test('authorizeLaunch — absent policy refuses like Python', () => {
+  assert.match(authorizeLaunch('anything', '{bin} {prompt}', undefined) ?? '', /malformed policy/);
   assert.match(authorizeLaunch('anything', '{bin} {prompt}', null) ?? '', /malformed policy/);
   assert.match(authorizeLaunch('anything', '{bin} {prompt}', {}) ?? '', /malformed policy/);
 });
@@ -175,15 +276,87 @@ test('processOne — ALWAYS reports the run signal even when the binary is missi
     },
   } as unknown as Server;
   const cfg: HandoverCfg = {...baseCfg, agentCmdOverride: '{bin} {prompt}'};
-  const item = {id: 'T1', agent: 'OPUS', handover: 'do x', bin: 'definitely-no-such-binary-xyz123', tooling_envelope: envelopeOff};
+  const item = {id: 'T1', agent: 'OPUS', handover: 'do x', bin: 'definitely-no-such-binary-xyz123', tooling_envelope: envelopeFor(cfg.agentCmdOverride ?? DEFAULT_AGENT_CMD)};
   const claimed = new Set(['T1']);
-  const ok = await processOne(srv, item, dir, cfg, claimed, () => {});
+  const logs: string[] = [];
+  const ok = await processOne(srv, item, dir, cfg, claimed, m => logs.push(m));
   assert.equal(ok, false);
   assert.equal(calls.length, 1); // the run signal is POSTed despite no feedback (the #455 breaker is reachable)
   assert.equal(calls[0]?.['content'], '');
   assert.equal(calls[0]?.['exit_code'], null);
   assert.equal(calls[0]?.['stderr'], 'binary-not-found');
   assert.equal(claimed.has('T1'), false); // un-claimed for retry/failover
+  // An older server object has neither method: both signal failures are logged and remain fail-soft.
+  assert.ok(logs.some(m => m.includes('/claim failed (continuing)')));
+  assert.ok(logs.some(m => m.includes('/unclaim failed (continuing)')));
+});
+
+test('processOne — POSTs /claim before spawn', async () => {
+  const dir = await fs.mkdtemp(join(tmpdir(), 'ink-ho-'));
+  const marker = join(dir, 'claimed.marker');
+  const checker = join(dir, 'claim-check.cjs');
+  await fs.writeFile(checker,
+    "const fs=require('fs'); if(!fs.existsSync(process.argv[2])) process.exit(9); fs.writeFileSync(process.argv[3], 'CLAIMED');",
+    'utf8');
+  const calls: Array<{path: string; body: Json}> = [];
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async (input, init) => {
+    const path = new URL(String(input)).pathname;
+    const body = JSON.parse(String(init?.body ?? '{}')) as Json;
+    calls.push({path, body});
+    if (path === '/claim') await fs.writeFile(marker, 'yes', 'utf8');
+    const payload = path === '/feedback'
+      ? {ok: true, classification: 'ok-feedback', feedback_file: 'fb.md'}
+      : {ok: true, status: path === '/claim' ? 'in_progress' : 'pending'};
+    return new Response(JSON.stringify(payload), {status: 200});
+  }) as typeof fetch;
+  try {
+    const srv = new Server('http://engine.test');
+    const cfg: HandoverCfg = {
+      ...baseCfg,
+      claudeBinOverride: process.execPath,
+      agentCmdOverride: `{bin} ${checker.replace(/\\/g, '/')} ${marker.replace(/\\/g, '/')} {feedback}`,
+    };
+    const claimed = new Set(['T1455']);
+    const ok = await processOne(
+      srv, {id: 'T1455', agent: 'OPUS', handover: 'claim first', tooling_envelope: envelopeFor(cfg.agentCmdOverride ?? DEFAULT_AGENT_CMD)},
+      dir, cfg, claimed, () => {});
+    assert.equal(ok, true); // the child exits 9 unless the mocked /claim completed before spawn
+    assert.deepEqual(calls.map(c => c.path), ['/claim', '/feedback']);
+    assert.deepEqual(calls[0]?.body, {task_id: 'T1455', agent: 'OPUS'});
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('processOne — POSTs /unclaim after coder failure', async () => {
+  const dir = await fs.mkdtemp(join(tmpdir(), 'ink-ho-'));
+  const calls: Array<{path: string; body: Json}> = [];
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async (input, init) => {
+    const path = new URL(String(input)).pathname;
+    const body = JSON.parse(String(init?.body ?? '{}')) as Json;
+    calls.push({path, body});
+    const payload = path === '/feedback'
+      ? {ok: true, classification: 'agent-failed'}
+      : {ok: true, status: path === '/claim' ? 'in_progress' : 'pending'};
+    return new Response(JSON.stringify(payload), {status: 200});
+  }) as typeof fetch;
+  try {
+    const srv = new Server('http://engine.test');
+    const cfg: HandoverCfg = {...baseCfg, agentCmdOverride: '{bin} {prompt}'};
+    const claimed = new Set(['T1456']);
+    const ok = await processOne(srv, {
+      id: 'T1456', agent: 'OPUS', handover: 'fail', bin: 'definitely-no-such-binary-1455',
+      tooling_envelope: envelopeFor(cfg.agentCmdOverride ?? DEFAULT_AGENT_CMD),
+    }, dir, cfg, claimed, () => {});
+    assert.equal(ok, false);
+    assert.deepEqual(calls.map(c => c.path), ['/claim', '/feedback', '/unclaim']);
+    assert.deepEqual(calls[2]?.body, {task_id: 'T1456'});
+    assert.equal(claimed.has('T1456'), false);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 });
 
 test('processOne — a nonzero exit with stderr and no feedback still reports the run signal (#455 failover)', async () => {
@@ -199,7 +372,7 @@ test('processOne — a nonzero exit with stderr and no feedback still reports th
   } as unknown as Server;
   const cfg: HandoverCfg = {...baseCfg, claudeBinOverride: process.execPath, agentCmdOverride: `{bin} ${failer.replace(/\\/g, '/')}`};
   const claimed = new Set(['T3']);
-  const ok = await processOne(srv, {id: 'T3', agent: 'OPUS', handover: 'do z', tooling_envelope: envelopeOff}, dir, cfg, claimed, () => {});
+  const ok = await processOne(srv, {id: 'T3', agent: 'OPUS', handover: 'do z', tooling_envelope: envelopeFor(cfg.agentCmdOverride ?? DEFAULT_AGENT_CMD)}, dir, cfg, claimed, () => {});
   assert.equal(ok, false);
   assert.equal(calls.length, 1); // the #455 breaker path: budget-exhausted run is reported, not silently retried
   assert.equal(calls[0]?.['content'], '');
@@ -222,7 +395,7 @@ test('processOne — uploads the captured final message via the {feedback} fallb
   // bin = this node; template runs the writer with the {feedback} capture path as its arg
   const cfg: HandoverCfg = {...baseCfg, claudeBinOverride: process.execPath, agentCmdOverride: `{bin} ${writer.replace(/\\/g, '/')} {feedback}`};
   const claimed = new Set(['T2']);
-  const ok = await processOne(srv, {id: 'T2', agent: 'OPUS', handover: 'do y', tooling_envelope: envelopeOff}, dir, cfg, claimed, () => {});
+  const ok = await processOne(srv, {id: 'T2', agent: 'OPUS', handover: 'do y', tooling_envelope: envelopeFor(cfg.agentCmdOverride ?? DEFAULT_AGENT_CMD)}, dir, cfg, claimed, () => {});
   assert.equal(ok, true);
   assert.equal(calls.length, 1);
   assert.equal(calls[0]?.['content'], 'CAPTURED'); // the {feedback} capture is read when no feedback file is written
@@ -256,7 +429,7 @@ test('processOne — a coder that emits its result ONLY to stdout is CAPTURED (n
     return true;
   }) as typeof process.stdout.write;
   try {
-    const ok = await processOne(srv, {id: 'T1406', agent: 'OPUS', handover: 'do stdout', tooling_envelope: envelopeOff}, dir, cfg, claimed, () => {});
+    const ok = await processOne(srv, {id: 'T1406', agent: 'OPUS', handover: 'do stdout', tooling_envelope: envelopeFor(cfg.agentCmdOverride ?? DEFAULT_AGENT_CMD)}, dir, cfg, claimed, () => {});
     assert.equal(ok, true);
   } finally {
     process.stdout.write = originalWrite;
@@ -285,7 +458,7 @@ test('processOne — coder stdout and stderr are written to a per-task log; clie
   } as unknown as Server;
   const logs: string[] = [];
   const cfg: HandoverCfg = {...baseCfg, claudeBinOverride: process.execPath, agentCmdOverride: `{bin} ${writer.replace(/\\/g, '/')}`};
-  const ok = await processOne(srv, {id: 'T1406LOG', agent: 'OPUS', handover: 'do noisy', tooling_envelope: envelopeOff}, dir, cfg, new Set(['T1406LOG']), (m) => logs.push(m));
+  const ok = await processOne(srv, {id: 'T1406LOG', agent: 'OPUS', handover: 'do noisy', tooling_envelope: envelopeFor(cfg.agentCmdOverride ?? DEFAULT_AGENT_CMD)}, dir, cfg, new Set(['T1406LOG']), (m) => logs.push(m));
   assert.equal(ok, false);
 
   const coderLog = join(dir, '.ironclad', 'agent', 'logs', 'T1406LOG_OPUS.log');
@@ -311,7 +484,7 @@ test('processOne — a FAILED run keeps its scratch for diagnosis + retry (#1300
     },
   } as unknown as Server;
   const cfg: HandoverCfg = {...baseCfg, claudeBinOverride: process.execPath, agentCmdOverride: `{bin} ${failer.replace(/\\/g, '/')}`};
-  const ok = await processOne(srv, {id: 'T4', agent: 'OPUS', handover: 'do w', tooling_envelope: envelopeOff}, dir, cfg, new Set(['T4']), () => {});
+  const ok = await processOne(srv, {id: 'T4', agent: 'OPUS', handover: 'do w', tooling_envelope: envelopeFor(cfg.agentCmdOverride ?? DEFAULT_AGENT_CMD)}, dir, cfg, new Set(['T4']), () => {});
   assert.equal(ok, false);
   // the handover drop survives a failed run — the retry re-reads it and the operator can inspect it
   await fs.access(join(dir, '.ironclad', 'agent', 'handovers', 'T4_OPUS.md'));
@@ -332,7 +505,7 @@ test('runHandover — the coder is launched in the server-shipped project cwd, n
   } as unknown as Server;
   const cfg: HandoverCfg = {...baseCfg, claudeBinOverride: process.execPath,
     agentCmdOverride: `{bin} ${writer.replace(/\\/g, '/')} {feedback}`};
-  const item = {id: 'P1', agent: 'OPUS', handover: 'build it', cwd: projDir, tooling_envelope: envelopeOff};
+  const item = {id: 'P1', agent: 'OPUS', handover: 'build it', cwd: projDir, tooling_envelope: envelopeFor(cfg.agentCmdOverride ?? DEFAULT_AGENT_CMD)};
   const ok = await processOne(srv, item, codedir, cfg, new Set(['P1']), () => {});
   assert.equal(ok, true);
   const reported = await fs.realpath(String(calls[0]?.['content']).trim());
@@ -355,7 +528,7 @@ test('runHandover — falls back to the client codedir when the server ships no 
   } as unknown as Server;
   const cfg: HandoverCfg = {...baseCfg, claudeBinOverride: process.execPath,
     agentCmdOverride: `{bin} ${writer.replace(/\\/g, '/')} {feedback}`};
-  const ok = await processOne(srv, {id: 'P2', agent: 'OPUS', handover: 'x', tooling_envelope: envelopeOff}, codedir, cfg, new Set(['P2']), () => {});
+  const ok = await processOne(srv, {id: 'P2', agent: 'OPUS', handover: 'x', tooling_envelope: envelopeFor(cfg.agentCmdOverride ?? DEFAULT_AGENT_CMD)}, codedir, cfg, new Set(['P2']), () => {});
   assert.equal(ok, true);
   assert.equal(await fs.realpath(String(calls[0]?.['content']).trim()), await fs.realpath(codedir));
 });
@@ -374,7 +547,7 @@ test('runHandover — falls back to codedir when the shipped cwd does not exist 
   const cfg: HandoverCfg = {...baseCfg, claudeBinOverride: process.execPath,
     agentCmdOverride: `{bin} ${writer.replace(/\\/g, '/')} {feedback}`};
   const ghost = join(codedir, 'does-not-exist-on-this-host'); // shipped by the server but absent here
-  const item = {id: 'P3', agent: 'OPUS', handover: 'x', cwd: ghost, tooling_envelope: envelopeOff};
+  const item = {id: 'P3', agent: 'OPUS', handover: 'x', cwd: ghost, tooling_envelope: envelopeFor(cfg.agentCmdOverride ?? DEFAULT_AGENT_CMD)};
   const ok = await processOne(srv, item, codedir, cfg, new Set(['P3']), () => {});
   assert.equal(ok, true);
   assert.equal(await fs.realpath(String(calls[0]?.['content']).trim()), await fs.realpath(codedir));

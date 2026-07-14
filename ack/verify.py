@@ -1,11 +1,11 @@
-"""Verifier / Evaluation Layer — MARK-ONLY behavioral evaluation (Agent-Contract-Kernel, #602 S602-4).
+"""Verifier / Evaluation Layer — reusable behavioral verdicts (Agent-Contract-Kernel, #602 S602-4).
 
-> **Evaluation beyond schema-validity, without ever gating.** The hard floor (`constrained_emission`) and
+> **Evaluation beyond schema-validity.** The hard floor (`constrained_emission`) and
 > the re-ask loop (`validated_emit`) guarantee a reply is *structurally* valid. This layer adds *behavioral*
 > evaluation — does the output satisfy business rules, is each claim grounded in retrieved evidence, would an
-> LLM judge pass it — and returns a :class:`VerdictResult`. **It is MARK-ONLY / advisory: a verdict can
-> neither relax nor tighten any gate.** The fail-closed core path is untouched; verdicts are read only by the
-> opt-in reflection layer (quality trends — #602 SUB-9), never by a gate.
+> LLM judge pass it — and returns a :class:`VerdictResult`. The result carries no authority by itself:
+> callers choose policy. The engine treats its named required handover rules as a synchronous staging gate,
+> while grounding and the LLM judge remain advisory.
 
 Three pluggable verifiers, all **opt-in, default-off** (nothing runs unless a caller invokes it → byte-
 identical) and **secret-free / transport-injected** (like `validated_emit`, auth lives in the injected

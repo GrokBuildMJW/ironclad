@@ -42,7 +42,7 @@ def _flags(monkeypatch, tmp_path):
     saved = (gx10.AUTOPILOT_AUTOPLAN, gx10.AUTOPILOT_MAX_TASKS, gx10._AUTOPLAN_DONE,
              gx10._EFFECTIVE_CFG)
     gx10.AUTOPILOT_AUTOPLAN = True
-    gx10.AUTOPILOT_MAX_TASKS = 0
+    gx10.AUTOPILOT_MAX_TASKS = 20
     gx10._AUTOPLAN_DONE = 0
     gx10._EFFECTIVE_CFG = {"paths": {"active_capability_backlog": "my-backlog.md"},
                            "autopilot": {}}

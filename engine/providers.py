@@ -23,10 +23,15 @@ from enum import Enum
 from typing import Dict, List, Optional
 
 from pydantic import BaseModel, Field, field_validator
-from ack.tooling_envelope import assert_authorized, load_tooling_envelope_policy
+from ack.tooling_envelope import (
+    DEFAULT_CLI_BIN,
+    DEFAULT_CLI_CMD_TEMPLATE,
+    assert_authorized,
+    load_tooling_envelope_policy,
+)
 
-DEFAULT_CLAUDE_CMD_TEMPLATE = "{bin} --model {model} --effort {effort} --permission-mode {permission} --print {prompt}"
-CLAUDE_BIN = os.environ.get("GX10_CLAUDE_BIN", "claude")
+DEFAULT_CLAUDE_CMD_TEMPLATE = DEFAULT_CLI_CMD_TEMPLATE
+CLAUDE_BIN = DEFAULT_CLI_BIN
 
 # #449 (review B): the agent_id is a filename token matched by the ASCII-only regexes
 # _HO_AGENT_RE/_FB_RE (r"_([A-Za-z]+)…"). Validate against the SAME ASCII class — `str.isalpha()`
@@ -45,6 +50,7 @@ class Capabilities(BaseModel):
     web_search: bool = False        # CLI with search tools (public research)
     file_io: bool = False           # may read local files (PC pool)
     local: bool = False             # runs on sovereign infra (Spark/loopback) → local-only capable
+    permission_bypass: bool = False # explicit per-agent opt-in to bypass interactive CLI permissions
     max_effort: str = "xhigh"       # highest effort tier it can serve (low|medium|high|xhigh)
 
     @field_validator("max_effort")
@@ -84,7 +90,7 @@ class ProviderSpec(BaseModel):
     models_probe: Optional[str] = None   # cli: opt-in args appended to the resolved bin to list models
     models_pattern: Optional[str] = None # cli: optional regex used only to display advertised model ids
     effort: Optional[str] = None         # cli: default effort ({effort}), per-item overridable
-    permission_mode: Optional[str] = None  # cli: {permission}; None → inherits CLAUDE_PERMISSION_MODE
+    permission_mode: Optional[str] = None  # cli: {permission}; None → inherits the safe client fallback
     mcp_template: Optional[str] = None   # cli: #480 — per-CLI read-only Memory MCP config args, injected
                                          #   into the {mcp} placeholder when memory is configured. The
                                          #   {mcp_server} token renders to the python invocation of
@@ -153,17 +159,18 @@ def load_registry(cfg: Dict) -> Optional["ProviderRegistry"]:
     pool = block.get("pool") or []
     if not pool:
         return None
-    reg = ProviderRegistry(
-        providers=_filter_authorized_specs([ProviderSpec(**p) for p in pool], cfg),
+    specs = [ProviderSpec(**p) for p in pool]
+    ProviderRegistry(providers=specs, default_id=block.get("default_id")).validate_loud()
+    return ProviderRegistry(
+        providers=_filter_authorized_specs(specs, cfg),
         default_id=block.get("default_id"),
-    )
-    return reg.validate_loud()
+    ).validate_loud()
 
 
 # --------------------------------------------------------------------------- #
 # Code-AGENT registry (#449, C0R-9) — the handover code-agent identity map. A SEPARATE,
 # ALWAYS-ON config surface (``config.code_agents.pool``), INDEPENDENT of the fan-out
-# ``providers.pool`` / ``providers.enabled`` (which is True in local-mode and would otherwise turn
+# ``providers.pool`` (whose dispatcher topology is derived only from setup.type and would otherwise turn
 # default agents into fan-out reasoning substrates). Each entry is a ProviderSpec carrying an
 # ``agent_id``. Ironclad ships OPUS/SONNET as OVERRIDABLE defaults; ``conf/`` adds CODEX/KIMI.
 # Unknown agent id fails closed (rejected, never silently defaulted) — replaces the six OPUS/SONNET
@@ -232,6 +239,15 @@ class CodeAgentRegistry(BaseModel):
             if not (a.bin and a.cmd_template):
                 raise ValueError(f"code-agent {aid} must define BOTH bin and cmd_template "
                                  f"(got bin={a.bin!r}, cmd_template={'set' if a.cmd_template else None})")
+            bypass_requested = (
+                a.permission_mode == "bypassPermissions"
+                or "--dangerously-skip-permissions" in (a.cmd_template or "")
+            )
+            if bypass_requested and not a.capabilities.permission_bypass:
+                raise ValueError(
+                    f"code-agent {aid} requests a permission bypass without the explicit "
+                    f"capabilities.permission_bypass=true opt-in"
+                )
         return self
 
 
@@ -241,8 +257,9 @@ def load_code_agents(cfg: Dict) -> "CodeAgentRegistry":
     config merge, so ``conf/`` re-lists the agents it wants (OPUS/SONNET/CODEX/…)."""
     block = (cfg or {}).get("code_agents") or {}
     pool = block.get("pool") or []
-    reg = CodeAgentRegistry(agents=_filter_authorized_specs([ProviderSpec(**p) for p in pool], cfg))
-    return reg.validate_loud()
+    specs = [ProviderSpec(**p) for p in pool]
+    CodeAgentRegistry(agents=specs).validate_loud()
+    return CodeAgentRegistry(agents=_filter_authorized_specs(specs, cfg)).validate_loud()
 
 
 def canonical_launch_tuple(spec: Optional[ProviderSpec]) -> tuple[str, str]:
@@ -255,11 +272,9 @@ def canonical_launch_tuple(spec: Optional[ProviderSpec]) -> tuple[str, str]:
 
 def _filter_authorized_specs(specs: List[ProviderSpec], cfg: Dict) -> List[ProviderSpec]:
     policy = load_tooling_envelope_policy(cfg)
-    if not policy.enabled:
-        return specs
     out: List[ProviderSpec] = []
     for spec in specs:
-        if spec.kind != ProviderKind.CLI:
+        if not spec.enabled or spec.kind != ProviderKind.CLI:
             out.append(spec)
             continue
         candidate_bin, candidate_template = canonical_launch_tuple(spec)

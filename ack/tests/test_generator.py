@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 from ack import generator as g
@@ -16,6 +17,23 @@ def _demo_widget_ctx():
     return g.build_context(args)
 
 
+def _template(root: Path, files: dict[str, str]) -> Path:
+    for rel, content in files.items():
+        path = root / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+    return root
+
+
+def _tree_snapshot(root: Path):
+    if not root.exists():
+        return None
+    return {
+        p.relative_to(root).as_posix(): None if p.is_dir() else p.read_bytes()
+        for p in sorted(root.rglob("*"))
+    }
+
+
 def test_generate_creates_files_into_output_root(tmp_path):
     ctx = _demo_widget_ctx()
     assert ctx["capability_key"] == "p-widget"
@@ -25,6 +43,153 @@ def test_generate_creates_files_into_output_root(tmp_path):
     assert res.files
     assert res.domain_dir is not None
     assert any(out.rglob("*"))
+
+
+@pytest.mark.parametrize("failure", ["target", "state"])
+def test_generate_commit_failure_rolls_back_entire_tree_and_state(tmp_path, monkeypatch, failure):
+    ctx = _demo_widget_ctx()
+    template = _template(
+        tmp_path / "template",
+        {"{{ domain_folder }}/a.txt": "old a\n", "{{ domain_folder }}/b.txt": "old b\n"},
+    )
+    out = tmp_path / "lib"
+    state_path = out / "Demo" / g.STATE_FILENAME
+
+    if failure == "state":
+        g.generate(ctx, template_root=template, output_root=out)
+        _template(
+            template,
+            {"{{ domain_folder }}/a.txt": "new a\n", "{{ domain_folder }}/b.txt": "new b\n"},
+        )
+
+    before = _tree_snapshot(out)
+    state_before = state_path.read_bytes() if state_path.exists() else None
+    original_write_text = Path.write_text
+    raised = False
+
+    def fail_commit_write(path, content, *args, **kwargs):
+        nonlocal raised
+        should_fail = path == (out / "Demo" / "b.txt") if failure == "target" else path == state_path
+        if should_fail and not raised:
+            raised = True
+            raise OSError("commit failed")
+        return original_write_text(path, content, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "write_text", fail_commit_write)
+    with pytest.raises(OSError, match="commit failed"):
+        g.generate(ctx, template_root=template, output_root=out)
+
+    assert raised
+    assert _tree_snapshot(out) == before
+    assert (state_path.read_bytes() if state_path.exists() else None) == state_before
+
+
+def test_generate_rollback_is_best_effort_and_preserves_original_error(tmp_path, monkeypatch):
+    ctx = _demo_widget_ctx()
+    template = _template(
+        tmp_path / "template",
+        {"{{ domain_folder }}/a.txt": "old a\n", "{{ domain_folder }}/b.txt": "old b\n"},
+    )
+    out = tmp_path / "lib"
+    g.generate(ctx, template_root=template, output_root=out)
+    _template(
+        template,
+        {"{{ domain_folder }}/a.txt": "new a\n", "{{ domain_folder }}/b.txt": "new b\n"},
+    )
+    state_path = out / "Demo" / g.STATE_FILENAME
+    state_before = state_path.read_bytes()
+    original_write_text = Path.write_text
+    original_write_bytes = Path.write_bytes
+
+    def fail_state_write(path, content, *args, **kwargs):
+        if path == state_path:
+            raise OSError("original commit error")
+        return original_write_text(path, content, *args, **kwargs)
+
+    def fail_one_rollback(path, content):
+        if path == out / "Demo" / "b.txt":
+            raise OSError("secondary rollback error")
+        return original_write_bytes(path, content)
+
+    monkeypatch.setattr(Path, "write_text", fail_state_write)
+    monkeypatch.setattr(Path, "write_bytes", fail_one_rollback)
+    with pytest.raises(OSError, match="original commit error"):
+        g.generate(ctx, template_root=template, output_root=out)
+
+    assert (out / "Demo" / "a.txt").read_text(encoding="utf-8") == "old a\n"
+    assert (out / "Demo" / "b.txt").read_text(encoding="utf-8") == "new b\n"
+    assert state_path.read_bytes() == state_before
+
+
+def test_generate_commits_matching_state_and_identical_rerun_writes_no_targets(tmp_path, monkeypatch):
+    ctx = _demo_widget_ctx()
+    template = _template(
+        tmp_path / "template",
+        {"{{ domain_folder }}/a.txt": "alpha\n", "{{ domain_folder }}/nested/b.txt": "beta\n"},
+    )
+    out = tmp_path / "lib"
+    first = g.generate(ctx, template_root=template, output_root=out)
+    state_path = out / "Demo" / g.STATE_FILENAME
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+
+    assert first.ok
+    assert state["files"]
+    assert {rel: (out / Path(rel)).read_text(encoding="utf-8") for rel in state["files"]} == state["files"]
+
+    writes: list[Path] = []
+    original_write_text = Path.write_text
+
+    def record_write(path, content, *args, **kwargs):
+        writes.append(path)
+        return original_write_text(path, content, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "write_text", record_write)
+    second = g.generate(ctx, template_root=template, output_root=out)
+    assert second.files and all(file.action == "unchanged" for file in second.files)
+    assert writes == [state_path]
+
+
+def test_generate_dry_run_changes_neither_new_nor_existing_tree(tmp_path):
+    ctx = _demo_widget_ctx()
+    template = _template(tmp_path / "template", {"{{ domain_folder }}/a.txt": "alpha\n"})
+    new_out = tmp_path / "new-lib"
+    g.generate(ctx, template_root=template, output_root=new_out, dry_run=True)
+    assert not new_out.exists()
+
+    existing_out = tmp_path / "existing-lib"
+    g.generate(ctx, template_root=template, output_root=existing_out)
+    before = _tree_snapshot(existing_out)
+    _template(template, {"{{ domain_folder }}/a.txt": "upgraded\n"})
+    result = g.generate(ctx, template_root=template, output_root=existing_out, dry_run=True)
+    assert any(file.action == "upgraded" for file in result.files)
+    assert _tree_snapshot(existing_out) == before
+
+
+def test_generate_first_run_then_upgrade_merges_local_edits_and_updates_base(tmp_path):
+    ctx = _demo_widget_ctx()
+    template = _template(
+        tmp_path / "template",
+        {"{{ domain_folder }}/a.txt": "title old\nstable anchor\nbody original\n"},
+    )
+    out = tmp_path / "lib"
+    first = g.generate(ctx, template_root=template, output_root=out)
+    target = out / "Demo" / "a.txt"
+    state_path = out / "Demo" / g.STATE_FILENAME
+
+    assert [file.action for file in first.files] == ["created"]
+    assert json.loads(state_path.read_text(encoding="utf-8"))["files"]["Demo/a.txt"] == (
+        "title old\nstable anchor\nbody original\n"
+    )
+
+    target.write_text("title old\nstable anchor\nbody local\n", encoding="utf-8")
+    _template(template, {"{{ domain_folder }}/a.txt": "title new\nstable anchor\nbody original\n"})
+    upgrade = g.generate(ctx, template_root=template, output_root=out)
+
+    assert [file.action for file in upgrade.files] == ["upgraded"]
+    assert target.read_text(encoding="utf-8") == "title new\nstable anchor\nbody local\n"
+    assert json.loads(state_path.read_text(encoding="utf-8"))["files"]["Demo/a.txt"] == (
+        "title new\nstable anchor\nbody original\n"
+    )
 
 
 def test_skipped_untracked_file_records_no_phantom_baseline(tmp_path):

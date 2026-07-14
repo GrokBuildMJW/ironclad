@@ -6,6 +6,8 @@ AUTO-managed INDEX.md (grouped by category/date, Obsidian [[links]]) and injects
 """
 from __future__ import annotations
 
+from design_test_support import approve_active_design
+
 import sys
 import types
 from pathlib import Path
@@ -174,10 +176,12 @@ def test_index_seed_h1_uses_title_not_slug(tmp_path):
 
 def test_stage_handover_autoreconciles_index(tmp_path):
     gx10.initiative_new("Proj", "software")
+    approve_active_design(gx10)
     idxp = tmp_path / "vault" / "proj" / "INDEX.md"
     idxp.unlink()                                            # prove the macro re-creates it
     tid = gx10._store().create(
-        {"type": "feature", "priority": "high", "title": "x", "description": "y"}, force=True)["id"]
+        {"type": "feature", "priority": "high", "title": "Reconcile the vault index",
+         "description": "Reconcile the complete vault index after a validated staged handover."}, force=True)["id"]
     gx10._stage_handover(tid, "OPUS", "## Handover\nbody")
     assert idxp.is_file()                                    # auto-reconcile fired on stage_handover
 
@@ -185,11 +189,13 @@ def test_stage_handover_autoreconciles_index(tmp_path):
 def test_autoreconcile_is_index_only_no_body_edits(tmp_path):
     # the auto-trigger must NOT inject Related blocks (links=False) — doc bodies stay untouched
     gx10.initiative_new("Proj", "software")
+    approve_active_design(gx10)
     _decision("proj", "db", "DB-Wahl", "2026-06-20", "[infra]")
     _decision("proj", "cache", "Cache-Wahl", "2026-06-19", "[infra]")
     before = (tmp_path / "vault" / "proj" / "decisions" / "db.md").read_text(encoding="utf-8")
     tid = gx10._store().create(
-        {"type": "feature", "priority": "high", "title": "x", "description": "y"}, force=True)["id"]
+        {"type": "feature", "priority": "high", "title": "Reconcile the vault links",
+         "description": "Reconcile the complete vault links after a validated staged handover."}, force=True)["id"]
     gx10._stage_handover(tid, "OPUS", "## Handover\nbody")   # fires links=False auto-reconcile
     after = (tmp_path / "vault" / "proj" / "decisions" / "db.md").read_text(encoding="utf-8")
     assert after == before                                   # no Related block written by the auto-trigger

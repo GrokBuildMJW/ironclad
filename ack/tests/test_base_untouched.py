@@ -11,6 +11,8 @@ cycle — is the operator-gated deploy check.
 """
 from __future__ import annotations
 
+from design_test_support import approve_active_design
+
 import hashlib
 import json
 import sys
@@ -112,9 +114,12 @@ def engine(tmp_path, monkeypatch):
 
 
 def _stage_unit(agent, title):
+    approve_active_design(gx10)
     return gx10._stage_handover(
         None, "OPUS", f"## Handover\n{title}",
-        task_json=json.dumps({"type": "feature", "priority": "high", "title": title, "description": "x"}),
+        task_json=json.dumps({"type": "feature", "priority": "high",
+                              "title": f"Complete validated unit {title}",
+                              "description": "Complete the validated unit with implementation and regression coverage."}),
         force=True,
     )
 

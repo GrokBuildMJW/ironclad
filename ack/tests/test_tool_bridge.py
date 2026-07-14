@@ -11,6 +11,7 @@ import sys
 import threading
 import types
 import time
+import urllib.error
 from pathlib import Path
 
 sys.modules.setdefault("openai", types.SimpleNamespace(OpenAI=object))
@@ -21,6 +22,7 @@ if str(_ENGINE) not in sys.path:
 
 import gx10  # noqa: E402
 import server  # noqa: E402
+import client  # noqa: E402
 import pytest  # noqa: E402
 
 
@@ -60,9 +62,13 @@ def test_bridge_request_emits_frame_and_waits_for_result():
 
 
 def test_bridge_timeout_returns_error():
-    bridge = server.ToolBridge(lambda _f: None, timeout=0.2)
+    frames = []
+    bridge = server.ToolBridge(frames.append, timeout=0.2)
     out = bridge.request("execute_command", {"command": "x"})
     assert out.startswith("ERROR") and "timed out" in out
+    payload = json.loads(frames[0][len(server._TR_PREFIX):-len(server._TR_SUFFIX)])
+    assert payload["name"] == "execute_command_sandboxed_v1"
+    assert payload["sandbox"] in {"auto", "bwrap", "firejail"}
 
 
 def test_deliver_unknown_id_is_false():
@@ -114,6 +120,100 @@ def test_bridge_frame_ships_exec_cwd_only_for_non_default_project(monkeypatch, t
 
     assert "exec_cwd" not in _frame(None)                        # default (no non-default ctx) → omitted
     assert _frame(str(tmp_path))["exec_cwd"] == str(tmp_path)     # non-default project → its root shipped
+
+
+def test_python_client_maps_versioned_exec_and_carries_sandbox_policy(monkeypatch):
+    calls = []
+    posted = []
+    monkeypatch.setattr(gx10, "run_tool", lambda name, args, **kw: calls.append((name, args, kw)) or "OK")
+    cli = client.Server.__new__(client.Server)
+    cli._req = lambda method, path, body: posted.append((method, path, body)) or {}
+    frame = "TR" + json.dumps({
+        "id": "e1", "name": "execute_command_sandboxed_v1", "args": {"command": "echo hi"},
+        "sandbox": "firejail", "exec_cwd": "/project",
+    })
+    cli._run_passthrough_tool(frame)
+    assert calls == [("execute_command", {"command": "echo hi"},
+                      {"exec_cwd": "/project", "sandbox_policy": "firejail"})]
+    assert posted == [("POST", "/tool-result", {"id": "e1", "result": "OK"})]
+
+
+def test_python_client_retries_transient_tool_result_post(monkeypatch):
+    attempts = []
+    sleeps = []
+    monkeypatch.setattr(gx10, "run_tool", lambda _name, _args, **_kw: "OK")
+    monkeypatch.setattr(client.time, "sleep", sleeps.append)
+    cli = client.Server.__new__(client.Server)
+
+    def _req(method, path, body):
+        attempts.append((method, path, body))
+        if len(attempts) == 1:
+            raise urllib.error.URLError("temporary network failure")
+        return {}
+
+    cli._req = _req
+    cli._run_passthrough_tool('TR{"id":"r1","name":"read_file","args":{"path":"a"}}')
+    assert attempts == [
+        ("POST", "/tool-result", {"id": "r1", "result": "OK"}),
+        ("POST", "/tool-result", {"id": "r1", "result": "OK"}),
+    ]
+    assert sleeps == [client._TOOL_RESULT_POST_BACKOFF_S]
+
+
+def test_python_client_retries_read_phase_socket_error(monkeypatch):
+    # #1490 (Opus review): a read-phase ConnectionResetError / socket.timeout on resp.read() is NOT a
+    # urllib.error.URLError subclass, so the retry must catch OSError — else it escapes _run_passthrough_tool
+    # and breaks the very stream this fix protects. Assert such an error is retried, not propagated.
+    attempts = []
+    monkeypatch.setattr(gx10, "run_tool", lambda _name, _args, **_kw: "OK")
+    monkeypatch.setattr(client.time, "sleep", lambda _seconds: None)
+    cli = client.Server.__new__(client.Server)
+
+    def _req(method, path, body):
+        attempts.append((method, path, body))
+        if len(attempts) == 1:
+            raise ConnectionResetError("connection reset while reading the response body")
+        return {}
+
+    cli._req = _req
+    cli._run_passthrough_tool('TR{"id":"r4","name":"read_file","args":{"path":"a"}}')  # must NOT raise
+    assert len(attempts) == 2  # first attempt reset → retried, second delivered
+
+
+def test_python_client_drops_permanent_tool_result_rejection_without_retry(monkeypatch):
+    attempts = []
+    monkeypatch.setattr(gx10, "run_tool", lambda _name, _args, **_kw: "OK")
+    monkeypatch.setattr(client.time, "sleep", lambda _seconds: pytest.fail("must not back off for 4xx"))
+    cli = client.Server.__new__(client.Server)
+
+    def _req(method, path, body):
+        attempts.append((method, path, body))
+        raise urllib.error.HTTPError(path, 410, "Gone", None, None)
+
+    cli._req = _req
+    cli._run_passthrough_tool('TR{"id":"r2","name":"read_file","args":{"path":"a"}}')
+    assert len(attempts) == 1
+
+
+def test_python_client_drops_tool_result_after_bounded_transient_retries(monkeypatch):
+    attempts = []
+    sleeps = []
+    monkeypatch.setattr(gx10, "run_tool", lambda _name, _args, **_kw: "OK")
+    monkeypatch.setattr(client.time, "sleep", sleeps.append)
+    cli = client.Server.__new__(client.Server)
+
+    def _req(method, path, body):
+        attempts.append((method, path, body))
+        raise urllib.error.URLError("persistent network failure")
+
+    cli._req = _req
+    cli._run_passthrough_tool('TR{"id":"r3","name":"read_file","args":{"path":"a"}}')
+    assert len(attempts) == client._TOOL_RESULT_POST_ATTEMPTS
+    assert sleeps == [
+        client._TOOL_RESULT_POST_BACKOFF_S,
+        client._TOOL_RESULT_POST_BACKOFF_S * 2,
+        client._TOOL_RESULT_POST_BACKOFF_S * 3,
+    ]
 
 
 def test_nonlocal_tool_not_routed(tmp_path, monkeypatch):

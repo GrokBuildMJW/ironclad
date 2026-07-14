@@ -3,10 +3,38 @@ import assert from 'node:assert/strict';
 import {promises as fs} from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import {runTool, winPowershellArgs, shellGuard} from '../src/tools/runTool.js';
+import {setTimeout as delay} from 'node:timers/promises';
+import {runOperatorShell, runTool, winPowershellArgs, shellGuard} from '../src/tools/runTool.js';
+import {withSandboxShim} from './sandboxFixture.js';
 
 async function tmp(): Promise<string> {
   return fs.mkdtemp(path.join(os.tmpdir(), 'ironclad-tool-'));
+}
+
+async function processTreeCommand(d: string): Promise<{command: string; ready: string; sentinel: string}> {
+  const sentinel = path.join(d, 'descendant-wrote');
+  const ready = path.join(d, 'descendant-started');
+  const writer = path.join(d, 'writer.mjs');
+  await fs.writeFile(writer, [
+    "import {writeFileSync} from 'node:fs';",
+    'setTimeout(() => writeFileSync(process.argv[2], \'survived\'), 1800);',
+    '',
+  ].join('\n'), 'utf-8');
+  const parent = path.join(d, 'parent.mjs');
+  await fs.writeFile(parent, [
+    "import {spawn} from 'node:child_process';",
+    "import {writeFileSync} from 'node:fs';",
+    'spawn(process.execPath, [process.argv[2], process.argv[3]], {stdio: \'ignore\'});',
+    "writeFileSync(process.argv[4], 'ready');",
+    'setTimeout(() => {}, 10_000);',
+    '',
+  ].join('\n'), 'utf-8');
+  const command = [process.execPath, parent, writer, sentinel, ready].map((v) => JSON.stringify(v)).join(' ');
+  return {command, ready, sentinel};
+}
+
+async function exists(p: string): Promise<boolean> {
+  return fs.stat(p).then(() => true).catch(() => false);
 }
 
 test('write_file then read_file round-trips with exact OK string', async () => {
@@ -26,7 +54,13 @@ test('runTool resolves relative paths + runs execute_command in the shipped base
   assert.equal(await fs.readFile(path.join(base, 'sub', 'f.txt'), 'utf-8'), 'hi');
   assert.equal(await runTool('read_file', {path: 'sub/f.txt'}, base), 'hi');
   // execute_command runs with cwd=base → a relative shell redirect lands under base, not process.cwd()
-  await runTool('execute_command', {command: 'echo cwdtest > marker.txt'}, base);
+  if (process.platform === 'win32') {
+    assert.match(await runTool('execute_command', {command: 'echo cwdtest > marker.txt'}, base),
+                 /refused.*Windows.*fails closed/);
+    await runOperatorShell('echo cwdtest > marker.txt', base);
+  } else {
+    await withSandboxShim(() => runTool('execute_command', {command: 'echo cwdtest > marker.txt'}, base));
+  }
   const there = await fs.stat(path.join(base, 'marker.txt')).then(() => true).catch(() => false);
   assert.ok(there, 'execute_command ran in the shipped baseCwd');
   await fs.rm(base, {recursive: true, force: true});
@@ -61,6 +95,17 @@ test('read_file caps >24000 chars head 16000 + marker + tail 8000', async () => 
     out.includes('[Ironclad: 1000 chars omitted — file 25000 chars, capped at 24000.'),
     'exact cap marker',
   );
+  await fs.rm(d, {recursive: true, force: true});
+});
+
+test('read_file refuses a sparse file above the byte bound before reading it', async () => {
+  const d = await tmp();
+  const p = path.join(d, 'sparse.txt');
+  const fh = await fs.open(p, 'w');
+  await fh.truncate(16 * 1024 * 1024 + 1);   // #1488: the byte cap is the 16 MiB allocation ceiling
+  await fh.close();
+  const out = await runTool('read_file', {path: p});
+  assert.match(out, /^ERROR: read_file refused: file too large — 16777217 bytes, cap 16777216 bytes$/);
   await fs.rm(d, {recursive: true, force: true});
 });
 
@@ -167,9 +212,72 @@ test('list_directory sorts dirs first then name, [D]/[F] labels', async () => {
 });
 
 test('execute_command captures output; unknown tool errors', async () => {
-  const cmd = process.platform === 'win32' ? 'Write-Output hello' : 'printf hello';
-  assert.equal(await runTool('execute_command', {command: cmd}), 'hello');
+  if (process.platform === 'win32') {
+    assert.match(await runTool('execute_command', {command: 'Write-Output hello'}), /refused.*Windows/);
+    assert.equal(await runOperatorShell('Write-Output hello'), 'hello');
+  } else {
+    const d = await tmp();
+    assert.equal(await withSandboxShim(() => runTool('execute_command', {command: 'printf hello'})), 'hello');
+    await fs.rm(d, {recursive: true, force: true});
+  }
   assert.equal(await runTool('totally_unknown', {}), 'ERROR: Unknown tool: totally_unknown');
+});
+
+test('#1489 execute_command timeout kills a spawned descendant tree', {
+  skip: process.platform === 'win32',
+}, async () => {
+  const d = await tmp();
+  try {
+    const {command, ready, sentinel} = await processTreeCommand(d);
+    const out = await withSandboxShim(() => runTool('execute_command', {command, timeout: 1}));
+    assert.equal(out, 'ERROR: Timeout after 1s');
+    assert.equal(await exists(ready), true, 'the descendant was spawned before the timeout');
+    await delay(1100);
+    assert.equal(await exists(sentinel), false, 'a descendant survived the timed-out process group');
+  } finally {
+    await fs.rm(d, {recursive: true, force: true});
+  }
+});
+
+test('#1489 execute_command abort kills a spawned descendant tree', {
+  skip: process.platform === 'win32',
+}, async () => {
+  const d = await tmp();
+  try {
+    const {command, ready, sentinel} = await processTreeCommand(d);
+    const ac = new AbortController();
+    const running = withSandboxShim(() => runTool('execute_command', {command, timeout: 10}, undefined, 'auto', ac.signal));
+    const deadline = Date.now() + 5000;
+    while (!(await exists(ready)) && Date.now() < deadline) await delay(10);
+    ac.abort();
+    assert.equal(await running, 'ERROR: cancelled');
+    assert.equal(await exists(ready), true, 'the descendant was spawned before the abort');
+    await delay(1900);
+    assert.equal(await exists(sentinel), false, 'a descendant survived abort of the process group');
+  } finally {
+    await fs.rm(d, {recursive: true, force: true});
+  }
+});
+
+test('#1489 execSandboxed passes the hardening flags to the bwrap backend', {
+  skip: process.platform === 'win32',
+}, async () => {
+  // The shim strips the sandbox flags before exec, so behavioural tests never see them. Capture the
+  // full argv the backend was invoked with and assert the isolation + tree-kill flags are actually present
+  // (parity with the Python test_sandbox.py string assertion; runTool.ts had zero coverage of this argv).
+  const d = await tmp();
+  const log = path.join(d, 'bwrap-argv');
+  process.env.IRONCLAD_BWRAP_ARGV_LOG = log;
+  try {
+    await withSandboxShim(() => runTool('execute_command', {command: 'printf ok'}));
+    const argv = await fs.readFile(log, 'utf-8');
+    for (const flag of ['--die-with-parent', '--unshare-pid', '--unshare-net', '--dev-bind', '--proc']) {
+      assert.ok(argv.includes(flag), `bwrap argv is missing ${flag}: ${argv}`);
+    }
+  } finally {
+    delete process.env.IRONCLAD_BWRAP_ARGV_LOG;
+    await fs.rm(d, {recursive: true, force: true});
+  }
 });
 
 test('#459 winPowershellArgs hardens WriteProgress + preserves the command', () => {

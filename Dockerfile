@@ -29,4 +29,8 @@ EXPOSE 8100
 
 # Autopilot stays off server-side (the client launches code-agents); the server
 # only reasons + holds state. Override host/port/url via env or compose.
-CMD ["sh", "-c", "python engine/server.py --host 0.0.0.0 --port ${GX10_SERVER_PORT}"]
+# F8 (#1469): the server binds the schema default host (loopback 127.0.0.1) unless configured, so a bare
+# `docker run -p ...` is reachable ONLY loopback INSIDE the container (not via published ports). To expose it,
+# set GX10_SERVER_HOST=0.0.0.0 AND either a token/sealed profile OR GX10_ALLOW_UNAUTHENTICATED_BIND=1 (an
+# explicit, greppable opt-in to an unauthenticated non-loopback bind), or mount a config that sets them.
+CMD ["sh", "-c", "python engine/server.py --port ${GX10_SERVER_PORT}"]

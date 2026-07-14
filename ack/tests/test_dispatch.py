@@ -123,7 +123,7 @@ def test_inactive_delegates_byte_identical():
     assert disp2.active() is False
 
 
-def test_inactive_does_not_spill_to_workers_when_envelope_on(monkeypatch):
+def test_inactive_local_fanout_is_not_spawn_authorization_gated(monkeypatch):
     from ack.tooling_envelope import load_tooling_envelope_policy
     monkeypatch.setattr(gx10, "TOOLING_ENVELOPE_POLICY", load_tooling_envelope_policy({
         "security": {"tooling_envelope": {"enabled": True, "allow_list": []}}
@@ -131,9 +131,8 @@ def test_inactive_does_not_spill_to_workers_when_envelope_on(monkeypatch):
     workers = FakeWorkers()
     disp = ProviderDispatcher(None, workers=workers, enabled=False)
     res = disp.dispatch(["a"])
-    assert res[0]["ok"] is False
-    assert "tooling-envelope" in res[0]["error"]
-    assert workers.calls == []
+    assert res[0]["ok"] is True and res[0]["content"] == "spark:a"
+    assert workers.calls == [{"prompts": ["a"], "max_tokens": None}]
 
 
 def test_default_cli_runner_refuses_unauthorized_without_spawn(monkeypatch):
@@ -197,7 +196,7 @@ def test_run_handover_refuses_unauthorized_without_spawn(monkeypatch, tmp_path):
         nonlocal called
         called = True
 
-    monkeypatch.setattr(client.subprocess, "run", _run)
+    monkeypatch.setattr(client.subprocess, "Popen", _run)
     item = {"id": "T1", "agent": "OPUS", "handover": "do it", "bin": "python",
             "cmd_template": "{bin} wrapper.py {prompt}", "model": "m", "effort": "high"}
     fb, meta = client._run_handover(item, tmp_path, log=lambda *_: None)
@@ -363,6 +362,7 @@ def test_provenance_fields_complete_on_every_active_result():
 
 def test_default_cli_runner_renders_argv(monkeypatch):
     import client  # noqa: E402
+    from ack.tooling_envelope import load_tooling_envelope_policy
     captured = {}
 
     def fake_run(argv, **kw):
@@ -372,6 +372,11 @@ def test_default_cli_runner_renders_argv(monkeypatch):
     monkeypatch.setattr(client.subprocess, "run", fake_run)
     spec = SimpleNamespace(cmd_template="{bin} --model {model} --print {prompt}",
                            bin="claude", model="sonnet", permission_mode=None)
+    monkeypatch.setattr(gx10, "TOOLING_ENVELOPE_POLICY", load_tooling_envelope_policy({
+        "security": {"tooling_envelope": {"allow_list": [
+            {"bin": spec.bin, "cmd_template": spec.cmd_template},
+        ]}}
+    }))
     r = client.default_cli_runner(spec, "hello world", effort="high")
     assert r["ok"] is True and r["content"] == "answer"
     assert captured["argv"][:4] == ["claude", "--model", "sonnet", "--print"]

@@ -8,7 +8,7 @@
  * forward slashes on Windows and would break parity. `filePattern` matches the BASENAME
  * (fnmatch semantics; case-insensitive on Windows, like NTFS / pathlib).
  */
-import {promises as fs, type Dirent} from 'node:fs';
+import {promises as fs} from 'node:fs';
 import path from 'node:path';
 
 function fnmatchToRe(pattern: string): RegExp {
@@ -21,29 +21,29 @@ function fnmatchToRe(pattern: string): RegExp {
   return new RegExp('^' + re + '$', process.platform === 'win32' ? 'i' : '');
 }
 
-/** Files under `directory` whose basename matches `filePattern`, depth-first, paths in `str(Path)` form. */
-export async function rglob(directory: string, filePattern: string): Promise<string[]> {
+/** Files under `directory` whose basename matches `filePattern`, depth-first, paths in `str(Path)` form.
+ *  The two bounded-memory passes preserve pathlib's current-directory-before-subdirectories order without
+ *  accumulating either the full tree or a directory's complete entry list (#1488). */
+export async function* rglob(directory: string, filePattern: string): AsyncGenerator<string> {
   const re = fnmatchToRe(filePattern);
-  const out: string[] = [];
-  async function walk(dir: string): Promise<void> {
-    let entries: Dirent[];
+  async function* walk(dir: string): AsyncGenerator<string> {
     try {
-      entries = await fs.readdir(dir, {withFileTypes: true});
+      const entries = await fs.opendir(dir);
+      for await (const e of entries) {
+        if (e.isFile() && re.test(e.name)) yield path.join(dir, e.name);
+      }
     } catch {
       return; // unreadable dir → skip (≙ rglob silently passing over it)
     }
-    // Parity (audit): Python Path(dir).rglob emits ALL matching files of the CURRENT
-    // directory first, then descends into subdirs — NOT interleaved depth-first. Collect
-    // current-dir matches here, recurse afterwards, so hit order (and which 50 survive
-    // the hits[:50] cap in search_files) match the Python source byte-for-byte.
-    const subdirs: string[] = [];
-    for (const e of entries) {
-      const full = path.join(dir, e.name);
-      if (e.isDirectory()) subdirs.push(full);
-      else if (e.isFile() && re.test(e.name)) out.push(full);
+    // A second lazy pass avoids retaining every subdirectory while keeping the established order.
+    try {
+      const entries = await fs.opendir(dir);
+      for await (const e of entries) {
+        if (e.isDirectory()) yield* walk(path.join(dir, e.name));
+      }
+    } catch {
+      return;
     }
-    for (const sub of subdirs) await walk(sub);
   }
-  await walk(directory);
-  return out;
+  yield* walk(directory);
 }

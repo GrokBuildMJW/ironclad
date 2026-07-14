@@ -3,7 +3,7 @@
 Single-tenant by design — the token is a *deployment secret*, not a user login (see
 docs/roadmap.md). These tests pin:
   - profile derivation + flags (open / token / sealed) and the fail-closed startup
-  - constant-time token check and the sealed loopback bind
+  - constant-time token check and fail-closed unauthenticated bind policy
   - the session lifecycle (open → live → expiry/close → sealed) on a controllable clock
   - the HTTP gate end to end against a real ThreadingHTTPServer (no vLLM):
       token  → 401 without the secret, 200 with it
@@ -44,16 +44,26 @@ def _restore_handler_policy():
 # --------------------------------------------------------------------------- #
 # SecurityPolicy — derivation, flags, fail-closed.
 # --------------------------------------------------------------------------- #
-def test_open_profile_is_permissive():
+def test_open_profile_allows_loopback_and_refuses_unauthenticated_lan_bind():
     p = SecurityPolicy.from_config({"security": {"profile": "open"}})
     assert p.profile == "open"
     assert p.auth_required is False
     assert p.session_required is False
     assert p.seals_when_idle is False
     assert p.check_token(None) is True              # nothing required
-    assert p.effective_bind("0.0.0.0") == "0.0.0.0"  # honours requested bind
+    assert p.effective_bind("127.0.0.1") == "127.0.0.1"
     assert p.code_locality == "mount"
-    assert p.startup_error() is None
+    assert p.startup_error("127.0.0.1") is None
+    err = p.startup_error("0.0.0.0")
+    assert err is not None and "security.allow_unauthenticated_bind" in err
+
+
+def test_open_non_loopback_bind_requires_named_dangerous_override():
+    p = SecurityPolicy.from_config({"security": {
+        "profile": "open", "allow_unauthenticated_bind": True,
+    }})
+    assert p.startup_error("0.0.0.0") is None
+    assert p.effective_bind("0.0.0.0") == "0.0.0.0"
 
 
 def test_token_profile_requires_secret(monkeypatch):
@@ -65,6 +75,7 @@ def test_token_profile_requires_secret(monkeypatch):
     monkeypatch.setenv("GX10_SERVER_TOKEN", "s3cret")
     p2 = SecurityPolicy.from_config({"security": {"profile": "token"}})
     assert p2.startup_error() is None
+    assert p2.startup_error("0.0.0.0") is None
     assert p2.check_token("Bearer s3cret") is True
     assert p2.check_token("Bearer wrong") is False
     assert p2.check_token("s3cret") is True          # bare token accepted too
@@ -85,13 +96,13 @@ def test_invalid_profile_refuses_boot_not_silent_open(monkeypatch):
     assert SecurityPolicy.from_config({}).profile == "open"            # missing section → default
 
 
-def test_sealed_profile_forces_loopback_and_local(monkeypatch):
+def test_sealed_profile_allows_authenticated_non_loopback_and_forces_local_code(monkeypatch):
     monkeypatch.setenv("GX10_SERVER_TOKEN", "tok")
     p = SecurityPolicy.from_config({"security": {"profile": "sealed", "code_locality": "mount"}})
     assert p.auth_required and p.session_required and p.seals_when_idle
-    assert p.effective_bind("0.0.0.0") == "127.0.0.1"   # tunnel terminates on loopback
+    assert p.effective_bind("0.0.0.0") == "0.0.0.0"
     assert p.code_locality == "local"                    # sealed forces pull-only
-    assert p.startup_error() is None
+    assert p.startup_error("0.0.0.0") is None
 
 
 def test_env_overrides_config_profile(monkeypatch):
@@ -243,6 +254,14 @@ def test_token_profile_gates_chat(tmp_path, monkeypatch):
         res = _post(port, "/chat", {"message": "ping"},
                     headers={"Authorization": "Bearer tok"})
         assert res["ok"] and "echo:ping" in res["output"]
+        # Task claim mutations are gated exactly like /pending and /feedback.
+        for path, body in (("/claim", {"task_id": "KGC-999", "agent": "OPUS"}),
+                           ("/unclaim", {"task_id": "KGC-999"})):
+            with pytest.raises(urllib.error.HTTPError) as ec:
+                _post(port, path, body)
+            assert ec.value.code == 401
+            ok = _post(port, path, body, headers={"Authorization": "Bearer tok"})
+            assert ok == {"ok": True, "status": "not_found"}
         # /tasks is gated too — 401 without, 200 with the secret.
         with pytest.raises(urllib.error.HTTPError) as et:
             _get(port, "/tasks")

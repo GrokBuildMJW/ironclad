@@ -1,8 +1,4 @@
-"""Pure tooling-envelope authorization policy.
-
-The policy is default-off. When enabled, a caller must present the canonical coder
-spawn tuple: executable identity plus the command template shape to run.
-"""
+"""Pure, mandatory tooling-envelope authorization policy."""
 from __future__ import annotations
 
 import os
@@ -13,15 +9,25 @@ from pathlib import Path
 from typing import Any, Optional, Sequence
 
 
-_TRUE = {"true", "1", "yes", "on"}
-_FALSE = {"false", "0", "no", "off", ""}
 _ASCII_WS_RE = re.compile(r"[ \t\n\r\f\v]+")
 _VAR_RE = re.compile(r"\$([A-Za-z_][A-Za-z0-9_]*)|\$\{([^}]+)\}")
-_AUTOPILOT_ALLOWED_STREAM = (
+_WINDOWS_EXECUTABLE_EXTENSIONS = frozenset({".exe", ".cmd", ".bat", ".com", ".ps1"})
+DEFAULT_CLI_BIN = os.environ.get("GX10_CLAUDE_BIN", "claude")
+DEFAULT_CLI_CMD_TEMPLATE = (
+    "{bin} --model {model} --effort {effort} --permission-mode {permission} --print {prompt}"
+)
+_AUTOPILOT_SAFE_STREAM = (
+    "{bin} --model {model} --effort {effort} --permission-mode {permission} "
+    "--verbose --output-format stream-json --print {prompt}"
+)
+_AUTOPILOT_SAFE_NON_STREAM = (
+    "{bin} --model {model} --effort {effort} --permission-mode {permission} --print {prompt}"
+)
+_AUTOPILOT_BYPASS_STREAM = (
     "{bin} --model {model} --effort {effort} --dangerously-skip-permissions "
     "--verbose --output-format stream-json --print {prompt}"
 )
-_AUTOPILOT_ALLOWED_NON_STREAM = (
+_AUTOPILOT_BYPASS_NON_STREAM = (
     "{bin} --model {model} --effort {effort} --dangerously-skip-permissions --print {prompt}"
 )
 
@@ -34,7 +40,7 @@ class ToolingEnvelopeEntry:
 
 @dataclass(frozen=True)
 class ToolingEnvelopePolicy:
-    enabled: bool = False
+    enabled: bool = True
     allow_list: tuple[ToolingEnvelopeEntry, ...] = field(default_factory=tuple)
 
 
@@ -47,34 +53,80 @@ class Verdict:
         return self.authorized
 
 
-def _strict_bool(value: Any) -> bool:
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, str):
-        s = value.strip().lower()
-        if s in _TRUE:
-            return True
-        if s in _FALSE:
-            return False
-    return False
-
-
 def load_tooling_envelope_policy(config: Optional[dict]) -> ToolingEnvelopePolicy:
-    """Load ``security.tooling_envelope`` from a config tree, fail-soft and default-off."""
+    """Load mandatory policy data; missing data derives from enabled CLI agents."""
     try:
-        section = (((config or {}).get("security") or {}).get("tooling_envelope") or {})
-        enabled = _strict_bool(section.get("enabled", False))
-        entries = []
-        for raw in section.get("allow_list") or []:
-            if not isinstance(raw, dict):
-                continue
-            b = str(raw.get("bin") or "").strip()
-            t = _normalize_template(raw.get("cmd_template"))
-            if b and t:
-                entries.append(ToolingEnvelopeEntry(bin=b, cmd_template=t))
-        return ToolingEnvelopePolicy(enabled=enabled, allow_list=tuple(entries))
+        root = config or {}
+        section = ((root.get("security") or {}).get("tooling_envelope") or {})
+        if not isinstance(section, dict):
+            return ToolingEnvelopePolicy()
+        raw_entries = section.get("allow_list")
+        if raw_entries is None:
+            raw_entries = _derived_entries(root)
+        entries = _validated_entries(raw_entries)
+        return ToolingEnvelopePolicy(allow_list=entries or ())
     except Exception:
         return ToolingEnvelopePolicy()
+
+
+def _derived_entries(config: dict) -> list[dict]:
+    """Return exact bin/template tuples from enabled CLI ProviderSpecs."""
+    out = []
+    for key in ("code_agents", "providers"):
+        block = config.get(key) or {}
+        pool = block.get("pool") if isinstance(block, dict) else None
+        if pool is None:
+            continue
+        if not isinstance(pool, list):
+            raise ValueError(f"malformed {key}.pool")
+        for spec in pool:
+            if not isinstance(spec, dict) or not isinstance(spec.get("enabled", True), bool):
+                raise ValueError(f"malformed {key} spec")
+            if not spec.get("enabled", True):
+                continue
+            if str(spec.get("kind") or "").strip().lower() != "cli":
+                continue
+            effective_bin = spec.get("bin") or DEFAULT_CLI_BIN
+            effective_template = spec.get("cmd_template") or DEFAULT_CLI_CMD_TEMPLATE
+            capabilities = spec.get("capabilities") or {}
+            permission_bypass = (
+                isinstance(capabilities, dict) and capabilities.get("permission_bypass") is True
+            )
+            if "--dangerously-skip-permissions" in str(effective_template) and not permission_bypass:
+                raise ValueError("permission bypass template lacks explicit per-agent capability")
+            out.append({"bin": effective_bin, "cmd_template": effective_template})
+            # The local/server handover lane renders the ProviderSpec template. The
+            # engine autopilot lane preserves Claude's stream/non-stream argv shape.
+            if os.path.basename(str(effective_bin)).lower() in {"claude", "claude.exe"}:
+                template = str(effective_template)
+                if "--print" in template:
+                    out.extend([
+                        {"bin": effective_bin, "cmd_template": _AUTOPILOT_SAFE_STREAM},
+                        {"bin": effective_bin, "cmd_template": _AUTOPILOT_SAFE_NON_STREAM},
+                    ])
+                    if permission_bypass:
+                        out.extend([
+                            {"bin": effective_bin, "cmd_template": _AUTOPILOT_BYPASS_STREAM},
+                            {"bin": effective_bin, "cmd_template": _AUTOPILOT_BYPASS_NON_STREAM},
+                        ])
+    return out
+
+
+def _validated_entries(raw_entries: Any) -> Optional[tuple[ToolingEnvelopeEntry, ...]]:
+    if not isinstance(raw_entries, list):
+        return None
+    entries = []
+    for raw in raw_entries:
+        if not isinstance(raw, dict):
+            return None
+        b, t = raw.get("bin"), raw.get("cmd_template")
+        if not isinstance(b, str) or not b.strip() or not isinstance(t, (str, list, tuple)):
+            return None
+        normalized = _normalize_template(t)
+        if not normalized:
+            return None
+        entries.append(ToolingEnvelopeEntry(bin=b.strip(), cmd_template=normalized))
+    return tuple(entries)
 
 
 def assert_authorized(bin: Any, cmd_template: Any, policy: Any) -> Verdict:
@@ -90,8 +142,6 @@ def assert_authorized(bin: Any, cmd_template: Any, policy: Any) -> Verdict:
         pol = _coerce_policy(policy)
         if pol is None:
             return Verdict(False, "tooling envelope refused malformed policy")
-        if not pol.enabled:
-            return Verdict(True)
         candidate_bin = _bin_identity(bin)
         candidate_template = _normalize_template(cmd_template)
         if not candidate_bin or not candidate_template:
@@ -106,26 +156,20 @@ def assert_authorized(bin: Any, cmd_template: Any, policy: Any) -> Verdict:
 
 def _coerce_policy(policy: Any) -> Optional[ToolingEnvelopePolicy]:
     if isinstance(policy, ToolingEnvelopePolicy):
-        if not isinstance(policy.enabled, bool):
+        if policy.enabled is not True:
             return None
         return policy
     if isinstance(policy, dict):
         if "tooling_envelope" in policy or "security" in policy:
             return load_tooling_envelope_policy(policy)
-        if "enabled" not in policy and "allow_list" not in policy:
+        if "allow_list" not in policy:
             return None
-        if not isinstance(policy.get("enabled"), bool) or not isinstance(policy.get("allow_list"), list):
+        if policy.get("enabled", True) is not True:
             return None
-        entries = []
-        for raw in policy.get("allow_list"):
-            if isinstance(raw, ToolingEnvelopeEntry):
-                entries.append(raw)
-            elif isinstance(raw, dict):
-                b = str(raw.get("bin") or "").strip()
-                t = _normalize_template(raw.get("cmd_template"))
-                if b and t:
-                    entries.append(ToolingEnvelopeEntry(b, t))
-        return ToolingEnvelopePolicy(_strict_bool(policy.get("enabled", False)), tuple(entries))
+        entries = _validated_entries(policy.get("allow_list"))
+        if entries is None:
+            return None
+        return ToolingEnvelopePolicy(allow_list=entries)
     return None
 
 
@@ -154,10 +198,18 @@ def _bin_matches(candidate_identity: str, allowed: str) -> bool:
     if not _is_bare_command(allowed_expanded):
         return candidate_identity == _path_identity(allowed_expanded)
     allowed_identity = _bin_identity(allowed_expanded)
+    candidate_basename = os.path.basename(candidate_identity)
+    allowed_basename = os.path.basename(allowed_identity)
     return (
         candidate_identity == allowed_identity
-        or os.path.basename(candidate_identity) == os.path.basename(allowed_identity)
+        or candidate_basename == allowed_basename
+        or _windows_executable_stem(candidate_basename).lower() == allowed_basename.lower()
     )
+
+
+def _windows_executable_stem(value: str) -> str:
+    stem, extension = os.path.splitext(value)
+    return stem if extension.lower() in _WINDOWS_EXECUTABLE_EXTENSIONS else value
 
 
 def _is_bare_command(value: str) -> bool:
@@ -231,13 +283,22 @@ def _normalize_argv(argv: Sequence[Any]) -> str:
 
 def _looks_like_autopilot(parts: Sequence[str]) -> str:
     tokens = list(parts)
-    names = {"claude", "claude.exe"}
-    if len(tokens) < 8 or os.path.basename(tokens[0]).lower() not in names:
+    # Extension-insensitive like _bin_matches: a probe-resolved claude.cmd/.exe stem is still `claude`.
+    if len(tokens) < 8 or _windows_executable_stem(os.path.basename(tokens[0])).lower() != "claude":
         return ""
     if tokens[1] != "--model" or not tokens[2] or tokens[3] != "--effort" or not tokens[4]:
         return ""
+    if len(tokens) == 9 and tokens[5] == "--permission-mode" and tokens[6] and tokens[7] == "--print" and tokens[8]:
+        return _AUTOPILOT_SAFE_NON_STREAM
+    if len(tokens) == 12 and tokens[5] == "--permission-mode" and tokens[6] and tokens[7:11] == [
+        "--verbose",
+        "--output-format",
+        "stream-json",
+        "--print",
+    ] and tokens[11]:
+        return _AUTOPILOT_SAFE_STREAM
     if len(tokens) == 8 and tokens[5:7] == ["--dangerously-skip-permissions", "--print"] and tokens[7]:
-        return _AUTOPILOT_ALLOWED_NON_STREAM
+        return _AUTOPILOT_BYPASS_NON_STREAM
     if len(tokens) == 11 and tokens[5:10] == [
         "--dangerously-skip-permissions",
         "--verbose",
@@ -245,10 +306,12 @@ def _looks_like_autopilot(parts: Sequence[str]) -> str:
         "stream-json",
         "--print",
     ] and tokens[10]:
-        return _AUTOPILOT_ALLOWED_STREAM
+        return _AUTOPILOT_BYPASS_STREAM
     return ""
 
 
-def autopilot_claude_print_template(stream: bool = True) -> str:
+def autopilot_claude_print_template(stream: bool = True, *, permission_bypass: bool = False) -> str:
     """The explicit non-provider-template Claude autopilot argv shape."""
-    return _AUTOPILOT_ALLOWED_STREAM if stream else _AUTOPILOT_ALLOWED_NON_STREAM
+    if permission_bypass:
+        return _AUTOPILOT_BYPASS_STREAM if stream else _AUTOPILOT_BYPASS_NON_STREAM
+    return _AUTOPILOT_SAFE_STREAM if stream else _AUTOPILOT_SAFE_NON_STREAM

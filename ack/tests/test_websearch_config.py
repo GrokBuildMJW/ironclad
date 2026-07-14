@@ -22,7 +22,7 @@ from websearch_brave import BraveAdapter  # noqa: E402
 
 def test_search_defaults_present():
     s = gx10._code_defaults()["search"]
-    assert s["enabled"] is True and s["adapter"] == "cli"
+    assert s["enabled"] is False and s["adapter"] == "cli"
     assert s["api_key_env"] == "GX10_SEARCH_API_KEY"        # NAME only, never the secret
     assert s["count"] == 10 and s["max_output_chars"] == 100_000
 
@@ -31,11 +31,11 @@ def test_search_env_overrides_apply(monkeypatch):
     monkeypatch.setenv("GX10_SEARCH_ADAPTER", "mock")
     monkeypatch.setenv("GX10_SEARCH_COUNT", "5")
     monkeypatch.setenv("GX10_SEARCH_MAX_OUTPUT_CHARS", "1234")
-    monkeypatch.setenv("GX10_SEARCH_ENABLED", "off")
+    monkeypatch.setenv("GX10_SEARCH_ENABLED", "on")
     cfg = gx10._apply_env(gx10._code_defaults())
     assert cfg["search"]["adapter"] == "mock"
     assert cfg["search"]["count"] == 5 and cfg["search"]["max_output_chars"] == 1234
-    assert cfg["search"]["enabled"] is False
+    assert cfg["search"]["enabled"] is True
 
 
 def test_web_search_keys_are_frozen():
@@ -53,7 +53,10 @@ def test_max_output_chars_config_caps_handler_output(monkeypatch):
 
 def test_count_config_flows_to_native_adapter(monkeypatch):
     monkeypatch.setenv("GX10_SEARCH_API_KEY", "k")
-    a = build_web_search_adapter({"search": {"adapter": "brave", "count": 3}}, None, runner_mode="local")
+    a = build_web_search_adapter(
+        {"search": {"enabled": True, "adapter": "brave", "count": 3}}, None,
+        runner_mode="local",
+    )
     assert isinstance(a, BraveAdapter) and a._count == 3
 
 

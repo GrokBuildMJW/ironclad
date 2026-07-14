@@ -49,6 +49,8 @@ from concurrent.futures import Future, ThreadPoolExecutor, wait
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+import config_schema
+import proc_tree
 from commands import HELP_TEXT, build_agent_argv, classify, setup_output
 
 # Default is localhost (secret-free); the real server address (e.g. the box on the
@@ -64,13 +66,10 @@ SERVER_TOKEN = os.environ.get("GX10_SERVER_TOKEN") or None
 TUNNEL_CMD = os.environ.get("GX10_TUNNEL_CMD") or None
 CLAUDE_BIN = os.environ.get("GX10_CLAUDE_BIN", "claude")
 DEFAULT_EFFORT = os.environ.get("GX10_CLAUDE_EFFORT", "high")
-#: The local code-agent runs HEADLESS (`--print`), so it cannot answer permission prompts.
-#: It must both WRITE FILES and RUN COMMANDS — a real handover implies running the tests it
-#: writes (#1308) — so the default is ``bypassPermissions`` (parity with the server-side
-#: autopilot launch, which uses ``--dangerously-skip-permissions``). ``acceptEdits`` (edits
-#: only, no commands) silently skips every command in a `--print` run, so a coder can't
-#: self-verify. An operator wanting a more restrictive mode sets GX10_CLAUDE_PERMISSION_MODE.
-CLAUDE_PERMISSION_MODE = os.environ.get("GX10_CLAUDE_PERMISSION_MODE", "bypassPermissions")
+#: Safe fallback for an old server item that omits the per-agent permission mode. A bypass
+#: additionally requires the server-shipped per-agent capability below.
+_SAFE_PERMISSION_MODE = config_schema.defaults_tree()["code_agents"]["pool"][0]["permission_mode"]
+CLAUDE_PERMISSION_MODE = os.environ.get("GX10_CLAUDE_PERMISSION_MODE", _SAFE_PERMISSION_MODE)
 #: The command that runs a local code-agent on a handover — a TEMPLATE so ANY headless
 #: coding CLI (not only Claude Code) can be wired with **no code change**. Placeholders:
 #: ``{bin} {model} {effort} {permission} {prompt}`` (use only the ones your CLI needs;
@@ -80,6 +79,9 @@ CLAUDE_PERMISSION_MODE = os.environ.get("GX10_CLAUDE_PERMISSION_MODE", "bypassPe
 #: prompt (read the handover, do the task, write the feedback file). See docs/code-agents.md.
 DEFAULT_AGENT_CMD = ("{bin} --model {model} --effort {effort} "
                      "--permission-mode {permission} --print {prompt}")
+_CODER_TIMEOUT_DEFAULT = 1800.0
+_TOOL_RESULT_POST_ATTEMPTS = 4
+_TOOL_RESULT_POST_BACKOFF_S = 0.5
 #: #449 (review B round 4): the RAW client-side overrides (None when unset) — an EXPLICIT
 #: ``GX10_AGENT_CMD``/``GX10_CLAUDE_BIN`` is the documented single-agent BYO path and must WIN over the
 #: server-resolved registry spec (otherwise the default server's OPUS/SONNET template would make the
@@ -197,12 +199,19 @@ def default_cli_runner(spec, prompt: str, *, effort: str, max_tokens: Optional[i
     if refused:
         return {"ok": False, "content": None, "error": refused,
                 "completion_tokens": None, "latency": 0.0, "tooling_envelope_refused": True}
+    permission = getattr(spec, "permission_mode", None) or CLAUDE_PERMISSION_MODE
+    bypass_allowed = bool(getattr(getattr(spec, "capabilities", None), "permission_bypass", False))
+    bypass_requested = permission == "bypassPermissions" or "--dangerously-skip-permissions" in template
+    if bypass_requested and not bypass_allowed:
+        refusal = "permission bypass requires capabilities.permission_bypass=true on this agent"
+        return {"ok": False, "content": None, "error": refusal,
+                "completion_tokens": None, "latency": 0.0, "permission_refused": True}
     argv = build_agent_argv(
         template,
         bin=bin_,
         model=spec.model,
         effort=str(effort),
-        permission=getattr(spec, "permission_mode", None) or CLAUDE_PERMISSION_MODE,
+        permission=permission,
         prompt=prompt,
     )
     t0 = time.monotonic()
@@ -340,7 +349,8 @@ class Server:
 
     def _run_passthrough_tool(self, frame: str) -> None:
         """Execute a passed-through code-tool LOCALLY and post the result to the server.
-        ``frame`` is ``TR{json}`` with the json carrying id/name/args."""
+        ``frame`` is ``TR{json}`` with the json carrying id/name/args. Transient result-post
+        failures are retried with bounded backoff; permanent 4xx rejections are dropped."""
         try:
             payload = json.loads(frame[2:]) if frame.startswith("TR") else json.loads(frame)
             rid, name, args = payload["id"], payload["name"], payload.get("args") or {}
@@ -348,16 +358,36 @@ class Server:
             return
         try:
             import gx10  # importable without openai; run_tool acts on the local cwd
+            if name == "execute_command_sandboxed_v1":
+                name = "execute_command"
+                sandbox_policy = payload.get("sandbox")
+                if sandbox_policy not in {"auto", "bwrap", "firejail"}:
+                    raise ValueError("mandatory sandbox policy missing from bridged execute_command")
+            else:
+                sandbox_policy = None
             # #1317: honour the server-shipped active-project exec cwd so a bridged tool resolves relative
             # paths + runs execute_command THERE, not in the client's boot workdir (fail-soft: run_tool
             # ignores a cwd that doesn't exist on this host — remote/sealed → byte-identical fallback).
-            result = gx10.run_tool(name, args, exec_cwd=payload.get("exec_cwd"))
+            result = gx10.run_tool(name, args, exec_cwd=payload.get("exec_cwd"),
+                                   sandbox_policy=sandbox_policy)
         except Exception as e:  # noqa: BLE001 — never break the stream on a tool error
             result = f"ERROR: {e!r}"
-        try:
-            self._req("POST", "/tool-result", {"id": rid, "result": result})
-        except urllib.error.URLError:
-            pass
+        for attempt in range(_TOOL_RESULT_POST_ATTEMPTS):
+            try:
+                self._req("POST", "/tool-result", {"id": rid, "result": result})
+                return
+            except urllib.error.HTTPError as e:
+                if 400 <= e.code < 500:
+                    return  # permanent (stale / bridge moved on) — drop, matching the Ink client
+                # 5xx is transient: fall through to the bounded retry.
+            except OSError:
+                # transient transport failure — retry below. OSError (not just URLError) so a read-phase
+                # socket.timeout / ConnectionResetError on resp.read() (NOT a URLError subclass) can't escape
+                # and break the stream (the very failure this retry exists to absorb). HTTPError is caught
+                # above, so this never swallows an HTTP status.
+                pass
+            if attempt + 1 < _TOOL_RESULT_POST_ATTEMPTS:
+                time.sleep(_TOOL_RESULT_POST_BACKOFF_S * (attempt + 1))
 
     def cancel(self) -> Dict[str, Any]:
         """Abort the turn currently running on the server (sets its cancel event)."""
@@ -368,6 +398,12 @@ class Server:
 
     def pending(self) -> List[Dict[str, Any]]:
         return self._req("GET", "/pending").get("pending", [])
+
+    def claim(self, task_id: str, agent: str) -> Dict[str, Any]:
+        return self._req("POST", "/claim", {"task_id": task_id, "agent": agent})
+
+    def unclaim(self, task_id: str) -> Dict[str, Any]:
+        return self._req("POST", "/unclaim", {"task_id": task_id})
 
     def coders(self) -> Dict[str, Any]:
         return self._req("GET", "/coders")
@@ -527,6 +563,12 @@ def _run_handover(item: Dict[str, Any], codedir: Path, log=print) -> Tuple[Optio
     bin_ = CLAUDE_BIN_OVERRIDE or item.get("bin") or CLAUDE_BIN
     template = AGENT_CMD_OVERRIDE or item.get("cmd_template") or DEFAULT_AGENT_CMD
     permission = item.get("permission") or CLAUDE_PERMISSION_MODE
+    bypass_requested = (permission == "bypassPermissions"
+                        or "--dangerously-skip-permissions" in template)
+    if bypass_requested and item.get("permission_bypass") is not True:
+        refused = "permission bypass requires the agent's capabilities.permission_bypass=true opt-in"
+        log(f"  ✗ {refused} — handover {tid} skipped")
+        return None, {"exit_code": None, "stderr_tail": refused}
     # #1307: BUILD PRODUCT CODE in the active project's code root — the server ships it per /pending item
     # (`cwd` = the engine's exec cwd for the active project = <project-root>/<code_subdir>). Honour it ONLY
     # when it is a real directory on THIS host — a remote/sealed client does not share the server's
@@ -549,7 +591,9 @@ def _run_handover(item: Dict[str, Any], codedir: Path, log=print) -> Tuple[Optio
     # Claude-only .claude/CLAUDE.md), so any headless code-agent can fulfil the contract.
     prompt = (f"Autonomously read and complete the handover at {ho_path}. "
               f"Follow any agent guide in this repo (e.g. AGENTS.md / CLAUDE.md). When done, write a "
-              f"short result summary to {fb_path}.")
+              f"short result summary to {fb_path}. The FIRST line of that file must be `status: done` when "
+              f"complete (the pipeline advances ONLY on `status: done`), otherwise `status: blocked` or "
+              f"`status: clarification_needed`.")
     # #480/#994-S10: the server resolves the read-only Memory MCP whenever a memory service is
     # configured and the agent ships an mcp_template. Empty when memory is unconfigured or the agent
     # has no mcp_template; the client only renders what the server sent.
@@ -574,17 +618,44 @@ def _run_handover(item: Dict[str, Any], codedir: Path, log=print) -> Tuple[Optio
     mcp_env = item.get("mcp_env")
     if isinstance(mcp_env, dict):
         env.update({str(k): str(v) for k, v in mcp_env.items()})
+    timeout_s = item.get("timeout_s")
+    try:
+        timeout_s = float(timeout_s) if timeout_s is not None else _CODER_TIMEOUT_DEFAULT
+    except (TypeError, ValueError):
+        timeout_s = _CODER_TIMEOUT_DEFAULT
+    # Defense-in-depth: a malformed /pending payload (<=0 fires an immediate kill; inf/NaN break the wait)
+    # must not be trusted blindly — an out-of-sane-range value falls back to the default. 86400s (24h) is a
+    # generous sanity ceiling well above the schema's 7200s max, so no valid value is ever rejected.
+    if not (0 < timeout_s <= 86400):
+        timeout_s = _CODER_TIMEOUT_DEFAULT
     try:
         # #455: capture stderr (and still surface it) so the server can classify a budget/quota
         # exhausted run as `agent-unavailable` and fail over instead of retrying forever.
-        proc = subprocess.run(argv, cwd=str(launch_cwd), env=env, stdin=subprocess.DEVNULL,
-                              text=True, stderr=subprocess.PIPE)
+        popen_args = dict(cwd=str(launch_cwd), env=env, stdin=subprocess.DEVNULL,
+                          stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace")
+        if os.name == "nt":
+            popen_args["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+        else:
+            popen_args["start_new_session"] = True
+        proc = subprocess.Popen(argv, **popen_args)
     except FileNotFoundError:
         log(f"  ✗ code-agent binary '{argv[0] if argv else CLAUDE_BIN}' not found "
             f"(set GX10_CLAUDE_BIN / GX10_AGENT_CMD) — handover {tid} skipped")
         return None, {"exit_code": None, "stderr_tail": "binary-not-found"}
+    try:
+        _stdout, stderr = proc.communicate(timeout=timeout_s)
+    except subprocess.TimeoutExpired:
+        # A hung coder holds its pool claim forever (#1491). Kill the whole tree and return the run signal:
+        # the `timeout …` stderr matches no exhausted pattern → classified `task-failed` (a normal failure,
+        # NOT budget-exhausted), so the server releases the claim and retries to budget rather than tripping
+        # the breaker / failing over. Any feedback the coder wrote in its last instant is intentionally
+        # dropped — a killed coder's partial result is not trusted as complete.
+        proc_tree.kill_process_tree(proc)
+        proc_tree.drain_after_kill(proc, 2.0)
+        log(f"  ✗ code-agent {tid} timed out after {timeout_s:.0f}s — killed")
+        return None, {"exit_code": None, "stderr_tail": f"timeout after {timeout_s:.0f}s"}
     rc = proc.returncode
-    stderr = getattr(proc, "stderr", "") or ""            # real proc captures it; tolerant of stubs
+    stderr = stderr or ""
     if stderr.strip():
         log(stderr.rstrip())                                  # keep the agent's stderr visible
     meta = {"exit_code": rc, "stderr_tail": stderr[-_STDERR_TAIL_CHARS:]}
@@ -610,6 +681,10 @@ def _process_one(srv: Server, codedir: Path, item: Dict[str, Any], claimed: set,
     tid = item.get("id") or ""
     agent = (item.get("agent") or "OPUS").upper()
     try:
+        srv.claim(tid, agent)
+    except Exception as e:  # noqa: BLE001 — an older/unreachable server must not block a working coder
+        log(f"  ⚠ {tid}: /claim failed (continuing): {e}")
+    try:
         fb, meta = _run_handover(item, codedir, log=log)
         # #455: ALWAYS report the run signal (even with no feedback) so the server can classify a
         # budget-exhausted run → trip the breaker + fail over on the next poll, instead of retrying
@@ -628,6 +703,10 @@ def _process_one(srv: Server, codedir: Path, item: Dict[str, Any], claimed: set,
         log(f"  ✗ {tid}: upload/network failed: {e}")
     except Exception as e:  # noqa: BLE001
         log(f"  ✗ {tid}: code-agent failed: {e!r}")
+    try:
+        srv.unclaim(tid)
+    except Exception as e:  # noqa: BLE001 — reconciler/stall watchdog remain the backstop
+        log(f"  ⚠ {tid}: /unclaim failed (continuing): {e}")
     claimed.discard(tid)
     return False
 

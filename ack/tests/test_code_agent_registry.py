@@ -38,7 +38,8 @@ from providers import (CodeAgentRegistry, ProviderSpec, load_code_agents,  # noq
                        probe_code_agents, resolve_agent_bin)
 from pydantic import ValidationError  # noqa: E402
 
-_TASK = {"type": "feature", "priority": "high", "title": "wire", "description": "x"}
+_TASK = {"type": "feature", "priority": "high", "title": "Wire the agent registry",
+         "description": "Wire the complete code-agent registry through validated staging behavior."}
 
 
 def _cfg_with_extra_agent() -> dict:
@@ -63,13 +64,26 @@ def test_default_registry_has_opus_and_sonnet():
     assert reg.resolve("sonnet").model == "claude-sonnet-5"   # case-insensitive lookup
 
 
-def test_default_coder_permission_allows_commands():
-    # #1308: the autonomous headless coder must run the tests it writes, so the built-in coder default
-    # permission mode is bypassPermissions — acceptEdits (edits only) silently skips every command in a
-    # `claude --print` run, so a coder could never self-verify.
+def test_default_coder_permission_is_safe_and_bypass_requires_capability():
     reg = load_code_agents(gx10._code_defaults())
-    assert reg.resolve("OPUS").permission_mode == "bypassPermissions"
-    assert reg.resolve("SONNET").permission_mode == "bypassPermissions"
+    assert reg.resolve("OPUS").permission_mode == "default"
+    assert reg.resolve("SONNET").permission_mode == "default"
+    assert reg.resolve("OPUS").capabilities.permission_bypass is False
+
+    cfg = gx10._code_defaults()
+    cfg["code_agents"]["pool"][0]["permission_mode"] = "bypassPermissions"
+    with pytest.raises(ValueError, match="capabilities.permission_bypass=true"):
+        load_code_agents(cfg)
+
+    cfg["code_agents"]["pool"][0]["capabilities"] = {"permission_bypass": True}
+    assert load_code_agents(cfg).resolve("OPUS").permission_mode == "bypassPermissions"
+
+    dangerous = gx10._code_defaults()
+    dangerous["code_agents"]["pool"][0]["cmd_template"] = (
+        "{bin} --dangerously-skip-permissions --print {prompt}"
+    )
+    with pytest.raises(ValueError, match="capabilities.permission_bypass=true"):
+        load_code_agents(dangerous)
 
 
 def test_config_pool_adds_a_third_agent():
@@ -219,8 +233,8 @@ def test_schema_enum_tracks_config_added_agent(monkeypatch):
 
 
 # ── _do_launch (autopilot): byte-identical Claude shape + feedback path for templated agents ─────
-def _capture_launch_argv(monkeypatch, tmp_path, agent, *, frontmatter, reg_cfg=None):
-    gx10._apply_config(gx10._code_defaults())
+def _capture_launch_argv(monkeypatch, tmp_path, agent, *, frontmatter, reg_cfg=None, cfg=None):
+    gx10._apply_config(cfg if cfg is not None else gx10._code_defaults())
     gx10.STORE = None
     # _do_launch spawns a monitor thread that _ui_prints a ✓ on completion; on a cp1252 test console
     # that daemon-thread print would raise UnicodeEncodeError. Silence it so the test is clean + stable.
@@ -229,6 +243,8 @@ def _capture_launch_argv(monkeypatch, tmp_path, agent, *, frontmatter, reg_cfg=N
     gx10.initiative_new("Auto", "software")
     if reg_cfg is not None:                            # override the registry AFTER _apply_config reset it
         monkeypatch.setattr(gx10, "_EFFECTIVE_CFG", reg_cfg, raising=False)
+        from ack.tooling_envelope import load_tooling_envelope_policy
+        monkeypatch.setattr(gx10, "TOOLING_ENVELOPE_POLICY", load_tooling_envelope_policy(reg_cfg))
     tid = gx10._store().create(dict(_TASK), force=True)["id"]
     (gx10.handovers_dir() / f"{tid}_{agent}.md").write_text(frontmatter, encoding="utf-8")
     captured = {}
@@ -259,12 +275,14 @@ def _launch_python_log_child(monkeypatch, tmp_path, code: str):
          "model": code, "bin": sys.executable, "cmd_template": "{bin} -c {model}"},
     ]}}
     monkeypatch.setattr(gx10, "_EFFECTIVE_CFG", cfg, raising=False)
+    from ack.tooling_envelope import load_tooling_envelope_policy
+    monkeypatch.setattr(gx10, "TOOLING_ENVELOPE_POLICY", load_tooling_envelope_policy(cfg))
     tid = gx10._store().create(dict(_TASK), force=True)["id"]
     (gx10.handovers_dir() / f"{tid}_PYLOG.md").write_text("---\nto: PYLOG\n---\nho", encoding="utf-8")
     gx10._autopilot_reserve()
     gx10._do_launch(tid, "PYLOG")
     proc = gx10._AUTOPILOT_PROCS[tid]
-    return tid, proc, tmp_path / ".ironclad" / "logs" / f"{tid}_PYLOG.log"
+    return tid, proc, gx10.state_root() / "logs" / f"{tid}_PYLOG.log"
 
 
 def _eventually(predicate, timeout=2.0):
@@ -289,9 +307,12 @@ def _stop_proc(proc):
 def test_do_launch_default_claude_keeps_stream_plumbing(tmp_path, monkeypatch):
     # review B-1: the default OPUS/SONNET launch must stay byte-identical — the Claude `--print` shape
     # keeps --verbose + --output-format stream-json even though the defaults now carry a cmd_template.
-    monkeypatch.setattr(gx10, "AUTOPILOT_STREAM", True, raising=False)
+    # F6a: the typed schema makes _code_defaults() a STATIC tree (no longer echoes the live
+    # AUTOPILOT_STREAM global), so drive streaming through the config the way a real deployment does.
+    cfg = gx10._code_defaults()
+    cfg["autopilot"]["stream"] = True
     argv, _ = _capture_launch_argv(monkeypatch, tmp_path, "OPUS",
-                                   frontmatter="---\nto: claude-opus-4-8\n---\nho")
+                                   frontmatter="---\nto: claude-opus-4-8\n---\nho", cfg=cfg)
     assert "--print" in argv and "--verbose" in argv
     assert "--output-format" in argv and "stream-json" in argv
 
@@ -391,7 +412,8 @@ def test_pending_handover_embeds_full_spec(tmp_path, monkeypatch):
     assert item["model"] == "claude-opus-4-8"          # from the registry spec
     assert item["bin"] == "claude"                     # spec.bin fallback (no resolved bin mocked)
     assert item["cmd_template"] and "{prompt}" in item["cmd_template"]
-    assert item["permission"] == "bypassPermissions"   # #1308: coder default allows running its own tests
+    assert item["permission"] == "default"
+    assert item["permission_bypass"] is False
 
 
 def test_pending_handover_frontmatter_overrides_spec_model(tmp_path, monkeypatch):
@@ -535,7 +557,11 @@ def test_run_handover_precedence_override_vs_server_spec(tmp_path, monkeypatch):
     # server-sent registry spec; without it the server spec is authoritative.
     import client
     item = {"id": "KGC-3", "agent": "OPUS", "model": "claude-opus-4-8", "bin": "claude",
-            "cmd_template": "claude --model {model} --print {prompt}", "permission": "acceptEdits"}
+            "cmd_template": "claude --model {model} --print {prompt}", "permission": "acceptEdits",
+            "tooling_envelope": {"enabled": True, "allow_list": [
+                {"bin": "claude", "cmd_template": "claude --model {model} --print {prompt}"},
+                {"bin": "mytool", "cmd_template": "{bin} --go {prompt}"},
+            ]}}
     captured = {}
 
     class _P:
@@ -545,7 +571,14 @@ def test_run_handover_precedence_override_vs_server_spec(tmp_path, monkeypatch):
         captured["argv"] = argv
         return _P()
 
-    monkeypatch.setattr(client.subprocess, "run", _fake_run)
+    class _FakePopen:
+        def __init__(self, argv, **kw):
+            self.returncode = _fake_run(argv, **kw).returncode
+
+        def communicate(self, timeout=None):
+            return None, ""
+
+    monkeypatch.setattr(client.subprocess, "Popen", _FakePopen)
 
     # (1) no explicit override → the server-sent spec is used
     monkeypatch.setattr(client, "AGENT_CMD_OVERRIDE", None, raising=False)

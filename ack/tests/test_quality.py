@@ -3,10 +3,10 @@
 Proves, offline:
 
   * `QualityBreaker` trips on `min_consecutive` sub-threshold scores, recovers on an at/above-threshold score,
-    is fail-open-safe (never raises; a hiccup leaves it untripped), and exposes a snapshot — all advisory
-    (no gate, no hard-abort);
-  * the engine wiring is OPT-IN: `gx10._apply_quality_breaker` builds the SEPARATE `_QUALITY_BREAKER` only
-    when `quality.enabled`, clears it when off, and the shipped default leaves NO breaker (byte-identical).
+    is fail-open-safe (never raises; a hiccup leaves it untripped), and exposes a snapshot consumed by the
+    engine's protected-boundary hold;
+  * the engine wiring is always-on: `gx10._apply_quality_breaker` always builds the SEPARATE
+    `_QUALITY_BREAKER`, and the retired enable leaf cannot clear it.
 
     python -m pytest ack/tests/test_quality.py -q
 """
@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -130,56 +131,150 @@ def test_window_caps_retained_samples():
     assert b.snapshot().samples == 3        # only the window is retained
 
 
+def test_reconfigure_preserves_recovered_state_without_replaying_an_old_low_run():
+    b = QualityBreaker(threshold=0.5, min_consecutive=3, window=20)
+    for score in (0.1, 0.1, 0.1):
+        b.record(score)
+    b.record(0.9)
+    b.reset()                               # engine recovery keeps history but clears the live latch
+
+    rebuilt = b.reconfigure(threshold=0.5, min_consecutive=3, window=10)
+
+    assert list(rebuilt._scores) == [0.1, 0.1, 0.1, 0.9]
+    assert rebuilt.snapshot().consecutive_low == 0
+    assert rebuilt.tripped is False
+
+
+def test_reconfigure_preserves_a_live_latch_even_when_new_rule_is_looser():
+    b = QualityBreaker(threshold=0.5, min_consecutive=2)
+    b.record(0.1); b.record(0.1)
+    assert b.tripped is True
+
+    rebuilt = b.reconfigure(threshold=0.5, min_consecutive=5, window=20)
+
+    assert rebuilt.snapshot().consecutive_low == 2
+    assert rebuilt.tripped is True
+
+
+def test_reconfigure_can_trip_from_a_newly_revealed_trailing_low_streak():
+    b = QualityBreaker(threshold=0.5, min_consecutive=3)
+    for score in (0.9, 0.6, 0.7, 0.75):
+        b.record(score)
+    assert b.tripped is False
+
+    rebuilt = b.reconfigure(threshold=0.8, min_consecutive=3, window=20)
+
+    assert rebuilt.snapshot().consecutive_low == 3
+    assert rebuilt.tripped is True
+
+
 def test_snapshot_is_frozen():
     snap = QualityBreaker().snapshot()
     with pytest.raises(Exception):
         snap.tripped = True
 
 
-# ─── engine wiring — OPT-IN, separate from the availability breaker ─────────────────────────────────
+# ─── engine wiring — always-on, separate from the availability breaker ──────────────────────────────
 @pytest.fixture
 def _clean_breaker():
     import gx10
     saved = gx10._QUALITY_BREAKER
+    saved_tripped = gx10._QUALITY_TRIPPED
     gx10._QUALITY_BREAKER = None
+    gx10._QUALITY_TRIPPED = None
     yield gx10
     gx10._QUALITY_BREAKER = saved
+    gx10._QUALITY_TRIPPED = saved_tripped
 
 
-def test_apply_builds_breaker_when_enabled(_clean_breaker):
+def test_apply_builds_breaker_with_tuning(_clean_breaker):
     gx10 = _clean_breaker
-    gx10._apply_quality_breaker({"quality": {"enabled": True, "threshold": 0.5, "min_consecutive": 2, "window": 5}})
+    gx10._apply_quality_breaker({"quality": {"threshold": 0.5, "min_consecutive": 2, "window": 5}})
     assert isinstance(gx10._quality_breaker(), QualityBreaker)
 
 
-def test_apply_default_config_builds_no_breaker(_clean_breaker):
+def test_apply_default_config_builds_breaker(_clean_breaker):
     gx10 = _clean_breaker
-    gx10._apply_quality_breaker(gx10._code_defaults())     # quality.enabled is False by default
-    assert gx10._quality_breaker() is None                 # byte-identical no-op
+    gx10._apply_quality_breaker(gx10._code_defaults())
+    assert isinstance(gx10._quality_breaker(), QualityBreaker)
 
 
-def test_apply_clears_breaker_when_disabled(_clean_breaker):
+def test_legacy_false_cannot_clear_the_breaker(_clean_breaker):
     gx10 = _clean_breaker
-    gx10._apply_quality_breaker({"quality": {"enabled": True}})
-    assert gx10._quality_breaker() is not None
+    gx10._apply_quality_breaker({"quality": {}})
+    existing = gx10._quality_breaker()
     gx10._apply_quality_breaker({"quality": {"enabled": False}})
-    assert gx10._quality_breaker() is None
+    assert gx10._quality_breaker() is existing
 
 
-def test_apply_keeps_existing_breaker_state_on_reapply(_clean_breaker):
+def test_runtime_quality_tuning_rebuilds_recomputes_and_preserves_compatible_history(
+        _clean_breaker, monkeypatch):
     gx10 = _clean_breaker
-    gx10._apply_quality_breaker({"quality": {"enabled": True, "min_consecutive": 2}})
-    b = gx10._quality_breaker()
-    b.record(0.1)
-    gx10._apply_quality_breaker({"quality": {"enabled": True}})   # re-apply must not drop the streak
-    assert gx10._quality_breaker() is b                            # same instance
-    assert gx10._quality_breaker().snapshot().consecutive_low == 1  # streak preserved (no in-place reset)
+    cfg = gx10._code_defaults()
+    gx10._apply_quality_breaker(cfg)
+    original = gx10._quality_breaker()
+    for score in (0.6, 0.7, 0.75):
+        original.record(score)
+    assert original.snapshot().samples == 3 and original.tripped is False
+
+    monkeypatch.setattr(gx10, "_EFFECTIVE_CFG", cfg)
+    monkeypatch.setattr(gx10, "_ui_print", lambda *a, **k: None)
+    gx10._dispatch(None, "config set quality.threshold 0.8")
+    threshold_tuned = gx10._quality_breaker()
+    assert threshold_tuned is not original
+    assert threshold_tuned.snapshot().samples == 3
+    assert threshold_tuned.snapshot().threshold == 0.8
+    assert threshold_tuned.tripped is True and gx10._quality_tripped() is not None
+
+    gx10._dispatch(None, "config set quality.min_consecutive 4")
+    assert gx10._quality_breaker().snapshot().samples == 3
+    assert gx10._quality_breaker().snapshot().min_consecutive == 4
+    assert gx10._quality_breaker().tripped is True and gx10._quality_tripped() is not None
+
+    gx10._dispatch(None, "config set quality.min_consecutive 2")
+    gx10._dispatch(None, "config set quality.window 2")
+    final = gx10._quality_breaker()
+    assert final.snapshot().samples == 2
+    assert getattr(final, "_scores").maxlen == 2
+    assert list(getattr(final, "_scores")) == [0.7, 0.75]
+    assert final.tripped is True and gx10._quality_tripped() is not None
+
+
+def test_runtime_window_tuning_does_not_resurrect_a_recovered_trip(_clean_breaker, monkeypatch):
+    gx10 = _clean_breaker
+    cfg = gx10._code_defaults()
+    cfg["quality"].update({"threshold": 0.5, "min_consecutive": 3, "window": 20})
+    gx10._apply_quality_breaker(cfg)
+    monkeypatch.setattr(gx10, "_EFFECTIVE_CFG", cfg)
+    monkeypatch.setattr(gx10, "_ui_print", lambda *a, **k: None)
+
+    for score in (0.1, 0.1, 0.1):
+        gx10._set_last_verdict(SimpleNamespace(score=score))
+        gx10._quality_consumer_hook({})
+    assert gx10._quality_tripped() is not None
+
+    gx10._set_last_verdict(SimpleNamespace(score=0.9))
+    gx10._quality_consumer_hook({})
+    assert gx10._quality_tripped() is None
+    assert gx10._quality_breaker().tripped is False
+
+    gx10._dispatch(None, "config set quality.window 7")
+    tuned = gx10._quality_breaker()
+    assert list(tuned._scores) == [0.1, 0.1, 0.1, 0.9]
+    assert tuned.snapshot().consecutive_low == 0
+    assert tuned.tripped is False and gx10._quality_tripped() is None
+
+    for score in (0.1, 0.1, 0.1):
+        gx10._set_last_verdict(SimpleNamespace(score=score))
+        gx10._quality_consumer_hook({})
+    assert gx10._quality_breaker().tripped is True
+    assert gx10._quality_tripped() is not None
 
 
 def test_apply_is_separate_from_availability_breaker(_clean_breaker):
     gx10 = _clean_breaker
     before = dict(gx10._CODE_AGENT_BREAKER)
-    gx10._apply_quality_breaker({"quality": {"enabled": True}})
+    gx10._apply_quality_breaker({"quality": {}})
     # the quality breaker is its own object; the availability breaker dict is untouched (byte-for-byte).
     assert gx10._quality_breaker() is not gx10._CODE_AGENT_BREAKER
     assert dict(gx10._CODE_AGENT_BREAKER) == before

@@ -28,13 +28,15 @@ def test_detect_shell_powershell_vs_bash():
     assert gx10._detect_shell("git status") == "bash"  # shell-agnostic defaults to bash
 
 
-def test_windows_guidance_opens_for_bash_only_when_git_bash_present():
+def test_windows_guidance_declares_model_shell_unavailable():
     g = gx10._platform_guidance("windows")
-    if gx10._git_bash():  # a real Windows box with Git Bash → both shells
-        assert "bash" in g.lower()
-    else:  # PowerShell-only (POSIX CI, or Windows without Git Bash)
-        assert "PowerShell" in g and "NO Unix" in g
+    assert "unavailable" in g.lower()
+    assert "list_directory" in g
+    assert "/sh" in g
+    assert "execute_command" in g
 
 
 def test_linux_guidance_stays_posix():
-    assert "POSIX/bash" in gx10._platform_guidance("linux")
+    g = gx10._platform_guidance("linux")
+    assert "POSIX/bash" in g
+    assert "list_directory" in g

@@ -116,6 +116,44 @@ def test_reference_missing_and_traversal_blocked(tmp_path):
         p.reference("../../SKILL.md")   # path traversal collapses to a basename → absent
 
 
+def test_reference_symlink_escape_blocked(tmp_path):
+    # M20 (#1487): a planted references/*.md symlink to a host file OUTSIDE the playbook must not be
+    # readable through use_skill — Path(name).name blocks textual ../ but read_text follows symlinks.
+    secret = tmp_path / "host_secret.txt"
+    secret.write_text("TOP SECRET", encoding="utf-8")
+    skill_md = _make_playbook(tmp_path, refs={"real.md": "R"})
+    link = skill_md.parent / "references" / "leak.md"
+    try:
+        link.symlink_to(secret)
+    except (OSError, NotImplementedError):
+        pytest.skip("symlink creation not permitted on this platform")
+    p = pb.parse_playbook(skill_md)
+    assert p.references() == ["real.md"]              # the symlink is NOT listed
+    with pytest.raises(pb.PlaybookError):
+        p.reference("leak.md")                        # and NOT readable (containment holds)
+    assert p.reference("real.md") == "R"              # the real reference still works
+
+
+def test_reference_dir_symlink_escape_blocked(tmp_path):
+    # M20 (#1487): if references/ ITSELF is a symlink/junction to a host dir, a real file under it must
+    # NOT read as contained — containment anchors to the resolved playbook dir, not the relocatable
+    # references/ dir (a resolve()-based anchor would follow the reparse point and leak the host dir).
+    host = tmp_path / "host_dir"
+    host.mkdir()
+    (host / "passwd.md").write_text("HOST SECRET", encoding="utf-8")
+    d = tmp_path / "skills" / "cap"
+    d.mkdir(parents=True)
+    (d / "SKILL.md").write_text(_SKILL_MD, encoding="utf-8")
+    try:
+        (d / "references").symlink_to(host, target_is_directory=True)
+    except (OSError, NotImplementedError):
+        pytest.skip("directory symlink creation not permitted on this platform")
+    p = pb.parse_playbook(d / "SKILL.md")
+    assert p.references() == []                       # a symlinked references/ dir lists nothing
+    with pytest.raises(pb.PlaybookError):
+        p.reference("passwd.md")                      # and reads nothing (containment holds)
+
+
 def test_trigger_routing(tmp_path):
     p = pb.parse_playbook(_make_playbook(tmp_path))
     assert p.matches("please write a report on X")

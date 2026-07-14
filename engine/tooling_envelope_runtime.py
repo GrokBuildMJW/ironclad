@@ -14,18 +14,9 @@ def _policy():
         return ToolingEnvelopePolicy()
 
 
-def envelope_enabled() -> bool:
-    try:
-        return bool(getattr(_policy(), "enabled", False))
-    except Exception:
-        return False
-
-
 def envelope_policy_public() -> dict:
     """Return the non-secret effective allow-list for client-side local spawn checks."""
     pol = _policy()
-    if not getattr(pol, "enabled", False):
-        return {"enabled": False, "allow_list": []}
     return {
         "enabled": True,
         "allow_list": [

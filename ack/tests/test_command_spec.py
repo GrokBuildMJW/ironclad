@@ -13,6 +13,7 @@ if str(_ENGINE) not in sys.path:
     sys.path.insert(0, str(_ENGINE))
 
 import command_spec as cs
+import config_schema
 
 
 def test_spec_is_internally_consistent():
@@ -46,12 +47,9 @@ def test_worst_offender_tiers_are_pinned():
     assert cs.by_verb("status").tier == cs.READ_ONLY
 
 
-def test_config_set_declares_the_six_boot_only_keys():
+def test_config_set_boot_only_keys_are_schema_derived():
     c = cs.by_verb("config set")
-    assert set(c.boot_only_keys) == {
-        "setup.type", "security.profile", "security.web_in_sealed",
-        "search.enabled", "search.adapter", "search.api_key_env",
-    }
+    assert set(c.boot_only_keys) == config_schema.BOOT_ONLY_KEYS
     assert cs.SPEC_FROZEN_CONFIG_KEYS == set(c.boot_only_keys)
 
 

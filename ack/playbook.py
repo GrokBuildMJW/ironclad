@@ -131,20 +131,61 @@ class Playbook:
             self._body_cache = self._raw_body
         return self._body_cache
 
+    def _references_root(self) -> "Path | None":
+        """The playbook's ``references/`` dir IFF it is a REAL subdirectory (not a reparse point).
+
+        Anchoring containment to ``references/`` is unsafe when ``references/`` is itself a symlink or a
+        Windows directory junction (a junction needs NO privilege): ``resolve()`` would then relocate the
+        anchor into the attacker's target dir, so a real file *under* the junction reads as "contained".
+        We therefore require ``references/`` to resolve to exactly ``<resolved-playbook-dir>/references``.
+        """
+        root = self.dir / "references"
+        if not root.is_dir():
+            return None
+        try:
+            if root.resolve(strict=True) != self.dir / "references":
+                return None            # references/ is a reparse point → containment cannot hold
+        except (OSError, ValueError):
+            return None
+        return root
+
     def references(self) -> list[str]:
-        """Names of available reference docs (no content read)."""
-        refs = self.dir / "references"
-        if not refs.is_dir():
+        """Names of available reference docs (no content read). Only REAL files physically contained in a
+        REAL ``references/`` subdir are listed — a symlinked entry OR a symlinked ``references/`` dir is
+        excluded (see reference() for the containment rationale)."""
+        root = self._references_root()
+        if root is None:
             return []
-        return sorted(p.name for p in refs.glob("*") if p.is_file())
+        return sorted(p.name for p in root.glob("*") if p.is_file() and not p.is_symlink())
 
     def reference(self, name: str) -> str:
-        """Read one reference doc by name (lazy). Raises PlaybookError if absent/outside."""
-        safe = Path(name).name  # no traversal
-        target = self.dir / "references" / safe
-        if not target.is_file():
+        """Read one reference doc by name (lazy). Raises PlaybookError if absent/outside/symlinked.
+
+        Containment is PHYSICAL and anchored to the resolved playbook dir (``self.dir``), not textual:
+        ``Path(name).name`` blocks ``../``, but ``read_text`` would still follow (a) a planted
+        ``references/x.md`` symlink to a host file, or (b) a symlinked/junctioned ``references/`` dir (a
+        Windows junction needs no privilege). So we require ``references/`` to be a real subdir, reject a
+        symlinked target, require the RESOLVED target to stay under the resolved playbook dir, and read the
+        resolved path (closing a check->read TOCTOU). A hardlink to an outside file on the same volume is an
+        inherent residual no path check can catch — the honest boundary is: do not load an UNTRUSTED
+        playbook dir (built-in/operator playbooks are trusted; #1476 tracks origin-aware handling).
+        """
+        safe = Path(name).name  # no textual traversal
+        try:
+            root = self._references_root()
+            if root is None:
+                raise PlaybookError(f"no such reference {safe!r} in {self.capability!r}")
+            target = root / safe
+            if target.is_symlink() or not target.is_file():
+                raise PlaybookError(f"no such reference {safe!r} in {self.capability!r}")
+            real = target.resolve(strict=True)
+            if not real.is_relative_to(self.dir):
+                raise PlaybookError(f"no such reference {safe!r} in {self.capability!r}")
+            return real.read_text(encoding="utf-8")
+        except PlaybookError:
+            raise
+        except (OSError, ValueError):
             raise PlaybookError(f"no such reference {safe!r} in {self.capability!r}")
-        return target.read_text(encoding="utf-8")
 
     def matches(self, query: str) -> bool:
         """Trigger routing: any trigger keyword (case-insensitive substring) in the query."""
@@ -184,6 +225,13 @@ def discover_playbooks(root: str | Path) -> list[Playbook]:
     out: list[Playbook] = []
     seen: set[str] = set()
     for skill_md in sorted(base.glob("**/SKILL.md")):
+        # Skip hidden/temp trees below the root: a `.`-prefixed directory component is never a published
+        # skill (install staging `.<name>.<rnd>.staging` / `.backup`, `.ironclad/` state, etc.). Without this
+        # a partial or stale copy left by an interrupted install would be discovered as a duplicate and — since
+        # duplicates keep the FIRST and `.name` sorts before the real name — could SHADOW the real skill with
+        # an older/partial version (#1493). `pathlib`'s `**` descends into dot-dirs, so filter them out here.
+        if any(part.startswith(".") for part in skill_md.relative_to(base).parts[:-1]):
+            continue
         try:
             pre_meta, _ = parse_frontmatter(skill_md.read_text(encoding="utf-8"))
             if pre_meta.get("kind") == "prompt":

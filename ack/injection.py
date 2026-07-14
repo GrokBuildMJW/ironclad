@@ -4,7 +4,7 @@ Ingested content (files, search/web results, tool output) is UNTRUSTED — an au
 be STEERED by an instruction-override / role-switch / tool-injection embedded in the data. This is the core
 of a LAYERED defense: a precision-first heuristic ``scan`` for injection patterns + a trust-boundary ``wrap``
 that fences the content as *data, not instructions* before it reaches the model. Pure / stdlib-only; the
-engine gates it (default-off) and wires it at the ingestion choke point (#1046).
+engine applies it unconditionally at the untrusted-result choke point.
 
 **Not a complete solution** (a determined attacker + a weak model can still be steered) — defense-in-depth,
 layered with the sealed trust profile, tool gating, and the audit log. The remaining layers (an LLM

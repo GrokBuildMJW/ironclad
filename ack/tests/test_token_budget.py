@@ -160,7 +160,12 @@ def test_apply_config_honors_operator_supplied_char_budget(monkeypatch):
     try:
         monkeypatch.setenv("GX10_MAX_CTX_CHARS", "12345")
         cfg = gx10._code_defaults()
-        cfg["context"].update({"token_budget": True, "max_model_len": 32768, "max_ctx_chars": 12345})
+        cfg["context"].update({
+            "token_budget": True,
+            "max_model_len": 32768,
+            "max_ctx_chars": 12345,
+            "trim_target_chars": 10000,
+        })
         gx10._apply_config(cfg)
         assert gx10.MAX_CTX_CHARS == 12345   # operator env honored despite token_budget on (no clobber)
     finally:

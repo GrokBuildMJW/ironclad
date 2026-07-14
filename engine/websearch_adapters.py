@@ -215,11 +215,11 @@ def build_web_search_adapter(cfg: Optional[dict], dispatcher: Any,
     * ``brave`` → native search is **local-only** (Fork 2): on a local desktop setup the real
       :class:`~websearch_brave.BraveAdapter` lands in S4 (#509); under server mode (``runner_mode
       != 'local'``) it falls back to the CLI-delegate so server deployments still search.
-    * anything else / ``cli`` / unset → :class:`CliDelegateAdapter` (today's behaviour; the
-      backward-compatible default).
+    * ``enabled=false`` / unset → :class:`UnavailableAdapter` (the secure default).
+    * anything else / ``cli`` → :class:`CliDelegateAdapter` after explicit enablement.
     """
     search = (cfg or {}).get("search") or {}
-    if not search.get("enabled", True):
+    if not search.get("enabled", False):
         return UnavailableAdapter("disabled", "web search is disabled (search.enabled=false)")
     adapter = str(search.get("adapter") or "cli").strip().lower()
     if adapter == "mock":

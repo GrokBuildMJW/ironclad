@@ -3,7 +3,7 @@
 `gx10._failover_budget(task_id)` resolves the code-agent failover attempt budget per the active task's TYPE:
 `loop_profiles.by_type[<type>].retry_budget` layered over `strategy.budget` (default) and clamped to the hard
 re-ask ceiling — so a per-type override can only LOWER it (escalate sooner). Empty `by_type` → the default
-(byte-identical to the flat #806 budget). Opt-in per `strategy.enabled`.
+(byte-identical to the flat #806 budget). The finite strategy is always on.
 """
 from __future__ import annotations
 
@@ -42,19 +42,18 @@ def _reset():
     gx10._apply_config(gx10._code_defaults())
 
 
-def _enable(monkeypatch, *, task_type, by_type=None):
+def _apply(monkeypatch, *, task_type, by_type=None):
     cfg = gx10._code_defaults()
-    cfg["strategy"]["enabled"] = True
     if by_type:
         cfg["loop_profiles"]["by_type"] = by_type
-    gx10._apply_config(cfg)                                   # sets _STRATEGY_ENABLED / _STRATEGY_BUDGET
+    gx10._apply_config(cfg)                                   # sets bounded _STRATEGY_BUDGET
     monkeypatch.setattr(gx10, "_EFFECTIVE_CFG", cfg)          # so _failover_budget sees loop_profiles
     monkeypatch.setattr(gx10, "_store", lambda: _FakeStore(task_type))
 
 
 def test_per_type_budget_lowers_escalation(monkeypatch):
     # a 'bug' task with by_type retry_budget=1 escalates on the FIRST failure (budget lowered from the default)
-    _enable(monkeypatch, task_type="bug", by_type={"bug": {"retry_budget": 1}})
+    _apply(monkeypatch, task_type="bug", by_type={"bug": {"retry_budget": 1}})
     act = gx10._revise_on_failure("KGC-1", providers.RESULT_FAILED)   # attempt 1, budget 1 → escalate
     assert act == StrategyAction.HUMAN_ESCALATION.value
     assert gx10._last_strategy().escalate is True
@@ -62,14 +61,14 @@ def test_per_type_budget_lowers_escalation(monkeypatch):
 
 def test_unoverridden_type_uses_the_default_budget(monkeypatch):
     # a 'feature' task (no by_type override) keeps the default budget (3) → attempt 1 is NOT an escalation
-    _enable(monkeypatch, task_type="feature", by_type={"bug": {"retry_budget": 1}})
+    _apply(monkeypatch, task_type="feature", by_type={"bug": {"retry_budget": 1}})
     act = gx10._revise_on_failure("KGC-2", providers.RESULT_FAILED)   # attempt 1 of default 3
     assert act != StrategyAction.HUMAN_ESCALATION.value
 
 
 def test_no_by_type_is_byte_identical_default(monkeypatch):
     # no loop_profiles.by_type → default budget (3) for any type, exactly like the flat #806 budget
-    _enable(monkeypatch, task_type="bug")
+    _apply(monkeypatch, task_type="bug")
     gx10._revise_on_failure("KGC-3", providers.RESULT_FAILED)         # 1
     gx10._revise_on_failure("KGC-3", providers.RESULT_FAILED)         # 2
     act = gx10._revise_on_failure("KGC-3", providers.RESULT_FAILED)   # 3 == default budget → escalate

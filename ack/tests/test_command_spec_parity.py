@@ -29,7 +29,7 @@ def _load():
 
 
 def test_live_parity_passes():
-    # the spec matches the real _dispatch verbs + _FROZEN_CONFIG_KEYS + generator.build_parser
+    # The spec matches the real dispatch verbs, typed boot-only schema, and generator parser.
     assert _load().check() == []
 
 
@@ -61,8 +61,9 @@ def test_guard_has_teeth_a_missing_verb_is_flagged():
     assert "newverb" in disp and "newverb" not in cs.verbs()   # a drift the guard reports as MISSING
 
 
-def test_frozen_keys_extracted_from_gx10_source_match_spec():
-    g = _load()
+def test_runtime_frozen_keys_match_schema_and_spec():
     import command_spec as cs
-    real = g.dispatch_frozen_keys(g.GX10.read_text(encoding="utf-8"))
-    assert real == cs.SPEC_FROZEN_CONFIG_KEYS and len(real) == 6
+    import gx10
+    import config_schema
+    assert gx10._FROZEN_CONFIG_KEYS
+    assert gx10._FROZEN_CONFIG_KEYS == cs.SPEC_FROZEN_CONFIG_KEYS == config_schema.BOOT_ONLY_KEYS

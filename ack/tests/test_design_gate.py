@@ -21,25 +21,36 @@ if str(_ENGINE) not in sys.path:
 import gx10  # noqa: E402
 
 
-def _setup(monkeypatch, tmp_path, *, gate=True):
+def _setup(monkeypatch, tmp_path):
     gx10._apply_config(gx10._code_defaults())
-    monkeypatch.setattr(gx10, "DESIGN_GATE_ENABLED", gate)   # the gate is opt-in (default OFF) — enable it here
     gx10.STORE = None
     monkeypatch.setattr(gx10, "_ui_print", lambda *a, **k: None)
     monkeypatch.chdir(tmp_path)
     gx10.initiative_new("Demo", "software")
 
 
-def test_gate_off_by_default_allows_impl(monkeypatch, tmp_path):
-    # opt-in: with the gate DISABLED (the default), an implementation handover is byte-identical (allowed).
-    _setup(monkeypatch, tmp_path, gate=False)
-    out = _stage(_impl_json())                               # no design, but the gate is off
-    assert "refused" not in out.lower()
-    assert len(_pending()) == 1
+def test_legacy_false_cannot_disable_design_protection(monkeypatch, tmp_path, capsys):
+    cfg = gx10._code_defaults()
+    cfg["design_gate"] = {"enabled": False}
+    gx10._apply_config(cfg)
+    warning_lines = [line for line in capsys.readouterr().out.splitlines() if "DEPRECATED" in line]
+    assert len(warning_lines) == 1
+    assert "design_gate.enabled" in warning_lines[0] and "retired and ignored" in warning_lines[0]
+    assert not hasattr(gx10, "DESIGN_GATE_ENABLED")
+
+    gx10.STORE = None
+    monkeypatch.setattr(gx10, "_ui_print", lambda *a, **k: None)
+    monkeypatch.chdir(tmp_path)
+    gx10.initiative_new("Demo", "software")
+    out = _stage(_impl_json())
+    assert "blind-coding refused" in out
+    assert _pending() == []
+    assert list(gx10.handovers_dir().glob("*.md")) == []
 
 
 def _impl_json(title="build it"):
-    return json.dumps({"type": "implementation", "priority": "high", "title": title, "description": "x"})
+    return json.dumps({"type": "implementation", "priority": "high", "title": f"Implement approved {title}",
+                       "description": "Implement the approved design with complete validation and regression coverage."})
 
 
 def _stage(task_json):
@@ -108,7 +119,8 @@ def test_impl_allowed_with_approved_design(monkeypatch, tmp_path):
 
 def test_non_impl_unaffected(monkeypatch, tmp_path):
     _setup(monkeypatch, tmp_path)
-    tj = json.dumps({"type": "architecture", "priority": "high", "title": "design it", "description": "x"})
+    tj = json.dumps({"type": "architecture", "priority": "high", "title": "Prepare the architecture design",
+                     "description": "Prepare the complete architecture design with explicit constraints and tradeoffs."})
     out = _stage(tj)
     assert "refused" not in out.lower()
     assert len(_pending()) == 1                              # design/analysis handover is NOT gated
@@ -174,10 +186,10 @@ def test_steering_no_design_calls_record_design_now(monkeypatch, tmp_path):
     assert "recommend that the operator run `/design --options [N]`" in block
 
 
-def test_steering_gate_off_has_no_design_gate_line(monkeypatch, tmp_path):
-    _setup(monkeypatch, tmp_path, gate=False)
-    assert "design gate:" not in gx10._steering_state_block()   # default-off steering remains byte-identical
-    assert "design options:" not in gx10._steering_state_block()
+def test_steering_always_reports_design_state(monkeypatch, tmp_path):
+    _setup(monkeypatch, tmp_path)
+    assert "design gate:" in gx10._steering_state_block()
+    assert "design options:" in gx10._steering_state_block()
 
 
 def test_record_design_non_destructive_after_approval(monkeypatch, tmp_path):
@@ -214,9 +226,7 @@ def test_record_design_no_approved_proposal_ever(monkeypatch, tmp_path):
     assert _decision_frontmatter()["approved"] == "true"
 
 
-def test_legacy_unapproved_decision_remains_pending(monkeypatch, tmp_path):
-    # ADR-0006 D5 (S3): record_design now writes proposals/, so write the stray unapproved decisions/design.md
-    # directly (legacy state). The gate must refuse impl until it is promoted (approved).
+def test_legacy_unapproved_decision_migrates_to_proposal(monkeypatch, tmp_path):
     _setup(monkeypatch, tmp_path)
     slug = gx10.active_slug()
     ddir = gx10.vault_root() / slug / "decisions"
@@ -225,15 +235,18 @@ def test_legacy_unapproved_decision_remains_pending(monkeypatch, tmp_path):
         "---\ntype: decision\nstage: design\napproved: false\ntitle: Legacy\n---\n\n# Legacy\n\nbody\n",
         encoding="utf-8", newline="\n")
 
-    assert _decision_frontmatter()["type"] == "decision"
-    assert _decision_frontmatter()["approved"] == "false"
     assert gx10._unit_design_status(slug)[1] is False
+    assert not _decision_doc().exists()
+    assert _proposal_files() == ["design-1.md"]
+    assert _proposal_frontmatter(1)["type"] == "proposal"
+    assert _proposal_frontmatter(1)["approved"] == "false"
+    assert "body" in _proposal_doc(1).read_text(encoding="utf-8")
     out = _stage(_impl_json())
     assert "NOT approved" in out
     assert _pending() == []
-    # /approve stamps the legacy stray in place (no proposal to promote).
     assert gx10._approve_design().startswith("OK")
     assert _decision_frontmatter()["approved"] == "true"
+    assert _proposal_doc(1).is_file()
 
 
 def test_rehandover_of_impl_task_gated_when_unapproved(monkeypatch, tmp_path):
@@ -258,6 +271,50 @@ def test_rehandover_unknown_task(monkeypatch, tmp_path):
     assert out.startswith("ERROR: no such task")
 
 
+def test_approved_standard_injection_failure_refuses_create_before_writes(monkeypatch, tmp_path):
+    _setup(monkeypatch, tmp_path)
+    gx10.record_design("Approach", "Use Python.", language="python")
+    assert gx10._approve_design().startswith("OK")
+    monkeypatch.setattr(
+        gx10,
+        "_inject_approved_design_standard",
+        lambda *_a, **_k: (_ for _ in ()).throw(RuntimeError("boom")),
+    )
+    task_json = json.dumps(
+        {"type": "documentation", "priority": "high", "title": "Write the public documentation",
+         "description": "Write the complete public documentation for the validated staging behavior."}
+    )
+
+    out = _stage(task_json)
+
+    assert "approved design standard injection failed" in out
+    assert _pending() == []
+    assert list(gx10.handovers_dir().glob("*.md")) == []
+
+
+def test_approved_standard_injection_failure_refuses_rehandover_before_write(monkeypatch, tmp_path):
+    _setup(monkeypatch, tmp_path)
+    gx10.record_design("Approach", "Use Python.", language="python")
+    assert gx10._approve_design().startswith("OK")
+    existing = gx10._store().create(
+        {"type": "documentation", "priority": "high", "title": "Write the public documentation",
+         "description": "Write the complete public documentation for the validated staging behavior."},
+        force=True,
+    )
+    before = [task["id"] for task in _pending()]
+    monkeypatch.setattr(
+        gx10,
+        "_inject_approved_design_standard",
+        lambda *_a, **_k: (_ for _ in ()).throw(RuntimeError("boom")),
+    )
+
+    out = gx10._stage_handover(existing["id"], "OPUS", "body", None)
+
+    assert "approved design standard injection failed" in out
+    assert [task["id"] for task in _pending()] == before
+    assert list(gx10.handovers_dir().glob("*.md")) == []
+
+
 def test_design_gate_unit(monkeypatch, tmp_path):
     _setup(monkeypatch, tmp_path)
     slug = gx10.active_slug()
@@ -266,49 +323,44 @@ def test_design_gate_unit(monkeypatch, tmp_path):
     assert gx10._design_gate("implementation", None).startswith("ERROR")     # no unit
 
 
-# ── #1346: design_gate.enabled uses strict _as_bool (string "false" must NOT enable) ───────────────
-@pytest.mark.parametrize(
-    ("value", "expected"),
-    [
-        (True, True),
-        (False, False),
-        ("true", True),
-        ("false", False),
-        ("0", False),
-        ("garbage", False),
-        ("", False),
-        (1, False),
-    ],
-)
-def test_design_gate_config_uses_strict_boolean(value, expected):
-    gx10._apply_design_gate({"design_gate": {"enabled": value}})
-    assert gx10.DESIGN_GATE_ENABLED is expected
-
-
-def test_design_gate_config_fails_soft(monkeypatch):
-    monkeypatch.setattr(gx10, "_cfg_get", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
-    gx10._apply_design_gate({})
-    assert gx10.DESIGN_GATE_ENABLED is False
-
-
-@pytest.mark.parametrize(
-    ("fragment", "expected"),
-    [
-        ({"design_gate": {"enabled": True}}, True),
-        ({"design_gate": {"enabled": "true"}}, True),
-        ({"design_gate": {"enabled": "false"}}, False),  # strict _as_bool rejects stringy false
-        ({"design_gate": {"enabled": "garbage"}}, False),
-        ({"design_gate": {"enabled": "0"}}, False),
-        ({}, False),  # missing key → public default off
-    ],
-    ids=["json-true", "string-true", "string-false", "garbage", "string-zero", "missing"],
-)
-def test_apply_config_design_gate_synthetic(fragment, expected):
-    """#1346: synthetic dict only — string config values must not wrongly enable the gate."""
+# ── #1462: design_gate.enabled is a warning-only tombstone ─────────────────────────────────────────────
+@pytest.mark.parametrize("value", [True, False], ids=["legacy-true", "legacy-false"])
+def test_design_gate_tombstone_warns_once_and_is_consumed(value, capsys):
     cfg = gx10._code_defaults()
-    cfg.update(fragment)
+    cfg["design_gate"] = {"enabled": value}
     gx10._apply_config(cfg)
-    assert gx10.DESIGN_GATE_ENABLED is expected
+    gx10._apply_config(cfg)
+
+    warnings = [line for line in capsys.readouterr().out.splitlines() if "DEPRECATED" in line]
+    assert len(warnings) == 1
+    assert "design_gate.enabled" in warnings[0] and "always on" in warnings[0]
+    assert "design_gate" not in cfg
+    assert not hasattr(gx10, "DESIGN_GATE_ENABLED")
+
+
+def test_design_gate_tombstone_loaded_from_file(tmp_path, capsys):
+    source = tmp_path / "legacy.json"
+    source.write_text('{"design_gate": {"enabled": false}}', encoding="utf-8")
+    cfg = gx10._deep_merge(gx10._code_defaults(), gx10._load_config_tree(source))
+
+    gx10._apply_config(cfg)
+
+    warnings = [line for line in capsys.readouterr().out.splitlines() if "DEPRECATED" in line]
+    assert len(warnings) == 1 and "design_gate.enabled" in warnings[0]
+    assert "design_gate" not in cfg
+
+
+def test_runtime_set_refuses_retired_design_gate(monkeypatch):
+    cfg = gx10._code_defaults()
+    monkeypatch.setattr(gx10, "_EFFECTIVE_CFG", cfg)
+    surfaced = []
+    monkeypatch.setattr(gx10, "_ui_print", lambda message, *a, **k: surfaced.append(str(message)))
+
+    gx10._dispatch(None, "config set design_gate.enabled false")
+
+    assert len(surfaced) == 1
+    assert "retired and cannot be set" in surfaced[0]
+    assert "design_gate" not in cfg
 
 
 # ── #1267: no duplicate H1 in the recorded design doc ───────────────────────────────────────────────
@@ -484,17 +536,15 @@ def test_unit_design_status_transitions(monkeypatch, tmp_path):
     assert hd and ap and ref.endswith("decisions/design.md")              # decision
 
 
-def test_flag_off_layout_byte_identical_no_proposals(monkeypatch, tmp_path):
-    # Gate OFF (default): record writes the single decisions/design.md and NEVER creates proposals/design-*.md.
-    _setup(monkeypatch, tmp_path, gate=False)
-    rel = gx10.record_design("Approach", "use Rust")
-    assert rel.endswith("decisions/design.md")
-    assert _decision_doc().is_file()
-    assert _proposal_files() == []                                          # no variant layout when off
-    assert _decision_frontmatter()["type"] == "proposal"
-    assert _decision_frontmatter()["approved"] == "false"
-    gx10._approve_design()                                                  # OFF path stamps in place
-    assert _decision_frontmatter()["approved"] == "true"
+def test_legacy_approved_decision_is_left_byte_identical(monkeypatch, tmp_path):
+    _setup(monkeypatch, tmp_path)
+    _decision_doc().parent.mkdir(parents=True, exist_ok=True)
+    legacy = "---\ntype: decision\nstage: design\napproved: true\ntitle: Legacy\n---\n\noperator bytes\n"
+    _decision_doc().write_text(legacy, encoding="utf-8", newline="\n")
+
+    assert gx10._unit_design_status(gx10.active_slug())[1] is True
+
+    assert _decision_doc().read_text(encoding="utf-8") == legacy
     assert _proposal_files() == []
 
 
@@ -576,16 +626,16 @@ def test_design_options_bad_args_refuse_before_model_turn(monkeypatch, tmp_path,
     assert _proposal_files() == []
 
 
-def test_design_options_refused_when_gate_off(monkeypatch, tmp_path):
-    _setup(monkeypatch, tmp_path, gate=False)
+def test_design_options_always_available(monkeypatch, tmp_path):
+    _setup(monkeypatch, tmp_path)
     agent = _DesignOptionsAgent()
 
     out = gx10._design_command(agent, "--options 2")
 
-    assert out.startswith("ERROR")
-    assert agent.prompts == []
+    assert out.startswith("OK")
+    assert len(agent.prompts) == 1
     assert not _decision_doc().exists()
-    assert _proposal_files() == []
+    assert _proposal_files() == ["design-1.md", "design-2.md"]
 
 
 def test_design_options_refuses_without_active_unit(monkeypatch, tmp_path):
@@ -637,60 +687,136 @@ def test_design_options_dispatch_invokes_agent(monkeypatch, tmp_path):
     assert any("recorded 2 of 2 design proposal variants" in str(s) for s in surfaced)
 
 
-def test_flag_off_record_design_after_approval_relabels_decision(monkeypatch, tmp_path):
-    # Gate OFF (default): the legacy single-doc layout self-heals on the next record_design write.
-    _setup(monkeypatch, tmp_path, gate=False)
+def test_new_record_never_changes_approved_decision_bytes(monkeypatch, tmp_path):
+    _setup(monkeypatch, tmp_path)
     gx10.record_design("Approach", "use Rust")
     gx10._approve_design()
+    before = _decision_doc().read_bytes()
 
     gx10.record_design("Revised approach", "use Python instead")
 
-    text = _decision_doc().read_text(encoding="utf-8")
-    fm = gx10._parse_frontmatter(text)
-    assert fm["type"] == "proposal"
-    assert fm["approved"] == "false"
-    assert "use Python instead" in text
-    assert _proposal_files() == []
+    assert _decision_doc().read_bytes() == before
+    assert _decision_frontmatter()["approved"] == "true"
+    assert "use Python instead" in _proposal_doc(2).read_text(encoding="utf-8")
 
 
-def test_approve_design_refuses_legacy_unapproved_doc_plus_proposals(monkeypatch, tmp_path):
-    # A vault can have a legacy unapproved decisions/design.md from gate OFF, then proposal variants after
-    # flipping the gate ON. Bare /approve must not overwrite the legacy doc; the operator has to pick a
-    # proposal id explicitly.
-    _setup(monkeypatch, tmp_path, gate=False)
-    gx10.record_design("Legacy", "legacy body")
-    legacy_before = _decision_doc().read_text(encoding="utf-8")
+def test_legacy_unapproved_decision_uses_next_collision_free_proposal(monkeypatch, tmp_path):
+    _setup(monkeypatch, tmp_path)
+    gx10.record_design("Existing", "proposal body")
+    _decision_doc().parent.mkdir(parents=True, exist_ok=True)
+    _decision_doc().write_text(
+        "---\ntype: decision\nstage: design\napproved: false\ntitle: Legacy\n---\n\nlegacy body\n",
+        encoding="utf-8",
+    )
 
-    monkeypatch.setattr(gx10, "DESIGN_GATE_ENABLED", True)
-    gx10.record_design("Variant", "proposal body")
-    proposal_before = _proposal_doc(1).read_text(encoding="utf-8")
+    assert gx10._unit_design_status(gx10.active_slug())[1] is False
+
+    assert not _decision_doc().exists()
+    assert _proposal_files() == ["design-1.md", "design-2.md"]
+    assert "proposal body" in _proposal_doc(1).read_text(encoding="utf-8")
+    assert "legacy body" in _proposal_doc(2).read_text(encoding="utf-8")
+    assert "multiple design proposals" in gx10._approve_design()
+
+
+@pytest.mark.parametrize(
+    "legacy",
+    [
+        "not frontmatter\n",
+        "---\ntype: decision\n---\nmissing approval\n",
+    ],
+    ids=["malformed", "missing-approved"],
+)
+def test_malformed_legacy_decision_refuses_without_byte_changes(monkeypatch, tmp_path, legacy):
+    _setup(monkeypatch, tmp_path)
+    _decision_doc().parent.mkdir(parents=True, exist_ok=True)
+    _decision_doc().write_text(legacy, encoding="utf-8")
+    before = _decision_doc().read_bytes()
 
     out = gx10._approve_design()
 
-    assert out.startswith("ERROR")
-    assert "legacy unapproved design.md and 1 proposal(s)" in out
-    assert "`/approve design <id>`" in out
-    assert _decision_doc().read_text(encoding="utf-8") == legacy_before
-    assert _proposal_doc(1).read_text(encoding="utf-8") == proposal_before
+    assert out.startswith("ERROR: legacy design migration refused")
+    assert _decision_doc().read_bytes() == before
+    assert _proposal_files() == []
 
 
-def test_off_path_approve_design_slug_targets_that_unit(monkeypatch, tmp_path):
-    # Byte-identical-off regression: with design_gate OFF, `/approve design <slug>` keeps its LEGACY
-    # positional-slug meaning — it approves THAT unit, not the active one (the S3 proposal-id
-    # reinterpretation is design_gate-ON only).
-    _setup(monkeypatch, tmp_path, gate=False)
-    a = gx10.active_slug()
-    b = gx10.initiative_new("Other unit", "software").slug                  # creates + activates "other-unit"
-    gx10.initiative_use(a)                                                   # re-activate the first unit
-    assert gx10.active_slug() == a
-    gx10.record_design("B approach", "x", slug=b)                           # design on the NON-active unit B
-    bdoc = gx10.vault_root() / b / "decisions" / "design.md"
-    assert gx10._parse_frontmatter(bdoc.read_text(encoding="utf-8"))["approved"] == "false"
+def test_oversized_legacy_decision_refuses_without_byte_changes(monkeypatch, tmp_path):
+    _setup(monkeypatch, tmp_path)
+    _decision_doc().parent.mkdir(parents=True, exist_ok=True)
+    _decision_doc().write_bytes(
+        b"---\ntype: decision\napproved: false\n---\n" + (b"x" * 65537)
+    )
+    before = _decision_doc().read_bytes()
 
-    out = gx10._approve_command(f"design {b}")                              # token is a SLUG on the OFF path
-    assert out.startswith("OK")
-    assert gx10._parse_frontmatter(bdoc.read_text(encoding="utf-8"))["approved"] == "true"  # B approved
-    assert not (gx10.vault_root() / a / "decisions" / "design.md").exists()  # active A untouched
+    out = gx10._approve_design()
+
+    assert "exceeds the 65536-byte limit" in out
+    assert _decision_doc().read_bytes() == before
+    assert _proposal_files() == []
+
+
+def test_migration_normalization_failure_restores_single_legacy_path(monkeypatch, tmp_path):
+    _setup(monkeypatch, tmp_path)
+    _decision_doc().parent.mkdir(parents=True, exist_ok=True)
+    legacy = "---\ntype: decision\napproved: false\n---\nlegacy bytes\n"
+    _decision_doc().write_text(legacy, encoding="utf-8")
+    monkeypatch.setattr(
+        gx10,
+        "_atomic_design_write",
+        lambda *_a, **_k: (_ for _ in ()).throw(OSError("normalize failed")),
+    )
+
+    out = gx10._approve_design()
+
+    assert "atomic migration failed" in out
+    assert _decision_doc().read_text(encoding="utf-8") == legacy
+    assert _proposal_files() == []
+
+
+def test_failed_migration_recovery_unblocks_after_manual_reconcile(monkeypatch, tmp_path):
+    _setup(monkeypatch, tmp_path)
+    _decision_doc().parent.mkdir(parents=True, exist_ok=True)
+    legacy = "---\ntype: decision\napproved: false\n---\nlegacy bytes\n"
+    _decision_doc().write_text(legacy, encoding="utf-8")
+    real_replace = gx10.os.replace
+    real_atomic_write = gx10._atomic_design_write
+    replace_calls = 0
+
+    def fail_restore(src, dst):
+        nonlocal replace_calls
+        replace_calls += 1
+        if replace_calls == 2:
+            raise OSError("restore failed")
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(gx10.os, "replace", fail_restore)
+    monkeypatch.setattr(
+        gx10,
+        "_atomic_design_write",
+        lambda *_a, **_k: (_ for _ in ()).throw(OSError("normalize failed")),
+    )
+
+    out = gx10._approve_design()
+
+    assert "atomic migration failed" in out
+    assert not _decision_doc().exists()
+    assert sorted(path.name for path in _proposals_dir().glob("design-*.md")) == ["design-1.md"]
+    assert _proposal_doc(1).read_text(encoding="utf-8") == legacy
+    with pytest.raises(gx10.DesignMigrationRefusal, match="prior recovery is incomplete"):
+        gx10.record_design("Blocked", "must not write")
+    assert sorted(path.name for path in _proposals_dir().glob("design-*.md")) == ["design-1.md"]
+
+    _proposal_doc(1).unlink()
+    _decision_doc().write_text(
+        "---\ntype: decision\napproved: true\n---\n\noperator-reconciled design\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(gx10, "_atomic_design_write", real_atomic_write)
+
+    created = gx10.record_design("Recovered", "new proposal")
+
+    assert created.endswith("proposals/design-1.md")
+    assert "operator-reconciled design" in _decision_doc().read_text(encoding="utf-8")
+    assert gx10._DESIGN_MIGRATION_BLOCKED == {}
 
 
 # ── S3 (#1416 / ADR-0006 D5): steering surfaces the proposal-variant state ───────────────────────────

@@ -54,7 +54,8 @@ overlay appears as you type (**Tab** completes, **↑/↓** pick, **Esc** dismis
 
 - **Local (client):** `/help`, `/reset` (start clean — transcript + server context + summary;
   long-term memory kept), `/resume` (restore the previous session — start is fresh by default),
-  `/update [pull]` (rebuild + reinstall the client from source, then restart — needs `GX10_SRC`),
+  `/update [pull]` (rebuild + reinstall the client from source, then restart — needs `GX10_SRC`;
+  launches git/npm with literal argv and refuses source paths containing shell/cmd metacharacters),
   `/tasks`, `/pending`, `/work`, `/auto on|off`, `/health`, `/exit`.
 - **`!<cmd>`** runs a shell command **locally** (PowerShell on Windows) in the codedir, e.g.
   `!git status` — no orchestrator round-trip.

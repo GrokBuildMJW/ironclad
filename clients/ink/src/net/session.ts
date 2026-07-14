@@ -19,9 +19,9 @@ export interface SessionHandle {
 const NOOP: SessionHandle = {active: false, async stop() {}};
 
 /**
- * GET /health; if `security.session` is set, open a session and keep it alive with a heartbeat interval
+ * GET /health; if `security.session` is set, open a session and keep it alive with a serial heartbeat loop
  * (re-open quietly on loss, mirroring `_heartbeat_loop`). Returns a handle whose `stop()` clears the
- * interval and closes the session. `log` receives the same status lines the Python client prints.
+ * scheduled heartbeat and closes the session. `log` receives the same status lines the Python client prints.
  */
 export async function establishSession(
   srv: Server,
@@ -46,20 +46,51 @@ export async function establishSession(
     log(`  ✗ could not open a session${status ? ` (HTTP ${status})` : ''}${hint}`);
     return NOOP;
   }
-  const timer = setInterval(() => {
-    void srv.sessionHeartbeat().then((ok) => {
-      // session lost server-side (restart / expiry) → try to re-open quietly
-      if (!ok) void srv.sessionOpen().catch(() => undefined);
-    });
-  }, hb * 1000);
-  timer.unref?.(); // the heartbeat must not, by itself, keep the process alive
   let stopped = false;
+  let timer: NodeJS.Timeout | undefined;
+  let inFlight: Promise<void> = Promise.resolve(); // the currently-running tick, so stop() can await it
+
+  const schedule = (): void => {
+    if (stopped) return;
+    timer = setTimeout(() => {
+      inFlight = tick();
+    }, hb * 1000);
+    timer.unref?.(); // the heartbeat must not, by itself, keep the process alive
+  };
+
+  const tick = async (): Promise<void> => {
+    if (stopped) return;
+    try {
+      const ok = await srv.sessionHeartbeat();
+      if (stopped) return;
+      if (!ok) {
+        // session lost server-side (restart / expiry) → try to re-open quietly
+        await srv.sessionOpen().catch(() => undefined);
+        if (stopped) {
+          // a re-open that finished AFTER stop() must not leave a live server session (unsealed until TTL)
+          await srv.sessionClose().catch(() => undefined);
+          return;
+        }
+      }
+    } catch {
+      // sessionHeartbeat is contracted fail-soft (returns false, never throws); guard anyway so a surprise
+      // error can never permanently kill the heartbeat loop (which would silently stale the session).
+      if (stopped) return;
+    }
+    schedule();
+  };
+
+  schedule();
   return {
     active: true,
     async stop() {
       if (stopped) return;
       stopped = true;
-      clearInterval(timer);
+      if (timer) clearTimeout(timer);
+      // await the in-flight tick FIRST so a re-open racing with stop() runs its stopped-guarded compensating
+      // close before we return — the "server ends sealed" guarantee then holds even for a caller that
+      // `process.exit()`s right after `await stop()` (it is not left to a natural event-loop drain).
+      await inFlight.catch(() => undefined);
       await srv.sessionClose();
     },
   };

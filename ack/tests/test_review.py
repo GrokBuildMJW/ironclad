@@ -33,6 +33,7 @@ def _spec(agent_id="SONNET", bin="claude", model="claude-sonnet-5"):
         cmd_template="{bin} --model {model} --print {prompt}",
         effort="high",
         permission_mode="bypassPermissions",
+        capabilities={"permission_bypass": True},
     )
 
 
@@ -49,7 +50,10 @@ def _cfg_two_agents():
 
 def _make_runnable(monkeypatch, agents=("OPUS", "SONNET")):
     """Registry + bin-resolve so _review_available / _pick_reviewer see runnable agents."""
-    reg = load_code_agents(_cfg_two_agents())
+    cfg = _cfg_two_agents()
+    reg = load_code_agents(cfg)
+    from ack.tooling_envelope import load_tooling_envelope_policy
+    monkeypatch.setattr(gx10, "TOOLING_ENVELOPE_POLICY", load_tooling_envelope_policy(cfg))
     monkeypatch.setattr(gx10, "_code_agent_registry", lambda: reg)
     monkeypatch.setattr(providers, "resolve_agent_bin",
                         lambda s: f"/usr/bin/{s.bin}" if s and s.agent_id in agents else None)

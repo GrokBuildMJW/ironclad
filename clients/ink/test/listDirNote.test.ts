@@ -22,12 +22,13 @@ test('limit branch: suffix "(limit=N)" and the GX10v3 note appears (limit-then-c
   await fs.rm(d, {recursive: true, force: true});
 });
 
-test('hard-cap branch: >200 entries → "(hard cap 200 — use sort=\'time\'+limit)"', async () => {
+test('hard-cap branch: >200 entries stops at cap-plus-one and reports many', async () => {
   const d = await tmpWith(205);
   const out = await runTool('list_directory', {path: d});
   const lines = out.split('\n');
   assert.equal(lines.length, 202, '#1183 count header + 200 entries + 1 note line');
-  assert.match(out, /\.\.\. \[GX10v3: showing 200 of 205 entries \(hard cap 200 — use sort='time'\+limit\)\]$/);
+  assert.match(out, /^At least 0 directories, 201 files\n/);
+  assert.match(out, /\.\.\. \[GX10v3: first 200 entries \(filesystem order\) of many; hard cap 200 — narrow the path for a complete listing; a sort\/limit ranks only this partial sample, not the whole directory\]$/);
   await fs.rm(d, {recursive: true, force: true});
 });
 

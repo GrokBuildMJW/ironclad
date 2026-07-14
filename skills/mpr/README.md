@@ -75,7 +75,7 @@ The global precedence is ironclad's: **code defaults < file/conf < env < CLI (`/
 
 | Key | Type | Default | Meaning |
 |-----|------|---------|---------|
-| `mpr.enabled` | bool | `false` | **RUNTIME gate** (see above) |
+| `mpr.enabled` | bool | `true` | **RUNTIME gate** (see above) — on by default; `/config set mpr.enabled off` pauses it |
 | `mpr.panel_mode` | `direct`\|`deep` | `direct` | panel execution depth (see above) |
 | `mpr.audit_level` | str | `full-per-perspective` | audit granularity (`full-per-perspective`\|`manifest-only`) |
 | `mpr.runs_dir` | str | `runs/mpr` | config fallback. **STATE layout (B3):** a run routes to the active project → `vault/<slug>/runs/<run_id>/`; with no active project `mpr_research` is fail-closed (no write into the root). |
@@ -105,8 +105,7 @@ the deploy-default path. After that, `/config set` wins at runtime.
 
 | Env | affects | Example |
 |-----|---------|---------|
-| `GX10_MPR` | **LOAD gate** (register the tool) | `GX10_MPR=1` |
-| `GX10_MPR_ENABLED` | `mpr.enabled` (RUNTIME default at deploy) | `GX10_MPR_ENABLED=1` |
+| `GX10_MPR_ENABLED` | `mpr.enabled` (RUNTIME default at boot; on by default) | `GX10_MPR_ENABLED=0` to start paused |
 | `GX10_MPR_PANEL_MODE` | `mpr.panel_mode` | `GX10_MPR_PANEL_MODE=deep` |
 | `GX10_MPR_AUDIT_LEVEL` | `mpr.audit_level` | `manifest-only` |
 | `GX10_MPR_RUNS_DIR` | `mpr.runs_dir` | `/work/runs/mpr` |
@@ -119,45 +118,41 @@ the deploy-default path. After that, `/config set` wins at runtime.
 
 ---
 
-## Deploy
+## Configuration
+
+MPR is a **core built-in** — it ships with the framework, is always loaded, and runs **on by default**.
+There is nothing to deploy separately. Configure it two ways:
 
 ```bash
-# Default: MPR loaded, runtime OFF (arm it via /config set):
-bash deploy/spark/deploy-mpr.sh
+# Boot default (env, applied once per process before the runtime toggle can override it):
+GX10_MPR_ENABLED=0        # start paused (default is on)
+GX10_MPR_PANEL_MODE=deep  # start in deep mode (default is direct)
 
-# Armed + deep already at deploy:
-GX10_MPR_ENABLED=1 GX10_MPR_PANEL_MODE=deep bash deploy/spark/deploy-mpr.sh
-
-# P0 provider router live (the external offload lane runs on the PC client, not on the server):
-GX10_PROVIDERS=1 bash deploy/spark/deploy-mpr.sh
+# Runtime (no restart) from inside the CLI:
+/config set mpr.enabled off      # pause the panel
+/config set mpr.panel_mode deep  # switch depth
 ```
-
-The script leaves the OSS image **untouched** and injects the plugin via a host volume mount
-(`-v skills:/skills`) + `GX10_PLUGINS_DIR=/skills`. No core edit, no image rebuild.
 
 ---
 
-## Operator test in the CLI (recipe)
+## Try it in the CLI (recipe)
 
 ```bash
 # 1) Connect (client → orchestrator)
 ironclad --server http://<your-server-host>:8100 --codedir .
 
-# 2) Loaded but off? → expect the disabled note
-/config get mpr.enabled          # → mpr.enabled = False
-<a reasoning question>           # → run_mpr replies "MPR is disabled …" (single pass stays)
-
-# 3) Arm it + ask the same question → the panel runs (a project must be active, else fail-closed)
+# 2) On by default → inside an active project, a reasoning question runs the panel
+/config get mpr.enabled          # → mpr.enabled = True
 /project new architecture-question
-/config set mpr.enabled on
-<the same question>              # → panel, run directory under vault/<slug>/runs/<run_id>/
+<a reasoning question>           # → panel; a run directory is created under the active project (else fail-closed)
 
-# 4) Compare depth
+# 3) Compare depth
 /config set mpr.panel_mode deep
 <the same question>              # → deeper perspectives (thinking-on, per-effort budget)
 
-# 5) Pause again
+# 4) Pause it → each call returns the short "MPR is disabled" note (single pass, 0 panel LLM calls, no run dir)
 /config set mpr.enabled off
+<the same question>
 ```
 
 Artifacts per run (`vault/<slug>/runs/<run_id>/`): `manifest.json` (provenance/budget/sovereignty),
@@ -170,7 +165,4 @@ and there are **0 LLM calls**.
 
 ```bash
 python -m pytest skills/mpr/tests -q          # plugin suite (deterministic, stub dispatcher)
-python scripts/ci/check_core_boundary.py      # core/ stays boundary-clean
 ```
-
-Build status + the specifications live under `vault/Plan/mpr/` (private).

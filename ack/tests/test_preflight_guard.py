@@ -65,6 +65,11 @@ class _FakeClient:
     def __init__(self):
         self.chat = types.SimpleNamespace(completions=_FakeCompletions())
 
+    def with_options(self, **kwargs):
+        # The real OpenAI client returns a per-call copy (used for the decoupled max_retries=0 path, now
+        # default-on because F8 gives connection.first_token_timeout_s a finite default). The mock reuses itself.
+        return self
+
 
 class _FakeMem:
     def __init__(self):

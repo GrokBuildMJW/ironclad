@@ -14,6 +14,8 @@ import threading
 import types
 from pathlib import Path
 
+import pytest
+
 sys.modules.setdefault("openai", types.SimpleNamespace(OpenAI=lambda **kw: object()))
 
 _ENGINE = Path(__file__).resolve().parents[2] / "engine"
@@ -46,10 +48,12 @@ class _FakeProc:
         return 0
 
 
-def _setup(monkeypatch, tmp_path, *, agent="OPUS", stage=True, frontmatter="---\n---\nho"):
+def _setup(monkeypatch, tmp_path, *, agent="OPUS", stage=True, frontmatter="---\n---\nho", cfg=None):
     """Fresh engine state + an active initiative + (optionally) a pending task with a staged handover.
     Returns (tid, popen_calls); popen_calls records every ``Popen(argv)`` so a test can assert launch/no-launch."""
-    gx10._apply_config(gx10._code_defaults())
+    cfg = cfg or gx10._code_defaults()
+    gx10._apply_config(cfg)
+    monkeypatch.setattr(gx10, "_EFFECTIVE_CFG", cfg)
     gx10.STORE = None
     gx10._AUTOPILOT_ACTIVE = 0            # isolate from any prior test's slot accounting
     gx10._AUTOPILOT_PROCS.clear()
@@ -99,7 +103,7 @@ def test_launch_coder_refuses_unauthorized_envelope_without_popen(monkeypatch, t
     assert gx10._store().get(tid)["status"] == "pending"
 
 
-def test_launch_coder_default_non_stream_autopilot_shape_authorized(monkeypatch, tmp_path):
+def test_launch_coder_default_non_stream_uses_safe_permission_mode(monkeypatch, tmp_path):
     from ack.tooling_envelope import autopilot_claude_print_template, load_tooling_envelope_policy
     tid, popen = _setup(monkeypatch, tmp_path)
     monkeypatch.setattr(gx10, "AUTOPILOT_STREAM", False, raising=False)
@@ -112,10 +116,26 @@ def test_launch_coder_default_non_stream_autopilot_shape_authorized(monkeypatch,
     out = _launch()
     assert out.startswith("OK:")
     assert len(popen) == 1
-    assert popen[0][:7] == [
+    assert popen[0][:8] == [
         "claude", "--model", "claude-opus-4-8", "--effort", "high",
-        "--dangerously-skip-permissions", "--print",
+        "--permission-mode", "default", "--print",
     ]
+    assert "--dangerously-skip-permissions" not in popen[0]
+    assert gx10._store().get(tid)["status"] == "in_progress"
+
+
+def test_launch_coder_explicit_agent_capability_restores_permission_bypass(monkeypatch, tmp_path):
+    cfg = gx10._code_defaults()
+    cfg["code_agents"]["pool"][0]["permission_mode"] = "bypassPermissions"
+    cfg["code_agents"]["pool"][0]["capabilities"] = {"permission_bypass": True}
+    tid, popen = _setup(monkeypatch, tmp_path, cfg=cfg)
+
+    out = _launch()
+
+    assert out.startswith("OK:")
+    assert len(popen) == 1
+    assert "--dangerously-skip-permissions" in popen[0]
+    assert "--permission-mode" not in popen[0]
     assert gx10._store().get(tid)["status"] == "in_progress"
 
 
@@ -326,6 +346,29 @@ def test_surface_coder_result_with_usable_feedback_is_not_blocked(monkeypatch, t
     (gx10.feedback_dir() / f"{tid}_OPUS-feedback.md").write_text("status: done\nok", encoding="utf-8")
     gx10._surface_coder_result(tid, "OPUS", 0, tmp_path / "missing.log")
     assert not gx10._store().get(tid).get("blocked")
+
+
+def test_surface_coder_result_exit_zero_stamps_missing_done_status(monkeypatch, tmp_path):
+    tid, _popen = _setup(monkeypatch, tmp_path)
+    gx10._store().transition(tid, "in_progress")
+    fb = gx10.feedback_dir() / f"{tid}_OPUS-feedback.md"
+    fb.write_text("## Result\nall checks passed", encoding="utf-8")
+
+    gx10._surface_coder_result(tid, "OPUS", 0, tmp_path / "missing.log")
+
+    assert fb.read_text(encoding="utf-8").startswith("status: done\n")
+
+
+@pytest.mark.parametrize("result", [1, None], ids=["nonzero", "unknown"])
+def test_surface_coder_result_non_success_never_stamps_done(monkeypatch, tmp_path, result):
+    tid, _popen = _setup(monkeypatch, tmp_path)
+    gx10._store().transition(tid, "in_progress")
+    fb = gx10.feedback_dir() / f"{tid}_OPUS-feedback.md"
+    fb.write_text("## Result\npartial output", encoding="utf-8")
+
+    gx10._surface_coder_result(tid, "OPUS", result, tmp_path / "missing.log")
+
+    assert gx10._feedback_status(fb.read_text(encoding="utf-8")) == ""
 
 
 def test_validate_code_agent_models_populates_cache_and_returns_mismatch(monkeypatch, tmp_path):

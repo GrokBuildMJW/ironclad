@@ -32,6 +32,7 @@ MAX_SEQS="${IRONCLAD_MAX_SEQS:-8}"
 WITH_ORCH=0
 ORCH_DOCKER=0
 ORCH_PORT="${GX10_SERVER_PORT:-8100}"
+ORCH_HOST="${GX10_SERVER_HOST:-127.0.0.1}"
 CONTAINER="${IRONCLAD_VLLM_CONTAINER:-vllm}"
 ORCH_CONTAINER="${IRONCLAD_ORCH_CONTAINER:-ironclad-orchestrator}"
 # Workspace volume OUTSIDE the synced repo: the container writes it as root, so it
@@ -121,6 +122,8 @@ if [ "$WITH_ORCH" = 1 ] && [ "$ORCH_DOCKER" = 1 ]; then
     -e GX10_WARM_URL="${GX10_WARM_URL:-}" \
     -e GX10_PROFILE="${GX10_PROFILE:-}" \
     -e GX10_SERVER_TOKEN="${GX10_SERVER_TOKEN:-}" \
+    -e GX10_SERVER_HOST="$ORCH_HOST" \
+    -e GX10_ALLOW_UNAUTHENTICATED_BIND="${GX10_ALLOW_UNAUTHENTICATED_BIND:-}" \
     -e GX10_FANOUT_CONCURRENCY="${GX10_FANOUT_CONCURRENCY:-}" \
     -e GX10_WORKERS_MAX_TOKENS="${GX10_WORKERS_MAX_TOKENS:-}" \
     -e GX10_WORKERS_MAX_BATCH_TOKENS="${GX10_WORKERS_MAX_BATCH_TOKENS:-}" \
@@ -153,10 +156,10 @@ elif [ "$WITH_ORCH" = 1 ]; then
     tmux kill-session -t ironclad 2>/dev/null || true
     tmux new-session -d -s ironclad -c "$REPO_ROOT" \
       "GX10_BASE_URL=$GX10_BASE_URL GX10_MODEL=$GX10_MODEL \
-       python engine/server.py --host 0.0.0.0 --port $ORCH_PORT"
+       python engine/server.py --host $ORCH_HOST --port $ORCH_PORT"
     log "orchestrator in tmux session 'ironclad' on :$ORCH_PORT"
   else
-    nohup python "$REPO_ROOT/engine/server.py" --host 0.0.0.0 --port "$ORCH_PORT" \
+    nohup python "$REPO_ROOT/engine/server.py" --host "$ORCH_HOST" --port "$ORCH_PORT" \
       >"$REPO_ROOT/orchestrator.log" 2>&1 &
     log "orchestrator (nohup) on :$ORCH_PORT — log: orchestrator.log"
   fi

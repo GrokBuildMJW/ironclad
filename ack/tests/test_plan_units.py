@@ -38,6 +38,8 @@ def _project(tmp_path, monkeypatch):
     monkeypatch.setattr(gx10, "_ui_print", lambda *a, **k: None)
     monkeypatch.chdir(tmp_path)
     gx10.initiative_new("Demo", "software")
+    gx10.record_design("Approved approach", "Use the approved approach.")
+    assert gx10._approve_design().startswith("OK")
     return tmp_path
 
 
@@ -115,16 +117,17 @@ def test_plan_units_rejects_nested_epics():
 
 
 def test_plan_units_design_gate_blocks_impl_units(monkeypatch):
-    monkeypatch.setattr(gx10, "DESIGN_GATE_ENABLED", True)
+    (gx10.vault_root() / gx10.active_slug() / "decisions" / "design.md").unlink()
+    for proposal in (gx10.vault_root() / gx10.active_slug() / "proposals").glob("design-*.md"):
+        proposal.unlink()
     out = gx10._plan_units(json.dumps(_EPIC), json.dumps([_u(1)]))
     assert out.startswith("ERROR") and "blind-coding refused" in out
     assert gx10._store().list() == []
 
 
 def test_plan_units_refuses_language_drift_before_creating_anything(monkeypatch):
-    monkeypatch.setattr(gx10, "DESIGN_GATE_ENABLED", True)
     gx10.record_design("Approach", "Use Python.", language="python")
-    assert gx10._approve_design().startswith("OK")
+    assert gx10._approve_design(design_id="2").startswith("OK")
 
     out = gx10._plan_units(json.dumps(_EPIC), json.dumps([_u(1, language="rust")]))
 
@@ -183,25 +186,23 @@ def test_rehand_normalizes_id_and_stamps_assigned_to():
 
 # ── /auto — the automation meta-switch ───────────────────────────────────────
 
-def test_watcher_defaults_off_and_config_cannot_enable_it_independently():
+def test_watcher_defaults_off_and_config_cannot_enable_it_independently(monkeypatch):
     saved = (gx10._WATCHER_ENABLED, gx10.AUTOPILOT_ENABLED, gx10.AUTOPILOT_AUTOPLAN,
              gx10._EFFECTIVE_CFG)
     try:
         cfg = gx10._code_defaults()
-        assert cfg["watcher"]["enabled"] is False
+        assert "enabled" not in cfg["watcher"]
         gx10._apply_config(cfg)
         assert gx10._WATCHER_ENABLED is False
 
-        cfg["watcher"]["enabled"] = True
-        cfg["autopilot"]["enabled"] = False
-        cfg["autopilot"]["autoplan"] = False
-        gx10._apply_config(cfg)
-        assert gx10._WATCHER_ENABLED is False
+        surfaced = []
+        gx10._EFFECTIVE_CFG = cfg
+        monkeypatch.setattr(gx10, "_ui_print", lambda message, *a, **k: surfaced.append(str(message)))
+        gx10._dispatch(None, "config set watcher.enabled true")
 
-        cfg["autopilot"]["enabled"] = True
-        cfg["autopilot"]["autoplan"] = True
-        gx10._apply_config(cfg)
         assert gx10._WATCHER_ENABLED is False
+        assert "enabled" not in cfg["watcher"]
+        assert len(surfaced) == 1 and "retired and cannot be set" in surfaced[0]
     finally:
         (gx10._WATCHER_ENABLED, gx10.AUTOPILOT_ENABLED, gx10.AUTOPILOT_AUTOPLAN,
          gx10._EFFECTIVE_CFG) = saved
@@ -236,12 +237,12 @@ def test_watcher_command_delegates_to_auto_meta_switch(monkeypatch):
 
         gx10._dispatch(None, "watcher on")
         assert gx10._WATCHER_ENABLED and gx10.AUTOPILOT_ENABLED and gx10.AUTOPILOT_AUTOPLAN
-        assert gx10._EFFECTIVE_CFG["watcher"]["enabled"] is True
+        assert "enabled" not in gx10._EFFECTIVE_CFG["watcher"]
         assert gx10._EFFECTIVE_CFG["autopilot"]["enabled"] is True
 
         gx10._dispatch(None, "watcher off")
         assert not (gx10._WATCHER_ENABLED or gx10.AUTOPILOT_ENABLED or gx10.AUTOPILOT_AUTOPLAN)
-        assert gx10._EFFECTIVE_CFG["watcher"]["enabled"] is False
+        assert "enabled" not in gx10._EFFECTIVE_CFG["watcher"]
         assert gx10._EFFECTIVE_CFG["autopilot"]["enabled"] is False
     finally:
         (gx10._WATCHER_ENABLED, gx10.AUTOPILOT_ENABLED, gx10.AUTOPILOT_AUTOPLAN,

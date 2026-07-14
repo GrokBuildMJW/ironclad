@@ -15,7 +15,7 @@ from pathlib import Path
 
 import pytest
 
-_REPO = Path(__file__).resolve().parents[3]                 # mjw_agentic/
+_REPO = Path(__file__).resolve().parents[3]                 # the monorepo root
 _AUDIT = _REPO / "scripts" / "ci" / "doc_reality_audit.py"
 _CORE = _REPO / "core"
 

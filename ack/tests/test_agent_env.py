@@ -85,6 +85,13 @@ def test_default_cli_runner_child_env_has_no_secrets(monkeypatch, tmp_path):
     monkeypatch.setattr(client.subprocess, "run", _fake_run)
     spec = types.SimpleNamespace(cmd_template="{bin} --model {model} --print {prompt}",
                                  bin="claude", model="m", permission_mode="plan")
+    import gx10
+    from ack.tooling_envelope import load_tooling_envelope_policy
+    monkeypatch.setattr(gx10, "TOOLING_ENVELOPE_POLICY", load_tooling_envelope_policy({
+        "security": {"tooling_envelope": {"allow_list": [
+            {"bin": spec.bin, "cmd_template": spec.cmd_template},
+        ]}}
+    }))
 
     res = client.default_cli_runner(spec, "hello", effort="high")
 

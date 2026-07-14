@@ -7,11 +7,10 @@
 
 This module is the mechanism; the *policy* is chosen by config (``security.profile``):
 
-  * ``open``   — today's behaviour: no auth, bind as requested, code-mount allowed.
-                 Out-of-the-box, maximum transparency (the OSS default).
+  * ``open``   — no auth, loopback-only by default, code-mount allowed. A non-loopback
+                 bind requires the explicit ``security.allow_unauthenticated_bind`` override.
   * ``token``  — a shared **deployment secret** (``Authorization: Bearer``) over the LAN.
-  * ``sealed`` — bind ``127.0.0.1`` only (meant to sit behind a client-managed tunnel),
-                 secret **required**, plus an explicit **session**: the client opens one,
+  * ``sealed`` — a secret **required**, plus an explicit **session**: the client opens one,
                  heartbeats it, and closes it on exit. With no live session the server is
                  **sealed** — client-facing endpoints refuse and background planning
                  pauses. Code-locality is enforced (pull-only, no mount).
@@ -23,6 +22,7 @@ live in the operator's private config, never here.
 from __future__ import annotations
 
 import hmac
+import ipaddress
 import os
 import secrets
 import threading
@@ -31,6 +31,17 @@ from typing import Any, Dict, Optional
 
 #: Profiles, weakest → strongest. ``open`` is the OSS default.
 PROFILES = ("open", "token", "sealed")
+
+
+def is_loopback_bind(host: str) -> bool:
+    """Return whether *host* names only the local machine."""
+    normalized = str(host or "").strip().lower().strip("[]")
+    if normalized == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(normalized).is_loopback
+    except ValueError:
+        return False
 
 #: Endpoints that require authorization (and, where applicable, a live session).
 #: ``/health`` and the ``/session/*`` lifecycle routes are intentionally excluded
@@ -41,7 +52,8 @@ PROFILES = ("open", "token", "sealed")
 #: likewise gated: the loaded prompt/skill registry snapshot (names + descriptions) is deployment
 #: detail that must not be readable without the secret.
 GATED_PATHS = ("/chat", "/chat/stream", "/tool-result", "/fanout", "/cancel",
-               "/tasks", "/pending", "/feedback", "/doctor", "/catalogue", "/coders")
+               "/tasks", "/pending", "/claim", "/unclaim", "/feedback", "/doctor",
+               "/catalogue", "/coders")
 
 
 class SecurityPolicy:
@@ -49,7 +61,7 @@ class SecurityPolicy:
     merged config + environment; immutable thereafter."""
 
     def __init__(self, profile: str, token: Optional[str], heartbeat_s: int,
-                 code_locality: str) -> None:
+                 code_locality: str, allow_unauthenticated_bind: bool = False) -> None:
         # SEC-1 (#503): an unknown NON-EMPTY profile must NOT silently downgrade to the weakest 'open'
         # (fail-open in a fail-closed module). Unset/empty → the documented 'open' default; a valid profile
         # is used; anything else is kept verbatim + flagged so startup_error() refuses to boot loudly.
@@ -65,6 +77,7 @@ class SecurityPolicy:
             self._invalid_profile = raw
         self.token = token or None
         self.heartbeat_s = max(5, int(heartbeat_s))
+        self.allow_unauthenticated_bind = allow_unauthenticated_bind is True
         # open allows a code mount; sealed forces pull-only/local. token leaves it as set.
         if self.profile == "sealed":
             code_locality = "local"
@@ -83,7 +96,8 @@ class SecurityPolicy:
         except (TypeError, ValueError):
             hb = 30
         code_locality = (sec.get("code_locality") or "mount").strip().lower()
-        return cls(profile, token, hb, code_locality)
+        allow_unauthenticated_bind = sec.get("allow_unauthenticated_bind", False) is True
+        return cls(profile, token, hb, code_locality, allow_unauthenticated_bind)
 
     # ── profile-derived flags ────────────────────────────────
     @property
@@ -99,12 +113,11 @@ class SecurityPolicy:
         return self.profile == "sealed"
 
     def effective_bind(self, requested: str) -> str:
-        """``sealed`` is reachable only via loopback (a tunnel terminates here); other
-        profiles honour the requested bind (default LAN-wide, like the model port)."""
-        return "127.0.0.1" if self.profile == "sealed" else requested
+        """Return the requested bind after :meth:`startup_error` authorizes it."""
+        return requested
 
-    def startup_error(self) -> Optional[str]:
-        """Fail-closed: an invalid profile, or a profile that demands a secret without one, refuses to boot."""
+    def startup_error(self, requested_bind: Optional[str] = None) -> Optional[str]:
+        """Return a fail-closed boot refusal for an invalid profile, secret, or bind."""
         if self._invalid_profile is not None:                       # SEC-1 (#503): no silent downgrade
             return (f"security.profile={self._invalid_profile!r} is not a valid trust profile "
                     f"(expected one of {list(PROFILES)}); refusing to start. Unset it for the default "
@@ -113,6 +126,14 @@ class SecurityPolicy:
             env = "GX10_SERVER_TOKEN"
             return (f"security.profile={self.profile!r} requires a deployment secret but "
                     f"none is set — export {env}=… (a shared secret, not a user login).")
+        if (requested_bind is not None and self.profile == "open"
+                and not is_loopback_bind(requested_bind)
+                and not self.allow_unauthenticated_bind):
+            return (
+                f"security.profile='open' cannot bind unauthenticated to non-loopback host "
+                f"{requested_bind!r}; use security.profile='token' or 'sealed', or explicitly set "
+                f"security.allow_unauthenticated_bind=true to accept this dangerous exposure."
+            )
         return None
 
     # ── request-time check ───────────────────────────────────

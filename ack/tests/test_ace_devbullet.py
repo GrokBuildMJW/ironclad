@@ -6,6 +6,8 @@ Covers the handover+feedback coder-addressing mode (GitHub-only autopilot + file
 """
 from __future__ import annotations
 
+from design_test_support import approve_active_design
+
 import sys
 import types
 from pathlib import Path
@@ -123,8 +125,9 @@ def test_handover_carries_playbook_and_records_unit_correlation(tmp_path, monkey
     monkeypatch.chdir(tmp_path)
     with pc.use(ProjectContext("p", str(tmp_path), "ns")):
         gx10._dispatch(_FakeAgent(), "initiative new Order Service --type software")
+        approve_active_design(gx10)
         gx10._stage_handover(None, "OPUS", "## Handover\nbuild it\n\nCloses #880",
-                             task_json='{"type":"feature","priority":"high","title":"wire (#880)","description":"do it"}',
+                             task_json='{"type":"feature","priority":"high","title":"Wire the dev bullet (#880)","description":"Wire the development bullet through the validated staging pipeline."}',
                              force=True)
         tid = gx10._store().list("pending")[0]["id"]
         ho = (gx10.handovers_dir() / f"{tid}_OPUS.md").read_text(encoding="utf-8")

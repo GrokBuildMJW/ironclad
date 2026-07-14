@@ -39,10 +39,9 @@ def test_execute_command_blocks_other_tool_used_as_shell():
     assert "search.adapter" not in out                                # only web_search gets that hint
 
 
-def test_execute_command_allows_a_normal_command(monkeypatch):
-    monkeypatch.setattr(gx10, "PLATFORM", "windows")
-    monkeypatch.setattr(gx10.subprocess, "run",
-                        lambda argv, **kw: types.SimpleNamespace(stdout="ok", stderr="", returncode=0))
+def test_execute_command_allows_a_normal_command(monkeypatch, model_sandbox_backend):
+    monkeypatch.setattr(gx10, "_run_model_command_process",
+                        lambda *a, **kw: types.SimpleNamespace(stdout="ok", stderr="", returncode=0))
     out = gx10.run_tool("execute_command", {"command": "Get-Date"})
     assert "is a tool" not in out                                     # not a tool name → runs normally
 

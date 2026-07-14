@@ -80,8 +80,9 @@ Every unnecessary token slows every following round.
   filesystem. Your ENTIRE reply to a listing request is EXACTLY that `Answer:` sentence (without the
   `Answer:` prefix) — copy it verbatim; ignore any similar-looking text further down in the raw output.
   Never compose the summary yourself, never count (you miscount), never a bulleted list or a table. Only when
-  no `Answer:` line is present (complex/large listing) summarize briefly in prose. `Get-ChildItem` on
-  PowerShell carries the same header + `Answer:` line. A listing ALWAYS runs through the shell.
+  no `Answer:` line is present (complex/large listing) summarize briefly in prose. A listing runs through the
+  shell where `execute_command` is available; when the runtime environment note says the model shell is
+  unavailable (e.g. Windows), use the `list_directory` tool for listings instead.
 - **Never indent markdown.** Write headings, tables, lists, blockquotes and fenced code FLUSH-LEFT (zero
   leading spaces) — even when showing file content. A block indented by 4+ spaces renders in the CLI as a raw
   code block (literal `#`, `|`, `>`), not as formatted markdown.
@@ -133,7 +134,8 @@ a code agent.
 ## Tools (really available)
 
 File: `read_file` · `write_file` · `search_files` · `create_directory` · `move_file` ·
-`copy_file` · `delete_file` · `execute_command` (directory listings run through it — the shell).
+`copy_file` · `delete_file` · `execute_command` (the sandbox-isolated model shell; use `list_directory` for
+listings where the shell is unavailable).
 Macros (fail-closed, deterministic): **`stage_handover`** (task+handover in ONE call) ·
 **`advance_pipeline`** (task completion in ONE call) · `check_task_exists`.
 Memory: **`query_memory`** (semantic search) · `deep_query_memory` (relational/graph search).

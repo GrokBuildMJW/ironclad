@@ -16,9 +16,7 @@ import gx10  # noqa: E402
 
 def _setup(monkeypatch, tmp_path):
     gx10._apply_config(gx10._code_defaults())
-    monkeypatch.setattr(gx10, "DESIGN_GATE_ENABLED", True)
-    monkeypatch.setattr(gx10, "CONSTRAINT_GATE_ENABLED", True)
-    monkeypatch.setattr(gx10, "CONSTRAINT_CONFLICT_DETECT", False)
+    monkeypatch.setattr(gx10, "FRAMING_NOTES_ENABLED", True)
     gx10.STORE = None
     monkeypatch.setattr(gx10, "_ui_print", lambda *a, **k: None)
     monkeypatch.chdir(tmp_path)
@@ -26,7 +24,8 @@ def _setup(monkeypatch, tmp_path):
 
 
 def _impl_json(title="build it", **typed):
-    payload = {"type": "implementation", "priority": "high", "title": title, "description": "x"}
+    payload = {"type": "implementation", "priority": "high", "title": f"Implement approved {title}",
+               "description": "Implement the approved design with complete validation and regression coverage."}
     payload.update(typed)
     return json.dumps(payload)
 
@@ -64,20 +63,29 @@ def test_run_tool_flow_records_framing_and_enforces_approved_design(monkeypatch,
     assert "- stdlib only" in md
 
 
-def test_gate_off_flow_is_byte_identical_for_missing_framing(monkeypatch, tmp_path):
+def test_framing_off_still_requires_and_injects_approved_design(monkeypatch, tmp_path):
     _setup(monkeypatch, tmp_path)
-    monkeypatch.setattr(gx10, "CONSTRAINT_GATE_ENABLED", False)
-    monkeypatch.setattr(gx10, "DESIGN_GATE_ENABLED", False)
+    monkeypatch.setattr(gx10, "FRAMING_NOTES_ENABLED", False)
 
     assert gx10.run_tool("record_constraints", {"title": "Context", "body": "x"}) == (
-        "ERROR: constraint gate disabled"
+        "ERROR: framing notes disabled"
     )
+    refused = gx10.run_tool(
+        "stage_handover",
+        {"agent": "OPUS", "handover_md": "body", "task_json": _impl_json("before design")},
+    )
+    assert "blind-coding refused" in refused
+    assert gx10._store().list("pending") == []
+
+    gx10.record_design("Approach", "Use Python.", language="python")
+    assert gx10._approve_design().startswith("OK")
     out = gx10.run_tool(
         "stage_handover",
-        {"agent": "OPUS", "handover_md": "body", "task_json": _impl_json()},
+        {"agent": "OPUS", "handover_md": "body", "task_json": _impl_json(language="python")},
     )
 
     assert out.startswith("OK")
     tid = gx10._store().list("pending")[0]["id"]
     md = next(gx10.handovers_dir().glob(f"{tid}_*.md")).read_text(encoding="utf-8")
-    assert "IRONCLAD:CONSTRAINTS" not in md
+    assert "## Approved design standard" in md
+    assert "- language: python" in md

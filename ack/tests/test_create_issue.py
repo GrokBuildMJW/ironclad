@@ -1,10 +1,8 @@
 """#1073 (epic #1043): the secret-free, escape-free `create_issue` tool — CAPABILITY-DETECTED + hardened.
 
-Lets the orchestrator FILE its own tracker issues (GitHub via the `gh` CLI). It is offered whenever its
-capability is PRESENT (the `gh` CLI on PATH) — mirroring web_search/memory/etc., so the whole tool surface is
-uniformly capability-detected rather than behind a manual opt-in flag (installing + authing gh IS the
-operator's deliberate opt-in). The operator can still force it off (forge.enabled=false); it is blocked under
-the sealed profile (no autonomous outbound writes). The body comes from a FILE (no giant JSON arg); no repo
+Lets the orchestrator FILE its own tracker issues (GitHub via the `gh` CLI). It is offered only after the
+operator explicitly enables forge and the selected adapter capability is present. It is blocked under the
+sealed profile (no autonomous outbound writes). The body comes from a FILE (no giant JSON arg); no repo
 literal or token in core (ambient gh). Hardened (#1130 follow-up): unknown labels are rejected with the valid
 set (validate→reask, the model must use existing labels not invent them), and an optional `parent` links the
 new issue as a native sub-issue via `gh issue edit --parent`.
@@ -52,10 +50,12 @@ def _present(monkeypatch):
 
 
 # ── capability detection ──────────────────────────────────────────────────────
-def test_create_issue_on_by_default_when_gh_present(monkeypatch):
-    assert gx10.FORGE_ENABLED is True                                   # default flipped to ON
+def test_create_issue_requires_explicit_enable_when_gh_present(monkeypatch):
+    assert gx10.FORGE_ENABLED is False
     monkeypatch.setattr(gx10.shutil, "which", lambda _: "/usr/bin/gh")
     monkeypatch.setattr(gx10, "_is_sealed_profile", lambda: False)
+    assert "create_issue" not in {t["function"]["name"] for t in gx10._effective_tools()}
+    monkeypatch.setattr(gx10, "FORGE_ENABLED", True)
     assert "create_issue" in {t["function"]["name"] for t in gx10._effective_tools()}
 
 

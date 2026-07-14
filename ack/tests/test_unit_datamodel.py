@@ -66,8 +66,9 @@ def test_unit_without_fields_is_unaffected(monkeypatch, tmp_path):
 
 
 def test_stage_handover_carries_labels_and_parent(monkeypatch, tmp_path):
-    _setup(monkeypatch, tmp_path)  # design_gate is off by default → a feature handover is not blocked
-    tj = json.dumps({"type": "feature", "priority": "high", "title": "x", "description": "y",
+    _setup(monkeypatch, tmp_path)
+    tj = json.dumps({"type": "documentation", "priority": "high", "title": "Document the unit model",
+                     "description": "Document the complete unit data model and preserve its metadata fields.",
                      "labels": ["area/ci"], "parent": "KGC-1"})
     gx10._stage_handover(None, "OPUS", "handover body", tj)
     got = gx10._store().get(gx10._store().list("pending")[0]["id"])

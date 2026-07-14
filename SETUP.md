@@ -135,8 +135,10 @@ orchestrator's file/command tools are **passed through to the client** and run o
 local files (and code-agents launch locally).
 
 ```bash
-# 1) the orchestrator (next to the model; localhost is fine on a single machine):
-python engine/server.py --host 0.0.0.0 --port 8100
+# 1) the orchestrator (fresh default: unauthenticated loopback only):
+python engine/server.py --port 8100
+# For a remote listener, use token/sealed auth (recommended), or explicitly accept the dangerous
+# open-LAN override; see docs/security.md.
 
 # 2) on your machine — the RECOMMENDED terminal client (TypeScript). Install it ONCE as a
 #    global command, then run `ironclad` from any folder (that folder becomes the codedir):
@@ -268,7 +270,7 @@ function ironclad {
 $IRONCLAD_PY = "$env:IRONCLAD_HOME\.venv\Scripts\python.exe"
 function ironclad-tui    { & $IRONCLAD_PY "$env:IRONCLAD_HOME\engine\tui.py"    --codedir (Get-Location).Path @args }
 function ironclad-repl   { & $IRONCLAD_PY "$env:IRONCLAD_HOME\engine\client.py" --codedir (Get-Location).Path @args }
-function ironclad-server { & $IRONCLAD_PY "$env:IRONCLAD_HOME\engine\server.py" --host 0.0.0.0 --port 8100 @args }
+function ironclad-server { & $IRONCLAD_PY "$env:IRONCLAD_HOME\engine\server.py" --host 127.0.0.1 --port 8100 @args }
 ```
 
 ### macOS / Linux (bash or zsh)
@@ -283,7 +285,7 @@ IRONCLAD_PY="$IRONCLAD_HOME/.venv/bin/python"
 # `ironclad` is the global npm bin (npm install -g .) — no function needed. Legacy clients + server:
 ironclad-tui()    { "$IRONCLAD_PY" "$IRONCLAD_HOME/engine/tui.py"    --codedir "$(pwd)" "$@"; }
 ironclad-repl()   { "$IRONCLAD_PY" "$IRONCLAD_HOME/engine/client.py" --codedir "$(pwd)" "$@"; }
-ironclad-server() { "$IRONCLAD_PY" "$IRONCLAD_HOME/engine/server.py" --host 0.0.0.0 --port 8100 "$@"; }
+ironclad-server() { "$IRONCLAD_PY" "$IRONCLAD_HOME/engine/server.py" --host 127.0.0.1 --port 8100 "$@"; }
 ```
 
 `ironclad` (the recommended client) is the global bin and runs from any folder; `ironclad-tui`

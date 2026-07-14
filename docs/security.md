@@ -11,12 +11,16 @@ Pick one with `security.profile` (or `GX10_PROFILE`). Weakest → strongest:
 
 | `security.profile` | Auth | Bind | Session | Code locality | Use it when |
 |--------------------|------|------|---------|---------------|-------------|
-| **`open`** (default) | none | as requested (LAN) | — | `mount` allowed | trusted home LAN / local dev |
+| **`open`** (default) | none | loopback by default; non-loopback only with the named dangerous override | — | `mount` allowed | local development |
 | **`token`** | `Bearer` deployment secret on gated routes | as requested (LAN) | — | honored as set | a shared LAN you want to gate |
-| **`sealed`** | secret **required** | forced `127.0.0.1` (loopback) | **required** (open/heartbeat/close) | forced `local` | exposed / behind a client tunnel |
+| **`sealed`** | secret **required** | as requested (loopback by default) | **required** (open/heartbeat/close) | forced `local` | exposed / behind a client tunnel |
 
 **Fail-closed boot:** a profile that needs a secret (`token`/`sealed`) **refuses to start** if none is set —
 `security.profile=… requires a deployment secret but none is set`. Export the token first.
+
+The fresh bind is `server.host=127.0.0.1`. An `open` profile that requests any non-loopback host refuses
+to boot and names `security.allow_unauthenticated_bind`. Prefer `token` or `sealed`; set the override to
+`true` only when you deliberately accept an unauthenticated network listener on a trusted deployment.
 
 ## Config keys & env overrides
 
@@ -25,21 +29,23 @@ read from the environment variable **named** by `security.token_env`.
 
 | Config key | Env override | Default | Meaning |
 |------------|--------------|---------|---------|
+| `server.host` | `GX10_SERVER_HOST` | `127.0.0.1` | server bind host (boot-only / frozen) |
 | `security.profile` | `GX10_PROFILE` | `open` | the trust profile (boot-only / [frozen](config-runtime.md)) |
+| `security.allow_unauthenticated_bind` | `GX10_ALLOW_UNAUTHENTICATED_BIND` | `false` | dangerous explicit opt-in for `open` + non-loopback (boot-only / frozen) |
 | `security.token_env` | — | `GX10_SERVER_TOKEN` | the **name** of the env var holding the secret |
 | *(the secret value)* | `GX10_SERVER_TOKEN` (or your `token_env`) | — | the shared deployment secret (never in config/repo) |
 | `security.session_heartbeat_s` | `GX10_SESSION_HEARTBEAT` | `30` | heartbeat interval; a session is live within **2×** this |
 | `security.code_locality` | `GX10_CODE_LOCALITY` | `mount` | `mount` \| `local`; **`sealed` forces `local`** |
 
-`security.profile` is a **frozen** config key (it wires the trust policy + bind host once at boot):
-`/config get` reads it, `/config set` is refused — set it in the deploy and restart.
+`server.host`, `security.profile`, and `security.allow_unauthenticated_bind` are **frozen** config keys:
+`/config get` reads them, `/config set` is refused — set them in the deployment and restart.
 
 ## The request gate
 
 These routes require authorization (and, under `sealed`, a live session):
 
 ```
-/chat  /chat/stream  /tool-result  /fanout  /cancel  /tasks  /pending  /feedback  /doctor
+/chat  /chat/stream  /tool-result  /fanout  /cancel  /tasks  /pending  /claim  /unclaim  /feedback  /doctor
 ```
 
 `/health` and `/session/open|heartbeat|close` are **not** gated — `/health` is the pre-auth handshake (it
@@ -66,11 +72,17 @@ X-Session-Id:  <session-id from /session/open> # sealed only
 3. `POST /session/close` on exit. The channel **seals the moment the last live session ends** (app-enforced
    by the heartbeat TTL; OS-enforced too when the loopback tunnel closes).
 
+The TypeScript client runs heartbeat and re-open attempts in one serial, self-scheduling loop. Shutdown
+rechecks after every network wait and compensates for a re-open already in flight, so stopping the client
+cannot leave a newly opened server session live until its TTL expires.
+
 ## Sealed deployment in practice
 
-`sealed` binds `127.0.0.1:<port>` (default `8100`, `GX10_SERVER_PORT`) — it is **not** on the LAN. The
-client reaches it over a **client-managed tunnel** (e.g. an SSH local-forward); the transport specifics live
-in the operator's private config, never in `core/`. Code stays local (`code_locality=local`, no mount).
+With the default `server.host`, `sealed` binds `127.0.0.1:<port>` (default `8100`,
+`GX10_SERVER_PORT`) and is **not** on the LAN. The client can reach it over a **client-managed tunnel**
+(e.g. an SSH local-forward); the transport specifics live in the operator's private config, never in
+`core/`. An explicitly configured non-loopback bind is permitted because sealed requires both the
+deployment secret and a live session. Code stays local (`code_locality=local`, no mount).
 
 ```bash
 export GX10_PROFILE=sealed

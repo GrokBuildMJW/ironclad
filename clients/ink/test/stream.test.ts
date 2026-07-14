@@ -26,6 +26,18 @@ test('stream parser — text + tool frame toggle, split across chunks', async ()
   assert.deepEqual(frames[0], {id: 'a', name: 'read_file', args: {path: 'x'}});
 });
 
+test('stream parser — versioned model exec carries the mandatory sandbox policy', async () => {
+  const frames: ToolFrame[] = [];
+  const feed = createStreamParser({onText: () => {}, onTool: (f) => {
+    frames.push(f);
+  }});
+  await feed(enc.encode(NUL + 'TR{"id":"e","name":"execute_command_sandboxed_v1","args":{"command":"echo hi"},"sandbox":"bwrap"}' + NUL));
+  await feed(null);
+  assert.deepEqual(frames, [{
+    id: 'e', name: 'execute_command_sandboxed_v1', args: {command: 'echo hi'}, sandbox: 'bwrap',
+  }]);
+});
+
 test('stripConfirm — #1281: --yes/--confirm recognised in any position, not only trailing', () => {
   assert.deepEqual(stripConfirm('project delete X --purge --yes'), {msg: 'project delete X --purge', confirm: true});
   assert.deepEqual(stripConfirm('project delete X --yes --purge'), {msg: 'project delete X --purge', confirm: true});

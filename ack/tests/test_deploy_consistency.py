@@ -6,7 +6,9 @@ in `scripts/ci/` (private) → skips in an installed/clean-room tree.
 from __future__ import annotations
 
 import importlib.util
+import json
 import sys
+import types
 from pathlib import Path
 
 import pytest
@@ -85,3 +87,51 @@ def test_live_deploy_tree_is_consistent():
     refs = cdc.repo_path_refs(scripts)                                  # F-K-01: reference-drag guard
     real = {rel for _, rel in refs if (cdc.REPO_ROOT / rel).exists()}
     assert cdc.dangling_repo_path_refs(refs, real) == []               # live tree has no stale $REPO_ROOT refs
+
+
+def test_private_spark_configs_preserve_pre_f8_effective_behavior(monkeypatch):
+    sys.modules.setdefault("openai", types.SimpleNamespace(OpenAI=object))
+    engine = _REPO / "core" / "engine"
+    if str(engine) not in sys.path:
+        sys.path.insert(0, str(engine))
+    import config_schema
+    import gx10
+    from providers import load_code_agents
+    from security import SecurityPolicy
+
+    def merged(name: str):
+        raw = json.loads((_REPO / "conf" / name).read_text(encoding="utf-8"))
+        projection = gx10._deep_merge(config_schema.defaults_tree(), raw)
+        config_schema.validate(projection)
+        return projection
+
+    monkeypatch.delenv("GX10_PROFILE", raising=False)
+    monkeypatch.delenv("GX10_SERVER_TOKEN", raising=False)
+    server_cfg = merged("server.json")
+    assert server_cfg["server"]["host"] == "0.0.0.0"
+    assert server_cfg["security"]["allow_unauthenticated_bind"] is True
+    assert server_cfg["search"]["enabled"] is True
+    assert server_cfg["forge"]["enabled"] is True
+    assert server_cfg["connection"]["connect_timeout_s"] == 10
+    assert server_cfg["connection"]["first_token_timeout_s"] == 600
+    assert SecurityPolicy.from_config(server_cfg).startup_error("0.0.0.0") is None
+    server_agents = load_code_agents(server_cfg)
+    for agent_id in ("OPUS", "SONNET"):
+        spec = server_agents.resolve(agent_id)
+        assert spec.permission_mode == "bypassPermissions"
+        assert spec.capabilities.permission_bypass is True
+    dockerfile = (_REPO / "core" / "Dockerfile").read_text(encoding="utf-8")
+    assert "server.py --host 0.0.0.0" not in dockerfile
+    bootstrap = (_REPO / "core" / "scripts" / "spark-bootstrap.sh").read_text(encoding="utf-8")
+    assert 'ORCH_HOST="${GX10_SERVER_HOST:-127.0.0.1}"' in bootstrap
+
+    local_cfg = merged("local.json")
+    assert local_cfg["server"]["host"] == "127.0.0.1"
+    assert local_cfg["search"]["enabled"] is True
+    assert local_cfg["forge"]["enabled"] is True
+    assert local_cfg["providers"]["cli_timeout_s"] == 3600
+    agents = load_code_agents(local_cfg)
+    for agent_id in ("OPUS", "SONNET"):
+        spec = agents.resolve(agent_id)
+        assert spec.permission_mode == "bypassPermissions"
+        assert spec.capabilities.permission_bypass is True

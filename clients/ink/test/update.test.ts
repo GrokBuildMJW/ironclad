@@ -1,36 +1,70 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {updatePlan, runUpdate, type Exec} from '../src/tools/update.js';
+import {join} from 'node:path';
+import {updatePlan, validateSrcDir, runUpdate, type Exec} from '../src/tools/update.js';
 
 test('updatePlan — build + install from <src>/clients/ink, git pull only when asked', () => {
+  const ink = join('/repo', 'clients', 'ink');
   const plain = updatePlan('/repo', false);
-  assert.deepEqual(plain.map((s) => s.label), ['build', 'install -g']);
-  for (const s of plain) assert.match(s.command, /clients[\\/]ink/, 'targets the ink package');
-  assert.match(plain[1]!.command, /install -g/);
+  assert.deepEqual(plain, [
+    {label: 'build', command: 'npm', args: ['--prefix', ink, 'run', 'build']},
+    {label: 'install -g', command: 'npm', args: ['install', '-g', ink]},
+  ]);
 
   const withPull = updatePlan('/repo', true);
-  assert.deepEqual(withPull.map((s) => s.label), ['git pull', 'build', 'install -g']);
-  assert.match(withPull[0]!.command, /git -C "\/repo" pull/);
+  assert.deepEqual(withPull, [
+    {label: 'git pull', command: 'git', args: ['-C', '/repo', 'pull', '--ff-only']},
+    ...plain,
+  ]);
+  assert.ok(withPull.every((step) => !/["&]/u.test(step.command) && step.args.every((arg) => !/["&]/u.test(arg))));
+});
+
+test('validateSrcDir — accepts normal paths and rejects shell/cmd metacharacters', () => {
+  assert.equal(validateSrcDir(String.raw`C:\Program Files (x86)\repo`), null);
+  assert.equal(validateSrcDir('/home/u/x'), null);
+  // a legitimate apostrophe path must NOT be refused (harmless under argv-no-shell + cmd.exe) — #1496 review
+  assert.equal(validateSrcDir(String.raw`C:\Users\O'Brien\repo`), null);
+  assert.equal(validateSrcDir("/home/O'Brien/repo"), null);
+
+  for (const unsafe of [String.raw`C:\x" & calc & "`, 'a|b', 'a`b', '$(calc)', 'a;b', 'a\nb']) {
+    assert.match(validateSrcDir(unsafe) ?? '', /shell\/cmd metacharacter/u, unsafe);
+  }
+});
+
+test('runUpdate — refuses an unsafe source path without executing a step', async () => {
+  const seen: Array<{command: string; args: string[]}> = [];
+  const exec: Exec = async (command, args) => {
+    seen.push({command, args});
+    return {code: 0, out: ''};
+  };
+
+  const {ok, log} = await runUpdate(String.raw`C:\x" & calc & "`, true, exec);
+  assert.equal(ok, false);
+  assert.deepEqual(seen, []);
+  assert.deepEqual(log, ['✗ /update refused: the source path contains a shell/cmd metacharacter']);
 });
 
 test('runUpdate — runs every step in order, reports ok + restart note', async () => {
-  const seen: string[] = [];
-  const exec: Exec = async (command) => {
-    seen.push(command);
+  const seen: Array<{command: string; args: string[]}> = [];
+  const exec: Exec = async (command, args) => {
+    seen.push({command, args});
     return {code: 0, out: ''};
   };
   const {ok, log} = await runUpdate('/repo', true, exec);
   assert.equal(ok, true);
-  assert.equal(seen.length, 3, 'git pull + build + install all ran');
-  assert.match(seen[0]!, /git .* pull/);
+  assert.deepEqual(
+    seen,
+    updatePlan('/repo', true).map(({command, args}) => ({command, args})),
+    'git pull + build + install all ran in order',
+  );
   assert.ok(log.some((l) => /restart ironclad/.test(l)), 'asks for a restart');
 });
 
 test('runUpdate — stops at the first failure (no later steps), ok=false', async () => {
-  const seen: string[] = [];
-  const exec: Exec = async (command) => {
-    seen.push(command);
-    return command.includes('run build') ? {code: 1, out: 'tsc error'} : {code: 0, out: ''};
+  const seen: Array<{command: string; args: string[]}> = [];
+  const exec: Exec = async (command, args) => {
+    seen.push({command, args});
+    return args.includes('build') ? {code: 1, out: 'tsc error'} : {code: 0, out: ''};
   };
   const {ok, log} = await runUpdate('/repo', false, exec);
   assert.equal(ok, false);

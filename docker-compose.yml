@@ -75,6 +75,12 @@ services:
       GX10_BASE_URL: ${GX10_BASE_URL:-http://localhost:8000/v1}
       GX10_MODEL: ${GX10_MODEL:-qwen3.6-35b}
       GX10_SERVER_PORT: ${GX10_SERVER_PORT:-8100}
+      # #1469 secure defaults: the orchestrator binds loopback (127.0.0.1) unless opened. To reach it from
+      # the workstation, forward-if-set a LAN bind + an explicit trust choice (empty ⇒ secure loopback):
+      GX10_SERVER_HOST: ${GX10_SERVER_HOST:-}
+      GX10_ALLOW_UNAUTHENTICATED_BIND: ${GX10_ALLOW_UNAUTHENTICATED_BIND:-}
+      GX10_PROFILE: ${GX10_PROFILE:-}
+      GX10_SERVER_TOKEN: ${GX10_SERVER_TOKEN:-}
       GX10_LANGUAGE: ${GX10_LANGUAGE:-en}
       GX10_MEMORY_URL: ${GX10_MEMORY_URL:-}
       # Warm tier (B0): a CO-LOCATED (server-mode) orchestrator reaches the mem-valkey loopback publish at

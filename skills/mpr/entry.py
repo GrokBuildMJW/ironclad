@@ -142,6 +142,7 @@ def _engine_deps(*, artifact_slug: Optional[str] = None) -> Deps:
     """
     d = Deps()
     try:  # noqa: BLE001 — every binding step is best-effort
+        import contextlib
         import gx10  # engine module (server-side; core/engine on sys.path at runtime)
         from .mpr_config import RunBudget, _apply_mpr_env, load_mpr_config
         from .registry.loader import get_registry
@@ -151,14 +152,19 @@ def _engine_deps(*, artifact_slug: Optional[str] = None) -> Deps:
         # the live tree (the engine core has no mpr awareness, so without this the env knobs are dead);
         # afterwards `/config set` mutations to _EFFECTIVE_CFG['mpr'] persist and override (env < runtime-set).
         global _MPR_ENV_SEEDED
-        tree = getattr(gx10, "_EFFECTIVE_CFG", None)
         # MPR-ENV-1 (#503): seed env ONCE via a process latch — NOT only when the tree lacks an `mpr` key.
         # The old guard meant ANY conf-file `mpr.*` made every GX10_MPR_* read dead (file beat env, inverting
         # the documented file<env precedence). The latch keeps env > file while a later runtime `/config set`
         # still persists (env is not re-applied over it).
-        if isinstance(tree, dict) and not _MPR_ENV_SEEDED:
-            _apply_mpr_env(tree)
-            _MPR_ENV_SEEDED = True
+        # F6b: `/config set` publishes by REBINDING _EFFECTIVE_CFG (a fresh deepcopy) under _CONFIG_LOCK, so
+        # read the live tree AND seed under that SAME lock — otherwise a concurrent set could replace the tree
+        # between our read and the seed, orphaning the one-time seed (the latch would then never re-apply it).
+        _cfg_lock = getattr(gx10, "_CONFIG_LOCK", None) or contextlib.nullcontext()
+        with _cfg_lock:
+            tree = getattr(gx10, "_EFFECTIVE_CFG", None)
+            if isinstance(tree, dict) and not _MPR_ENV_SEEDED:
+                _apply_mpr_env(tree)
+                _MPR_ENV_SEEDED = True
         cfg = load_mpr_config(tree if isinstance(tree, dict) else {})
         # MPR-1 (#503): build the per-run RunBudget from cfg.budget so the cap is actually USED — enforced on
         # the provider lane (a router usd_cap, below) and charged per perspective into the manifest. It was

@@ -102,13 +102,14 @@ def test_mock_adapter_always_available_and_returns_batch():
 
 
 # ── builder selection (Fork 2 + Fork 3) ──────────────────────────────────────
-def test_builder_defaults_to_cli_delegate():
+def test_builder_defaults_to_disabled():
     a = build_web_search_adapter({}, _FakeDispatcher(web=True))
-    assert isinstance(a, CliDelegateAdapter) and a.available() is True
+    assert isinstance(a, UnavailableAdapter) and a.available() is False
 
 
 def test_builder_selects_mock():
-    assert isinstance(build_web_search_adapter({"search": {"adapter": "mock"}}, None), MockAdapter)
+    assert isinstance(build_web_search_adapter(
+        {"search": {"enabled": True, "adapter": "mock"}}, None), MockAdapter)
 
 
 def test_builder_disabled_is_unavailable():
@@ -117,21 +118,23 @@ def test_builder_disabled_is_unavailable():
 
 
 def test_builder_brave_falls_back_to_cli_in_server_mode():   # Fork 2: native search is local-only
-    a = build_web_search_adapter({"search": {"adapter": "brave"}}, _FakeDispatcher(web=True),
+    a = build_web_search_adapter({"search": {"enabled": True, "adapter": "brave"}}, _FakeDispatcher(web=True),
                                  runner_mode="none")
     assert isinstance(a, CliDelegateAdapter)
 
 
 def test_builder_brave_local_unavailable_without_key(monkeypatch):
     monkeypatch.delenv("GX10_SEARCH_API_KEY", raising=False)
-    a = build_web_search_adapter({"search": {"adapter": "brave"}}, None, runner_mode="local")
+    a = build_web_search_adapter(
+        {"search": {"enabled": True, "adapter": "brave"}}, None, runner_mode="local")
     assert isinstance(a, UnavailableAdapter) and not a.available()
 
 
 def test_builder_brave_local_builds_native_adapter_with_key(monkeypatch):
     monkeypatch.setenv("GX10_SEARCH_API_KEY", "secret-key")
     from websearch_brave import BraveAdapter
-    a = build_web_search_adapter({"search": {"adapter": "brave"}}, None, runner_mode="local")
+    a = build_web_search_adapter(
+        {"search": {"enabled": True, "adapter": "brave"}}, None, runner_mode="local")
     assert isinstance(a, BraveAdapter) and a.available() is True
 
 
@@ -139,6 +142,7 @@ def test_builder_brave_tolerates_a_bad_count_value(monkeypatch):
     monkeypatch.setenv("GX10_SEARCH_API_KEY", "secret-key")
     from websearch_brave import BraveAdapter
     # a non-numeric config count must not raise out of the builder (server boot is fail-soft).
-    a = build_web_search_adapter({"search": {"adapter": "brave", "count": "oops"}}, None,
+    a = build_web_search_adapter(
+        {"search": {"enabled": True, "adapter": "brave", "count": "oops"}}, None,
                                  runner_mode="local")
     assert isinstance(a, BraveAdapter)

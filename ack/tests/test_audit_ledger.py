@@ -54,9 +54,9 @@ def test_record_action_is_content_free_and_bounded(tmp_path):
     assert len(big["payload"]["detail"]) == 512                 # truncated → can't bloat the trail
 
 
-def test_maybe_audit_records_only_mutating_tools_when_enabled(monkeypatch, tmp_path):
+def test_maybe_audit_records_only_selected_tools(monkeypatch, tmp_path):
     import gx10
-    monkeypatch.setattr(gx10, "AUDIT_ENABLED", True)
+    monkeypatch.setattr(gx10, "AUDIT_SCOPE", "mutating")
     monkeypatch.setattr(gx10, "state_root", lambda: tmp_path)
     gx10._maybe_audit("write_file", {"path": "a.py"}, "OK: Written 3 chars to a.py")
     gx10._maybe_audit("execute_command", {"command": "ls"}, "some output")
@@ -67,14 +67,16 @@ def test_maybe_audit_records_only_mutating_tools_when_enabled(monkeypatch, tmp_p
     assert al.verify_chain(tmp_path / "audit" / "ledger.jsonl") == []
 
 
-def test_maybe_audit_marks_errors_and_is_noop_when_disabled(monkeypatch, tmp_path):
+def test_maybe_audit_marks_errors_and_scope_all_records_reads(monkeypatch, tmp_path):
     import gx10
     monkeypatch.setattr(gx10, "state_root", lambda: tmp_path)
-    monkeypatch.setattr(gx10, "AUDIT_ENABLED", True)
+    monkeypatch.setattr(gx10, "AUDIT_SCOPE", "mutating")
     gx10._maybe_audit("execute_command", {"command": "boom"}, "ERROR: blocked")
     recs = al.read_all(tmp_path / "audit" / "ledger.jsonl")
     assert recs[-1]["payload"]["ok"] is False                   # a failed action is recorded as ok=False
-    monkeypatch.setattr(gx10, "AUDIT_ENABLED", False)
     before = len(recs)
-    gx10._maybe_audit("write_file", {"path": "z"}, "OK")        # disabled → no new record (byte-identical)
+    gx10._maybe_audit("read_file", {"path": "z"}, "OK")
     assert len(al.read_all(tmp_path / "audit" / "ledger.jsonl")) == before
+    monkeypatch.setattr(gx10, "AUDIT_SCOPE", "all")
+    gx10._maybe_audit("read_file", {"path": "z"}, "OK")
+    assert len(al.read_all(tmp_path / "audit" / "ledger.jsonl")) == before + 1

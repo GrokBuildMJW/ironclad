@@ -7,6 +7,8 @@ scanners degrade to no-ops (never crash the daemon). The project root stays clea
 """
 from __future__ import annotations
 
+from design_test_support import approve_active_design
+
 import sys
 import types
 from pathlib import Path
@@ -21,7 +23,8 @@ if str(_ENGINE) not in sys.path:
 
 import gx10  # noqa: E402
 
-_TASK = {"type": "feature", "priority": "high", "title": "wire it", "description": "do the thing"}
+_TASK = {"type": "feature", "priority": "high", "title": "Wire the routed artifact",
+         "description": "Wire the routed artifact through the complete validated staging pipeline."}
 
 
 @pytest.fixture(autouse=True)
@@ -55,6 +58,7 @@ def test_taskstore_list_soft_without_active():
 # ── stage_handover → .work/handovers inbox ────────────────────
 def test_stage_handover_lands_in_work_inbox(tmp_path):
     gx10.initiative_new("Staged", "software")
+    approve_active_design(gx10)
     tid = gx10._store().create(dict(_TASK), force=True)["id"]
     out = gx10._stage_handover(tid, "OPUS", "## Handover\nbody")
     assert "ERROR" not in out
@@ -68,6 +72,7 @@ def test_stage_handover_normalizes_body_recipient_to_the_agent(tmp_path):
     # `to:` (e.g. `Recipient: CODEX` on a SONNET handover). The engine rewrites the body `Recipient:` line
     # to the resolved agent so the coder reads a consistent recipient.
     gx10.initiative_new("Recip", "software")
+    approve_active_design(gx10)
     tid = gx10._store().create(dict(_TASK), force=True)["id"]
     body = "---\nto: SONNET\n---\n## Meta\n- **Recipient:** OPUS\n\n## Steps\ndo it"   # OPUS = a wrong (configured) agent
     out = gx10._stage_handover(tid, "SONNET", body)
@@ -120,6 +125,7 @@ def test_stage_handover_failclosed_without_active(tmp_path):
 # ── full advance round-trip, all under vault/<slug>/ ──────────
 def test_advance_round_trip_under_initiative(tmp_path):
     gx10.initiative_new("Flow", "software")
+    approve_active_design(gx10)
     base = tmp_path / "vault" / "flow"
     store = gx10._store()
     tid = store.create(dict(_TASK), force=True)["id"]
@@ -128,7 +134,7 @@ def test_advance_round_trip_under_initiative(tmp_path):
     # the local agent drops feedback into the inbox
     fb = gx10.feedback_dir() / f"{tid}_OPUS-feedback.md"
     fb.parent.mkdir(parents=True, exist_ok=True)
-    fb.write_text("## Result\nok", encoding="utf-8")
+    fb.write_text("status: done\n\n## Result\nok", encoding="utf-8")
 
     out = gx10._advance_pipeline(tid, "OPUS")
     assert "ERROR" not in out

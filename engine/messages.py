@@ -67,7 +67,7 @@ _MESSAGES: dict[str, dict[str, str]] = {
         "tiers.mutating": "mutating (change state)",
         "tiers.costly": "costly (spend model turns / spawn work)",
         "tiers.destructive": "destructive (can delete work)",
-        "config.unknown_key": "[config] unknown key '{name}' — its root section is not in the config (typo?). See /config keys. Nothing was written.",
+        "config.unknown_key": "[config] refused: unknown key '{name}' — its root section is not in the config (typo?). See /config keys. Nothing was written.",
         "skills.params": "params:",
     },
     "de": {
@@ -115,7 +115,7 @@ _MESSAGES: dict[str, dict[str, str]] = {
         "tiers.mutating": "verändernd (Zustand)",
         "tiers.costly": "kostspielig (Modell-Turns / erzeugt Arbeit)",
         "tiers.destructive": "destruktiv (kann Arbeit löschen)",
-        "config.unknown_key": "[config] unbekannter Key '{name}' — die Root-Sektion ist nicht in der Config (Tippfehler?). Siehe /config keys. Nichts geschrieben.",
+        "config.unknown_key": "[config] abgelehnt: unbekannter Key '{name}' — die Root-Sektion ist nicht in der Config (Tippfehler?). Siehe /config keys. Nichts geschrieben.",
         "skills.params": "Parameter:",
     },
 }

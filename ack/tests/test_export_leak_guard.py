@@ -17,7 +17,7 @@ from pathlib import Path
 
 import pytest
 
-_REPO = Path(__file__).resolve().parents[3]          # mjw_agentic/ (private monorepo root)
+_REPO = Path(__file__).resolve().parents[3]          # the monorepo root
 _BOUNDARY = _REPO / "scripts" / "ci" / "check_core_boundary.py"
 _EXPORT = _REPO / "scripts" / "ci" / "export_core.py"
 # Assembled so the contiguous literal never appears in this source file (see module docstring).

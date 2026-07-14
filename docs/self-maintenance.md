@@ -93,18 +93,21 @@ Found something broken? The same loop fixes it:
 
 ## Letting the agent actually change files (permissions)
 
-The code-agent runs headless, so it can't stop to ask you to approve each action. Two
-modes (set `GX10_CLAUDE_PERMISSION_MODE`):
+The code-agent runs headless, so it can't stop to ask you to approve each action. Since #1469 the
+**least-privilege posture is the default**: an agent launches with `permission_mode: default`, which
+auto-denies commands without blocking — the coder can propose file edits but cannot run commands on your
+machine, so it cannot itself run the tests it writes. Nothing runs commands unless you explicitly opt in.
 
-- **`bypassPermissions`** (default) — also lets it run commands (e.g. `pytest`, git).
-  Needed for the full *write-and-run-the-test* loop, so it is the default (an autonomous
-  coder must be able to run the tests it writes).
-- **`acceptEdits`** — auto-accepts file edits/writes only (no commands). Restricts the
-  coder to "write code + write the test" — it cannot then run it.
+To enable the full *write-and-run-the-test* loop, grant it on the **individual** `agent_id` in your config:
+set `permission_mode: bypassPermissions` **and** `capabilities.permission_bypass: true` on that pool entry
+(both are required — a `bypassPermissions` mode without the capability is refused fail-closed). That restores
+the `--dangerously-skip-permissions` / `bypassPermissions` autonomy for that one agent only, still bounded by
+the always-on tooling authorization (only allow-listed executables + command-template shapes) and the OS
+command sandbox. Other CLIs use their own approval flags. See [`code-agents.md`](code-agents.md).
 
-`bypassPermissions` means the agent can run commands on your machine. That's fine for the
-intended use — **your machine, your code, you asked for it** — but understand it before
-turning it on, and keep it to repos you trust.
+`permission_bypass` means the agent can run commands on your machine. That's fine for the intended use —
+**your machine, your code, you asked for it** — but it is now opt-in per agent, never a silent default;
+understand it before granting it, and keep it to repos you trust.
 
 **Prefer a different coding CLI?** The code-agent isn't locked to Claude Code — it's a
 command template (`GX10_AGENT_CMD`), so you can plug in any headless coding agent you

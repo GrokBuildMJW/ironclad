@@ -5,6 +5,8 @@ regardless of the invocation directory.
 """
 import sys
 import copy
+import base64
+import subprocess
 from collections import deque
 from pathlib import Path
 
@@ -19,6 +21,10 @@ if str(CORE_DIR) not in sys.path:
 _GX10_STATE_ATTRS = (
     "_BASE_CFG",
     "_EFFECTIVE_CFG",
+    # F6a: schema-derived runtime policy maps are process globals and must not leak in-place test changes.
+    "_FROZEN_CONFIG_KEYS",
+    "_CONFIG_TOMBSTONES",
+    "_CONFIG_ALIASES",
     "DEFAULT_BASE_URL",
     "DEFAULT_MODEL",
     "API_KEY_ENV",
@@ -33,7 +39,6 @@ _GX10_STATE_ATTRS = (
     "ONBOARDING_MODE",
     "TASK_PREFIX",
     "_TASK_ID_RE",
-    "ACK_ENABLED",
     "LODESTAR_ENABLED",
     "FORGE_ENABLED",
     "FORGE_REPO",
@@ -42,9 +47,8 @@ _GX10_STATE_ATTRS = (
     "REVIEW_AGENT",       # #1221: default reviewer agent_id
     "REVIEW_TIMEOUT_S",  # #1221: review CLI timeout
     "NOTIFY_WEBHOOK",
-    "AUDIT_ENABLED",
     "AUDIT_SCOPE",
-    "INJECTION_DEFENSE",
+    "_AUDIT_DEGRADED",
     "SANDBOX",
     "MULTI_TENANT",
     "TOOLING_ENVELOPE_POLICY",
@@ -115,10 +119,8 @@ _GX10_STATE_ATTRS = (
     "_MEMORY",
     "_WARM",
     "_TOKENS",
-    "DESIGN_GATE_ENABLED",
-    "CONSTRAINT_GATE_ENABLED",
-    "CONSTRAINT_CONFLICT_DETECT",
-    "ADVANCE_GATE_ENABLED",
+    "_DESIGN_MIGRATION_BLOCKED",
+    "FRAMING_NOTES_ENABLED",
     "AUTOMATION_DECOUPLED",
     "HEARTBEAT_STALL_S",
     "_NOTIFY_CONSUMER",
@@ -126,16 +128,40 @@ _GX10_STATE_ATTRS = (
     "_LAST_VERDICT",
     "_VERIFY_GROUNDING_THRESHOLD",
     "_QUALITY_TRIPPED",
-    "_STRATEGY_ENABLED",
     "_STRATEGY_BUDGET",
     "_LAST_STRATEGY",
     "_LAST_FAILURE_CLASS",
+    "_FAILURE_ATTEMPTS",   # F5b: strategy is always-on now → the per-task attempt counter must reset per test
+                           # (else a leaked count escalates a later test's task into a durable blocked state)
     "_AUTOPILOT_ACTIVE",
     "_UI_LINES",
     "_PROMPTS",
     "_PLAYBOOKS",
     "_PLUGIN_TOOLS",
 )
+
+
+@pytest.fixture
+def model_sandbox_backend(monkeypatch):
+    """Deterministic positive-path backend for tests, independent of host bwrap/firejail provisioning.
+
+    The product still resolves only real bwrap/firejail. This opt-in fixture replaces only the sandbox
+    command-construction seam with a separate subprocess shim, so positive tests exercise wrapper dispatch
+    and subprocess execution without making CI runner state a security assumption.
+    """
+    import gx10
+    import sandbox
+
+    shim = Path(__file__).with_name("sandbox_test_shim.py")
+
+    def _prepare(command, preference, *, net=False):
+        encoded = base64.b64encode(command.encode("utf-8")).decode("ascii")
+        wrapped = subprocess.list2cmdline([sys.executable, str(shim), encoded])
+        return wrapped, "test-sandbox-shim"
+
+    monkeypatch.setattr(gx10, "PLATFORM", "linux")
+    monkeypatch.setattr(sandbox, "sandbox_command", _prepare)
+    return _prepare
 
 
 def _snapshot_value(value):
@@ -188,6 +214,17 @@ def _ace_isolation(request, tmp_path, monkeypatch):
                 pc_token = pc.set_current(pc.current())
             except Exception:
                 pc_token = None
+        # F3a: mandatory audit preflight needs a writable hermetic ledger in positive tool tests. Redirect
+        # only that ledger to a sibling of the test project: STATE_ROOT must remain project-scoped because
+        # project/session isolation tests assert its real .ironclad routing.
+        if request.module.__name__ not in {"test_audit_ledger", "test_audit_full"}:
+            ledger = tmp_path.parent / f".{tmp_path.name}-audit" / "ledger.jsonl"
+            monkeypatch.setattr(gx10, "_audit_ledger_path", lambda: ledger)
+        # Positive coder fixtures inherit the real boot-derived launch policy. Tests of
+        # refusal replace it explicitly; an absent policy is no longer an allow path.
+        from ack.tooling_envelope import load_tooling_envelope_policy
+        monkeypatch.setattr(gx10, "TOOLING_ENVELOPE_POLICY",
+                            load_tooling_envelope_policy(gx10._code_defaults()))
 
     pr = sys.modules.get("project_registry")
     if pr is not None and request.module.__name__ != "test_project_registry":
@@ -206,7 +243,11 @@ def _ace_isolation(request, tmp_path, monkeypatch):
             except Exception:
                 pass
     for attr, val in (("_ACE_WORKER", None), ("_ACE_STORE", None), ("_ACE_MIGRATED", False),
-                      ("_ACE_FORK_WORKER", None), ("_ACE_FORK_MPR", False)):
+                      ("_ACE_FORK_WORKER", None), ("_ACE_FORK_MPR", False),
+                      # F5a: the quality breaker is ALWAYS-ON now (fed on every handover) and is a rebind-only
+                      # singleton — reset its in-place state so a trip in one test never holds the next test's
+                      # staging (the documented "reset a mutated singleton yourself" pattern).
+                      ("_QUALITY_BREAKER", None), ("_QUALITY_TRIPPED", None), ("_LAST_VERDICT", None)):
         if hasattr(gx10, attr):
             setattr(gx10, attr, val)
     if hasattr(gx10, "_ACE_INJECTED"):

@@ -11,6 +11,8 @@ this is its deterministic offline counterpart.
 """
 from __future__ import annotations
 
+from design_test_support import approve_active_design
+
 import json
 import sys
 import types
@@ -30,7 +32,7 @@ import gx10                     # noqa: E402
 
 
 def _is_under(child: Path, parent: Path) -> bool:
-    """Path containment that is robust to Windows 8.3 short names (MARCOW~1 vs MarcoWolf) — resolve both."""
+    """Path containment that is robust to Windows 8.3 short names (e.g. LONGNA~1 vs LongName) — resolve both."""
     c, p = child.resolve(), parent.resolve()
     return c == p or c.is_relative_to(p)
 
@@ -105,9 +107,12 @@ def engine(tmp_path, monkeypatch):
 
 def _stage_unit(agent, title):
     """A deterministic 'unit of work' under the active project: stage a task+handover (no model/agent)."""
+    approve_active_design(gx10)
     return gx10._stage_handover(
         None, "OPUS", f"## Handover\n{title}",
-        task_json=json.dumps({"type": "feature", "priority": "high", "title": title, "description": "x"}),
+        task_json=json.dumps({"type": "feature", "priority": "high",
+                              "title": f"Complete validated unit {title}",
+                              "description": "Complete the validated unit with implementation and regression coverage."}),
         force=True,
     )
 

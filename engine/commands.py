@@ -77,7 +77,7 @@ SERVER_COMMANDS = {
     "status", "config", "clear", "read", "write", "cat", "ls",
     "watcher", "autopilot", "autoplan", "log-terminal", "initiative",
     "project", "switch", "prompts", "skills",
-    "rag", "context", "tool", "generate", "design",
+    "rag", "context", "tool", "generate", "design", "quality",
 }
 
 HELP_TEXT = """\
@@ -104,6 +104,7 @@ Commands (with a / prefix) — plain text without / is sent to the orchestrator 
     /config get <key>          read a dotted config key (e.g. mpr.enabled)
     /config set <key> <value>  override a config key at runtime
                                (on|off|true|false|num|str)
+    /quality reset     clear a latched output-quality staging hold
     /clear             clear the orchestrator's context
     /read <path>       read a file in the server workdir
     /ls [path]         list a directory in the server workdir
@@ -114,8 +115,8 @@ Commands (with a / prefix) — plain text without / is sent to the orchestrator 
     /project list | use <slug> | active | track new|use|list | delete <id> [--purge] | archive|unarchive <id>
     /initiative …   deprecated alias for /project (kept one release)
     /switch <project_id>   rebind the engine to a project (own paths + memory partition)
-    /design --options [N]   ask for N design proposal variants with explicit pros/cons (design_gate only)
-    /approve design [<slug>|<id>]   approve a design (design_gate: promote proposal variant <id>)
+    /design --options [N]   ask for N design proposal variants with explicit pros/cons
+    /approve design [<id>]   promote a design proposal variant
     /fork list | <unit>   inspect M5 architecture-fork proposals
     /generate <args>   scaffold a paved-road capability into the active project library
     /tool <name> <args>   run a tool directly/deterministically (no model election, no RAG)

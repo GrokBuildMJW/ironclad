@@ -29,7 +29,7 @@ import {menuKey, completionText} from './menuModel.js';
 import {splitToolBlocks} from './toolBlocks.js';
 import {ToolCall} from './ToolCall.js';
 import {runPassthroughTool} from '../tools/bridge.js';
-import {runTool} from '../tools/runTool.js';
+import {runOperatorShell} from '../tools/runTool.js';
 import {runUpdate} from '../tools/update.js';
 import {Pool, dispatchPending, type HandoverCfg} from '../agent/handover.js';
 import {loadConfig, VERSION} from '../config.js';
@@ -231,7 +231,7 @@ export function App({
               setLiveAnswer(answerBody(router));
             }
           },
-          onTool: (f) => runPassthroughTool(srv, f),
+          onTool: (f) => runPassthroughTool(srv, f, ac.signal),
         },
         ac.signal,
       );
@@ -298,7 +298,7 @@ export function App({
         if (!payload) commit(<Text color={DIM}> (empty command)</Text>);
         else {
           commit(<Box marginTop={1}><Text color={DIM}>{`! ${payload}`}</Text></Box>);
-          const out = await runTool('execute_command', {command: payload});
+          const out = await runOperatorShell(payload);
           commit(<Box paddingLeft={2}><Text>{out}</Text></Box>);
         }
       } else if (name === 'reset') {

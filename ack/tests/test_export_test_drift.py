@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pytest
 
-_REPO = Path(__file__).resolve().parents[3]          # mjw_agentic/ (private monorepo root)
+_REPO = Path(__file__).resolve().parents[3]          # the monorepo root
 _GUARD = _REPO / "scripts" / "ci" / "check_export_test_drift.py"
 _CORE = _REPO / "core"
 

@@ -15,7 +15,7 @@ One env var, `GX10_AGENT_CMD`, is the command template. Placeholders:
 | `{bin}` | the binary (also settable via `GX10_CLAUDE_BIN`) |
 | `{model}` | the model the orchestrator picked for the task |
 | `{effort}` | the effort level (`GX10_CLAUDE_EFFORT`, default `high`) |
-| `{permission}` | the permission mode (`GX10_CLAUDE_PERMISSION_MODE`, default `bypassPermissions` so the coder can run the tests it writes) |
+| `{permission}` | the permission mode (`GX10_CLAUDE_PERMISSION_MODE`, safe default `default`) |
 | `{prompt}` | the instruction (stays a **single argument**, even with spaces) |
 | `{feedback}` | a result-capture path — a CLI that writes its final message to a file (e.g. Codex `-o {feedback}`) gets a deterministic fallback if it skips the feedback file (point 4); optional |
 
@@ -27,10 +27,16 @@ The contract any code-agent must satisfy is simple, and stated in the prompt its
 1. run **headless / non-interactive** (no prompts to a human),
 2. be able to **write files** in the working directory,
 3. **read** the handover at `.ironclad/agent/handovers/<ID>_<AGENT>.md`, do the task, and
-4. **write** a short result to `.ironclad/agent/feedback/<ID>_<AGENT>-feedback.md`.
+4. **write** a short result to `.ironclad/agent/feedback/<ID>_<AGENT>-feedback.md`, whose first line is
+   `status: done`, `status: blocked`, or `status: clarification_needed` as applicable.
 
-The client reads that feedback file back and reports the task done. Whatever CLI you use,
-if it honours those four points, it works.
+The client claims the task before launch so the task board shows it as **in progress**, then
+reads that feedback file back and reports it to the server. Only `status: done` advances the task. For
+compatibility with prose-only final-message capture, both local and remote autonomous lanes add that status
+only when the coder exits zero and the non-empty feedback has no status token; explicit statuses are preserved.
+A failed run is unclaimed for retry;
+claim/unclaim transport failures remain fail-soft. Whatever CLI you use, if it honours those
+four points, it works.
 
 ## The agent registry — many agents, config-driven (#449)
 
@@ -41,11 +47,12 @@ implementation), declare them in the **code-agent registry** — a config block,
 ```jsonc
 // config.code_agents — a SEPARATE, always-on surface (not the fan-out providers.pool)
 "code_agents": {
+  "timeout_s": 1800,
   "pool": [
     { "provider_id": "claude-opus",  "kind": "cli", "agent_id": "OPUS",
       "model": "claude-opus-4-8",  "bin": "claude", "display": "Claude Opus 4.8",
       "cmd_template": "{bin} --model {model} --effort {effort} --permission-mode {permission} --print {prompt}",
-      "effort": "xhigh", "permission_mode": "bypassPermissions" },
+      "effort": "xhigh", "permission_mode": "default" },
     { "provider_id": "codex", "kind": "cli", "agent_id": "CODEX", "model": "gpt-5.5", "bin": "codex",
       "cmd_template": "{bin} exec -m {model} -s workspace-write -c 'approval_policy=\"never\"' --skip-git-repo-check -o {feedback} {prompt}" }
   ]
@@ -57,7 +64,8 @@ implementation), declare them in the **code-agent registry** — a config block,
   `CLAUDE_OPUS`). It's what `stage_handover`/`advance_pipeline` accept in their `agent` field.
 - Ironclad ships **OPUS** and **SONNET** as **overridable** defaults — override their model/template,
   drop them, or add your own freely; nothing is hard-coded.
-- The **server resolves the full spec** (`bin`/`cmd_template`/`model`/`effort`/`permission`) from the
+- The **server resolves the full spec** (`bin`/`cmd_template`/`model`/`effort`/`permission` and the
+  permission-bypass capability) from the
   registry and ships it to the client, which just renders it — so each agent runs with its own command
   shape. The handover's frontmatter `to:`/`effort:` still override the registry model/effort per task.
 - An **unknown agent fails closed**: a handover/transition for an agent that isn't in the registry is
@@ -75,6 +83,15 @@ implementation), declare them in the **code-agent registry** — a config block,
   with `/coders use <id>`; ALL handovers then run on it until you `/coders use auto`. The pin
   (`code_agents.pinned`, set via the guarded `POST /coders`) fails closed on an unknown agent and is
   applied at every execution/reconciliation seam, so the override is global and consistent.
+- **Hard launch wall-clock (`code_agents.timeout_s`).** Every local coder gets a live, per-launch timeout
+  (default 1800 seconds; range greater than 0 through 7200; env `GX10_CODE_AGENTS_TIMEOUT_S`). The server
+  resolves it into each `/pending` item, so `/config set code_agents.timeout_s <seconds>` affects the next
+  launch without a restart. On expiry both clients kill the complete coder process tree and report a
+  **failed** run, so the claim is released and the task is retried — on the same agent — up to its retry
+  budget before escalating. A timeout is a normal failure, not a budget-exhausted one: it is classified
+  `task-failed` (not `agent-unavailable`), so it does **not** trip the circuit-breaker or fail over to a
+  peer. Ink retains only the last 256 KiB of each stdout/stderr stream, with an explicit truncation marker,
+  and writes those bounded tails to the per-task diagnostic log.
 - **Budget/quota failover (task-class-scoped).** When an agent's run reports it is out of budget/quota,
   the server classifies the run as `agent-unavailable` (a layered check of a JSON error event → a stderr
   regex → an exit code, with patterns in your `conf/`), trips a process-lifetime circuit-breaker for that
@@ -122,15 +139,14 @@ spec**, else the built-in Claude default. So setting `GX10_AGENT_CMD` on the cli
 even against a default server that ships OPUS/SONNET — while a deployment that configures the registry and
 sets no client override gets each agent's own command shape.
 
-## Tooling envelope (opt-in launch allow-list)
+## Tooling envelope (mandatory launch allow-list)
 
 `GX10_AGENT_CMD`, `GX10_CLAUDE_BIN`, and each `code_agents.pool[*].cmd_template` decide which local
-program a coder handover may spawn. ADR-0007's tooling envelope can constrain exactly that launch surface:
+program a coder handover may spawn. The tooling envelope authorizes that launch surface on every path:
 
 ```jsonc
 "security": {
   "tooling_envelope": {
-    "enabled": true,
     "allow_list": [
       {
         "bin": "claude",
@@ -141,23 +157,50 @@ program a coder handover may spawn. ADR-0007's tooling envelope can constrain ex
 }
 ```
 
-When `security.tooling_envelope.enabled` is `false` (the default), coder launches are byte-identical to the
-existing BYO behavior. When it is `true`, every coder-spawn lane authorizes the final executable and command
-template immediately before spawn. A mismatch is refused fail-closed and no process is started.
+Every coder-spawn lane authorizes the final executable and command template immediately before spawn. When
+`allow_list` is omitted, boot derives exact tuples from enabled CLI entries in `code_agents.pool` and
+`providers.pool`; for Claude entries it also derives the engine's canonical stream and non-stream autopilot
+shapes. An explicit empty list denies every external spawn. Malformed or empty derived policy also denies.
+The retired `security.tooling_envelope.enabled` and `GX10_TOOLING_ENVELOPE_ENABLED` controls warn and are
+ignored; they cannot disable authorization. A mismatch is refused fail-closed and no process is started.
+The generated [`config-runtime.md`](config-runtime.md) inventory therefore lists the retired key only as
+tombstone metadata; there is no live enable row for tooling authorization.
 
 The allow-list is intentionally small and non-secret:
 
 - `bin` names the authorized executable identity. A bare command name may match by basename after normal
-  resolution; a path-shaped value pins the executable by realpath identity. `$VAR`/`${VAR}` and a leading
-  bare `~` are expanded; undefined env references remain literal. Only `*` and `?` globs are portable.
+  resolution; the candidate's trailing `.exe`, `.cmd`, `.bat`, `.com`, or `.ps1` is ignored for this
+  case-insensitive bare-name comparison. A path-shaped value still pins the executable by byte-exact
+  realpath identity. `$VAR`/`${VAR}` and a leading bare `~` are expanded; undefined env references remain
+  literal. Only `*` and `?` globs are portable.
 - `cmd_template` is the authorized template shape, not the rendered prompt. The guard normalizes variable
   fields like model/effort/prompt, but extra flags or a different template refuse.
+- `allow_list` is boot-only; `/config set` cannot alter launch authority in a running process.
 - The policy applies only to coder invocation surfaces: provider CLI runner, Python/Ink handover clients,
   autopilot launch/reconciler launches, the `review` tool, and `/coders use`. It does not enforce a network
-  egress policy; egress controls are separate and deferred.
+  egress policy. The separate always-on build-boundary tripwire handles approved-design egress posture at
+  advance time; its only policy input is `network: none|declared|open` under `## Build policy`.
 
 Keep concrete private paths, wrapper names, and deployment-specific templates in your own config. Public core
 docs show only anonymized shapes.
+
+## Model command sandbox (mandatory)
+
+The orchestrator's model-facing `execute_command` tool is separate from the coding-agent launch described
+above. Every native or client-bridged model command requires a Linux isolation backend selected by
+`security.sandbox` / `GX10_SANDBOX`: `auto` (default), `bwrap`, or `firejail`. `auto` prefers `bwrap`.
+
+No backend means no command: Ironclad returns an actionable fail-closed refusal before starting a subprocess.
+Windows therefore refuses model `execute_command` until a supported containment backend exists. Install
+`bwrap` on the production Linux host (or `firejail` and select it explicitly). Legacy `off`/`none` values are
+ignored with a deprecation warning and cannot restore direct execution.
+
+The Ink `/sh` command is an explicit operator-only shell channel. It does not pass through the model tool and
+cannot be invoked by a model tool call. Conversely, the versioned client bridge cannot fall back to `/sh` or
+to an older client's unsandboxed `execute_command` implementation.
+
+This command sandbox does not sandbox the separately authorized coding-agent CLI process. Coding-agent
+launch authority is governed by the mandatory tooling envelope and by the CLI's own permission/sandbox flags.
 
 ## Examples
 
@@ -168,8 +211,23 @@ Nothing to set — this is the built-in default:
 ```bash
 # equivalent to the default GX10_AGENT_CMD:
 export GX10_AGENT_CMD='{bin} --model {model} --effort {effort} --permission-mode {permission} --print {prompt}'
-export GX10_CLAUDE_PERMISSION_MODE=bypassPermissions   # so it can also run tests/commands
+export GX10_CLAUDE_PERMISSION_MODE=default
 ```
+
+Permission bypass is not an environment-only default. It requires an explicit per-agent policy in the
+registry; both the mode and capability must be present:
+
+```json
+{
+  "agent_id": "OPUS",
+  "permission_mode": "bypassPermissions",
+  "capabilities": {"permission_bypass": true}
+}
+```
+
+For the Claude autopilot shape this opt-in renders `--dangerously-skip-permissions`. A bypass mode or
+dangerous flag without the matching capability is refused before spawn. The mandatory tooling-envelope
+authorization and OS sandbox policy remain independent enforcement layers and are not weakened by this opt-in.
 
 ### Codex (OpenAI, verified)
 
@@ -228,12 +286,10 @@ template — the orchestrator's model hint is then ignored and the CLI uses its 
 
 ## Notes
 
-- **Permissions / autonomy.** A headless agent can't stop to ask, and a real handover
-  implies running the tests it writes — so the coder **defaults to `bypassPermissions`**
-  (parity with the server-side autopilot launch, which uses `--dangerously-skip-permissions`).
-  This runs commands on your machine, against your code; set
-  `GX10_CLAUDE_PERMISSION_MODE=acceptEdits` for an edits-only coder (no commands, so it
-  cannot self-run tests), and other CLIs have their own auto-approve flag. See
+- **Permissions / autonomy.** The default Claude permission mode is `default`; neither the client nor
+  autopilot adds a bypass flag. A deployment that needs unattended command execution must opt in on the
+  individual `agent_id` with `permission_mode=bypassPermissions` and
+  `capabilities.permission_bypass=true`. Other CLIs have their own approval flags. See
   [`self-maintenance.md`](self-maintenance.md).
 - **Concurrency.** `GX10_MAX_AGENTS` bounds how many run at once (default 3).
 - **Quick check.** Set `GX10_AGENT_CMD`, start a small handover, and confirm the agent

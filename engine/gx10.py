@@ -43,9 +43,13 @@ import copy
 import urllib.request
 import urllib.error
 import urllib.parse
+import config_schema
+import proc_tree
 from collections import deque
+from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Dict, Any, Optional, Tuple, Callable
+from types import MappingProxyType
+from typing import List, Dict, Any, Optional, Tuple, Callable, Mapping
 
 # Note: the earlier watchdog-based feedback watcher was replaced by a
 # polling reconciler (more reliable, no dependency required).
@@ -250,6 +254,12 @@ MEMORY_BRIEF_TOKENS = 1200
 LANGUAGE         = "en"          # the orchestrator's reply language (OSS default en; via GX10_LANGUAGE/config)
 MAX_FILE_CHARS   = 24_000        # PERF-05: read_file cap (head+tail) — the CEILING; the live budget-aware
                                  # cap (#994-S16) may lower it per-turn so one read can't overflow the window.
+# #1488: filesystem reads must be bounded BEFORE allocating/decoding, but this is the ALLOCATION ceiling
+# (OOM protection), NOT the model-output cap — the returned text is still capped by MAX_FILE_CHARS (head+tail)
+# or a ranged/pattern slice. It must be high enough to load a normal repo file (sources, docs — the engine's
+# own gx10.py is ~800 KB) so #1047 ranged/pattern reads of large files keep working, yet low enough to refuse
+# a truly-huge (multi-GB) file that would OOM the always-on server. 16 MiB is a safe momentary allocation.
+_MAX_FILE_BYTES  = 16 * 1024 * 1024
 _READ_FLOOR_CHARS = 2_000        # #994-S16: always allow at least a small excerpt (emergency-trim backstops)
 #: #994-S16: the per-turn safe char cap for a file/tool read, set by the session before each tool dispatch
 #: from the live remaining window budget. None ⇒ read_file uses the fixed MAX_FILE_CHARS (convenience callers,
@@ -268,10 +278,18 @@ def _read_char_cap() -> int:
 #: #1046 (L1-choke, epic #1043): the ingestion tools whose result is INGESTED into the model context and
 #: must be capped to the live per-turn budget at the SINGLE run-loop choke point. `read_file` caps itself,
 #: but `search_files`/`list_directory`/`execute_command` do NOT, and the local-tool bridge returns before
-#: read_file's cap — so ALL of them are capped here. Deliberately NOT web_search/parallel_reason/MPR/memory:
-#: those return already-budgeted or structured JSON payloads a blind head+tail cap would corrupt.
+#: read_file's cap — so ALL of them are capped here. This set controls only the destructive character cap;
+#: already-budgeted or structured web/provider/plugin/memory results stay out of it.
 _INGESTION_TOOLS = frozenset({"read_file", "list_directory", "search_files", "execute_command", "fetch_url", "view_issue", "pr_status", "review"})
 _INGEST_MARKER_SLACK = 512   # a result read_file already capped (cap + its own marker) must pass through here
+
+#: #1464 F3b: every result in this class crosses the mandatory injection fence before model ingestion.
+#: This is deliberately distinct from `_INGESTION_TOOLS`: structured provider/plugin/memory payloads must
+#: be fenced but must not be corrupted by the head/tail character cap.
+_UNTRUSTED_RESULT_TOOLS = frozenset({
+    *_INGESTION_TOOLS,
+    "web_search", "parallel_reason", "query_memory", "deep_query_memory",
+})
 
 
 def _cap_ingested_result(name: str, result: str, cap_chars: int) -> str:
@@ -295,8 +313,25 @@ def _cap_ingested_result(name: str, result: str, cap_chars: int) -> str:
     )
 
 
+def _is_untrusted_result(name: str) -> bool:
+    """Whether a serialized tool result is untrusted model input, including every dynamic plugin/MPR."""
+    return name in _UNTRUSTED_RESULT_TOOLS or name in _PLUGIN_TOOLS
+
+
+def _fence_untrusted_result(name: str, result: str) -> str:
+    """Apply the one mandatory post-serialization fence, failing closed without exposing raw content."""
+    if not _is_untrusted_result(name):
+        return result
+    try:
+        from ack import injection as _inj
+        return _inj.wrap_untrusted(result, source=name)
+    except Exception:  # noqa: BLE001 — raw untrusted bytes must never bypass a broken fence
+        return (f"ERROR: {name} result withheld because mandatory injection fencing failed; "
+                "the raw result was not added to model context.")
+
+
 # #1084: per-action audit — the mutating/outward tool surface whose actions are recorded (content-free) into
-# the tamper-evident audit ledger when `audit.enabled`. The minimal first step of the audit-log epic (#1067).
+# the mandatory tamper-evident audit ledger. The minimal first step of the audit-log epic (#1067).
 _AUDIT_TOOLS = frozenset({"write_file", "write_last_reply", "edit_file", "execute_command", "create_issue", "create_pr", "comment_on_issue"})
 
 
@@ -374,20 +409,23 @@ def _tenant_mem_scope(scope: str, tenant: str = "default") -> str:
 
 
 def _maybe_audit(name: str, args: "Dict[str, Any]", result: str) -> None:
-    """#1084/#1067: append a tamper-evident per-action record when auditing is enabled (default-off). Records
-    WHO (actor) / WHAT (action + content-free target) / WHEN (ts) / WHY (active scope) / ok. `audit.scope`
-    selects the surface — `mutating` (write/exec/create, #1084) or `all` (EVERY tool call, #1067). Fail-soft;
-    a core-owned hash-chain ledger (`engine.audit_ledger`), not the private one."""
-    if not (AUDIT_ENABLED and (name in _AUDIT_TOOLS or AUDIT_SCOPE == "all")):
-        return
-    try:
-        import audit_ledger
-        path = state_root() / "audit" / "ledger.jsonl"
-        ok = not str(result or "").startswith("ERROR")
-        audit_ledger.record_action(path, name, _audit_detail(name, args), ok=ok, ts=time.time(),
-                                   actor=_audit_principal(), reason=_audit_reason())
-    except Exception:   # noqa: BLE001 — an audit failure must never break the tool/turn
-        pass
+    """Append a result record for the configured audit surface; failures propagate."""
+    if name in _AUDIT_TOOLS or AUDIT_SCOPE == "all":
+        _append_audit(name, args, "result", ok=not str(result or "").startswith("ERROR"))
+
+
+def _audit_ledger_path() -> Path:
+    """Return the project-scoped mandatory audit-ledger path."""
+    return state_root() / "audit" / "ledger.jsonl"
+
+
+def _append_audit(name: str, args: "Dict[str, Any]", phase: str, *, ok: bool) -> None:
+    """Append one mandatory audit record."""
+    import audit_ledger
+    audit_ledger.record_action(
+        _audit_ledger_path(), name, _audit_detail(name, args), ok=ok,
+        ts=time.time(), actor=_audit_principal(), reason=_audit_reason(), phase=phase,
+    )
 
 
 def _metrics_report() -> "Dict[str, Any]":
@@ -452,6 +490,13 @@ def _receive_alert(payload: "Any") -> "Dict[str, Any]":
 
 
 LIST_DIR_HARD_CAP = 200          # HV-B: hard cap in list_directory
+# #1488: search is bounded independently of read_file. It scans up to _SEARCH_MAX_FILES candidates (one at a
+# time, each discarded after scanning), so the per-file read cap is DECOUPLED from read_file's 16 MiB
+# single-file ceiling and kept small — a source file's matchable lines fit easily; a huge data file is
+# skipped past the cap. This keeps the whole search bounded in both files-scanned and per-file bytes.
+_SEARCH_MAX_FILES = LIST_DIR_HARD_CAP * 5
+_SEARCH_MAX_FILE_BYTES = 1024 * 1024
+_SEARCH_HIT_CAP = 50
 TEMPERATURE      = 0.3
 RETRY_BACKOFF    = 1.5           # OPT-4: wait time (s) before 1× retry on an API error
 # Guard 1 (#1131/epic #1130): per-request LLM bound. Without it a hung completion (a stalled stream, a wedged
@@ -459,9 +504,8 @@ RETRY_BACKOFF    = 1.5           # OPT-4: wait time (s) before 1× retry on an A
 # retries = a silent multi-minute stall. Applied at EVERY OpenAI() construction (the agent client + the ACE
 # reflector; workers/MPR reuse the agent client). Tunable via connection.request_timeout_s / GX10_LLM_TIMEOUT_S.
 LLM_REQUEST_TIMEOUT_S = 120.0    # seconds per LLM request (connect+read); a slow LAN 35B first-token stays well under
-LLM_CONNECT_TIMEOUT_S: "Optional[float]" = None      # GX10_LLM_CONNECT_TIMEOUT_S / connection.connect_timeout_s
-LLM_FIRST_TOKEN_TIMEOUT_S: "Optional[float]" = None  # GX10_LLM_FIRST_TOKEN_TIMEOUT_S / connection.first_token_timeout_s
-# None is byte-identical: the OpenAI client still receives the single float LLM_REQUEST_TIMEOUT_S.
+LLM_CONNECT_TIMEOUT_S: "Optional[float]" = float(config_schema.LEAVES["connection.connect_timeout_s"].default)
+LLM_FIRST_TOKEN_TIMEOUT_S: "Optional[float]" = float(config_schema.LEAVES["connection.first_token_timeout_s"].default)
 LLM_MAX_RETRIES       = 1        # SDK client retries; kept low so it can't compound _make_completion's own retry
 # Guard 1 / S2 (#1132/epic #1130): per-turn IDLE watchdog. If a turn makes NO progress (no generation chunk, no
 # completed generation, no tool result) for this long it is aborted AND SURFACED ("⏱ TURN ABORTED — model
@@ -583,18 +627,17 @@ TASK_PREFIX = "KGC"
 
 # ─── ACK (Agent-Contract-Kernel) integration ──────────────────
 # Validates every model-emitted task_json at the stage_handover boundary against the
-# ACK contract (ack.case_spec). Soft path: on a violation the exact error is
+# ACK contract (ack.case_spec). On a violation the exact error is
 # returned → the agent loop hands it back to the model as a tool result (reask),
 # nothing is created. LODESTAR_ENABLED → CapabilityTaskSpec (capability mandatory for
-# buildable types). Both config-driven (ack.enabled / lodestar.enabled).
-ACK_ENABLED      = True
+# buildable types). Lodestar is an optional stricter schema selector; base ACK
+# validation is always on.
 LODESTAR_ENABLED = False
-# #1073: forge (code-host) issue-filing. CAPABILITY-DETECTED (default ON) — offered whenever the `gh` CLI is
-# present + authenticated, mirroring web_search/memory/etc. (installing + authing gh IS the operator's
-# deliberate opt-in; a redundant manual flag is not). The operator can still force it OFF (forge.enabled=false),
-# and it is blocked under the sealed profile (no autonomous outbound writes) — see _forge_available().
+# #1073: forge (code-host) issue-filing. Explicitly enabled and capability-detected — offered only when
+# forge.enabled=true and the selected transport is usable. It is blocked under the sealed profile (no
+# autonomous outbound writes) — see _forge_available().
 # FORGE_REPO is optional (empty ⇒ the gh CLI's default repo for the cwd); never a repo literal baked into core.
-FORGE_ENABLED    = True
+FORGE_ENABLED    = bool(config_schema.LEAVES["forge.enabled"].default)
 FORGE_REPO       = ""
 # #1213 (epic #1212): the forge adapter seam — `cli` (default, the ambient `gh` CLI, byte-identical) |
 # `native` (a stdlib-urllib GitHub client, so the forge tools work with NO `gh` on the box, e.g. the Spark) |
@@ -611,13 +654,11 @@ _REVIEW_MATERIAL_CAP = 80_000    # char cap on assembled material before the rev
 # configured (deploy secret via GX10_NOTIFY_WEBHOOK / notify.webhook — NEVER a URL literal in core) the
 # notifier POSTs it to an off-duty human. Empty ⇒ no consumer registered (byte-identical default-off).
 NOTIFY_WEBHOOK   = ""
-# #1084: per-action audit ledger. Default OFF (a record per mutating tool call is a deliberate opt-in);
-# when on, write_file/edit_file/execute_command append a hash-chained, tamper-evident record under
+# #1084: mandatory per-action audit ledger. Mutations append hash-chained intent and result records under
 # STATE_ROOT/audit/ledger.jsonl. Boundary-clean (a core-owned ledger, not the private dev-process one).
-AUDIT_ENABLED    = False
 AUDIT_SCOPE      = "mutating"   # #1067: "mutating" (write/exec/create — #1084) | "all" (every tool call)
-INJECTION_DEFENSE = False       # #1068: fence untrusted ingested content (data-not-instructions) — default OFF
-SANDBOX          = "off"        # #1069: OS exec sandbox for execute_command — off | auto | bwrap | firejail
+_AUDIT_DEGRADED  = False
+SANDBOX          = "auto"       # #1464: mandatory OS exec sandbox policy — auto | bwrap | firejail
 MULTI_TENANT     = False        # #1071: per-principal RBAC + tenant memory isolation — default OFF (single-tenant)
 # #1061: alerting pipeline. When enabled AND a notify webhook (#1083) is configured, a periodic self-scan
 # pages the telemetry SLO/anomaly (#1060) to the webhook, and an inbound POST /alert receiver pages external
@@ -632,17 +673,17 @@ ONBOARDING_MODE = False
 
 # Autopilot (Path B): for pending tasks with a handover the reconciler
 # automatically starts `claude --print` (API-free execution) and moves pending →
-# in_progress. Default OFF (starts Claude autonomously with skip-permissions).
+# in_progress. Default OFF; any permission bypass is an explicit per-agent capability.
 AUTOPILOT_ENABLED        = False
 AUTOPILOT_CLAUDE_BIN     = "claude"
-AUTOPILOT_EXTRA_ARGS     = ["--dangerously-skip-permissions"]
+AUTOPILOT_EXTRA_ARGS     = list(config_schema.LEAVES["autopilot.extra_args"].default)
 AUTOPILOT_DEFAULT_EFFORT = "medium"
 AUTOPILOT_LOGS_DIR       = "logs"     # resolved under state_root() (.ironclad/logs); absolute path verbatim
-AUTOPILOT_MAX_CONCURRENT = 1            # 1 = sequential; >1 parallel; 0 = unlimited
+AUTOPILOT_MAX_CONCURRENT = int(config_schema.LEAVES["autopilot.max_concurrent"].default)
 AUTOPILOT_STREAM         = False        # live log streaming (claude --verbose --output-format stream-json); default OFF
 AUTOPILOT_TERMINATE_ON_ADVANCE = False  # terminate the associated claude session on advance; default OFF
 AUTOPILOT_AUTOPLAN       = False   # after an empty queue, have GX10 automatically plan the next task; default OFF
-AUTOPILOT_MAX_TASKS      = 0       # max tasks autoplan plans (0 = unlimited — use LOCAL vLLM ONLY!)
+AUTOPILOT_MAX_TASKS      = int(config_schema.LEAVES["autopilot.autoplan_max_tasks"].default)
 _AUTOPLAN_DONE           = 0       # session counter (touched only in the agent_thread → no lock needed)
 # ROUTE-2 (#503): removed the dead `_TURN_DID_ADVANCE` guard — it was only reset, never set or read, so it
 # never blocked anything (its comment claimed otherwise). The actual auto-plan control is AUTOPILOT_AUTOPLAN.
@@ -1377,8 +1418,8 @@ def _render_board(slug: "Optional[str]" = None) -> str:
     for st in TaskStore.STATUSES:
         lines.append(f"## {st} ({counts[st]})")
         for t in by_status[st]:
-            # Coerce EVERY field to str — a task JSON stored while the ACK contract was soft (ack.enabled off /
-            # unimportable) can carry non-string values (labels:[1,2], type:7); a bare str.join would then raise
+            # Coerce EVERY field to str — a legacy pre-ACK task can carry non-string values
+            # (labels:[1,2], type:7); a bare str.join would then raise
             # and silently kill /board. Defensive: str() each bit so a malformed unit renders instead of crashing.
             labels = t.get("labels") or []
             if isinstance(labels, str):
@@ -1618,23 +1659,14 @@ def lifecycle_completeness(slug: str, *, required_stages: "List[str]", tree_sha:
     return (not reasons), reasons
 
 
-# ─── S5 (#1227): fail-closed design→impl approval gate (no blind coding, R2/R3) ───────────────────
-# Opt-in, default OFF → byte-identical (the shared engine + all non-DEV-1 flows + the test suite are
-# unaffected), exactly like the verify/quality/strategy seams. DEV-1 turns it ON via `design_gate.enabled`
-# (config) to enforce no-blind-coding.
-DESIGN_GATE_ENABLED = False
-# Framing-note capture + optional handover injection are opt-in, default OFF -> byte-identical off.
-# Config `constraint_gate.enabled` now controls only the non-gating record_constraints tool exposure.
-CONSTRAINT_GATE_ENABLED = False
-# #1341 / #1337 / #1342 (epic #1344 S5+S3+S6): L2 conflict-detect + L3 hard-check — default OFF → byte-identical.
-# Config `safety.constraint_conflict_detect`. When ON, `record_design` detects typed HARD conflicts and
-# Retired product constraint-conflict flag kept for config compatibility; always false at runtime.
-CONSTRAINT_CONFLICT_DETECT = False
-# S2 (#1224): the BASIC public no-blind-advance gate — opt-in (default OFF → byte-identical, like design_gate).
-# When on, an advance to `done` requires a feedback `status: done`; blocked/clarification_needed/no-status is
-# refused ("no signal ≠ done"). The FULL composed gate (coupling/CI/quality guards) stays PRIVATE (the addon).
-# DEV-1 turns it on via `advance_gate.enabled` (config).
-ADVANCE_GATE_ENABLED = False
+# ─── S5 (#1227): fail-closed design→impl approval lifecycle (no blind coding, R2/R3) ──────────────
+# Design recording, approval, injection, and build-boundary anti-drift are always on. The retired
+# `design_gate.enabled` config leaf is consumed only as a deprecated tombstone.
+# Framing-note capture is opt-in, default OFF -> byte-identical off. Config `framing_notes.enabled` controls
+# only the non-gating record_constraints tool exposure; design authority and implementation checks stay on.
+FRAMING_NOTES_ENABLED = False
+# S2 (#1224/#1463): completion authority is always on. An advance to `done` requires a readable,
+# non-empty feedback artifact with an explicit normalized `status: done`; no other content state advances.
 # S7 (#1229): disentangle /watcher (feedback-advance) from /autopilot (launch) — two orthogonal concerns over
 # ONE reconciler loop. Opt-in (default OFF → byte-identical: the loop is gated on _WATCHER_ENABLED only, launch
 # needs watcher on, and `autopilot on` points the operator at `/auto on`). When ON: autopilot is self-sufficient
@@ -1642,9 +1674,10 @@ ADVANCE_GATE_ENABLED = False
 # is suppressed. DEV-1 turns it on via `automation.decoupled`.
 AUTOMATION_DECOUPLED = False
 # S7 (#1229): task-scoped detect-progress heartbeat (distinct from the per-turn idle-watchdog #1132). Seconds
-# without a progress signal (coder-log / feedback / task-json mtime) before an in_progress task is flagged
-# stalled. 0.0 ⇒ off / byte-identical (mirrors TURN_IDLE_TIMEOUT_S). DEV-1 sets `heartbeat.stall_seconds`.
-HEARTBEAT_STALL_S = 0.0
+# without a progress signal (coder log / feedback mtime) before an in_progress task that has shown progress is
+# flagged stalled. A task with no signal ever is deliberately excluded so manually managed work is not
+# false-flagged. Positive finite tuning only; the protection has no off state.
+HEARTBEAT_STALL_S = 900.0
 DESIGN_STAGE = "design"
 # Task types that PRODUCE CODE — a stage_handover of one of these is REFUSED until the active unit has an
 # APPROVED design. Design/analysis types (architecture, concept, research, documentation, verification,
@@ -1719,6 +1752,139 @@ def _constraint_status(slug: "Optional[str]") -> "tuple[str, Optional[str]]":
         return (UNCAPTURED, None)
 
 
+class DesignMigrationRefusal(RuntimeError):
+    """A legacy design cannot be reconciled without risking operator-authored bytes."""
+
+
+_DESIGN_MIGRATION_BLOCKED: "Dict[str, Path]" = {}
+
+
+def _fsync_directory(path: Path) -> None:
+    """Durably commit a contained replace where directory fsync is supported."""
+    try:
+        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        fd = os.open(path, flags)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    except OSError:
+        pass
+
+
+def _atomic_design_write(path: Path, content: str) -> None:
+    """Crash-safe UTF-8 design write: unique temp, file fsync, replace, directory fsync."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.{time.time_ns()}.tmp")
+    try:
+        with tmp.open("w", encoding="utf-8", newline="\n") as fh:
+            fh.write(content)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+        _fsync_directory(path.parent)
+    finally:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _numbered_design_proposals(slug: str) -> "List[Path]":
+    """Return numbered proposal paths without invoking legacy migration recursively."""
+    pdir = vault_root() / slug / "proposals"
+    if not pdir.is_dir():
+        return []
+    numbered: "List[tuple[int, Path]]" = []
+    for path in pdir.glob("design-*.md"):
+        suffix = path.stem[len("design-"):]
+        if suffix.isdigit():
+            numbered.append((int(suffix), path))
+    return [path for _number, path in sorted(numbered, key=lambda item: item[0])]
+
+
+def _migration_refusal(slug: str, reason: str) -> DesignMigrationRefusal:
+    return DesignMigrationRefusal(
+        f"legacy design migration refused for unit {slug!r}: {reason}. "
+        "Reconcile decisions/design.md manually and retry; nothing was overwritten or deleted."
+    )
+
+
+def _blocked_design_reconciled(decision: Path, blocked: Path) -> bool:
+    """Return whether an operator replaced the blocked partial with one valid decision."""
+    if blocked.exists() or not decision.is_file():
+        return False
+    try:
+        raw = decision.read_bytes()
+        if len(raw) > 65536:
+            return False
+        fm = _parse_frontmatter(raw.decode("utf-8"))
+        return bool(fm) and str(fm.get("approved") or "").strip().lower() in {"true", "false"}
+    except Exception:  # noqa: BLE001 -- an inconsistent operator state must remain blocked
+        return False
+
+
+def _migrate_legacy_design(slug: "Optional[str]") -> None:
+    """Lazily reconcile one unit's legacy design layout under the project/track vault lock."""
+    target = str(slug or "").strip()
+    if not target:
+        return
+    with _vault_lock():
+        vdir = vault_root() / target
+        decision = vdir / "decisions" / "design.md"
+        blocked_key = str(vdir.resolve())
+        blocked = _DESIGN_MIGRATION_BLOCKED.get(blocked_key)
+        if blocked is not None:
+            if _blocked_design_reconciled(decision, blocked):
+                _DESIGN_MIGRATION_BLOCKED.pop(blocked_key, None)
+            else:
+                raise _migration_refusal(target, f"prior recovery is incomplete at {blocked.as_posix()}")
+        if not decision.exists():
+            return
+        if not decision.is_file():
+            raise _migration_refusal(target, "decisions/design.md is not a regular file")
+        try:
+            raw = decision.read_bytes()
+        except Exception as ex:  # noqa: BLE001 -- unreadable operator state is a protected refusal
+            raise _migration_refusal(target, f"decisions/design.md is unreadable ({ex!r})") from ex
+        if len(raw) > 65536:
+            raise _migration_refusal(target, "decisions/design.md exceeds the 65536-byte limit")
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError as ex:
+            raise _migration_refusal(target, "decisions/design.md is not valid UTF-8") from ex
+        fm = _parse_frontmatter(text)
+        approved_raw = str(fm.get("approved") or "").strip().lower() if fm else ""
+        if approved_raw not in {"true", "false"}:
+            raise _migration_refusal(target, "decisions/design.md has missing or malformed frontmatter")
+        if approved_raw == "true":
+            return
+
+        proposals = _numbered_design_proposals(target)
+        numbers = [int(path.stem[len("design-"):]) for path in proposals]
+        proposal = vdir / "proposals" / f"design-{max(numbers, default=0) + 1}.md"
+        proposal.parent.mkdir(parents=True, exist_ok=True)
+        normalized = _set_frontmatter_flag(text, "type", "proposal")
+        normalized = _set_frontmatter_flag(normalized, "approved", "false")
+        if normalized == text and (str(fm.get("type") or "").strip().lower() != "proposal"):
+            raise _migration_refusal(target, "decisions/design.md frontmatter cannot be normalized")
+        try:
+            os.replace(decision, proposal)
+            _fsync_directory(decision.parent)
+            _fsync_directory(proposal.parent)
+            _atomic_design_write(proposal, normalized)
+        except Exception as ex:  # noqa: BLE001 -- restore the sole authoritative path whenever possible
+            if proposal.exists() and not decision.exists():
+                try:
+                    decision.parent.mkdir(parents=True, exist_ok=True)
+                    os.replace(proposal, decision)
+                    _fsync_directory(proposal.parent)
+                    _fsync_directory(decision.parent)
+                except Exception:  # noqa: BLE001 -- retain exactly one recoverable design path and block
+                    _DESIGN_MIGRATION_BLOCKED[blocked_key] = proposal
+            raise _migration_refusal(target, f"atomic migration failed ({ex!r})") from ex
+
+
 def _design_typed(slug: "Optional[str]") -> "Dict[str, Any]":
     """Return typed build-standard fields from the approved ``decisions/design.md``.
 
@@ -1729,6 +1895,7 @@ def _design_typed(slug: "Optional[str]") -> "Dict[str, Any]":
     target = (slug or "").strip()
     if not target:
         return {}
+    _migrate_legacy_design(target)
     doc = vault_root() / target / "decisions" / "design.md"
     try:
         if not doc.is_file():
@@ -1750,44 +1917,78 @@ def _design_typed(slug: "Optional[str]") -> "Dict[str, Any]":
         return {}
 
 
-def _design_build_policy(slug: "Optional[str]") -> str:
-    """Return the approved design's ``## Build policy`` section body (fail-soft ``""``)."""
+def _approved_design_build_policy_section(slug: "Optional[str]") -> "Optional[str]":
+    """Return the approved design's ``## Build policy`` body, or ``None`` when absent."""
     target = (slug or "").strip()
     if not target:
-        return ""
+        return None
+    _migrate_legacy_design(target)
     doc = vault_root() / target / "decisions" / "design.md"
+    if not doc.is_file():
+        return None
+    raw = doc.read_bytes()
+    if len(raw) > 65536:
+        return None
+    text = raw.decode("utf-8")
+    fm = _parse_frontmatter(text)
+    if not fm or not _fm_is_true(fm.get("approved")):
+        return None
+    lines = text.splitlines()
+    start = None
+    for i, line in enumerate(lines):
+        if re.match(r"^##\s+Build policy\s*$", line.strip(), flags=re.IGNORECASE):
+            start = i
+            break
+    if start is None:
+        return None
+    body: "List[str]" = []
+    for line in lines[start + 1:]:
+        if re.match(r"^##\s+", line):
+            break
+        body.append(line)
+    return "\n".join(body).strip()
+
+
+def _design_build_policy(slug: "Optional[str]") -> str:
+    """Return the approved design's ``## Build policy`` body, using ``""`` when absent."""
+    return _approved_design_build_policy_section(slug) or ""
+
+
+def _split_egress_packages(raw: str) -> "List[str]":
+    return [p.strip().lower() for p in re.split(r"[\s,]+", raw or "") if p.strip()]
+
+
+def _design_egress_policy(slug: "Optional[str]") -> "Dict[str, Any]":
+    """Return machine-readable egress policy from the approved design build policy."""
     try:
-        if not doc.is_file():
-            return ""
-        raw = doc.read_bytes()
-        if len(raw) > 65536:
-            return ""
-        text = raw.decode("utf-8")
-        fm = _parse_frontmatter(text)
-        if not fm or not _fm_is_true(fm.get("approved")):
-            return ""
-        lines = text.splitlines()
-        start = None
-        for i, line in enumerate(lines):
-            if re.match(r"^##\s+Build policy\s*$", line.strip(), flags=re.IGNORECASE):
-                start = i
-                break
-        if start is None:
-            return ""
-        body: "List[str]" = []
-        for line in lines[start + 1:]:
-            if re.match(r"^##\s+", line):
-                break
-            body.append(line)
-        return "\n".join(body).strip()
-    except Exception:  # noqa: BLE001 -- advisory design-standard read must never raise
-        return ""
+        policy = _approved_design_build_policy_section(slug)
+        if policy is None:
+            return {"network": "absent", "allow": [], "deny": []}
+        out = {"network": "invalid", "allow": [], "deny": []}
+        network_seen = False
+        for line in policy.splitlines():
+            m = re.match(r"^\s*(network|allow|deny)\s*:\s*(.*?)\s*$", line, flags=re.IGNORECASE)
+            if not m:
+                continue
+            key = m.group(1).lower()
+            value = m.group(2).strip()
+            if key == "network":
+                network_seen = True
+                network = value.lower()
+                out["network"] = network if network in {"none", "declared", "open"} else "invalid"
+            elif key in {"allow", "deny"}:
+                out[key] = _split_egress_packages(value)
+        if not network_seen:
+            out["network"] = "invalid"
+        return out
+    except DesignMigrationRefusal:
+        raise
+    except Exception:  # noqa: BLE001 -- a declared-policy read/parse failure is restrictive fail-closed input
+        return {"network": "invalid", "allow": [], "deny": []}
 
 
 def _design_build_check(slug: "Optional[str]", task_typed: "Optional[Dict[str, Any]]") -> "Optional[str]":
     """Build-boundary anti-drift check against the approved design's typed standard."""
-    if not DESIGN_GATE_ENABLED:
-        return None
     try:
         dt = _design_typed(slug)
         if not dt:
@@ -1812,6 +2013,102 @@ def _design_build_check(slug: "Optional[str]", task_typed: "Optional[Dict[str, A
                 "Nothing changed.")
 
 
+def _egress_finding_message(finding: "Dict[str, Any]") -> str:
+    subject = (
+        finding.get("package")
+        or finding.get("symbol")
+        or finding.get("command")
+        or finding.get("step")
+        or finding.get("file")
+        or "finding"
+    )
+    reason = str(finding.get("reason") or "egress-capable operation").strip()
+    loc = ""
+    if finding.get("file"):
+        loc = str(finding["file"])
+        if finding.get("line"):
+            loc += f":{finding['line']}"
+        loc = f" ({loc})"
+    if finding.get("package"):
+        return f"package {subject}: {reason}"
+    if finding.get("command"):
+        return f"build step {subject}: {reason}"
+    return f"{subject}{loc}: {reason}"
+
+
+def _egress_advance_findings(root: "Path", pol: "Dict[str, Any]") -> "tuple[List[str], List[str]]":
+    """Run best-effort egress analyzers for the post-coder advance hook."""
+    block_msgs: "List[str]" = []
+    advisory_msgs: "List[str]" = []
+
+    from ack.egress import analyze_dependencies
+    from ack.egress.staticscan import scan_source_tree
+    from engine import egress_runner
+
+    for result in (
+        analyze_dependencies(root, pol, rust_feature_resolver=egress_runner.rust_feature_resolver),
+        scan_source_tree(root),
+        egress_runner.run_hermetic(root, network=str(pol.get("network") or "open")),
+    ):
+        for finding in list((result or {}).get("findings") or []):
+            msg = _egress_finding_message(finding)
+            if finding.get("severity") == "block":
+                block_msgs.append(msg)
+            else:
+                advisory_msgs.append(msg)
+    return block_msgs, advisory_msgs
+
+
+def _egress_advance_check_log() -> "tuple[Optional[str], List[str]]":
+    """Return the always-on egress refusal plus advisory log lines for advance."""
+    try:
+        pol = _design_egress_policy(active_slug())
+    except DesignMigrationRefusal as ex:
+        return (
+            f"ERROR: egress analysis refused advance; the approved design vault is unreadable ({ex}). "
+            "Reconcile decisions/design.md and retry. Task stays in_progress.",
+            [],
+        )
+    net = str(pol.get("network") or "invalid")
+    if net in ("absent", "open"):
+        return None, []
+    if net == "invalid":
+        return (
+            "ERROR: egress analysis refused advance; the approved design `## Build policy` is present but its "
+            "`network:` posture is missing or invalid (declare exactly one of network: none|declared|open). "
+            "Task stays in_progress.",
+            [],
+        )
+    root = _project_root() or Path(_exec_cwd() or ".")
+    if not root or not Path(root).is_dir():
+        return (
+            "ERROR: egress analysis refused advance; a restrictive network posture requires a code root to "
+            "analyze but none is available. Task stays in_progress.",
+            [],
+        )
+    try:
+        block_msgs, advisory_msgs = _egress_advance_findings(root, pol)
+    except Exception:  # noqa: BLE001 -- restrictive posture: analyzer failure must refuse, not skip
+        return (
+            "ERROR: egress analysis refused advance; the analyzers could not complete under a restrictive "
+            "network posture (fail-closed). Task stays in_progress.",
+            [],
+        )
+
+    log = [f"egress advisory: {msg}" for msg in advisory_msgs]
+    if not block_msgs:
+        return None, log
+    bullets = "\n".join(f"  - {msg}" for msg in block_msgs)
+    return (
+        "ERROR: egress analysis refused advance; blocking findings:\n"
+        f"{bullets}\n"
+        "Resolve by allow-listing the dependency in the approved design `## Build policy` "
+        "(`allow: <package>`) or by removing the egress-capable dependency/import/build step. "
+        "Task stays in_progress.",
+        log,
+    )
+
+
 def _task_typed_fields(fields: "Optional[Dict[str, Any]]") -> "Dict[str, Any]":
     """Normalize optional TaskSpec ``language`` / ``network`` from a task dict (fail-soft ``{}``)."""
     if not fields:
@@ -1826,23 +2123,16 @@ def _task_typed_fields(fields: "Optional[Dict[str, Any]]") -> "Dict[str, Any]":
 def _design_proposals(slug: "Optional[str]") -> "List[Path]":
     """All recorded design proposal variants for *slug*, sorted by their integer index (ascending).
 
-    ADR-0006 D5 (S3): under ``design_gate.enabled`` a recorded design is a non-destructive *variant* at
+    ADR-0006 D5 (S3): a recorded design is a non-destructive *variant* at
     ``vault_root()/<slug>/proposals/design-<n>.md`` where ``<n>`` is a pure decimal integer. Files whose
     suffix after ``design-`` is not a pure int are ignored. Pure/fail-soft: no unit / no folder / a read
-    hiccup → ``[]`` (never raises). Default-off: no proposal is ever written, so this returns ``[]``."""
+    hiccup → ``[]`` (never raises after migration succeeds)."""
     target = (slug or "").strip()
     if not target:
         return []
+    _migrate_legacy_design(target)
     try:
-        pdir = vault_root() / target / "proposals"
-        if not pdir.is_dir():
-            return []
-        numbered: "List[tuple[int, Path]]" = []
-        for p in pdir.glob("design-*.md"):
-            suffix = p.stem[len("design-"):]
-            if suffix.isdigit():
-                numbered.append((int(suffix), p))
-        return [p for _n, p in sorted(numbered, key=lambda t: t[0])]
+        return _numbered_design_proposals(target)
     except Exception:  # noqa: BLE001 — a proposal probe must never raise into a write/steering path
         return []
 
@@ -1863,19 +2153,18 @@ def _effective_design_doc(slug: "Optional[str]") -> "Optional[Path]":
     """The design doc the gate/steering should read: the approved decision ``decisions/design.md`` when it
     exists, else the highest-index proposal variant, else ``None``. Pure/fail-soft.
 
-    Byte-identical when off: with no proposal ever written, this returns exactly ``decisions/design.md``
-    (or ``None``), matching today's single-doc reader."""
+    Legacy single-doc state is migrated before lookup."""
     target = (slug or "").strip()
     if not target:
         return None
+    _migrate_legacy_design(target)
     try:
         decision = vault_root() / target / "decisions" / "design.md"
         if decision.is_file():
             return decision
-        if DESIGN_GATE_ENABLED:
-            proposals = _design_proposals(target)
-            if proposals:
-                return proposals[-1]
+        proposals = _design_proposals(target)
+        if proposals:
+            return proposals[-1]
         return None
     except Exception:  # noqa: BLE001
         return None
@@ -1903,19 +2192,20 @@ def _unit_design_status(slug: "Optional[str]") -> "tuple[bool, bool, Optional[st
     behaviour), else the latest proposal variant, else no design. Cheap: at most ONE file read + one dir
     scan. Pure/fail-soft (no unit / read hiccup → ``(False, False, None)``).
 
-    Byte-identical when off: no proposal is ever written with ``design_gate`` off, so the proposal branch
-    is unreachable and the decision-first branch reproduces the single-doc reader exactly."""
+    Legacy single-doc state is migrated before lookup."""
     if not slug:
         return (False, False, None)
+    _migrate_legacy_design(slug)
     doc = vault_root() / slug / "decisions" / "design.md"
     try:
         if doc.is_file():
             fm = _parse_frontmatter(doc.read_text(encoding="utf-8"))
             return (True, _fm_is_true(fm.get("approved")), doc.relative_to(vault_root()).as_posix())
-        if DESIGN_GATE_ENABLED:
-            proposals = _design_proposals(slug)
-            if proposals:
-                return (True, False, proposals[-1].relative_to(vault_root()).as_posix())
+        proposals = _design_proposals(slug)
+        if proposals:
+            return (True, False, proposals[-1].relative_to(vault_root()).as_posix())
+    except DesignMigrationRefusal:
+        raise
     except Exception:  # noqa: BLE001 — a design-status probe must never raise (it runs every turn)
         return (False, False, None)
     return (False, False, None)
@@ -1925,14 +2215,15 @@ def _design_gate(task_type: str, slug: "Optional[str]") -> "Optional[str]":
     """R2/R3 fail-closed PRE-code gate: an implementation handover is refused until the active unit has a
     recorded + APPROVED design. Design/analysis/docs handovers are unaffected. Returns an ERROR string
     (refusal) or ``None`` (allow). Pure/deterministic — no model call."""
-    if not DESIGN_GATE_ENABLED:       # opt-in (default OFF, config `design_gate.enabled`) → byte-identical when off
-        return None
     if (task_type or "").strip().lower() not in _IMPLEMENTATION_TASK_TYPES:
         return None
     if not slug:
         return ("ERROR: blind-coding refused (R2) — no active unit. Record + approve a design "
                 "(record_design → /approve) before an implementation handover.")
-    has_design, approved, rel = _unit_design_status(slug)
+    try:
+        has_design, approved, rel = _unit_design_status(slug)
+    except DesignMigrationRefusal as ex:
+        return f"ERROR: {ex}"
     if not has_design:
         return (f"ERROR: blind-coding refused (R2) — unit {slug!r} has no design on record. Call "
                 f"record_design to persist the design (idea/approach/architecture), get it approved "
@@ -1952,15 +2243,13 @@ def record_design(title: str, body: str, *, slug: "Optional[str]" = None,
     gate needs, then reconciles the vault (cross-links, R4). A fresh recording resets approval to ``false`` (a
     changed design must be re-approved). Fail-closed: no resolvable unit raises ``ValueError``.
 
-    ADR-0006 D5 (#1416 / S3): under ``design_gate.enabled`` (DEV-1) recording is **non-destructive** — it
-    writes a retained VARIANT to ``proposals/design-<n>.md`` and does NOT overwrite / un-approve an existing
-    ``decisions/design.md``; ``/approve design [<id>]`` promotes the chosen variant into ``decisions/`` as the
-    decision. Flag off (default) → the single canonical ``decisions/design.md`` above (byte-identical). Returns the
-    doc path (posix).
+    Recording is **non-destructive**: it writes a retained variant to ``proposals/design-<n>.md`` and does
+    not overwrite or unapprove an existing ``decisions/design.md``. ``/approve design [<id>]`` promotes the
+    chosen variant into ``decisions/`` as the decision. Returns the doc path (posix).
 
-    #1341: optional typed ``language`` / ``network`` params are normalized via ``ack.ace.constraint_types``
-    and persisted as design frontmatter keys when provided + valid. Invalid provided value →
-    ``GateRefusal``. Default (no typed param) → frontmatter unchanged from S1.
+    Optional typed ``language`` is normalized and persisted as design frontmatter. The compatibility
+    ``network`` argument is never persisted or passed to the design hard-check; egress posture belongs only
+    in the approved design's ``## Build policy`` section.
 
     """
     target = (slug or active_slug() or "").strip()
@@ -1971,11 +2260,12 @@ def record_design(title: str, body: str, *, slug: "Optional[str]" = None,
     if not body.endswith("\n"):
         body += "\n"
     # #1341: optional typed design fields (fail-closed when a value is provided but not allow-listed).
-    typed_fm_lines = _typed_frontmatter_lines(language, network, refuse_invalid=True)
+    typed_fm_lines = _typed_frontmatter_lines(language, "", refuse_invalid=True)
     with _vault_lock():
         vdir = vault_root() / target
         if not (vdir / "meta.md").is_file():
             raise ValueError(_msg("vault.no_initiative", slug=target, root=vault_root().as_posix()))
+        _migrate_legacy_design(target)
         # #1267: the model's body frequently already opens with its own top-level heading; injecting
         # `# {title}` on top of that produces a DUPLICATE H1. Inject the title heading only when the body
         # does not already lead with one (the frontmatter `title:` stays canonical either way).
@@ -1991,27 +2281,10 @@ def record_design(title: str, body: str, *, slug: "Optional[str]" = None,
             f"{heading}"
             f"{body}"
         )
-        if DESIGN_GATE_ENABLED:
-            # ADR-0006 D5 (#1416 / S3): non-destructive design VARIANTS. Recording an alternative approach
-            # yields a RETAINED variant under proposals/design-<n>.md (comparable, never an in-place
-            # overwrite); it does NOT reset/delete an existing approved decision under decisions/ — the
-            # build stays on the approved decision until the operator runs `/approve design <id>` on the new
-            # proposal. decisions/ purity: the decision is written ONLY by promote (see
-            # _promote_design_proposal). Flag-gated ⇒ default-off layout stays the single decisions/design.md.
-            pdir = vdir / "proposals"
-            pdir.mkdir(parents=True, exist_ok=True)
-            doc = _next_design_proposal_path(target)
-            doc.write_text(content, encoding="utf-8", newline="\n")
-            try:
-                reconcile_vault(target, links=False)
-            except Exception:  # noqa: BLE001 — projection must not fail on a reconcile hiccup
-                pass
-            return _display_doc_path((doc.relative_to(vault_root())).as_posix())   # #1276: navigable path
-        # OFF path (default): byte-identical single canonical decisions/design.md.
-        ddir = vdir / "decisions"
-        ddir.mkdir(parents=True, exist_ok=True)
-        doc = ddir / "design.md"        # single canonical design doc — re-recording replaces it (resets approval)
-        doc.write_text(content, encoding="utf-8", newline="\n")
+        pdir = vdir / "proposals"
+        pdir.mkdir(parents=True, exist_ok=True)
+        doc = _next_design_proposal_path(target)
+        _atomic_design_write(doc, content)
         try:
             reconcile_vault(target, links=False)
         except Exception:  # noqa: BLE001 — projection must not fail on a reconcile hiccup
@@ -2101,19 +2374,17 @@ def _approve_command(arg: "Optional[str]") -> str:
     """Route design approval only.
 
     Accepted forms: bare ``/approve``, ``/approve design``, and
-    ``/approve design <slug-or-proposal-id>``. Product constraint approval was
-    retired in S1 (#1414).
+    ``/approve design <proposal-id>`` (the token is a design proposal id in the
+    active unit). Product constraint approval was retired in S1 (#1414).
     """
     parts = (arg or "").split()
     if not parts:
         return _approve_design()
     head = parts[0].lower()
     if head != "design":
-        return "ERROR: usage: /approve [design [<slug>|<proposal-id>]]"
+        return "ERROR: usage: /approve [design [<proposal-id>]]"
     token = parts[1] if len(parts) > 1 else None
-    if DESIGN_GATE_ENABLED:
-        return _approve_design(design_id=token)
-    return _approve_design(slug=token)
+    return _approve_design(design_id=token)
 
 
 def _approve_design(slug: "Optional[str]" = None, *, design_id: "Optional[str]" = None) -> str:
@@ -2122,41 +2393,17 @@ def _approve_design(slug: "Optional[str]" = None, *, design_id: "Optional[str]" 
     File-based (R1). Returns a human message. Fail-closed: no unit / no design doc → a clear ERROR, nothing
     changed.
 
-    ADR-0006 D5 (#1416 / S3): under ``design_gate.enabled`` (DEV-1) approval PROMOTES the chosen proposal
-    variant (``design_id`` = ``'2'`` / ``'design-2'``, else the sole proposal) into ``decisions/design.md``;
-    Flag off (default) uses the single-doc stamp-in-place path below (byte-identical).
+    Approval promotes the chosen proposal variant (``design_id`` = ``'2'`` / ``'design-2'``, else the sole
+    proposal) into ``decisions/design.md``.
     """
     target = (slug or active_slug() or "").strip()
     if not target:
         return "ERROR: no active unit — nothing to approve."
-    if DESIGN_GATE_ENABLED:
+    try:
+        _migrate_legacy_design(target)
         return _promote_design_proposal(target, design_id)
-    with _vault_lock():
-        vdir = vault_root() / target
-        if not (vdir / "meta.md").is_file():
-            return f"ERROR: no unit {target!r}."
-        doc = vdir / "decisions" / "design.md"
-        if not doc.is_file():
-            return (f"ERROR: unit {target!r} has no design to approve — record one first "
-                    f"(record_design). Nothing changed.")
-        rel = _display_doc_path(doc.relative_to(vault_root()).as_posix())   # #1276: navigable path
-        text = doc.read_text(encoding="utf-8")
-        if _fm_is_true(_parse_frontmatter(text).get("approved")):
-            return f"Design for {target!r} is already approved ({rel})."
-        new = _set_frontmatter_flag(text, "approved", "true")
-        new = _set_frontmatter_flag(new, "type", "decision")
-        if new == text:
-            return f"ERROR: could not stamp approval on the design doc for {target!r} ({rel})."
-        doc.write_text(new, encoding="utf-8", newline="\n")
-        try:
-            reconcile_vault(target, links=False)
-        except Exception:  # noqa: BLE001
-            pass
-    return (f"OK: approved the design for {target!r} ({rel}) — implementation handovers are now unblocked.\n"
-            f"👉 Next: ask the model to break the approved design into units — it creates ONE epic plus ALL "
-            f"implementation units via plan_units (no handovers yet). Then `/auto on [N]` drains them: the "
-            f"engine stages, launches and advances unit after unit until the epic is done; `/auto off` keeps "
-            f"it guided (the engine recommends each next unit, you drive).")
+    except DesignMigrationRefusal as ex:
+        return f"ERROR: {ex}"
 
 
 def _proposal_matches_decision(proposal: Path, decision_text: str) -> bool:
@@ -2185,57 +2432,51 @@ def _promote_design_proposal(target: str, design_id: "Optional[str]") -> str:
     exist), or (multiple proposals) a pick-one ERROR, or (legacy unapproved ``decisions/design.md``) stamp it
     in place, else the no-design ERROR.
     """
-    decision_doc = vault_root() / target / "decisions" / "design.md"
-    decision_exists = decision_doc.is_file()
-    decision_approved = False
-    if decision_exists:
-        try:
-            decision_approved = _fm_is_true(
-                _parse_frontmatter(decision_doc.read_text(encoding="utf-8")).get("approved"))
-        except Exception:  # noqa: BLE001 — a status probe must never raise into approval
-            decision_approved = False
-    proposals = _design_proposals(target)
-    ids_hint = ", ".join(p.stem for p in proposals)  # e.g. "design-1, design-2"
-    already_approved = False
-
-    raw_id = str(design_id or "").strip()
-    if raw_id:
-        chosen = _resolve_design_proposal(target, raw_id)
-        if chosen is None:
-            tail = f" (recorded: {ids_hint})" if ids_hint else " — record one first (record_design)"
-            return (f"ERROR: no such design proposal {raw_id!r} for {target!r}{tail}. Nothing changed.")
-    elif decision_exists and decision_approved:
-        chosen = decision_doc
-        already_approved = True
-    elif decision_exists and not decision_approved and proposals:
-        return (f"ERROR: legacy unapproved design.md and {len(proposals)} proposal(s) for {target!r} — "
-                f"pick one: `/approve design <id>` ({ids_hint}). Nothing changed.")
-    elif len(proposals) == 1:
-        chosen = proposals[0]
-    elif len(proposals) > 1:
-        return (f"ERROR: multiple design proposals for {target!r} — pick one: "
-                f"`/approve design <id>` ({ids_hint}). Nothing changed.")
-    elif decision_exists:
-        chosen = decision_doc  # legacy stray unapproved decisions/design.md → stamp it in place
-    else:
-        return (f"ERROR: unit {target!r} has no design to approve — record one first "
-                f"(record_design). Nothing changed.")
-
-    if already_approved:
-        rel = _display_doc_path(decision_doc.relative_to(vault_root()).as_posix())
-        # Exclude the ALREADY-promoted proposal (the one that IS the current decision) from the switch hint —
-        # only genuinely NEWER variants are worth switching to. Fail-soft: an unreadable decision → no filter.
-        try:
-            decision_text = decision_doc.read_text(encoding="utf-8")
-        except Exception:  # noqa: BLE001
-            decision_text = ""
-        newer = [p for p in proposals
-                 if not (decision_text and _proposal_matches_decision(p, decision_text))]
-        newer_hint = ", ".join(p.stem for p in newer)
-        hint = (f" Newer proposal(s) recorded ({newer_hint}) — `/approve design <id>` to switch the decision."
-                if newer else "")
-        return f"Design for {target!r} is already approved ({rel})." + hint
     with _vault_lock():
+        _migrate_legacy_design(target)
+        decision_doc = vault_root() / target / "decisions" / "design.md"
+        decision_exists = decision_doc.is_file()
+        decision_approved = False
+        if decision_exists:
+            try:
+                decision_approved = _fm_is_true(
+                    _parse_frontmatter(decision_doc.read_text(encoding="utf-8")).get("approved"))
+            except Exception:  # noqa: BLE001 — migration already rejected unreadable/malformed state
+                decision_approved = False
+        proposals = _design_proposals(target)
+        ids_hint = ", ".join(p.stem for p in proposals)
+        already_approved = False
+
+        raw_id = str(design_id or "").strip()
+        if raw_id:
+            chosen = _resolve_design_proposal(target, raw_id)
+            if chosen is None:
+                tail = f" (recorded: {ids_hint})" if ids_hint else " — record one first (record_design)"
+                return f"ERROR: no such design proposal {raw_id!r} for {target!r}{tail}. Nothing changed."
+        elif decision_exists and decision_approved:
+            chosen = decision_doc
+            already_approved = True
+        elif len(proposals) == 1:
+            chosen = proposals[0]
+        elif len(proposals) > 1:
+            return (f"ERROR: multiple design proposals for {target!r} — pick one: "
+                    f"`/approve design <id>` ({ids_hint}). Nothing changed.")
+        else:
+            return (f"ERROR: unit {target!r} has no design to approve — record one first "
+                    f"(record_design). Nothing changed.")
+
+        if already_approved:
+            rel = _display_doc_path(decision_doc.relative_to(vault_root()).as_posix())
+            try:
+                decision_text = decision_doc.read_text(encoding="utf-8")
+            except Exception:  # noqa: BLE001
+                decision_text = ""
+            newer = [p for p in proposals
+                     if not (decision_text and _proposal_matches_decision(p, decision_text))]
+            newer_hint = ", ".join(p.stem for p in newer)
+            hint = (f" Newer proposal(s) recorded ({newer_hint}) — `/approve design <id>` to switch the decision."
+                    if newer else "")
+            return f"Design for {target!r} is already approved ({rel})." + hint
         vdir = vault_root() / target
         if not (vdir / "meta.md").is_file():
             return f"ERROR: no unit {target!r}."
@@ -2245,12 +2486,13 @@ def _promote_design_proposal(target: str, design_id: "Optional[str]") -> str:
             return f"ERROR: could not read the design proposal for {target!r} ({ex!r}). Nothing changed."
         new = _set_frontmatter_flag(text, "approved", "true")
         new = _set_frontmatter_flag(new, "type", "decision")
-        ddir = vdir / "decisions"
-        ddir.mkdir(parents=True, exist_ok=True)
         rel = _display_doc_path((decision_doc.relative_to(vault_root())).as_posix())
         if new == text:
             return f"ERROR: could not stamp approval on the design doc for {target!r} ({rel})."
-        decision_doc.write_text(new, encoding="utf-8", newline="\n")  # ratified copy; proposal is retained
+        try:
+            _atomic_design_write(decision_doc, new)
+        except Exception as ex:  # noqa: BLE001 -- promotion must not expose a partial ratified decision
+            return f"ERROR: could not atomically promote the design for {target!r} ({ex!r}). Nothing changed."
         try:
             reconcile_vault(target, links=False)
         except Exception:  # noqa: BLE001
@@ -2487,6 +2729,10 @@ def _reconcile_orphan_memory(*, dry_run: bool = True) -> Dict[str, Any]:
 #: resolution + ``execute_command`` cwd) targets the active project, not the client's frozen boot workdir.
 _EXEC_CWD_OVERRIDE: "contextvars.ContextVar[Optional[str]]" = contextvars.ContextVar(
     "_EXEC_CWD_OVERRIDE", default=None)
+#: A bridged client receives the server's validated sandbox preference with the internal tool frame. The
+#: context-local override keeps concurrent requests isolated and is never model-controlled.
+_SANDBOX_POLICY_OVERRIDE: "contextvars.ContextVar[Optional[str]]" = contextvars.ContextVar(
+    "_SANDBOX_POLICY_OVERRIDE", default=None)
 
 
 def _exec_cwd() -> "Optional[str]":
@@ -3025,6 +3271,9 @@ _UI_SINK: Optional[Callable[[str], None]] = None
 
 _INPUT_QUEUE: _q.Queue        = _q.Queue()
 _CANCEL_EVENT                 = threading.Event()
+_EXEC_COMMAND_TIMEOUT_S       = 30
+_COMMAND_CANCEL_POLL_S        = 0.05
+_POST_KILL_DRAIN_S            = 2.0   # #1489: bound the reap after a tree kill so a survivor can't hang the tool
 _RELOAD_FLAG                  = False
 _WATCHER_ENABLED              = False   # auto-advance via reconciler; enabled only by /auto on
 RECONCILER_INTERVAL           = 3.0     # polling interval (s)
@@ -3040,6 +3289,7 @@ _status = {"thinking": False, "label": "ready"}
 
 # Effectively loaded config + source (set in main()) — for the `config` command.
 _EFFECTIVE_CFG: Optional[Dict[str, Any]] = None
+_CONFIG_LOCK = threading.RLock()
 TOOLING_ENVELOPE_POLICY = None
 _CFG_SOURCE: Optional[Path] = None
 
@@ -3502,7 +3752,7 @@ TOOLS = [
             "description": ("Persist the DESIGN for the active unit BEFORE any implementation. Call this "
                             "after your analysis: `title` = the design's title, `body` = the design (goal, "
                             "the chosen approach/technology + WHY, architecture, the facets to cover). It "
-                            "writes a decisions/ proposal the engine's design-gate reads, then you STOP — an "
+                            "writes a design proposal (proposals/design-N.md) the engine reads, then you STOP — an "
                             "implementation stage_handover is REFUSED until the operator approves the design "
                             "(/approve). This is the no-blind-coding contract (R2)."),
             "parameters": {
@@ -3997,6 +4247,11 @@ def _code_agent_pin() -> Optional[str]:
     pin = (pin or "").strip().upper()
     return pin if pin and _code_agent_registry().has(pin) else None
 
+def _code_agent_timeout_s() -> float:
+    """Live per-coder wall-clock shipped to clients for their next local launch."""
+    cfg = _EFFECTIVE_CFG if _EFFECTIVE_CFG is not None else _code_defaults()
+    return float(((cfg.get("code_agents") or {}).get("timeout_s") or 1800.0))
+
 # #455: process-lifetime circuit-breaker — agents whose last run reported budget/quota EXHAUSTED
 # (classified `agent-unavailable`). Server-side, in-memory (resets on restart). Tripped agents are
 # excluded from execution/failover so we never burn a zero-budget agent on retry (turns Kimi's
@@ -4018,10 +4273,11 @@ def _breaker_snapshot() -> Dict[str, str]:
     return dict(_CODE_AGENT_BREAKER)
 
 # epic #602 SUB-9: a SEPARATE per-task output-QUALITY breaker (an ``ack.quality.QualityBreaker`` or None) —
-# distinct from the per-peer availability breaker above (folding quality in would corrupt failover). Built /
-# cleared by ``_apply_quality_breaker`` from the ``quality`` config block; OPT-IN, default off → None → no-op
-# byte-identical. A trip is ADVISORY (escalate/surface, never a hard-abort).
+# distinct from the per-peer availability breaker above (folding quality in would corrupt failover). It is
+# always built from the ``quality`` tuning block; a latched trip is an always-on, fail-closed pre-write staging
+# hold until a passing-quality submission or explicit operator reset clears it.
 _QUALITY_BREAKER = None
+_QUALITY_LOCK = threading.Lock()
 
 # #456 (FORK-D): task_class is derived DETERMINISTICALLY from task_json.type — never from model output.
 # #1287 (operator role model, 2026-07-08 — REVERSES the 2026-06-25 "staged pick is authoritative" rule):
@@ -4397,7 +4653,7 @@ def _effective_tools() -> List[Dict[str, Any]]:
     plug = [t["schema"] for t in _PLUGIN_TOOLS.values()]
     skl = [USE_SKILL_TOOL] if _PLAYBOOKS else []
     prm = [USE_PROMPT_TOOL] if _PROMPTS else []
-    con = [CONSTRAINT_TOOL] if CONSTRAINT_GATE_ENABLED else []
+    con = [CONSTRAINT_TOOL] if FRAMING_NOTES_ENABLED else []
     return (_tools_with_agent_enum(TOOLS) + con + mem + par + web + iss + rev + fet + plug + skl + prm
             + (ONBOARDING_TOOLS if ONBOARDING_MODE else []))
 
@@ -4559,31 +4815,38 @@ def _feedback_status(text: str) -> str:
     raw = next((v for k, v in fm.items() if k.strip().lower() == "status"), "")
     if not raw:
         head = "\n".join((text or "").splitlines()[:20])
-        m = re.search(r"(?im)^\s*status:\s*(\w+)", head)
+        m = re.search(r"(?im)^\s*status:\s*(\S+)", head)
         raw = m.group(1) if m else ""
     toks = raw.strip().split()
-    return toks[0].lower() if toks else ""
+    if not toks:
+        return ""
+    token = toks[0]
+    if len(token) >= 2 and token[0] == token[-1] and token[0] in ("'", '"'):
+        token = token[1:-1]
+    return token.rstrip(".,;:!?").lower()
+
+
+def _stamp_done_if_clean(text: str, exit_code) -> str:
+    """Stamp status only for non-empty, status-less feedback from a confirmed clean exit."""
+    content = text or ""
+    # A confirmed clean exit is the integer 0 ONLY — reject bool `False` (`False == 0` in Python)
+    # and any non-int (e.g. a JSON string/null) so a malformed exit_code can never stamp `done`.
+    clean_exit = isinstance(exit_code, int) and not isinstance(exit_code, bool) and exit_code == 0
+    if clean_exit and content.strip() and not _feedback_status(content):
+        return "status: done\n" + content
+    return content
 
 
 def _advance_gate(fb_text: str) -> "Optional[str]":
-    """S2 (#1224): the BASIC no-blind-advance gate. Opt-in (default OFF → byte-identical). An advance to done
-    is allowed only when the feedback declares ``status: done``; ``blocked``/``clarification_needed`` is
-    refused, and a missing/unrecognized status is refused too ("no signal ≠ done", fail-closed). Deterministic,
-    no model call — the FULL composed gate (coupling/CI/quality) stays private. Returns an ERROR string
-    (refuse) or ``None`` (allow)."""
-    if not ADVANCE_GATE_ENABLED:
-        return None
-    # Single-authority stabilization (presence-based): completion is decided by the feedback FILE'S
-    # PRESENCE (the caller already fail-closes on a missing file — that is the ONE authority for 'done', with
-    # the exit-0 ingest-stamp behind it). The status token is now an ADVISORY DOWNGRADE only — it may HOLD a
-    # finished task ONLY on an EXPLICIT `status: blocked`/`clarification_needed`. A present feedback with a
-    # done / mis-placed / absent token ADVANCES (as SF always did), deleting the whole stall class where a
-    # bare leading `status:` (vs a frontmatter parser) or a prose-only capture defeated a content parser.
+    """Return ``None`` only for explicit normalized ``status: done`` completion evidence."""
+    # #1463: strict done is forced by the fail-closed transition invariant. It deliberately reconciles the
+    # old presence-wins stall fix with "no signal != done"; this is not an operator-selectable policy.
     status = _feedback_status(fb_text or "")
-    if status in ("blocked", "clarification_needed"):
-        return (f"ERROR: not advancing — the feedback status is {status!r}, not done. Resolve it first; the "
-                f"task stays in_progress (no blind advance).")
-    return None   # presence + no explicit non-done ⇒ advance (SF-grade completion; token is advisory only)
+    if status == "done":
+        return None
+    shown = repr(status) if status else "missing"
+    return (f"ERROR: not advancing — the feedback status is {shown}, not done. Resolve it first; the "
+            f"task stays in_progress (no blind advance).")
 
 
 def _advance_pipeline_impl(task_id: str, agent: str, next_task_id: Optional[str] = None) -> str:
@@ -4633,22 +4896,29 @@ def _advance_pipeline_impl(task_id: str, agent: str, next_task_id: Optional[str]
     fb = _exact[-1] if _exact else _cands[-1]      # exact caller agent (newest), else newest matching feedback
     agent = _fb_agent(fb)                          # the TRUE runner, from the filename (authoritative for the rest)
     log.append(f"feedback found: {fb} (agent {agent})")
-    if ADVANCE_GATE_ENABLED:   # S2 (#1224): basic no-blind-advance gate — only read/parse feedback when ON (byte-identical off)
+    try:
+        _fbtext = fb.read_text(encoding="utf-8")
+    except Exception as exc:   # noqa: BLE001 — unreadable evidence cannot authorize completion
+        _fbtext = ""
+        _gate_err = f"ERROR: not advancing — feedback is unreadable ({exc}); the task stays in_progress."
+    else:
+        _gate_err = (_advance_gate(_fbtext) if _fbtext.strip() else
+                     "ERROR: not advancing — feedback is empty; the task stays in_progress.")
+    if _gate_err:
+        # S7 (#1229): the refused task stays in_progress — mark it BLOCKED so the operator sees the stall on
+        # the board/steering instead of a healthy-looking in_progress (transition() clears it on advance).
+        _st = _feedback_status(_fbtext or "")   # dev-loop stab: same tolerant parse as the gate
         try:
-            _fbtext = fb.read_text(encoding="utf-8")
-        except Exception:   # noqa: BLE001 — a read failure is "no signal" → fail-closed
-            _fbtext = ""
-        _gate_err = _advance_gate(_fbtext)
-        if _gate_err:
-            # S7 (#1229): the refused task stays in_progress — mark it BLOCKED so the operator sees the stall on
-            # the board/steering instead of a healthy-looking in_progress (transition() clears it on advance).
-            _st = _feedback_status(_fbtext or "")   # dev-loop stab: same tolerant parse as the gate
-            try:
-                store.mark_blocked(task_id, reason=_gate_err.replace("ERROR: ", "")[:200],
-                                   kind=_st if _st in ("blocked", "clarification_needed") else "blocked")
-            except Exception:   # noqa: BLE001 — a marking hiccup must not change the refusal outcome
-                pass
-            return _gate_err
+            store.mark_blocked(task_id, reason=_gate_err.replace("ERROR: ", "")[:200],
+                               kind=_st if _st in ("blocked", "clarification_needed") else "blocked")
+        except Exception:   # noqa: BLE001 — a marking hiccup must not change the refusal outcome
+            pass
+        return _gate_err
+
+    _egress_err, _egress_log = _egress_advance_check_log()
+    log.extend(_egress_log)
+    if _egress_err:
+        return _egress_err
 
     try:
         # 1. archive the current active.md handover (before the switch)
@@ -4713,14 +4983,8 @@ def _advance_pipeline_impl(task_id: str, agent: str, next_task_id: Optional[str]
             except Exception:
                 pass
 
-        # 3b. LessonStore (ADR-0011 AD-10 / S14-4) is RE-HOMED onto the Hook-Bus (#804): the completion
-        # feedback is reported as a scoped loop-lesson by the `post_feedback` consumer (`_lessons_consumer_hook`)
-        # emitted by the wrapper below — gated on a registered provider (byte-identical no-op when none is
-        # wired), outside the vault lock. (No inline call here.)
-
-        # 3c. Process-SC (#602 S602-6) is RE-HOMED onto the Hook-Bus (#803): the typed process-lesson is
-        # distilled + stored by the `post_feedback` consumer (`_process_consumer_hook`) emitted by the
-        # wrapper below — one consistent reflection path, outside the vault lock. (No inline call here.)
+        # 3b. ACE consumes the completion through its always-on post_feedback hook outside the vault lock.
+        # Legacy lesson files remain migration input; process.hints_enabled controls only pre-turn reads.
 
         # 4. delete the handover in the inbox (.work/handovers)
         deleted = False
@@ -4823,65 +5087,59 @@ def _handover_path_warnings(handover_md: str) -> List[str]:
 
 
 # ─── Macro tool: publish a handover (OPT-2, store-backed) ──
+def _approved_design_standard_snapshot(slug: "Optional[str]") -> "List[str]":
+    """Read the authoritative approved design material before a staging mutation."""
+    standard: "List[str]" = []
+    design_typed = _design_typed(slug)
+    if "language" in design_typed:
+        standard.append(f"- language: {design_typed['language']}")
+    policy = _design_build_policy(slug)
+    if policy:
+        standard.append("## Build policy\n\n" + policy)
+    return standard
+
+
+def _inject_approved_design_standard(handover_md: str, standard: "List[str]", log: "List[str]") -> str:
+    """Strip stale injected context and add the preflighted authoritative design standard."""
+    open_m, close_m = _CONSTRAINT_MARKERS
+    enriched = re.sub(
+        rf"{re.escape(open_m)}.*?{re.escape(close_m)}\n*",
+        "",
+        handover_md,
+        flags=re.DOTALL,
+    )
+    if not standard:
+        return enriched
+    standard_body = "\n\n".join(standard)
+    log.append("Approved design standard injected")
+    return (
+        f"{open_m}\n"
+        f"## Approved design standard (authoritative — honour verbatim; do not override)\n"
+        f"\n"
+        f"{standard_body}\n"
+        f"{close_m}\n"
+        f"\n"
+        f"{enriched}"
+    )
+
+
 def _enrich_handover(tid: str, handover_md: str, fields: Dict[str, Any], log: List[str],
                      agent: str = "",
-                     constraint_snapshot: "Optional[tuple[str, Optional[str]]]" = None) -> str:
+                     constraint_snapshot: "Optional[tuple[str, Optional[str]]]" = None,
+                     approved_design_standard: "Optional[List[str]]" = None,
+                     approved_design_preinjected: bool = False) -> str:
     """Shared handover enrichment (#1296 parity — used by BOTH staging paths, create and re-hand):
     normalize the embedded task id, inject captured constraints (S2 #1339, single-snapshot, idempotent
     strip-then-add), append the token-budgeted Memory brief (#458 D1, fail-soft) and the advisory
     ACE/lesson context (#863/#877/#880). ``fields`` supplies title/type (the creation payload on the
-    create path; the STORED task on the re-hand path). Every stage is fail-soft — enrichment never
-    breaks a staging call. ``constraint_snapshot`` is the caller's one status read (C10.7); ``None``
-    is a no-op (gate off / byte-identical)."""
+    create path; the STORED task on the re-hand path). The approved-design snapshot is protected and is
+    preflighted by both callers; later advisory enrichments remain fail-soft."""
     ho_md = _normalize_handover_id(handover_md, tid)
     ho_md = _normalize_handover_recipient(ho_md, agent)   # #1311: body Recipient agrees with frontmatter `to:`
     ho_md = _inject_code_root_note(ho_md)                 # #1328: coder cwd already IS the configured code root
-    # S2 (#1415): build handovers read the approved design standard when the design gate is enforcing.
-    # Flag off keeps the legacy framing-note injection path byte-identical.
-    if constraint_snapshot is not None:
-        try:
-            open_m, close_m = _CONSTRAINT_MARKERS
-            ho_md = re.sub(
-                rf"{re.escape(open_m)}.*?{re.escape(close_m)}\n*",
-                "",
-                ho_md,
-                flags=re.DOTALL,
-            )
-            if DESIGN_GATE_ENABLED:
-                standard: "List[str]" = []
-                design_typed = _design_typed(active_slug())
-                if "language" in design_typed:
-                    standard.append(f"- language: {design_typed['language']}")
-                policy = _design_build_policy(active_slug())
-                if policy:
-                    standard.append("## Build policy\n\n" + policy)
-                if standard:
-                    standard_body = "\n\n".join(standard)
-                    ho_md = (
-                        f"{open_m}\n"
-                        f"## Approved design standard (authoritative — honour verbatim; do not override)\n"
-                        f"\n"
-                        f"{standard_body}\n"
-                        f"{close_m}\n"
-                        f"\n"
-                        f"{ho_md}"
-                    )
-                    log.append("Approved design standard injected")
-            else:
-                status, body = constraint_snapshot
-                if status == CAPTURED and body:
-                    ho_md = (
-                        f"{open_m}\n"
-                        f"## Framing notes (context only — approved design remains authoritative)\n"
-                        f"\n"
-                        f"{body}\n"
-                        f"{close_m}\n"
-                        f"\n"
-                        f"{ho_md}"
-                    )
-                    log.append("Framing notes injected")
-        except Exception:  # noqa: BLE001 — advisory: a constraint inject must never break staging
-            pass
+    # S2 (#1415): every handover receives the approved design standard when one is present.
+    if constraint_snapshot is not None and not approved_design_preinjected:
+        ho_md = _inject_approved_design_standard(ho_md, approved_design_standard or [], log)
     # The richer token-budgeted Memory brief from past patterns (#458 D1, fail-soft):
     # body-keyed search + optional relational hits + the shared warm rolling summary.
     if _MEMORY is not None and _MEMORY.is_available():
@@ -4938,14 +5196,12 @@ def _enrich_handover(tid: str, handover_md: str, fields: Dict[str, Any], log: Li
     return ho_md
 
 
-def _ack_validate(fields: Dict[str, Any]) -> Optional[str]:
-    """ACK soft-path gate: validates a model-emitted task_json against the
-    ACK contract. Returns an EXACT error string on a violation, otherwise None
-    (valid / gate off / ACK package unavailable → degrades softly, the engine
-    keeps running). With Lodestar enabled, the capability-bearing spec is
-    used (capability mandatory for buildable types)."""
-    if not ACK_ENABLED:
-        return None
+def _ack_validate(fields: Dict[str, Any], *, stored: bool = False) -> Optional[str]:
+    """Validate a staged task against the mandatory ACK contract.
+
+    Returns the exact Pydantic validation error for a schema violation. An unavailable validator is an
+    internal refusal rather than a bypass. Lodestar remains an optional stricter schema selector.
+    """
     try:
         from ack.case_spec import TaskSpec
         spec_cls = TaskSpec
@@ -4954,12 +5210,157 @@ def _ack_validate(fields: Dict[str, Any]) -> Optional[str]:
             spec_cls = CapabilityTaskSpec
         from pydantic import ValidationError
     except Exception:
-        return None  # ACK not importable → degrade softly
+        return "ACK validator unavailable (internal) — refuse (fail-closed). Nothing created."
     try:
-        spec_cls.model_validate(fields)
+        runtime_fields = {
+            "id", "status", "created_at", "started_at", "completed_at", "updated_at", "assigned_to",
+            *_BLOCKED_ANNOTATION_KEYS,
+        }
+        payload = ({key: value for key, value in fields.items() if key not in runtime_fields}
+                   if stored else fields)
+        spec_cls.model_validate(payload)
         return None
     except ValidationError as e:
         return str(e)
+
+
+def _required_verifier_gate(fields: Dict[str, Any]) -> Optional[str]:
+    """Run the always-on deterministic handover rules and refuse any failed required rule."""
+    try:
+        from ack.verify import verify_rules
+    except Exception:
+        return "ERROR: required verifier unavailable (internal) — refuse (fail-closed). Nothing created."
+    rules = [
+        ("description_substantive", lambda f: len(str((f or {}).get("description", "")).strip()) >= 40),
+        ("title_specific", lambda f: len(str((f or {}).get("title", "")).split()) >= 3),
+    ]
+    verdict = verify_rules(fields, rules, verifier="required_rules")
+    _set_last_verdict(verdict)
+    if verdict.passed:
+        return None
+    failed = verdict.reason.removeprefix("failed: ")
+    return (f"ERROR: required handover verifier rule(s) failed: {failed} — fix the task fields and retry. "
+            "Nothing created.")
+
+
+def _record_advisory_grounding(fields: Dict[str, Any], handover_md: str) -> None:
+    """Combine the required-rules score with advisory grounding, explicitly preserving unavailable state."""
+    rules_verdict = _last_verdict()
+    if rules_verdict is None:
+        return
+    try:
+        from ack.verify import VerdictResult, verify_grounding
+    except Exception:
+        return
+
+    try:
+        evs = tuple(_loop_profile(fields.get("type")).eval_verifiers or ())
+    except Exception:
+        evs = ()
+    run_grounding = ("grounding" in evs) if evs else True
+    grounding = None
+    unavailable = "grounding not selected"
+    if run_grounding:
+        unavailable = "grounding unavailable (no memory tier)"
+        try:
+            if _MEMORY is not None and _MEMORY.is_available():
+                claims = [ln.strip() for ln in handover_md.splitlines()
+                          if len(ln.strip()) >= 30 and not ln.lstrip().startswith("#")][:12]
+                if claims:
+                    retrieved_any = False
+                    retrieval_error = False
+
+                    def retrieve(claim: str) -> bool:
+                        nonlocal retrieved_any, retrieval_error
+                        try:
+                            hits = _MEMORY.search(claim, limit=3)
+                        except Exception:
+                            retrieval_error = True
+                            return False
+                        if hits:
+                            retrieved_any = True
+                            return True
+                        return False
+
+                    candidate = verify_grounding(
+                        claims,
+                        retrieve,
+                        threshold=_VERIFY_GROUNDING_THRESHOLD,
+                    )
+                    if retrieval_error:
+                        unavailable = "grounding unavailable (memory error)"
+                    elif retrieved_any:
+                        grounding = candidate
+                    else:
+                        unavailable = "grounding unavailable (no grounding hits)"
+                else:
+                    unavailable = "grounding unavailable (no substantive claims)"
+        except Exception:
+            unavailable = "grounding unavailable (memory error)"
+
+    if grounding is None:
+        _set_last_verdict(VerdictResult(
+            rules_verdict.passed,
+            rules_verdict.score,
+            f"rules {rules_verdict.score:.2f}; {unavailable}",
+            "handover",
+        ))
+        return
+    score = (rules_verdict.score + grounding.score) / 2
+    _set_last_verdict(VerdictResult(
+        rules_verdict.passed and grounding.passed,
+        score,
+        f"rules {rules_verdict.score:.2f}; grounding {grounding.score:.2f}",
+        "handover",
+    ))
+
+
+def _ambiguity_gate(handover_md: str, unit: str) -> Optional[str]:
+    """Refuse an ambiguous handover with the detector's halt-to-ask question and options."""
+    try:
+        from ack.ace.fork import detect_ambiguity
+        signal = detect_ambiguity(handover_md, unit=unit)
+    except Exception:
+        return "ERROR: ambiguity detector unavailable (internal) — refuse (fail-closed). Nothing created."
+    if signal is None or signal.is_empty():
+        return None
+    options = " | ".join(signal.options) or "Ask the operator to clarify"
+    return (f"ERROR: ambiguous handover refused — {signal.question}\n"
+            f"Options: {options}\nNothing created; clarify the fork and retry.")
+
+
+def _quality_hold() -> Optional[str]:
+    """Hold the next protected staging write while the output-quality breaker is tripped."""
+    snapshot = _quality_tripped()
+    if snapshot is None:
+        return None
+    reason = str(getattr(snapshot, "reason", "sustained degradation") or "sustained degradation")
+    message = (f"ERROR: output-quality breaker tripped ({reason}) — staging held until a passing-quality "
+               "submission clears the breaker or the operator runs `/quality reset`. Nothing created.")
+    _ui_print(col(f"  [quality] escalation — {message}", C.YELLOW))
+    _emit_hook("escalation", {"kind": "output_quality", "reason": reason, "action": "staging_hold"})
+    return message
+
+
+def _mandatory_staging_gates(fields: Dict[str, Any], handover_md: str, unit: str, *, stored: bool = False) -> Optional[str]:
+    """Shared F5a pre-write boundary for both task creation and re-handing."""
+    _set_last_verdict(None)
+    ack_err = _ack_validate(fields, stored=stored)
+    if ack_err:
+        return ("ERROR: task_json violates the ACK contract (nothing created):\n"
+                + ack_err + "\n→ fix the fields and call stage_handover again.")
+    # The required verifier rules validate a NEWLY AUTHORED task_json's quality. A pure re-hand (stored=True)
+    # carries no new task_json — the task was authored + validated at create — so re-checking the stored
+    # fields would wrongly refuse an already-created task. Ambiguity + quality-hold still gate both paths.
+    if not stored:
+        verifier_err = _required_verifier_gate(fields)
+        if verifier_err:
+            return verifier_err
+    _record_advisory_grounding(fields, handover_md)
+    ambiguity_err = _ambiguity_gate(handover_md, unit)
+    if ambiguity_err:
+        return ambiguity_err
+    return _quality_hold()
 
 
 def _stage_handover(task_id: Optional[str], agent: str, handover_md: str,
@@ -5011,22 +5412,22 @@ def _stage_handover_impl(task_id: Optional[str], agent: str, handover_md: str,
                 if not isinstance(fields, dict):
                     return "ERROR: task_json must be a JSON object — nothing created."
             task_type = str(fields.get("type", "")).lower()
-            # ACK soft-path gate: validate the task_json against the contract BEFORE
-            # the store mutates anything. On a violation, fail-closed with the exact error
-            # → the agent loop hands it back to the model (reask).
-            ack_err = _ack_validate(fields)
-            if ack_err:
-                return ("ERROR: task_json violates the ACK contract (nothing created):\n"
-                        + ack_err + "\n→ fix the fields and call stage_handover again.")
+            validation_err = _mandatory_staging_gates(fields, handover_md, active_slug() or "")
+            if validation_err:
+                return validation_err
             # S5 (#1227): fail-closed design→impl gate — refuse an IMPLEMENTATION handover until the active
             # unit has a recorded + APPROVED design (no blind coding, R2). Runs BEFORE store.create, so a
             # refusal mutates nothing. `force` does NOT bypass it (the approval file is the intended override).
             gate_err = _design_gate(task_type, active_slug())
             if gate_err:
                 return gate_err
-            csnap: "Optional[tuple[str, Optional[str]]]" = None
-            if CONSTRAINT_GATE_ENABLED or DESIGN_GATE_ENABLED:
-                csnap = _constraint_status(active_slug()) if CONSTRAINT_GATE_ENABLED else (UNCAPTURED, None)
+            csnap = (_constraint_status(active_slug()) if FRAMING_NOTES_ENABLED else (UNCAPTURED, None))
+            try:
+                design_standard = _approved_design_standard_snapshot(active_slug())
+                protected_handover = _inject_approved_design_standard(handover_md, design_standard, log)
+            except Exception as ex:  # noqa: BLE001 -- protected injection preflight must fail closed
+                return (f"ERROR: approved design standard injection failed ({ex!r}) — refuse "
+                        "(fail-closed). Nothing changed.")
             # #1342 (S6): L3 typed hard-check on the REAL task object (TaskSpec language/network).
             # IMPLEMENTATION types only; PRE-write; `force` does NOT bypass. Flag off → no-op.
             if task_type in _IMPLEMENTATION_TASK_TYPES:
@@ -5048,7 +5449,11 @@ def _stage_handover_impl(task_id: Optional[str], agent: str, handover_md: str,
                 return f"ERROR: {e} — no task created."
             tid = task["id"]
             log.append(f"task created: {tid} (pending, created_at={task['created_at']})")
-            ho_md = _enrich_handover(tid, handover_md, fields, log, agent, constraint_snapshot=csnap)
+            ho_md = _enrich_handover(
+                tid, protected_handover, fields, log, agent, constraint_snapshot=csnap,
+                approved_design_standard=design_standard,
+                approved_design_preinjected=True,
+            )
             ho = handovers_dir() / f"{tid}_{agent}.md"
             _atomic_write(ho, ho_md)
             log.append(f"handover written: {ho} ({len(ho_md)} chars)")
@@ -5059,14 +5464,21 @@ def _stage_handover_impl(task_id: Optional[str], agent: str, handover_md: str,
             existing = store.get(task_id)
             if existing is None:
                 return f"ERROR: no such task {task_id!r} — create it with task_json first (nothing written)."
+            validation_err = _mandatory_staging_gates(existing, handover_md, active_slug() or "", stored=True)
+            if validation_err:
+                return validation_err
             # S5 (#1227): re-handing an IMPLEMENTATION task still needs an approved design — a blank
             # re-handover of an impl-typed task cannot slip past the design gate.
             gate_err = _design_gate(str(existing.get("type", "")), active_slug())
             if gate_err:
                 return gate_err
-            csnap = None
-            if CONSTRAINT_GATE_ENABLED or DESIGN_GATE_ENABLED:
-                csnap = _constraint_status(active_slug()) if CONSTRAINT_GATE_ENABLED else (UNCAPTURED, None)
+            csnap = (_constraint_status(active_slug()) if FRAMING_NOTES_ENABLED else (UNCAPTURED, None))
+            try:
+                design_standard = _approved_design_standard_snapshot(active_slug())
+                protected_handover = _inject_approved_design_standard(handover_md, design_standard, log)
+            except Exception as ex:  # noqa: BLE001 -- protected injection preflight must fail closed
+                return (f"ERROR: approved design standard injection failed ({ex!r}) — refuse "
+                        "(fail-closed). Nothing changed.")
             # #1342 (S6): re-hand of an IMPLEMENTATION task still hard-checks the stored typed fields.
             if str(existing.get("type", "")).strip().lower() in _IMPLEMENTATION_TASK_TYPES:
                 hc_err = _design_build_check(active_slug(), _task_typed_fields(existing))
@@ -5075,7 +5487,11 @@ def _stage_handover_impl(task_id: Optional[str], agent: str, handover_md: str,
             tid = task_id
             # #1296 parity: the lazily staged unit handover (the continuation's [NEXT-UNIT] path)
             # gets the SAME enrichment as a created one — id normalization, memory brief, lessons.
-            ho_md = _enrich_handover(tid, handover_md, existing, log, agent, constraint_snapshot=csnap)
+            ho_md = _enrich_handover(
+                tid, protected_handover, existing, log, agent, constraint_snapshot=csnap,
+                approved_design_standard=design_standard,
+                approved_design_preinjected=True,
+            )
             ho = handovers_dir() / f"{tid}_{agent}.md"
             _atomic_write(ho, ho_md)
             log.append(f"handover written: {ho} ({len(ho_md)} chars)")
@@ -5419,6 +5835,14 @@ def _work_in_flight(store: "TaskStore") -> bool:
 # through this API, serialized (single-writer). NO AI involvement:
 # ID assignment, created_at, schema, double-ID and topic dedup are code.
 
+_BLOCKED_ANNOTATION_KEYS = ("blocked", "blocked_reason", "blocked_kind", "blocked_at")
+
+
+def _task_is_escalated(task: Any) -> bool:
+    """Return whether *task* carries the durable terminal retry-budget annotation."""
+    return bool(isinstance(task, dict) and task.get("blocked") and task.get("blocked_kind") == "escalated")
+
+
 class DuplicateTaskError(Exception):
     """Raised when a task on the same topic already exists."""
     def __init__(self, existing_id: str, exact: bool = False):
@@ -5645,7 +6069,7 @@ class TaskStore:
             data["status"] = to_status
             # S7 (#1229): a task that advances is no longer blocked — drop any blocked annotation. No-op (byte-
             # identical) for a task that never carried one.
-            for _bk in ("blocked", "blocked_reason", "blocked_kind", "blocked_at"):
+            for _bk in _BLOCKED_ANNOTATION_KEYS:
                 data.pop(_bk, None)
             self._dir(to_status).mkdir(parents=True, exist_ok=True)
             _atomic_write(self._path(task_id, to_status),
@@ -5688,7 +6112,7 @@ class TaskStore:
                 return
             if not isinstance(data, dict) or not data.get("blocked"):
                 return
-            for _bk in ("blocked", "blocked_reason", "blocked_kind", "blocked_at"):
+            for _bk in _BLOCKED_ANNOTATION_KEYS:
                 data.pop(_bk, None)
             _atomic_write(self._path(task_id, s), json.dumps(data, ensure_ascii=False, indent=2))
 
@@ -5725,6 +6149,40 @@ def _store() -> "TaskStore":
     if STORE is None:
         STORE = TaskStore(root=None)
     return STORE
+
+
+def claim_task(task_id: str, agent: str) -> str:
+    """Atomically claim a client-run task without moving a later state backward."""
+    agent_u = (agent or "").strip().upper()
+    registry = _code_agent_registry()
+    if not registry.has(agent_u):
+        raise ValueError(f"unknown agent {agent_u!r} (configured: {', '.join(registry.names()) or 'none'})")
+    store = _store()
+    with store._lock:
+        task = store.get((task_id or "").strip())
+        if task is None:
+            return "not_found"
+        status = str(task.get("status") or "not_found")
+        if _task_is_escalated(task):
+            return status
+        if status == "pending":
+            return str(store.transition(task["id"], "in_progress")["status"])
+        return status
+
+
+def unclaim_task(task_id: str) -> str:
+    """Atomically release a failed client-run task without reopening a terminal escalation."""
+    store = _store()
+    with store._lock:
+        task = store.get((task_id or "").strip())
+        if task is None:
+            return "not_found"
+        status = str(task.get("status") or "not_found")
+        if _task_is_escalated(task):
+            return status
+        if status == "in_progress":
+            return str(store.transition(task["id"], "pending")["status"])
+        return status
 
 
 # ─── Platform mode (shell + syntax guidance from ONE source) ──
@@ -5995,25 +6453,20 @@ def _language_guidance(lang: str) -> str:
 def _platform_guidance(platform: str) -> str:
     """Dynamically injected runtime note — keeps the prompt file neutral."""
     if platform == "windows":
-        if _git_bash():
-            # #1183: Git Bash present → execute_command routes each command to the shell it's written for,
-            # so BOTH work — the model may use either flavour.
-            return (
-                "## Runtime environment\n"
-                "Operating system: **Windows** with **Git Bash** available. `execute_command` runs each "
-                "command in the shell it is written for — use POSIX/bash (`ls`, `cat`, `grep`, `find`) OR "
-                "PowerShell cmdlets (`Get-ChildItem`, `Select-String`); both work."
-            )
         return (
             "## Runtime environment\n"
-            "Operating system: **Windows**. For `execute_command` use PowerShell syntax "
-            "(e.g. `Get-Date`, `Get-ChildItem`, `Get-Content`, `Select-String`) — NO Unix "
-            "commands like `date`, `ls`, `cat`, `grep`."
+            "Operating system: **Windows**. The model `execute_command` shell tool is **unavailable** here: "
+            "command isolation is mandatory and no supported sandbox backend (bwrap/firejail) exists on Windows, "
+            "so every `execute_command` call fails closed with a refusal. Use the `list_directory` tool for "
+            "directory listings, and `read_file`/`write_file`/`edit_file`/`search_files` for file work — those are "
+            "unaffected. A direct, unrestricted shell is operator-only via `/sh` and is not a model tool."
         )
     return (
         "## Runtime environment\n"
-        "Operating system: **Linux**. For `execute_command` use POSIX/bash syntax "
-        "(e.g. `date`, `ls`, `cat`, `grep`)."
+        "Operating system: **Linux**. For `execute_command` use POSIX/bash syntax (e.g. `date`, `ls`, `cat`, "
+        "`grep`). Model command execution runs inside a mandatory sandbox (bwrap/firejail); on a host without a "
+        "supported backend `execute_command` fails closed with a refusal, so fall back to the `list_directory` "
+        "tool for listings."
     )
 
 
@@ -6114,9 +6567,19 @@ def _steering_state_block() -> str:
         ]
         if stage:
             lines.append(f"- lifecycle stage: {stage}")
-        if unit and DESIGN_GATE_ENABLED:  # S5 (#1227): surface the design gate — only when it is enforced
-            _hd, _ap, _rel = _unit_design_status(unit)
-            if not _hd:
+        if unit:
+            try:
+                _hd, _ap, _rel = _unit_design_status(unit)
+            except DesignMigrationRefusal as ex:
+                lines.append(f"- design gate: BLOCKED — {ex}")
+                _hd = _ap = False
+                _rel = None
+                design_migration_blocked = True
+            else:
+                design_migration_blocked = False
+            if design_migration_blocked:
+                pass
+            elif not _hd:
                 lines.append("- design gate: no design on record — implementation handovers are BLOCKED "
                              "— if you have just researched/analysed a design, CALL record_design NOW to "
                              "persist it (a prose proposal is not enough); then wait for /approve.")
@@ -6124,8 +6587,7 @@ def _steering_state_block() -> str:
                              "the operator run `/design --options [N]`; never fan out automatically.")
             elif not _ap:
                 # ADR-0006 D5 (#1416 / S3): with >1 recorded proposal variants, promotion needs an explicit
-                # id. The approved design may carry a `## Build policy` section (dep/egress guidance honoured
-                # at build). Flag-gated (this whole block is behind DESIGN_GATE_ENABLED) → byte-identical off.
+                # id. The approved design may carry a `## Build policy` section honoured at build.
                 _props = _design_proposals(unit)
                 _pick = (f" — {len(_props)} proposal variants recorded ({', '.join(p.stem for p in _props)}); "
                          f"`/approve design <id>` to promote one" if len(_props) > 1 else "")
@@ -6200,13 +6662,10 @@ def _design_options_prompt(n: int) -> str:
 
 
 def _design_command(agent: "Optional[GX10]", raw: str) -> str:
-    """Operator-triggered S5 fan-out. With design_gate off, refuse before touching model state so the
-    public/default path remains byte-identical."""
+    """Operator-triggered S5 design-proposal fan-out."""
     n, err = _parse_design_options_args(raw)
     if err:
         return err
-    if not DESIGN_GATE_ENABLED:
-        return "ERROR: /design --options requires design_gate.enabled; nothing changed."
     if not active_slug():
         return "ERROR: /design --options needs an active unit. Create/select one with /project first."
     if agent is None:
@@ -7198,7 +7657,8 @@ def _read_file_ranged(text: str, *, start=None, end=None, max_chars=None, patter
         return None
 
 
-def run_tool(name: str, args: Dict[str, Any], exec_cwd: "Optional[str]" = None) -> str:
+def run_tool(name: str, args: Dict[str, Any], exec_cwd: "Optional[str]" = None,
+             sandbox_policy: "Optional[str]" = None) -> str:
     """#1202: the SINGLE structural site that renders a listing's machine ``AnswerData`` into the localized
     ``Answer:`` sentence. It wraps the tool dispatch and is **command-gated**, so EVERY caller (the model
     run loop, ``/tool``, ``/ls``, the API) and EVERY topology (native + bridged client) gets the localized
@@ -7209,11 +7669,13 @@ def run_tool(name: str, args: Dict[str, Any], exec_cwd: "Optional[str]" = None) 
     target the active project, not the client's frozen boot workdir. Honoured only when the path exists on
     THIS host (mount) — a remote/sealed client or an older server (no cwd) falls back to the process workdir,
     byte-identical. ``exec_cwd=None`` (every non-bridge caller) is byte-identical."""
-    if exec_cwd and os.path.isdir(exec_cwd):
-        _tok = _EXEC_CWD_OVERRIDE.set(exec_cwd)
+    if (exec_cwd and os.path.isdir(exec_cwd)) or sandbox_policy is not None:
+        _tok = _EXEC_CWD_OVERRIDE.set(exec_cwd if exec_cwd and os.path.isdir(exec_cwd) else None)
+        _stok = _SANDBOX_POLICY_OVERRIDE.set(sandbox_policy)
         try:
             return _run_tool_localized(name, args)
         finally:
+            _SANDBOX_POLICY_OVERRIDE.reset(_stok)
             _EXEC_CWD_OVERRIDE.reset(_tok)
     return _run_tool_localized(name, args)
 
@@ -7226,6 +7688,113 @@ def _run_tool_localized(name: str, args: Dict[str, Any]) -> str:
 
 
 def _run_tool_dispatch(name: str, args: Dict[str, Any]) -> str:
+    """Audit-gated dispatch shared by local, bridged, and server tool lanes."""
+    global _AUDIT_DEGRADED
+    protected = name in _AUDIT_TOOLS
+    selected = protected or AUDIT_SCOPE == "all"
+    if selected:
+        # The intent append is the sole fail-closed enforcer. _AUDIT_DEGRADED is the surfaced health
+        # signal from a post-mutation result failure; it stays latched until a protected intent recovers.
+        was_degraded = protected and _AUDIT_DEGRADED
+        try:
+            _append_audit(name, args, "intent", ok=True)
+        except Exception as exc:  # noqa: BLE001 — fail closed before the protected action
+            if was_degraded:
+                return f"ERROR: audit intent append failed; audit health is degraded; {name} was refused: {exc}"
+            return f"ERROR: audit intent append failed; {name} was refused: {exc}"
+        if protected:
+            _AUDIT_DEGRADED = False
+    result = _run_tool_dispatch_impl(name, args)
+    if selected:
+        try:
+            _maybe_audit(name, args, result)
+        except Exception as exc:  # noqa: BLE001 — mutation may already have happened
+            if protected:
+                _AUDIT_DEGRADED = True
+            return (f"ERROR: audit result append failed after {name}; audit health is degraded: {exc}. "
+                    f"Action result: {result}")
+    return result
+
+
+def _sandbox_model_command(command: str) -> "Tuple[Optional[str], Optional[str]]":
+    """Prepare one model-issued command for execution, or return an actionable fail-closed refusal."""
+    if PLATFORM == "windows":
+        return None, (
+            "ERROR: execute_command refused: no supported model-command sandbox backend is available "
+            "on Windows. Ironclad fails closed; use a Linux host with bwrap/firejail, or use the separate "
+            "operator /sh channel for an explicitly unrestricted operator command."
+        )
+    preference = _SANDBOX_POLICY_OVERRIDE.get() or SANDBOX
+    try:
+        import sandbox as _sbx
+        prepared = _sbx.sandbox_command(command, preference)
+        if isinstance(prepared, _sbx.SandboxRefusal):
+            return None, (
+                "ERROR: execute_command refused: no supported sandbox backend is available "
+                f"for policy '{preference}' ({prepared.reason}). Ironclad fails closed; install bwrap "
+                "or firejail on this Linux host."
+            )
+        run_cmd, backend = prepared
+        if not run_cmd or not backend:
+            return None, (
+                "ERROR: execute_command refused: sandbox preparation returned no isolated command. "
+                "Ironclad fails closed; install bwrap or firejail on this Linux host."
+            )
+        return run_cmd, None
+    except Exception:  # noqa: BLE001 — import/wrapper failures must never fall back to the raw command
+        return None, (
+            "ERROR: execute_command refused: mandatory sandbox preparation failed. Ironclad fails closed; "
+            "verify that bwrap or firejail is installed and usable on this Linux host."
+        )
+
+
+class _CommandCancelled(Exception):
+    """Internal control flow for a cancelled model command."""
+
+
+def _kill_command_process_tree(proc, *, windows: "Optional[bool]" = None) -> None:
+    """Kill *proc* and every descendant; the caller remains responsible for reaping *proc*."""
+    proc_tree.kill_process_tree(proc, windows=windows)
+
+
+def _drain_after_kill(proc) -> "tuple":
+    """Reap *proc* and drain buffered output after a tree kill, but NEVER block forever. On the bwrap path
+    --unshare-pid guarantees every pipe writer dies (EOF), so this returns at once; the bounded wait is a
+    belt-and-suspenders for a weaker backend (e.g. firejail) where a descendant might survive the group kill
+    and hold the pipe open — the idle watchdog cannot unblock an in-flight communicate()."""
+    return proc_tree.drain_after_kill(proc, _POST_KILL_DRAIN_S)
+
+
+def _run_model_command_process(run_cmd: str, timeout: float, cwd: "Optional[str]"):
+    """Run a model command in its own process tree, observing timeout and turn cancellation."""
+    popen_args = dict(
+        shell=True, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True, encoding="utf-8", errors="replace", cwd=cwd,
+    )
+    if os.name == "nt":
+        popen_args["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+    else:
+        popen_args["start_new_session"] = True
+    proc = subprocess.Popen(run_cmd, **popen_args)
+    deadline = time.monotonic() + timeout
+    while True:
+        if _CANCEL_EVENT.is_set():
+            _kill_command_process_tree(proc)
+            _drain_after_kill(proc)
+            raise _CommandCancelled()
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            _kill_command_process_tree(proc)
+            stdout, stderr = _drain_after_kill(proc)
+            raise subprocess.TimeoutExpired(run_cmd, timeout, output=stdout, stderr=stderr)
+        try:
+            stdout, stderr = proc.communicate(timeout=min(remaining, _COMMAND_CANCEL_POLL_S))
+        except subprocess.TimeoutExpired:
+            continue
+        return subprocess.CompletedProcess(run_cmd, proc.returncode, stdout, stderr)
+
+
+def _run_tool_dispatch_impl(name: str, args: Dict[str, Any]) -> str:
     try:
         # #459 (§4, review A S2): the shell guardrail fires SERVER-SIDE here, BEFORE the local-tool bridge
         # dispatches execute_command to a client — otherwise a thin/Ink client would run the blocked
@@ -7260,8 +7829,25 @@ def _run_tool_dispatch(name: str, args: Dict[str, Any]) -> str:
             p = _resolve_exec_path(args["path"])
             if not p.exists():
                 return f"ERROR: Not found: {args['path']}"
+            size = p.stat().st_size
+            if size > _MAX_FILE_BYTES:
+                return (f"ERROR: read_file refused: file too large — {size} bytes, "
+                        f"cap {_MAX_FILE_BYTES} bytes")
             # errors="replace": a non-UTF-8 file is read lossily, never crashes the read.
-            text = p.read_text(encoding="utf-8", errors="replace")
+            # The bounded binary read also closes the stat/open growth race: even if the file grows after
+            # stat(), this path never asks the allocator for more than the fixed byte ceiling plus one.
+            with p.open("rb") as fh:
+                raw_bytes = fh.read(_MAX_FILE_BYTES + 1)
+            if len(raw_bytes) > _MAX_FILE_BYTES:
+                try:
+                    size = max(size, p.stat().st_size)
+                except OSError:
+                    size = len(raw_bytes)
+                return (f"ERROR: read_file refused: file too large — {size} bytes, "
+                        f"cap {_MAX_FILE_BYTES} bytes")
+            # Match read_text()'s universal-newline translation (the bounded binary read replaced it):
+            # CRLF/CR → LF, so callers like the `cat` tool and ranged reads see the same content as before.
+            text = raw_bytes.decode("utf-8", errors="replace").replace("\r\n", "\n").replace("\r", "\n")
             # #1047: a targeted ranged/pattern read returns only the relevant slice; a bad range/pattern
             # returns None → fall through to the existing head+tail cap below.
             if any(args.get(k) is not None for k in ("start", "end", "max_chars", "pattern")):
@@ -7585,9 +8171,17 @@ def _run_tool_dispatch(name: str, args: Dict[str, Any]) -> str:
             p = _resolve_exec_path(args.get("path", "."))
             if not p.exists():
                 return f"ERROR: Not found: {args.get('path', '.')}"
-            items = list(p.iterdir())
+            # #1488: cap-plus-one detects overflow without materialising a hostile directory. Exact totals
+            # remain available for normal directories; an overflow is deliberately reported as "many".
+            items = []
+            overflow = False
+            for item in p.iterdir():
+                items.append(item)
+                if len(items) > LIST_DIR_HARD_CAP:
+                    overflow = True
+                    break
             total = len(items)
-            n_dirs_total = sum(1 for i in items if i.is_dir())  # #1183: count the FULL set before cap/limit
+            n_dirs_total = sum(1 for i in items if i.is_dir())
             if args.get("sort") == "time":
                 items.sort(key=lambda x: x.stat().st_mtime, reverse=True)
             else:
@@ -7612,17 +8206,26 @@ def _run_tool_dispatch(name: str, args: Dict[str, Any]) -> str:
             # numbers and let the model report them verbatim instead of re-counting.
             n_dirs = n_dirs_total
             n_files = total - n_dirs
-            count = _fmt_count(n_dirs, n_files)
+            count = (("At least " if overflow else "") + _fmt_count(n_dirs, n_files))
             out = f"{count}\n" + "\n".join(lines) if lines else "(empty)"
             shown = len(lines)
-            if shown < total:
+            if overflow:
+                # #1488 M1: on an overflowing dir the sample is the first LIST_DIR_HARD_CAP entries in
+                # FILESYSTEM order, so a sort/limit ranks only this partial sample — NOT the true newest
+                # across the whole dir (that would need a full walk, the DoS this cap avoids). Steer the
+                # model to NARROW the path, not to sort='time' (which was misleadingly reliable-sounding).
+                out += (f"\n... [GX10v3: first {shown} entries (filesystem order) of many"
+                        + (f"; hard cap {LIST_DIR_HARD_CAP} — narrow the path for a complete listing" if capped else f" (limit={limit})")
+                        + "; a sort/limit ranks only this partial sample, not the whole directory]")
+            elif shown < total:
                 out += (f"\n... [GX10v3: showing {shown} of {total} entries"
                         + (f" (hard cap {LIST_DIR_HARD_CAP} — use sort='time'+limit)" if capped else f" (limit={limit})")
                         + "]")
             return out
 
         elif name == "execute_command":
-            timeout = int(args.get("timeout", 30))
+            timeout_arg = args.get("timeout", _EXEC_COMMAND_TIMEOUT_S)
+            timeout = int(timeout_arg) if "timeout" in args else float(timeout_arg)
             command = args["command"]
             # #459: the fail-closed shell guardrail already ran at the top of run_tool (server-side, before
             # any bridge), so a blocked command never reaches here.
@@ -7632,56 +8235,22 @@ def _run_tool_dispatch(name: str, args: Dict[str, Any]) -> str:
             # get EOF immediately instead of blocking for the full timeout.
             # encoding/errors explicit: decode command output as UTF-8 lossily, so a
             # non-locale byte (cp1252 on Windows) never raises decoding the result.
-            if PLATFORM == "windows":
-                _bash = _git_bash()
-                if _bash and _detect_shell(command) == "bash":
-                    # #1183: a POSIX/bash command runs in Git Bash (both shells work, neither is forced).
-                    r = subprocess.run(
-                        [_bash, "-lc", command], stdin=subprocess.DEVNULL,
-                        capture_output=True, text=True, encoding="utf-8", errors="replace",
-                        timeout=timeout, cwd=_exec_cwd()   # S9c: run in the active project's root
-                    )
-                else:
-                    # #459: harden the PowerShell invocation — silence WriteProgress so a progress bar can
-                    # never draw into the renderer-owned conhost (a 2nd layer behind the deny-list above).
-                    hardened = "$ProgressPreference='SilentlyContinue'; " + command
-                    argv = ["powershell", "-NoProfile", "-NonInteractive",
-                            "-Command", hardened]
-                    r = subprocess.run(
-                        argv, stdin=subprocess.DEVNULL,
-                        capture_output=True, text=True, encoding="utf-8", errors="replace",
-                        timeout=timeout, cwd=_exec_cwd()   # S9c: run in the active project's root (None → process workdir)
-                    )
-            else:
-                run_cmd = command
-                if SANDBOX not in ("", "off", "none"):     # #1069: OS-isolate the command when a backend is present
-                    try:
-                        import sandbox as _sbx
-                        run_cmd, _ = _sbx.sandbox_command(command, SANDBOX)   # net-isolated; unchanged if no backend
-                    except Exception:   # noqa: BLE001 — sandboxing must never break the command path
-                        run_cmd = command
-                r = subprocess.run(
-                    run_cmd, shell=True, stdin=subprocess.DEVNULL,
-                    capture_output=True, text=True, encoding="utf-8", errors="replace",
-                    timeout=timeout, cwd=_exec_cwd()       # S9c: run in the active project's root (None → process workdir)
-                )
-                # #1196: BSD/macOS `ls` rejects the GNU-only `--color=always` (exit != 0), which would drop
-                # the fs-computed header/Answer (gated on exit 0). Retry the LISTING without the colour flag
-                # so it still works on a non-coreutils host. (Windows uses Git Bash = coreutils, no retry.)
-                if (r.returncode != 0 and "--color=always" in command
-                        and _listing_target_for_command(command) is not None):
-                    _fb = re.sub(r"\s*--color=always\b", "", command)
-                    _fb_cmd = _fb
-                    if SANDBOX not in ("", "off", "none"):
-                        try:
-                            import sandbox as _sbx
-                            _fb_cmd, _ = _sbx.sandbox_command(_fb, SANDBOX)
-                        except Exception:   # noqa: BLE001
-                            _fb_cmd = _fb
-                    r = subprocess.run(
-                        _fb_cmd, shell=True, stdin=subprocess.DEVNULL,
-                        capture_output=True, text=True, encoding="utf-8", errors="replace",
-                        timeout=timeout, cwd=_exec_cwd())
+            run_cmd, refusal = _sandbox_model_command(command)
+            if refusal is not None:
+                return refusal
+            r = _run_model_command_process(
+                run_cmd, timeout, _exec_cwd()          # S9c: active project's root (None → process workdir)
+            )
+            # #1196: BSD/macOS `ls` rejects the GNU-only `--color=always` (exit != 0), which would drop
+            # the fs-computed header/Answer (gated on exit 0). Retry the LISTING without the colour flag
+            # so it still works on a non-coreutils host. The retry is independently sandbox-prepared.
+            if (r.returncode != 0 and "--color=always" in command
+                    and _listing_target_for_command(command) is not None):
+                _fb = re.sub(r"\s*--color=always\b", "", command)
+                _fb_cmd, refusal = _sandbox_model_command(_fb)
+                if refusal is not None:
+                    return refusal
+                r = _run_model_command_process(_fb_cmd, timeout, _exec_cwd())
             out = (r.stdout + r.stderr).strip()
             if r.returncode == 0 and out:   # #1193: prepend a deterministic listing count (from the fs)
                 target = _listing_target_for_command(command)
@@ -7741,17 +8310,41 @@ def _run_tool_dispatch(name: str, args: Dict[str, Any]) -> str:
                 def _hit(line: str) -> bool:
                     return needle in line.lower()
             hits = []
+            files_scanned = 0
+            byte_truncated = False
+            budget_truncated = False
             for fp in _resolve_exec_path(directory).rglob(file_pattern):
                 if fp.is_file():
+                    if files_scanned >= _SEARCH_MAX_FILES:
+                        budget_truncated = True
+                        break
+                    files_scanned += 1
                     try:
-                        for i, line in enumerate(
-                            fp.read_text(encoding="utf-8", errors="replace").splitlines(), 1
-                        ):
+                        with fp.open("rb") as fh:
+                            raw_bytes = fh.read(_SEARCH_MAX_FILE_BYTES + 1)
+                        if len(raw_bytes) > _SEARCH_MAX_FILE_BYTES:
+                            byte_truncated = True
+                        text = raw_bytes[:_SEARCH_MAX_FILE_BYTES].decode("utf-8", errors="replace")
+                        for i, line in enumerate(text.splitlines(), 1):
                             if _hit(line):
                                 hits.append(f"{fp}:{i}: {line.strip()}")
+                                if len(hits) >= _SEARCH_HIT_CAP:
+                                    notes = [f"stopped at the {_SEARCH_HIT_CAP}-hit cap"]
+                                    if byte_truncated:
+                                        notes.append(f"one or more files exceeded the {_SEARCH_MAX_FILE_BYTES}-byte read cap")
+                                    return ("\n".join(hits) + "\n... [Ironclad: search truncated — "
+                                            + "; ".join(notes) + "] ...")
                     except Exception:
                         pass
-            return "\n".join(hits[:50]) if hits else "No matches"
+            notes = []
+            if budget_truncated:
+                notes.append(f"stopped after the {_SEARCH_MAX_FILES}-file scan budget")
+            if byte_truncated:
+                notes.append(f"one or more files exceeded the {_SEARCH_MAX_FILE_BYTES}-byte read cap")
+            out = "\n".join(hits) if hits else "No matches"
+            if notes:
+                out += "\n... [Ironclad: search truncated — " + "; ".join(notes) + "] ..."
+            return out
 
         elif name == "create_directory":
             _resolve_exec_path(args["path"]).mkdir(parents=True, exist_ok=True)
@@ -7845,8 +8438,8 @@ def _run_tool_dispatch(name: str, args: Dict[str, Any]) -> str:
                     f"(/approve) before an implementation handover; the engine refuses one until then.")
 
         elif name == "record_constraints":
-            if not CONSTRAINT_GATE_ENABLED:
-                return "ERROR: constraint gate disabled"
+            if not FRAMING_NOTES_ENABLED:
+                return "ERROR: framing notes disabled"
             try:
                 rel = record_constraints(
                     args.get("title", ""),
@@ -8004,7 +8597,9 @@ def _run_tool_dispatch(name: str, args: Dict[str, Any]) -> str:
             return f"ERROR: Unknown tool: {name}"
 
     except subprocess.TimeoutExpired:
-        return f"ERROR: Timeout after {args.get('timeout', 30)}s"
+        return f"ERROR: Timeout after {args.get('timeout', _EXEC_COMMAND_TIMEOUT_S)}s"
+    except _CommandCancelled:
+        return "ERROR: cancelled"
     except Exception as e:
         return f"ERROR: {e}"
 
@@ -8047,10 +8642,15 @@ class GX10:
         self._ensure_dirs()
         # Initialize the memory layer (fail-soft, once per process)
         global _MEMORY, _WARM, _TOKENS
-        if _MemoryManager is not None and _MEMORY_CONFIG and _MEMORY is None:
+        # Activation keys on a CONFIGURED endpoint, not on the config dict being non-empty: the typed
+        # schema (F6a) always seeds a full `memory`/`warm` default tree, so the dict is now truthy even
+        # when unconfigured. Without a base_url/url the layer stays off (hooks inert), as documented.
+        if (_MemoryManager is not None and _MEMORY is None
+                and str((_MEMORY_CONFIG or {}).get("base_url") or "").strip()):
             _MEMORY = _MemoryManager(_MEMORY_CONFIG)
         # Initialize the warm tier (B0) — optional; without a url the tier stays a no-op (fail-soft).
-        if _WarmTier is not None and _WARM_CONFIG and _WARM is None:
+        if (_WarmTier is not None and _WARM is None
+                and str((_WARM_CONFIG or {}).get("url") or "").strip()):
             _WARM = _WarmTier(_WARM_CONFIG)
         # Epic #366 — the per-engine token counter (vLLM /tokenize + calibrated char fallback).
         # GX10_TOKENIZE: unset/auto ⇒ probe only a real remote/LAN host; 1/on ⇒ force the probe
@@ -9215,6 +9815,7 @@ class GX10:
                 _rb = _READ_BUDGET_CV.set(cap)                        # read_file reads it for its own cap
                 try:
                     raw_result = None   # #1196: pre-strip raw result for the display (set for ingestion tools)
+                    result_failed = False
                     if name == "write_last_reply":
                         # #1048 (L1-write): escape-free authoring — persist the model's PREVIOUS reply text
                         # (already produced as ordinary output) instead of a huge JSON-escaped write_file
@@ -9228,11 +9829,13 @@ class GX10:
                             result_t = run_tool("write_file", {"path": args.get("path", ""),
                                                                "content": body,
                                                                "mode": args.get("mode", "write")})
+                        result_failed = result_t.startswith("ERROR")
                     else:
                         # #1202: run_tool itself renders a listing's AnswerData into the localized Answer
                         # (command-gated, all topologies) — so the machine line is already resolved here,
                         # BEFORE the cap/fence below, for every caller.
                         result_t = run_tool(name, args)
+                        result_failed = result_t.startswith("ERROR")
                         # #1196: keep the RAW (possibly ANSI-coloured, e.g. `ls --color`) result for the
                         # DISPLAY, and STRIP escapes for the model context + cap/fence below — the model reads
                         # clean text (escape bytes are noise and skew the char count), the user sees colour.
@@ -9243,17 +9846,16 @@ class GX10:
                         raw_result = result_t
                         if name == "execute_command":
                             result_t = _strip_ansi(result_t)
-                        # #1046 (L1-choke): cap EVERY ingestion tool's result at this one choke point — not
+                        # #1046 (L1-choke): cap EVERY character-capped ingestion result at this choke point —
                         # just read_file (which caps itself) but search_files/list_directory/execute_command
                         # AND the local-bridge return (which bypasses read_file's cap). Idempotent + scoped;
-                        # other tools (web_search/parallel_reason/MPR/memory) pass through untouched.
+                        # structured/provider/plugin/memory results deliberately bypass this destructive cap.
                         result_t = _cap_ingested_result(name, result_t, cap)
-                        if INJECTION_DEFENSE and name in _INGESTION_TOOLS:   # #1068: fence untrusted content
-                            try:
-                                from ack import injection as _inj
-                                result_t = _inj.wrap_untrusted(result_t, source=name)
-                            except Exception:   # noqa: BLE001 — the defense must never break a turn
-                                pass
+                        # #1464 F3b: ONE mandatory post-serialization fence for every untrusted source,
+                        # including web/provider/plugin/MPR/memory results. A wrapper failure returns only
+                        # a safe error; raw content is never appended to the model context.
+                        result_t = _fence_untrusted_result(name, result_t)
+                        result_failed = result_failed or result_t.startswith("ERROR")
                     # #1048: warn-only integrity guard — if the generation that EMITTED this write was cut off
                     # by the token limit (finish_reason=length), the body may be silently truncated (a
                     # char-count can't detect it). Warn + steer to append; never block.
@@ -9263,10 +9865,9 @@ class GX10:
                         result_t += ("\n\n[Ironclad: WARNING — the generation that produced this write was cut "
                                      "off by the token limit (finish_reason=length); the file may be truncated. "
                                      "Continue it with mode='append'.]")
-                    _maybe_audit(name, args, result_t)   # #1084: tamper-evident per-action audit (default-off)
                 finally:
                     _READ_BUDGET_CV.reset(_rb)
-                _ok = not result_t.startswith("ERROR")
+                _ok = not result_failed
                 # #1196: DISPLAY the raw (coloured) result for ingestion tools (e.g. `ls --color`), else the
                 # final result_t (carries write-warnings etc.). A line that carries its OWN colour streams
                 # as-is (native ls colours — the prefix stays plain so the client still parses the block); a
@@ -9405,6 +10006,7 @@ HELP = """
     config get <key>          read a dotted config key (e.g. mpr.enabled)
     config set <key> <value>  override a dotted config key at runtime
                               (on|off|true|false|num|str; e.g. mpr.enabled on)
+    quality reset    clear a latched output-quality staging hold
     tool <name> <args|text>   run a tool DIRECTLY/deterministically (no model election, no RAG);
                               text → first required arg, or {json}. e.g. tool mpr_research <frage>
     rag on|off       toggle per-turn retrieval (RAG) for this session
@@ -9450,7 +10052,7 @@ def _render_config() -> str:
         col(f"  tasks         : dedup_threshold={tk['dedup_threshold']}", C.GRAY),
         col(f"  onboarding    : {bool(ob['enabled'])}", C.GRAY),
         col(f"  autopilot     : enabled={bool(ap['enabled'])} · claude={ap['claude_bin']} · max_concurrent={ap['max_concurrent']} · effort={ap['default_effort']} · stream={bool(ap.get('stream',False))} · terminate={bool(ap.get('terminate_on_advance',False))} · autoplan={bool(ap.get('autoplan',False))} · log_terminal={bool(ap.get('log_terminal',False))}", C.GRAY),
-        col(f"  watcher       : enabled={bool(wa['enabled'])} · interval={wa['interval']}s · dir={wa['feedback_dir']}", C.GRAY),
+        col(f"  watcher       : enabled={bool(_WATCHER_ENABLED)} · interval={wa['interval']}s · dir={wa['feedback_dir']}", C.GRAY),
         col(f"  thinking_auto : {len(ta['planning_keywords'])} planning / {len(ta['routine_keywords'])} routine keywords", C.GRAY),
         col(f"  workspace     : {len(ws['dirs'])} dirs", C.GRAY),
         col(f"  ui            : max_lines={ui['max_lines']} · refresh={ui['refresh_interval']}s", C.GRAY),
@@ -9460,8 +10062,8 @@ def _render_config() -> str:
 
 # ─── Runtime config control (/config get|set) ─────────────────
 # Generic, plugin-agnostic runtime override of the live config tree. `/config set <dotted.key> <value>`
-# writes the merged in-memory config (_EFFECTIVE_CFG) and re-derives the engine globals via _apply_config;
-# plugin sections (e.g. an `mpr` block read by the MPR plugin per request) take effect on their next call.
+# clones the merged config, validates and derives it completely, then commits globals + integrations before
+# publishing the candidate. Plugin sections (e.g. MPR) take effect on their next call after the same commit.
 # Secret-free + no plugin-specific knowledge here — see docs/config-runtime.md.
 #
 # Frozen keys are BOOT-ONLY: they wire something at startup (e.g. the offload runner for `setup.type`),
@@ -9470,12 +10072,37 @@ def _render_config() -> str:
 # + the effective bind host (security.profile, e.g. sealed→loopback). A runtime change would
 # NOT re-wire the already-built dispatcher/policy/socket → `/config set` refuses it
 # with the boot-only message. Set it in the deploy config + restart. See config-runtime.md.
-_FROZEN_CONFIG_KEYS = frozenset({
-    "setup.type", "security.profile",
-    # epic #505: boot-only so a runtime `/config set` cannot lift the seal or re-point the search
-    # adapter/key without a restart (else it defeats the boot-time fail-closed guarantees).
-    "security.web_in_sealed", "search.enabled", "search.adapter", "search.api_key_env",
-})
+_FROZEN_CONFIG_KEYS = config_schema.BOOT_ONLY_KEYS
+
+_CONFIG_TOMBSTONES = {
+    key: spec.reason for key, spec in config_schema.TOMBSTONES.items() if not spec.alias
+}
+
+_CONFIG_ALIASES = {
+    key: spec.replacement for key, spec in config_schema.TOMBSTONES.items() if spec.alias
+}
+
+_ENV_TOMBSTONES = {
+    "GX10_TOOLING_ENVELOPE_ENABLED": "tooling authorization is always on",
+    "GX10_AUDIT_ENABLED": "mutating-action audit is always on",
+    "GX10_INJECTION_DEFENSE": "injection fencing is always on",
+    "GX10_EGRESS_ANALYSIS_ENABLED": "egress enforcement is always on",
+    "GX10_AMBIGUITY_DETECT": "the no-guessing ambiguity gate is always on",
+    "GX10_PROVIDERS": "setup.type is the single provider-topology authority",
+}
+
+_SANDBOX_POLICIES = frozenset({"auto", "bwrap", "firejail"})
+_RETIRED_SANDBOX_POLICIES = frozenset({"off", "none"})
+
+
+def _validated_sandbox_policy(value: Any) -> str:
+    """Return a live sandbox policy or raise. Retired off/none are handled at their input boundaries."""
+    if not isinstance(value, str):
+        raise ValueError("security.sandbox must be one of: auto, bwrap, firejail")
+    policy = value.strip().lower()
+    if policy not in _SANDBOX_POLICIES:
+        raise ValueError("security.sandbox must be one of: auto, bwrap, firejail")
+    return policy
 
 
 def _coerce_cfg_value(raw: str):
@@ -9517,6 +10144,67 @@ def _cfg_get(cfg: Dict[str, Any], dotted: str):
             return None
         node = node[k]
     return node
+
+
+def _consume_config_aliases(cfg: Dict[str, Any]) -> None:
+    """Map one-release legacy leaves to their canonical keys, warn, and remove the aliases."""
+    for legacy, canonical in _CONFIG_ALIASES.items():
+        keys = legacy.split(".")
+        node: Any = cfg
+        parents: "List[tuple[Dict[str, Any], str]]" = []
+        for key in keys[:-1]:
+            if not isinstance(node, dict) or key not in node:
+                break
+            parents.append((node, key))
+            node = node[key]
+        else:
+            if not isinstance(node, dict) or keys[-1] not in node:
+                continue
+            value = node[keys[-1]]
+            _cfg_set(cfg, canonical, value)
+            node.pop(keys[-1])
+            for parent, key in reversed(parents):
+                child = parent.get(key)
+                if isinstance(child, dict) and not child:
+                    parent.pop(key)
+                else:
+                    break
+            print(col(f"  [DEPRECATED] config key '{legacy}' is an alias for '{canonical}'; "
+                      "the alias will be removed after one release.", C.YELLOW))
+
+
+def _config_tombstone_reason(dotted: str) -> Optional[str]:
+    """Return the retirement reason for an exact tombstone or a leaf below a retired subtree."""
+    if dotted in _CONFIG_TOMBSTONES:
+        return _CONFIG_TOMBSTONES[dotted]
+    return next((reason for retired, reason in _CONFIG_TOMBSTONES.items()
+                 if dotted.startswith(retired + ".")), None)
+
+
+def _consume_config_tombstones(cfg: Dict[str, Any]) -> None:
+    """Warn once per loaded tree for retired leaves, remove them, and never apply their values."""
+    for dotted, replacement in _CONFIG_TOMBSTONES.items():
+        keys = dotted.split(".")
+        node: Any = cfg
+        parents: "List[tuple[Dict[str, Any], str]]" = []
+        for key in keys[:-1]:
+            if not isinstance(node, dict) or key not in node:
+                break
+            parents.append((node, key))
+            node = node[key]
+        else:
+            if isinstance(node, dict) and keys[-1] in node:
+                node.pop(keys[-1])
+                print(col(f"  [DEPRECATED] config key '{dotted}' is retired and ignored; {replacement}.",
+                          C.YELLOW))
+                for parent, key in reversed(parents):
+                    child = parent.get(key)
+                    if isinstance(child, dict) and not child:
+                        parent.pop(key)
+                    else:
+                        break
+    for key, default in config_schema.CONTAINER_DEFAULTS.items():
+        cfg.setdefault(key, copy.deepcopy(default))
 
 
 def _cfg_flatten_keys(cfg: Dict[str, Any], prefix: str = "") -> "List[str]":
@@ -10669,10 +11357,29 @@ def _dispatch(agent: GX10, user_input: str):
             import command_spec as _command_spec   # #953: spec-derived usage (single source)
             _ui_print(col("  " + _command_spec.guided_usage("config set"), C.YELLOW))
         elif _EFFECTIVE_CFG is None:
-            _ui_print(col("  [config] no live config to set (start the server first)", C.YELLOW))
+            _ui_print(col("  [config] refused: no live config to set (start the server first)", C.RED))
+        elif parts[2].strip() in _CONFIG_ALIASES:
+            legacy = parts[2].strip()
+            key, val = _CONFIG_ALIASES[legacy], _coerce_cfg_value(parts[3])
+            refusal = _config_set_atomic(key, val)
+            if refusal is not None:
+                _ui_print(col(f"  [config] refused: {refusal}", C.RED))
+            else:
+                _ui_print(col(f"  [config] '{legacy}' is deprecated; set {key} = {val!r} "
+                              "(alias kept for one release)", C.YELLOW))
+        elif _config_tombstone_reason(parts[2].strip()) is not None:
+            _ui_print(col(f"  [config] refused: '{parts[2].strip()}' is retired and cannot be set; "
+                          f"{_config_tombstone_reason(parts[2].strip())}.", C.RED))
+        elif (parts[2].strip() == "security.sandbox"
+              and parts[3].strip().lower() in _RETIRED_SANDBOX_POLICIES):
+            _ui_print(col("  [config] refused: security.sandbox off/none is retired and ignored; model command "
+                          "isolation remains mandatory.", C.RED))
+        elif (parts[2].strip() == "security.sandbox"
+              and parts[3].strip().lower() not in _SANDBOX_POLICIES):
+            _ui_print(col("  [config] refused: security.sandbox must be one of: auto, bwrap, firejail.", C.RED))
         elif parts[2].strip() in _FROZEN_CONFIG_KEYS:
-            _ui_print(col(f"  [config] '{parts[2].strip()}' is boot-only — set it in the deploy "
-                          f"(env/config-file), not at runtime.", C.YELLOW))
+            _ui_print(col(f"  [config] refused: '{parts[2].strip()}' is boot-only — set it in the deploy "
+                          f"(env/config-file), not at runtime.", C.RED))
         elif parts[2].strip().split(".")[0] not in _EFFECTIVE_CFG:
             # #932 gap-2: an unknown ROOT section is a typo, not a real key — REFUSE (no silent write, no
             # false-GREEN). Known core sections + existing plugin namespaces (e.g. mpr.*) have a live root,
@@ -10681,12 +11388,28 @@ def _dispatch(agent: GX10, user_input: str):
             _ui_print(col("  " + _msg("config.unknown_key", name=parts[2].strip()), C.RED))
         else:
             key, val = parts[2].strip(), _coerce_cfg_value(parts[3])
-            _cfg_set(_EFFECTIVE_CFG, key, val)
-            try:
-                _apply_config(_EFFECTIVE_CFG)        # re-derive core globals; plugin sections re-read per call
-            except Exception as e:  # noqa: BLE001 — non-core key (e.g. a plugin section) → dict write stands
-                _ui_print(col(f"  [config] stored (not a core global: {e!r})", C.GRAY))
-            _ui_print(col(f"  [config] set {key} = {val!r}", C.GREEN))
+            if key in config_schema.LEAVES:
+                try:
+                    config_schema.validate_leaf(key, val)
+                except config_schema.ConfigError as e:
+                    _ui_print(col(f"  [config] refused: {e}", C.RED))
+                    return
+            elif key.split(".")[0] in {leaf.split(".")[0] for leaf in config_schema.LEAVES}:
+                _ui_print(col("  " + _msg("config.unknown_key", name=key), C.RED))
+                return
+            refusal = _config_set_atomic(key, val)
+            if refusal is not None:
+                _ui_print(col(f"  [config] refused: {refusal}", C.RED))
+            else:
+                _ui_print(col(f"  [config] set {key} = {val!r}", C.GREEN))
+    elif cmd == "quality reset":
+        global _QUALITY_TRIPPED
+        with _QUALITY_LOCK:
+            breaker = _quality_breaker()
+            if breaker is not None:
+                breaker.reset()
+            _QUALITY_TRIPPED = None
+        _ui_print(col("  [quality] reset — staging hold cleared.", C.GREEN))
     elif cmd.startswith("read "):
         _ui_print(agent.manual_read(user_input[5:].strip()))
     elif cmd.startswith("write "):
@@ -10707,19 +11430,20 @@ def _dispatch(agent: GX10, user_input: str):
         arg   = parts[1] if len(parts) > 1 else ""
         n_arg = parts[2] if len(parts) > 2 else None
         if arg == "on":
-            if n_arg is not None:
-                try:
-                    AUTOPILOT_MAX_TASKS = int(n_arg)
-                    if _EFFECTIVE_CFG: _EFFECTIVE_CFG["autopilot"]["autoplan_max_tasks"] = AUTOPILOT_MAX_TASKS
-                except ValueError:
-                    _ui_print(col(f"[AUTO] invalid number: {n_arg!r}", C.RED))
-                    return  # type: ignore
+            try:
+                task_cap = AUTOPILOT_MAX_TASKS if n_arg is None else int(n_arg)
+                config_schema.validate_leaf("autopilot.autoplan_max_tasks", task_cap)
+            except (ValueError, config_schema.ConfigError) as exc:
+                _ui_print(col(f"[AUTO] invalid task cap {n_arg!r}: {exc}", C.RED))
+                return  # type: ignore
+            AUTOPILOT_MAX_TASKS = task_cap
+            if _EFFECTIVE_CFG:
+                _EFFECTIVE_CFG["autopilot"]["autoplan_max_tasks"] = AUTOPILOT_MAX_TASKS
             _WATCHER_ENABLED   = True
             AUTOPILOT_ENABLED  = True
             _AUTOPLAN_DONE     = 0
             AUTOPILOT_AUTOPLAN = True
             if _EFFECTIVE_CFG:
-                _EFFECTIVE_CFG["watcher"]["enabled"]    = True
                 _EFFECTIVE_CFG["autopilot"]["enabled"]  = True
                 _EFFECTIVE_CFG["autopilot"]["autoplan"] = True
             cap = (f"max {AUTOPILOT_MAX_TASKS} tasks, stops automatically" if AUTOPILOT_MAX_TASKS > 0
@@ -10741,7 +11465,6 @@ def _dispatch(agent: GX10, user_input: str):
             AUTOPILOT_AUTOPLAN = False
             _AUTOPLAN_DONE     = 0
             if _EFFECTIVE_CFG:
-                _EFFECTIVE_CFG["watcher"]["enabled"]    = False
                 _EFFECTIVE_CFG["autopilot"]["enabled"]  = False
                 _EFFECTIVE_CFG["autopilot"]["autoplan"] = False
             _ui_print(col("[AUTO] GUIDED mode — nothing fires by itself (advance/launch/planning are "
@@ -10801,27 +11524,22 @@ def _dispatch(agent: GX10, user_input: str):
         n_arg = parts[2] if len(parts) > 2 else None
         if arg == "on":
             # Optional count: "autoplan on 5"
-            if n_arg is not None:
-                try:
-                    AUTOPILOT_MAX_TASKS = int(n_arg)
-                    if _EFFECTIVE_CFG: _EFFECTIVE_CFG["autopilot"]["autoplan_max_tasks"] = AUTOPILOT_MAX_TASKS
-                except ValueError:
-                    _ui_print(col(f"[AUTOPLAN] invalid number: {n_arg!r}", C.RED))
-                    return  # type: ignore
+            try:
+                task_cap = AUTOPILOT_MAX_TASKS if n_arg is None else int(n_arg)
+                config_schema.validate_leaf("autopilot.autoplan_max_tasks", task_cap)
+            except (ValueError, config_schema.ConfigError) as exc:
+                _ui_print(col(f"[AUTOPLAN] invalid task cap {n_arg!r}: {exc}", C.RED))
+                return  # type: ignore
+            AUTOPILOT_MAX_TASKS = task_cap
+            if _EFFECTIVE_CFG:
+                _EFFECTIVE_CFG["autopilot"]["autoplan_max_tasks"] = AUTOPILOT_MAX_TASKS
             _AUTOPLAN_DONE     = 0   # always reset the counter on activation
             AUTOPILOT_AUTOPLAN = True
             if _EFFECTIVE_CFG: _EFFECTIVE_CFG["autopilot"]["autoplan"] = True
-            if AUTOPILOT_MAX_TASKS > 0:
-                limit_info = f", max {AUTOPILOT_MAX_TASKS} tasks — stops automatically"
-                _ui_print(col(
-                    f"[AUTOPLAN] continuation ON{limit_info}",
-                    C.GREEN))
-            else:
-                _ui_print(col(
-                    "[AUTOPLAN] continuation ON — max_tasks=0 (no automatic stop: an epic's unit "
-                    "count bounds a design drain, but a capability backlog runs until it is empty!)\n"
-                    "  → recommendation: cap it with  autoplan on N  (or  auto on N)",
-                    C.YELLOW))
+            limit_info = f", max {AUTOPILOT_MAX_TASKS} tasks — stops automatically"
+            _ui_print(col(
+                f"[AUTOPLAN] continuation ON{limit_info}",
+                C.GREEN))
             _ui_print(col(
                 "  ⚠ COST: every continued task launches a PAID coder run (claude/codex/…) — the "
                 "planner turn is the cheap part.\n"
@@ -11045,8 +11763,9 @@ def _surface_coder_result(task_id: str, agent: str, rc, logfile) -> None:
                     _txt = _fb.read_text(encoding="utf-8")
                 except Exception:   # noqa: BLE001
                     continue
-                if _txt.strip() and not _feedback_status(_txt):
-                    _fb.write_text("status: done\n" + _txt, encoding="utf-8", newline="\n")
+                _stamped = _stamp_done_if_clean(_txt, rc)
+                if _stamped != _txt:
+                    _fb.write_text(_stamped, encoding="utf-8", newline="\n")
                     _ui_print(col(f"  [AUTO] {task_id}: stamped `status: done` on {_fb.name} "
                                   f"(exit 0, capture had no status token)", C.CYAN))
         has_usable = False
@@ -11083,6 +11802,10 @@ def _do_launch(task_id: str, agent: str):
     in_progress. The subprocess runs detached; a monitor thread frees the
     concurrency slot on exit. On error the slot is freed
     immediately. (The reconciler has already reserved the slot.)"""
+    if _task_is_escalated(_store().get(task_id)):
+        _autopilot_release()
+        _ui_print(col(f"  [AUTO] {task_id} is terminally escalated — launch discarded", C.YELLOW))
+        return
     ho = _find_handover(task_id)
     if not ho:
         _autopilot_release()
@@ -11157,13 +11880,36 @@ def _do_launch(task_id: str, agent: str):
               f"advances ONLY on `status: done`), otherwise `status: blocked` or `status: clarification_needed`.")
     _bin = spec.bin or AUTOPILOT_CLAUDE_BIN
     _tmpl = spec.cmd_template or ""
-    # #449 (review B-1): the Claude `--print` autopilot shape KEEPS its stream plumbing (--verbose +
-    # output-format stream-json + AUTOPILOT_EXTRA_ARGS) so the default OPUS/SONNET launch stays
-    # byte-identical — the defaults carry a cmd_template now, so branch on the SHAPE, not its presence.
+    # #449 (review B-1): the Claude `--print` autopilot shape keeps its stream plumbing. The permission
+    # mode comes from the agent spec; bypass is emitted only for an explicit per-agent capability opt-in.
     _is_claude_print = _bin in (AUTOPILOT_CLAUDE_BIN, "claude") and "--print" in _tmpl
     if _is_claude_print or not _tmpl:
         argv = [_bin, "--model", str(model), "--effort", str(effort)]
         extra = list(AUTOPILOT_EXTRA_ARGS)
+        bypass_allowed = bool(getattr(spec.capabilities, "permission_bypass", False))
+        bypass_requested = spec.permission_mode == "bypassPermissions"
+        dangerous_flag = "--dangerously-skip-permissions"
+        if dangerous_flag in extra and not bypass_allowed:
+            _autopilot_release()
+            _ui_print(col(
+                f"  ✗ [AUTO] agent {agent} requires capabilities.permission_bypass=true before "
+                f"{dangerous_flag} may be used — launch {task_id} discarded",
+                C.RED,
+            ))
+            return
+        if bypass_requested:
+            if not bypass_allowed:
+                _autopilot_release()
+                _ui_print(col(
+                    f"  ✗ [AUTO] agent {agent} requests bypassPermissions without "
+                    f"capabilities.permission_bypass=true — launch {task_id} discarded",
+                    C.RED,
+                ))
+                return
+            if dangerous_flag not in extra:
+                extra.append(dangerous_flag)
+        elif dangerous_flag not in extra and "--permission-mode" not in extra:
+            extra.extend(["--permission-mode", spec.permission_mode or "default"])
         if AUTOPILOT_STREAM:
             # Live streaming: stream-json NEEDS --verbose (otherwise claude aborts).
             # Stdout is piped to the line-oriented log drainer below so tailers see live output without
@@ -11311,7 +12057,8 @@ def _trigger_coder(task_id: "Optional[str]" = None) -> str:
         if target is None:
             return f"ERROR: no such task {task_id!r}."
     else:
-        pend = sorted(store.list("pending"), key=lambda t: (t.get("created_at", ""), t.get("id", "")))
+        pend = sorted((t for t in store.list("pending") if not _task_is_escalated(t)),
+                      key=lambda t: (t.get("created_at", ""), t.get("id", "")))
         target = next((t for t in reversed(pend) if _find_handover(t.get("id", ""))), None)
         if target is None:
             return ("No staged handover to launch — nothing pending has a handover. Stage one via "
@@ -11320,6 +12067,8 @@ def _trigger_coder(task_id: "Optional[str]" = None) -> str:
     # 2. double-launch guard — in_progress (running) OR done (a stale handover that advance failed to unlink)
     if target.get("status") in ("in_progress", "done"):
         return f"{tid} is already {target.get('status')} — not relaunched."
+    if _task_is_escalated(target):
+        return f"{tid} is terminally escalated — not relaunched."
     ho = _find_handover(tid)
     if not ho:
         return f"ERROR: {tid} has no staged handover file — stage_handover first."
@@ -11347,7 +12096,7 @@ def _trigger_coder(task_id: "Optional[str]" = None) -> str:
     #    atom, but it does not race: tool dispatch runs under _AGENT_LOCK (one turn at a time) and the
     #    orchestrator is the SINGLE steering author, so two launch_coder calls never overlap; the autopilot
     #    daemon (the only other launcher) stays off by default.
-    if AUTOPILOT_MAX_CONCURRENT and _autopilot_active() >= AUTOPILOT_MAX_CONCURRENT:
+    if _autopilot_active() >= AUTOPILOT_MAX_CONCURRENT:
         return (f"BUSY: {_autopilot_active()} coder(s) already running (max_concurrent="
                 f"{AUTOPILOT_MAX_CONCURRENT}) — {tid} not launched, retry after one finishes.")
     # 5. reserve a slot + launch via the SAME machinery (NOT AUTOPILOT_ENABLED-gated). `_do_launch` flips the
@@ -11412,6 +12161,8 @@ def _reconcile_once(store: "TaskStore", enqueue, seen_mtime: Dict[str, float],
     if AUTOPILOT_ENABLED and launch_enqueue is not None and launched is not None:
         for task in sorted(store.list("pending"),
                            key=lambda t: (t.get("created_at", ""), t.get("id", ""))):
+            if _task_is_escalated(task):
+                continue
             tid = task.get("id") or ""
             ho = _find_handover(tid)
             if not ho:
@@ -11427,7 +12178,7 @@ def _reconcile_once(store: "TaskStore", enqueue, seen_mtime: Dict[str, float],
                 ho_key = (tid, 0.0)
             if ho_key in launched:
                 continue
-            if AUTOPILOT_MAX_CONCURRENT and _autopilot_active() >= AUTOPILOT_MAX_CONCURRENT:
+            if _autopilot_active() >= AUTOPILOT_MAX_CONCURRENT:
                 break                         # no free slot → retry later
             # #454: operator pin override. #456: a budget failover stays within the task-class-capable
             # agents on the autopilot launch path too (NOT just the server /pending path) — else a tripped
@@ -11441,8 +12192,8 @@ def _reconcile_once(store: "TaskStore", enqueue, seen_mtime: Dict[str, float],
 
     # S7 (#1229): when decoupled and only autopilot is on, this is a launch-only tick — the feedback-advance
     # side belongs to the watcher concern. Byte-identical when coupled (the loop only runs with watcher on).
-    # ── S7 (#1229) heartbeat side: flag an in_progress task with no progress signal (coder log / feedback
-    #    mtime) for HEARTBEAT_STALL_S seconds. 0 ⇒ off / byte-identical. Runs whenever the loop ticks —
+    # ── S7 (#1229) heartbeat side: flag an in_progress task that had a progress signal (coder log /
+    #    feedback mtime) and then went silent for HEARTBEAT_STALL_S seconds. Runs whenever the loop ticks —
     #    INDEPENDENT of the watcher/feedback concern (a wedged autopilot coder must be caught in decoupled,
     #    watcher-off mode too), so it sits BEFORE the decoupled feedback-side skip. Dedup + un-stall via the
     #    persistent `enqueued` set (a `__stall_<tid>` key), mirroring the orphan-warning dedup.
@@ -11497,6 +12248,8 @@ def _reconcile_once(store: "TaskStore", enqueue, seen_mtime: Dict[str, float],
                     f"Analysis documents do not belong in the .work/feedback inbox",
                     C.YELLOW))
     for task in (store.list("pending") + store.list("in_progress")):
+        if _task_is_escalated(task):
+            continue
         tid = task.get("id") or ""
         staged = _task_agent(task)           # expected agent (not from an arbitrary filename!)
         # #454 (review B): the handover may have run under a pin that has since changed/cleared — so the
@@ -11727,7 +12480,10 @@ def _continuation_tick(tid: str, enqueue) -> None:
 
 
 def _code_defaults() -> Dict[str, Any]:
-    """Snapshot of the module constants as the lowest precedence level."""
+    """Return a fresh lowest-precedence tree derived from the typed schema."""
+    return config_schema.defaults_tree()
+
+    # The schema is authoritative; the legacy literal below is unreachable during the staged F6a diff.
     return {
         "connection": {
             "base_url":    DEFAULT_BASE_URL,
@@ -11761,8 +12517,7 @@ def _code_defaults() -> Dict[str, Any]:
         "notify": {                                     # #1083: escalation → webhook (default OFF)
             "webhook": NOTIFY_WEBHOOK,                   # deploy secret via GX10_NOTIFY_WEBHOOK; empty ⇒ off
         },
-        "audit": {                                      # #1084/#1067: per-action tamper-evident audit ledger
-            "enabled": AUDIT_ENABLED,                   # opt-in: record tool actions (default OFF)
+        "audit": {                                      # #1084/#1067: mandatory tamper-evident audit ledger
             "scope":   AUDIT_SCOPE,                      # #1067: "mutating" (default) | "all" (full tool surface)
         },
         "metrics": {                                    # #1060: runtime telemetry — GET /metrics + SLO/anomaly
@@ -11774,21 +12529,13 @@ def _code_defaults() -> Dict[str, Any]:
             "enabled":    ALERT_ENABLED,                # opt-in: periodic SLO/anomaly self-scan → webhook page
             "interval_s": 300,                          # how often the self-scan evaluates the SLO/anomaly
         },
-        "safety": {                                     # #1065: autonomy-safety pre-flight gates (default OFF)
-            "ambiguity_detect": False,                  # #1066 Variant-B: warn on an ambiguous handover requirement
-            # #1341 (epic #1344 S5): L2 conflict-detect + L3 hard-check enablement. Default OFF →
-            # byte-identical. Detect (S3) and compare (S6) wire on later; MPR worker uses ace.fork_mpr.enabled.
-            "constraint_conflict_detect": False,
-        },
+        "safety": {},                                    # #1065: autonomy-safety operational settings
         "platform": {
             "mode": PLATFORM_MODE,   # "auto" | "windows" | "linux"
         },
         "tasks": {
             "dedup_threshold": TASKS_DEDUP_THRESHOLD,
             "id_prefix":       TASK_PREFIX,
-        },
-        "ack": {
-            "enabled": ACK_ENABLED,
         },
         "lodestar": {
             "enabled": LODESTAR_ENABLED,
@@ -11802,33 +12549,23 @@ def _code_defaults() -> Dict[str, Any]:
             "default": {},
             "by_type": {},
         },
-        "lessons": {
-            # epic #602 SUB-5: the project-private lesson distiller (a LessonProvider registered via
-            # ack.lessons.set_provider). OPT-IN / default OFF → byte-identical: no provider is wired, so
-            # the #601 lesson seam (handover brief read + completion write + scope-aware forget) stays a
-            # no-op. When ON, EngineLessonStore persists scope-keyed lessons under ironclad_home()/lessons;
-            # the typed distiller schema is provider-internal. C1 = project-private only (global
-            # user_preferences tier deferred — needs the curated-global store + a promote() redactor).
-            "enabled":       False,
-            "max_per_scope": 200,    # compaction cap per scope (oldest dropped first)
-        },
         "quality": {
             # epic #602 SUB-9: a SEPARATE per-task output-quality circuit breaker (distinct from the
-            # availability breaker _CODE_AGENT_BREAKER). OPT-IN / default OFF → no breaker is built → no-op
-            # byte-identical. When ON, a QualityBreaker trips on `min_consecutive` mark-only verifier scores
-            # (ack.verify) below `threshold`; a trip is ADVISORY (escalate/surface, NEVER a hard-abort).
-            "enabled":         False,
+            # availability breaker _CODE_AGENT_BREAKER). Always present and fed from handover verdicts;
+            # a sustained trip holds the next staging write. The leaves below are operational tuning only.
             "threshold":       0.5,
             "min_consecutive": 3,
             "window":          20,
         },
         "process": {
-            # epic #602 SUB-6: Process-Level Self-Correction. OPT-IN / default OFF → no process-lesson is
-            # recorded at completion and no hint is injected pre-turn (byte-identical). It records TYPED
-            # process-lessons via the concrete EngineLessonStore (so it also needs lessons.enabled), NOT the
-            # string-only ack.lessons seam.
-            "enabled":   False,
-            "max_hints": 3,
+            # Optional pre-turn retrieval of known working approaches from the always-on ACE provider.
+            # This switch controls hints only; ACE reflection and writes are not configurable here.
+            "hints_enabled": False,
+            "max_hints":     3,
+        },
+        "framing_notes": {
+            # Optional capture/exposure only. Design authority and implementation checks are always on.
+            "enabled": False,
         },
         "ace": {
             # epic #855 ACE-WIRE (#863): the always-on Agentic Context Engineering loop-intelligence core.
@@ -11842,29 +12579,19 @@ def _code_defaults() -> Dict[str, Any]:
             "rounds":      1,      # reflection rounds per online adaptation (L-001)
             "top_k":       8,      # bullets injected into the Generator handover context (H-001)
             "cost":        1,      # budget units charged per online adaptation (when a budget is wired)
-            "safe_promote": False, # #1070 learned-state safety: snapshot-before-adapt + eval-gate (default OFF)
             "embed_url":   "",     # the memory-service /embed endpoint (semantic dedup/retrieval); "" ⇒ derive
                                    # from GX10_MEMORY_URL, else lexical fallback (the dependency-free default)
         },
         "verify": {
-            # epic #602 SUB-4 / 2.1: the MARK-ONLY Verifier on the dev-task pipeline. OPT-IN / default OFF →
-            # no hook is registered, so the `pre_handover` Hook-Bus dispatch is an O(1) no-op (byte-identical).
-            # When ON, a runner evaluates each staged task: deterministic BEHAVIORAL rules over task_json +
-            # (when a memory tier is up) GROUNDING of the handover's claims against the cold store. It produces
-            # a VerdictResult the Quality breaker (#602 SUB-9) reads — it NEVER gates a handover. The LLM-judge
-            # is a separate explicit opt-in (it charges the budget ledger) and is not run by this hook.
-            "enabled":             False,
+            # Required deterministic rules gate staging synchronously. Grounding remains advisory and feeds
+            # the always-on Quality breaker when available. The LLM judge remains a separate explicit opt-in.
             "grounding_threshold": 0.5,
         },
         "strategy": {
-            # epic #602 SUB-3/SUB-7 (2.4-2.5): the failure→action policy on the code-agent failover. OPT-IN /
-            # default OFF → no FailureClass is recorded on a run failure and no strategy is applied
-            # (byte-identical). When ON, a code-agent run failure is classified into the shared FailureClass
-            # (#805) and the Strategy Revisor maps it to a targeted action on the failover/retry path (#806):
-            # a per-task attempt counter vs `budget` escalates to HUMAN_ESCALATION when spent (no endless
-            # silent failover). MARK-ONLY/advisory — it surfaces, never hard-aborts.
-            "enabled": False,
-            "budget":  3,
+            # epic #602 SUB-3/SUB-7 (2.4-2.5): the always-on finite failure strategy classifies every failed
+            # code-agent run and maps it to a targeted action. The positive bounded attempt budget escalates
+            # to a durable terminal task state when spent, preventing endless silent failover.
+            "budget": 3,
         },
         "security": {
             # Phase-d trust profile (single-tenant): open | token | sealed.
@@ -11875,12 +12602,10 @@ def _code_defaults() -> Dict[str, Any]:
             "session_heartbeat_s": 30,
             "code_locality":       "mount",   # sealed forces "local"
             "web_in_sealed":       False,     # epic #505 S7: opt-in to allow outbound web_search under sealed
-            "injection_defense":   False,     # #1068: fence untrusted ingested content (data-not-instructions)
-            "sandbox":             "off",     # #1069: OS exec sandbox — off | auto | bwrap | firejail (Linux)
+            "sandbox":             "auto",    # #1464: mandatory OS exec sandbox — auto | bwrap | firejail
             "multi_tenant":        False,     # #1071: per-principal RBAC + tenant memory isolation (default OFF)
-            "tooling_envelope": {              # ADR-0007 FA-S1: policy data only; FA-S2 wires launch checks
-                "enabled":    False,           # default-off → public installs byte-identical
-                "allow_list": [],              # private deployments put concrete substrate values in conf/
+            "tooling_envelope": {              # ADR-0007: mandatory launch authorization policy
+                # Omitted allow_list derives exact tuples from enabled code_agents.pool entries.
             },
         },
         "setup": {
@@ -11907,22 +12632,18 @@ def _code_defaults() -> Dict[str, Any]:
             "write_mode":       WORKER_WRITE_MODE,  # "reducer" (default) | "direct" (autonomous agents)
         },
         "providers": {
-            # P0 provider router (engine/providers.py + router.py + dispatch.py). Default EMPTY/OFF →
-            # parallel_reason stays on _WORKERS.fanout, byte-identical. The private deploy supplies the
-            # real pool (models, $/token, endpoints) in conf/ — NO provider literal in core/.
-            "enabled":     False,            # global on/off; off ⇒ dispatcher delegates to _WORKERS
+            # P0 provider router (engine/providers.py + router.py + dispatch.py). setup.type is the single
+            # topology authority. The private deploy supplies the real pool in conf/ — no literals in core.
             "default_id":  None,
             "max_agents":  3,                # server CLI-pool cap (own default; NOT == client --max-agents)
             "cli_timeout_s": None,           # timeout for default_cli_runner (None ⇒ no timeout)
             "effort_max_tokens": {"low": 512, "medium": 1024, "high": 2048, "xhigh": 4096},
-            "scoring":     {"w_cost": 1.0, "w_sensitivity": 0.5, "cost_norm_usd": 0.10,
-                            "input_chars_per_token": 4},
             "budget":      {"usd_cap": None},
             "pool":        [],               # no default providers hard-coded (boundary); conf/ fills it
         },
         "code_agents": {
             # #449 (C0R-9): the handover code-AGENT registry — a SEPARATE, ALWAYS-ON surface, independent
-            # of providers.enabled (which is True in local-mode). Each entry is a providers.ProviderSpec
+            # of the setup-derived provider-dispatch topology. Each entry is a providers.ProviderSpec
             # carrying an agent_id (ASCII-letters-only filename token, C0R-1). Ironclad ships OPUS/SONNET
             # as OVERRIDABLE defaults (public Claude model ids — already used by the handover lane); conf/
             # re-lists the pool to add its own agents (lists replace on merge). Unknown agent → fail-closed.
@@ -12045,8 +12766,10 @@ def _code_defaults() -> Dict[str, Any]:
         },
         "watcher": {
             "feedback_dir": WATCHER_FEEDBACK_DIR,
-            "enabled":      _WATCHER_ENABLED,
             "interval":     RECONCILER_INTERVAL,
+        },
+        "heartbeat": {
+            "stall_seconds": 900,
         },
         "ui": {
             "max_lines":        _UI_MAX_LINES,
@@ -12089,10 +12812,13 @@ def _resolve_config_source(cli_config: Optional[str]) -> Optional[Path]:
 def _read_json_dict(p: Path) -> Dict[str, Any]:
     try:
         data = json.loads(p.read_text(encoding="utf-8"))
-        return data if isinstance(data, dict) else {}
     except Exception as e:
-        print(col(f"  [WARN] config not loadable ({p}): {e} — skipped.", C.YELLOW))
-        return {}
+        raise config_schema.ConfigError(f"config not loadable ({p}): {e}") from e
+    if not isinstance(data, dict):
+        raise config_schema.ConfigError(
+            f"config root in {p}: expected object, got {type(data).__name__}"
+        )
+    return data
 
 
 def _load_config_tree(source: Optional[Path], _seen: Optional[set] = None) -> Dict[str, Any]:
@@ -12133,6 +12859,9 @@ def _load_config_tree(source: Optional[Path], _seen: Optional[set] = None) -> Di
         includes = data.pop("include", [])
         # never carry comment/meta keys (_ prefix) into cfg
         data = {k: v for k, v in data.items() if not k.startswith("_")}
+        # Normalize one-release aliases before defaults/includes are merged so a legacy value has the same
+        # precedence as its canonical spelling instead of being masked by the canonical code default.
+        _consume_config_aliases(data)
         merged = {}
         if isinstance(includes, list):
             for inc in includes:
@@ -12149,6 +12878,30 @@ def _apply_env(cfg: Dict[str, Any]) -> Dict[str, Any]:
     The API key itself does NOT come from here, but only in main() from
     the variable named via api_key_env."""
     env = os.environ
+    for name, replacement in _ENV_TOMBSTONES.items():
+        if name in env:
+            print(col(f"  [DEPRECATED] env '{name}' is retired and ignored; {replacement}.", C.YELLOW))
+    for name, spec in config_schema.ENV_BINDINGS.items():
+        raw = env.get(name)
+        if raw in (None, ""):        # an unset OR empty env var means "not provided" for every leaf
+            continue
+        if name == "GX10_SANDBOX" and raw.strip().lower() in _RETIRED_SANDBOX_POLICIES:
+            print(col("  [DEPRECATED] env GX10_SANDBOX=off/none is retired and ignored; model command "
+                      "isolation remains mandatory.", C.YELLOW))
+            continue
+        try:
+            value = spec.env_parser(raw)
+            config_schema.validate_leaf(spec.key, value)
+            _cfg_set(cfg, spec.key, value)
+        except config_schema.ConfigError as e:
+            print(col(f"  [WARN] env {name}={raw!r} ignored ({e})", C.YELLOW))
+    return cfg
+
+    # The schema mapping is authoritative; the legacy mapping below is unreachable during the staged F6a diff.
+    env = os.environ
+    for name, replacement in _ENV_TOMBSTONES.items():
+        if name in env:
+            print(col(f"  [DEPRECATED] env '{name}' is retired and ignored; {replacement}.", C.YELLOW))
     def setif(name, section, key, transform=lambda x: x):
         v = env.get(name)
         if v not in (None, ""):
@@ -12166,7 +12919,7 @@ def _apply_env(cfg: Dict[str, Any]) -> Dict[str, Any]:
                 target[path[-1]] = transform(v)
             except Exception:
                 print(col(f"  [WARN] env {name}={v!r} ignored (invalid)", C.YELLOW))
-    _truthy = lambda v: v.strip().lower() in ("1", "true", "yes", "on")
+    _truthy = config_schema.parse_env_bool
     setif("GX10_BASE_URL",   "connection", "base_url")
     setif("GX10_MODEL",      "connection", "model")
     setif("GX10_LLM_TIMEOUT_S",   "connection", "request_timeout_s", float)   # #1131: per-request LLM bound
@@ -12199,18 +12952,24 @@ def _apply_env(cfg: Dict[str, Any]) -> Dict[str, Any]:
     setif("GX10_REVIEW_AGENT",            "review", "agent")              # #1221: default reviewer agent_id
     setif("GX10_REVIEW_TIMEOUT_S",        "review", "timeout_s", float)   # #1221: review CLI timeout
     setif("GX10_NOTIFY_WEBHOOK",          "notify", "webhook")            # #1083: escalation webhook (deploy secret)
-    setif("GX10_AUDIT_ENABLED",           "audit",  "enabled", _truthy)   # #1084: opt-in per-action audit ledger
     setif("GX10_AUDIT_SCOPE",             "audit",  "scope")              # #1067: mutating | all
-    setif("GX10_INJECTION_DEFENSE",       "security", "injection_defense", _truthy)   # #1068: fence ingested content
-    setif("GX10_SANDBOX",                 "security", "sandbox")                      # #1069: OS exec sandbox backend
+    _sandbox_env = env.get("GX10_SANDBOX")
+    if _sandbox_env not in (None, ""):
+        _sandbox_env_l = _sandbox_env.strip().lower()
+        if _sandbox_env_l in _RETIRED_SANDBOX_POLICIES:
+            print(col("  [DEPRECATED] env GX10_SANDBOX=off/none is retired and ignored; model command "
+                      "isolation remains mandatory.", C.YELLOW))
+        else:
+            try:
+                cfg["security"]["sandbox"] = _validated_sandbox_policy(_sandbox_env)
+            except ValueError:
+                print(col(f"  [WARN] env GX10_SANDBOX={_sandbox_env!r} ignored (invalid; expected "
+                          "auto|bwrap|firejail)", C.YELLOW))
     setif("GX10_MULTI_TENANT",            "security", "multi_tenant", _truthy)        # #1071: per-principal RBAC
-    setif_path("GX10_TOOLING_ENVELOPE_ENABLED", "security", ("tooling_envelope", "enabled"), _truthy)  # #1420: coder launch policy
     setif("GX10_ALERT_ENABLED",           "alert",  "enabled", _truthy)   # #1061: opt-in alerting self-scan
-    setif("GX10_AMBIGUITY_DETECT",        "safety", "ambiguity_detect", _truthy)   # #1066: Variant-B pre-flight
     setif("GX10_SEARCH_ADAPTER",          "search", "adapter")
     setif("GX10_SEARCH_COUNT",            "search", "count", int)
     setif("GX10_SEARCH_MAX_OUTPUT_CHARS", "search", "max_output_chars", int)
-    setif("GX10_PROVIDERS",              "providers", "enabled",   _truthy)   # P0 router on/off (A/B switch)
     setif("GX10_PROVIDERS_DEFAULT",      "providers", "default_id")           # default provider id
     setif("GX10_PROVIDERS_BUDGET_USD",   "providers", "budget", lambda v: {"usd_cap": float(v)})  # run budget
     setif("GX10_PROVIDERS_MAX_AGENTS",   "providers", "max_agents", int)      # server CLI-pool cap
@@ -12251,25 +13010,84 @@ def _apply_env(cfg: Dict[str, Any]) -> Dict[str, Any]:
     return cfg
 
 
-def _apply_config(cfg: Dict[str, Any]):
-    """Writes the merged config back into the module globals, so the
-    existing references (run_tool, macros, _trim_context, _classify_thinking,
-    watcher, UI …) keep running unchanged."""
-    global DEFAULT_BASE_URL, DEFAULT_MODEL, API_KEY_ENV, STATE_ROOT, VAULT_ROOT, SESSION_FILE, CODE_ROOT, CODE_SUBDIR
-    global PLATFORM_MODE, PLATFORM, TASKS_DEDUP_THRESHOLD, ONBOARDING_MODE, TASK_PREFIX, _TASK_ID_RE, ACK_ENABLED, LODESTAR_ENABLED, FORGE_ENABLED, FORGE_REPO, FORGE_ADAPTER, FORGE_TOKEN_ENV, REVIEW_AGENT, REVIEW_TIMEOUT_S, NOTIFY_WEBHOOK, AUDIT_ENABLED, AUDIT_SCOPE, INJECTION_DEFENSE, SANDBOX, MULTI_TENANT, ALERT_ENABLED, LLM_REQUEST_TIMEOUT_S, LLM_CONNECT_TIMEOUT_S, LLM_FIRST_TOKEN_TIMEOUT_S, LLM_MAX_RETRIES
-    global AUTOPILOT_ENABLED, AUTOPILOT_CLAUDE_BIN, AUTOPILOT_EXTRA_ARGS
-    global AUTOPILOT_DEFAULT_EFFORT, AUTOPILOT_LOGS_DIR, AUTOPILOT_MAX_CONCURRENT, AUTOPILOT_STREAM, AUTOPILOT_TERMINATE_ON_ADVANCE, AUTOPILOT_AUTOPLAN, AUTOPILOT_MAX_TASKS, AUTOPILOT_LOG_TERMINAL
-    global TEMPERATURE, MAX_TOKENS, FINALIZE_ON_TRUNCATION, RETRY_BACKOFF, LANGUAGE
-    global MAX_ITERATIONS, MAX_CTX_CHARS, TRIM_TARGET_CHARS, MAX_FILE_CHARS, LIST_DIR_HARD_CAP
-    global SUMMARIZE_EVICTED, SUMMARY_MAX_TOKENS, RAG_ENABLED, RAG_TOP_K, RAG_MAX_TOKENS, EMERGENCY_SUMMARIZE
-    global PROACTIVE_ROLL, INGEST_SOFT_FRAC, MAX_SUMMARIES_PER_TURN
-    global MAX_MODEL_LEN, TOKEN_BUDGET, CHARS_PER_TOKEN, THINKING_RESERVE, MEMORY_BRIEF_TOKENS, MIN_OUTPUT_TOKENS, OVERFLOW_SAFETY_TOKENS, TURN_IDLE_TIMEOUT_S
-    global WORKER_MEMORY, WORKER_WRITE, WORKER_WRITE_MODE, WARM_SESSION_ID
-    global _PLANNING_KW, _ROUTINE_KW, WORKSPACE_DIRS, _IDLE_ACTIVE
-    global WATCHER_FEEDBACK_DIR, _WATCHER_ENABLED, RECONCILER_INTERVAL
-    global SPINNER_FRAMES, UI_REFRESH_INTERVAL, _UI_MAX_LINES, _UI_LINES
-    global _MEMORY_CONFIG, _WARM_CONFIG
-    global TOOLING_ENVELOPE_POLICY
+def _normalize_config_for_apply(cfg: Dict[str, Any]) -> None:
+    """Consume supported legacy boundaries on an unpublished config candidate."""
+    _consume_config_aliases(cfg)
+    _consume_config_tombstones(cfg)
+    _sandbox_boundary = cfg.get("security", {}).get("sandbox") if isinstance(cfg.get("security"), dict) else None
+    if isinstance(_sandbox_boundary, str) and _sandbox_boundary.strip().lower() in _RETIRED_SANDBOX_POLICIES:
+        print(col("  [DEPRECATED] security.sandbox off/none is retired and ignored; model command "
+                  "isolation remains mandatory (using auto).", C.YELLOW))
+        cfg["security"]["sandbox"] = "auto"
+
+
+def _config_plugin_roots(cfg: Dict[str, Any]) -> Tuple[str, ...]:
+    """Return the loaded, non-core namespaces that the core schema must preserve."""
+    _core_roots = set(config_schema.defaults_tree())
+    return tuple(k for k in cfg
+                 if isinstance(k, str) and not k.startswith("_") and k not in _core_roots)
+
+
+def _validate_config_projection(cfg: Dict[str, Any]) -> None:
+    """Validate the complete merged core projection while retaining loaded plugin roots."""
+    config_schema.validate(cfg, plugin_roots=_config_plugin_roots(cfg))
+
+
+@dataclass(frozen=True)
+class _DerivedConfigState:
+    """An unpublished, immutable container for one complete runtime-state derivation."""
+
+    values: "Mapping[str, Any]"
+    warnings: Tuple[str, ...] = ()
+
+
+_CONFIG_DERIVED_GLOBALS = (
+    "DEFAULT_BASE_URL", "DEFAULT_MODEL", "API_KEY_ENV", "LLM_REQUEST_TIMEOUT_S",
+    "LLM_CONNECT_TIMEOUT_S", "LLM_FIRST_TOKEN_TIMEOUT_S", "LLM_MAX_RETRIES", "STATE_ROOT",
+    "VAULT_ROOT", "CODE_SUBDIR", "SESSION_FILE", "CODE_ROOT", "PLATFORM_MODE", "PLATFORM",
+    "TASKS_DEDUP_THRESHOLD", "TASK_PREFIX", "_TASK_ID_RE", "FORGE_ENABLED", "FORGE_REPO",
+    "FORGE_ADAPTER", "FORGE_TOKEN_ENV", "REVIEW_AGENT", "REVIEW_TIMEOUT_S", "NOTIFY_WEBHOOK",
+    "AUDIT_SCOPE", "SANDBOX", "MULTI_TENANT", "TOOLING_ENVELOPE_POLICY", "ALERT_ENABLED",
+    "LODESTAR_ENABLED", "ONBOARDING_MODE", "AUTOPILOT_ENABLED", "AUTOPILOT_CLAUDE_BIN",
+    "AUTOPILOT_EXTRA_ARGS", "AUTOPILOT_DEFAULT_EFFORT", "AUTOPILOT_LOGS_DIR",
+    "AUTOPILOT_MAX_CONCURRENT", "AUTOPILOT_STREAM", "AUTOPILOT_TERMINATE_ON_ADVANCE",
+    "AUTOPILOT_AUTOPLAN", "AUTOPILOT_MAX_TASKS", "AUTOPILOT_LOG_TERMINAL", "TEMPERATURE",
+    "MAX_TOKENS", "FINALIZE_ON_TRUNCATION", "RETRY_BACKOFF", "LANGUAGE", "MAX_ITERATIONS",
+    "MAX_CTX_CHARS", "TRIM_TARGET_CHARS", "MAX_FILE_CHARS", "LIST_DIR_HARD_CAP",
+    "SUMMARIZE_EVICTED", "SUMMARY_MAX_TOKENS", "EMERGENCY_SUMMARIZE", "PROACTIVE_ROLL",
+    "INGEST_SOFT_FRAC", "MAX_SUMMARIES_PER_TURN", "RAG_ENABLED", "RAG_TOP_K",
+    "RAG_MAX_TOKENS", "MAX_MODEL_LEN", "TOKEN_BUDGET", "CHARS_PER_TOKEN", "THINKING_RESERVE",
+    "MIN_OUTPUT_TOKENS", "OVERFLOW_SAFETY_TOKENS", "TURN_IDLE_TIMEOUT_S",
+    "MEMORY_BRIEF_TOKENS", "WORKER_MEMORY", "WORKER_WRITE", "WORKER_WRITE_MODE",
+    "WARM_SESSION_ID", "_PLANNING_KW", "_ROUTINE_KW", "WORKSPACE_DIRS", "_IDLE_ACTIVE",
+    "_MEMORY_CONFIG", "_WARM_CONFIG", "WATCHER_FEEDBACK_DIR", "RECONCILER_INTERVAL",
+    "SPINNER_FRAMES", "UI_REFRESH_INTERVAL", "_UI_MAX_LINES", "_UI_LINES",
+    "FRAMING_NOTES_ENABLED", "AUTOMATION_DECOUPLED", "HEARTBEAT_STALL_S",
+    "_VERIFY_GROUNDING_THRESHOLD", "_STRATEGY_BUDGET", "_QUALITY_BREAKER", "_QUALITY_TRIPPED",
+)
+
+
+def _derive_config_state(cfg: Dict[str, Any]) -> _DerivedConfigState:
+    """Derive every config-owned module global without publishing runtime state or side effects."""
+    current = globals()
+    (API_KEY_ENV, LLM_REQUEST_TIMEOUT_S, LLM_MAX_RETRIES, STATE_ROOT, VAULT_ROOT, CODE_ROOT,
+     TASK_PREFIX, FORGE_ENABLED, FORGE_REPO, FORGE_ADAPTER, FORGE_TOKEN_ENV, REVIEW_AGENT,
+     REVIEW_TIMEOUT_S, NOTIFY_WEBHOOK, AUDIT_SCOPE, MULTI_TENANT, ALERT_ENABLED, LODESTAR_ENABLED,
+     FINALIZE_ON_TRUNCATION, SUMMARY_MAX_TOKENS, INGEST_SOFT_FRAC, MAX_SUMMARIES_PER_TURN,
+     RAG_TOP_K, RAG_MAX_TOKENS, MAX_MODEL_LEN, CHARS_PER_TOKEN, THINKING_RESERVE,
+     MIN_OUTPUT_TOKENS, OVERFLOW_SAFETY_TOKENS, TURN_IDLE_TIMEOUT_S, MEMORY_BRIEF_TOKENS,
+     RECONCILER_INTERVAL, _UI_MAX_LINES, _UI_LINES) = (
+        current[name] for name in (
+            "API_KEY_ENV", "LLM_REQUEST_TIMEOUT_S", "LLM_MAX_RETRIES", "STATE_ROOT", "VAULT_ROOT",
+            "CODE_ROOT", "TASK_PREFIX", "FORGE_ENABLED", "FORGE_REPO", "FORGE_ADAPTER",
+            "FORGE_TOKEN_ENV", "REVIEW_AGENT", "REVIEW_TIMEOUT_S", "NOTIFY_WEBHOOK", "AUDIT_SCOPE",
+            "MULTI_TENANT", "ALERT_ENABLED", "LODESTAR_ENABLED", "FINALIZE_ON_TRUNCATION",
+            "SUMMARY_MAX_TOKENS", "INGEST_SOFT_FRAC", "MAX_SUMMARIES_PER_TURN", "RAG_TOP_K",
+            "RAG_MAX_TOKENS", "MAX_MODEL_LEN", "CHARS_PER_TOKEN", "THINKING_RESERVE",
+            "MIN_OUTPUT_TOKENS", "OVERFLOW_SAFETY_TOKENS", "TURN_IDLE_TIMEOUT_S",
+            "MEMORY_BRIEF_TOKENS", "RECONCILER_INTERVAL", "_UI_MAX_LINES", "_UI_LINES",
+        )
+    )
 
     conn, paths, gen = cfg["connection"], cfg["paths"], cfg["generation"]
     ctx, ta, ws       = cfg["context"], cfg["thinking_auto"], cfg["workspace"]
@@ -12300,8 +13118,7 @@ def _apply_config(cfg: Dict[str, Any]):
     TASKS_DEDUP_THRESHOLD = float(cfg["tasks"]["dedup_threshold"])
     TASK_PREFIX           = str(cfg["tasks"].get("id_prefix", TASK_PREFIX))
     _TASK_ID_RE           = re.compile(rf"^{re.escape(TASK_PREFIX)}-[A-Za-z0-9_]+$")
-    ACK_ENABLED           = bool(cfg.get("ack", {}).get("enabled", ACK_ENABLED))
-    FORGE_ENABLED         = bool(cfg.get("forge", {}).get("enabled", FORGE_ENABLED))   # #1073 default OFF
+    FORGE_ENABLED         = cfg.get("forge", {}).get("enabled", FORGE_ENABLED)   # #1073 default OFF
     FORGE_REPO            = str(cfg.get("forge", {}).get("repo", FORGE_REPO) or "")
     FORGE_ADAPTER         = str(cfg.get("forge", {}).get("adapter", FORGE_ADAPTER) or "cli").strip().lower()  # #1213
     FORGE_TOKEN_ENV       = str(cfg.get("forge", {}).get("token_env", FORGE_TOKEN_ENV) or "GX10_FORGE_TOKEN")  # #1213
@@ -12311,33 +13128,39 @@ def _apply_config(cfg: Dict[str, Any]):
     except (TypeError, ValueError):
         REVIEW_TIMEOUT_S  = 180.0
     NOTIFY_WEBHOOK        = str(cfg.get("notify", {}).get("webhook", NOTIFY_WEBHOOK) or "")   # #1083
-    AUDIT_ENABLED         = bool(cfg.get("audit", {}).get("enabled", AUDIT_ENABLED))   # #1084 default OFF
     AUDIT_SCOPE           = str(cfg.get("audit", {}).get("scope", AUDIT_SCOPE) or "mutating").lower()   # #1067
-    INJECTION_DEFENSE     = bool(cfg.get("security", {}).get("injection_defense", INJECTION_DEFENSE))   # #1068
-    SANDBOX               = str(cfg.get("security", {}).get("sandbox", SANDBOX) or "off").lower()   # #1069
-    MULTI_TENANT          = bool(cfg.get("security", {}).get("multi_tenant", MULTI_TENANT))   # #1071 default OFF
+    if AUDIT_SCOPE not in {"mutating", "all"}:
+        raise ValueError("audit.scope must be 'mutating' or 'all'")
+    _sandbox_raw = cfg.get("security", {}).get("sandbox", "auto")
+    if isinstance(_sandbox_raw, str) and _sandbox_raw.strip().lower() in _RETIRED_SANDBOX_POLICIES:
+        print(col("  [DEPRECATED] security.sandbox off/none is retired and ignored; model command "
+                  "isolation remains mandatory (using auto).", C.YELLOW))
+        cfg.setdefault("security", {})["sandbox"] = "auto"
+        _sandbox_raw = "auto"
+    SANDBOX               = _validated_sandbox_policy(_sandbox_raw)
+    MULTI_TENANT          = cfg.get("security", {}).get("multi_tenant", MULTI_TENANT)   # #1071 default OFF
     from ack.tooling_envelope import load_tooling_envelope_policy
-    TOOLING_ENVELOPE_POLICY = load_tooling_envelope_policy(cfg)   # ADR-0007 FA-S1: pure policy; no enforcement
-    ALERT_ENABLED         = bool(cfg.get("alert", {}).get("enabled", ALERT_ENABLED))   # #1061 default OFF
-    LODESTAR_ENABLED      = bool(cfg.get("lodestar", {}).get("enabled", LODESTAR_ENABLED))
-    ONBOARDING_MODE       = bool(cfg["onboarding"]["enabled"])
+    TOOLING_ENVELOPE_POLICY = load_tooling_envelope_policy(cfg)   # ADR-0007: always-on launch enforcement
+    ALERT_ENABLED         = cfg.get("alert", {}).get("enabled", ALERT_ENABLED)   # #1061 default OFF
+    LODESTAR_ENABLED      = cfg.get("lodestar", {}).get("enabled", LODESTAR_ENABLED)
+    ONBOARDING_MODE       = cfg["onboarding"]["enabled"]
 
     ap = cfg["autopilot"]
-    AUTOPILOT_ENABLED        = bool(ap["enabled"])
+    AUTOPILOT_ENABLED        = ap["enabled"]
     AUTOPILOT_CLAUDE_BIN     = ap["claude_bin"]
     AUTOPILOT_EXTRA_ARGS     = list(ap["extra_args"])
     AUTOPILOT_DEFAULT_EFFORT = ap["default_effort"]
     AUTOPILOT_LOGS_DIR       = ap["logs_dir"]
     AUTOPILOT_MAX_CONCURRENT = int(ap["max_concurrent"])
-    AUTOPILOT_STREAM         = bool(ap.get("stream", False))
-    AUTOPILOT_TERMINATE_ON_ADVANCE = bool(ap.get("terminate_on_advance", False))
-    AUTOPILOT_AUTOPLAN    = bool(ap.get("autoplan", False))
-    AUTOPILOT_MAX_TASKS   = int(ap.get("autoplan_max_tasks", 0))
-    AUTOPILOT_LOG_TERMINAL = bool(ap.get("log_terminal", False))
+    AUTOPILOT_STREAM         = ap.get("stream", False)
+    AUTOPILOT_TERMINATE_ON_ADVANCE = ap.get("terminate_on_advance", False)
+    AUTOPILOT_AUTOPLAN    = ap.get("autoplan", False)
+    AUTOPILOT_MAX_TASKS   = int(ap["autoplan_max_tasks"])
+    AUTOPILOT_LOG_TERMINAL = ap.get("log_terminal", False)
 
     TEMPERATURE   = float(gen["temperature"])
     MAX_TOKENS    = int(gen["max_tokens"])
-    FINALIZE_ON_TRUNCATION = bool(gen.get("finalize_on_truncation", FINALIZE_ON_TRUNCATION))
+    FINALIZE_ON_TRUNCATION = gen.get("finalize_on_truncation", FINALIZE_ON_TRUNCATION)
     RETRY_BACKOFF = float(gen["retry_backoff"])
     LANGUAGE      = (str(gen.get("language", "en")).strip() or "en")
 
@@ -12346,20 +13169,20 @@ def _apply_config(cfg: Dict[str, Any]):
     TRIM_TARGET_CHARS = int(ctx["trim_target_chars"])
     MAX_FILE_CHARS    = int(ctx["max_file_chars"])
     LIST_DIR_HARD_CAP = int(ctx["list_dir_hard_cap"])
-    SUMMARIZE_EVICTED  = bool(ctx.get("summarize_evicted", True))    # B1: default ON (06-18)
+    SUMMARIZE_EVICTED  = ctx.get("summarize_evicted", True)    # B1: default ON (06-18)
     SUMMARY_MAX_TOKENS = int(ctx.get("summary_max_tokens", SUMMARY_MAX_TOKENS))
-    EMERGENCY_SUMMARIZE = bool(ctx.get("emergency_summarize", False))   # #1050 L3: default OFF
-    PROACTIVE_ROLL         = bool(ctx.get("proactive_roll", False))           # #1051 L3: default OFF
+    EMERGENCY_SUMMARIZE = ctx.get("emergency_summarize", False)   # #1050 L3: default OFF
+    PROACTIVE_ROLL         = ctx.get("proactive_roll", False)           # #1051 L3: default OFF
     INGEST_SOFT_FRAC       = float(ctx.get("ingest_soft_frac", INGEST_SOFT_FRAC))
     MAX_SUMMARIES_PER_TURN = int(ctx.get("max_summaries_per_turn", MAX_SUMMARIES_PER_TURN))
-    RAG_ENABLED        = bool(ctx.get("rag_enabled", True))          # B2: default ON (06-18)
+    RAG_ENABLED        = ctx.get("rag_enabled", True)          # B2: default ON (06-18)
     RAG_TOP_K          = int(ctx.get("rag_top_k", RAG_TOP_K))
     RAG_MAX_TOKENS     = int(ctx.get("rag_max_tokens", RAG_MAX_TOKENS))
     # MEM-9: couple the trim working set to the model window (after output/RAG/summary reserve). ON →
     # derive MAX_CTX_CHARS/TRIM_TARGET_CHARS from MAX_MODEL_LEN (overrides the char defaults);
     # OFF → the char thresholds above stay (today's behaviour, GX10_MAX_CTX_CHARS applies).
     MAX_MODEL_LEN      = int(ctx.get("max_model_len", MAX_MODEL_LEN))
-    TOKEN_BUDGET       = bool(ctx.get("token_budget", True))
+    TOKEN_BUDGET       = ctx.get("token_budget", True)
     CHARS_PER_TOKEN    = float(ctx.get("chars_per_token", CHARS_PER_TOKEN))   # #366 calibrated fallback
     THINKING_RESERVE   = int(ctx.get("thinking_reserve", THINKING_RESERVE))   # #366 D5
     MIN_OUTPUT_TOKENS  = max(1, int(ctx.get("min_output_tokens", MIN_OUTPUT_TOKENS)))   # #366 adaptive-reserve floor
@@ -12373,9 +13196,9 @@ def _apply_config(cfg: Dict[str, Any]):
         MAX_CTX_CHARS, TRIM_TARGET_CHARS = _derive_ctx_budget(
             MAX_MODEL_LEN, MAX_TOKENS, RAG_MAX_TOKENS, SUMMARY_MAX_TOKENS, CHARS_PER_TOKEN)
     _wcfg = cfg.get("workers", {})
-    WORKER_MEMORY      = bool(_wcfg.get("memory_read", True))    # §3c MAP: default ON (06-18)
-    WORKER_WRITE       = bool(_wcfg.get("memory_write", True))   # §3c REDUCE: default ON (06-18)
-    WORKER_WRITE_MODE  = (str(_wcfg.get("write_mode", "reducer")).strip().lower() or "reducer")
+    WORKER_MEMORY      = _wcfg.get("memory_read", True)    # §3c MAP: default ON (06-18)
+    WORKER_WRITE       = _wcfg.get("memory_write", True)   # §3c REDUCE: default ON (06-18)
+    WORKER_WRITE_MODE  = _wcfg.get("write_mode", "reducer")
     WARM_SESSION_ID    = (os.environ.get("GX10_SESSION_ID", "").strip() or "main")   # pure-from-base, no self-ref accumulation (S3b)
 
     _PLANNING_KW = tuple(ta["planning_keywords"])
@@ -12386,45 +13209,33 @@ def _apply_config(cfg: Dict[str, Any]):
 
     # Memory config: file (conf/memory/memory.json) OR env (GX10_MEMORY_URL).
     # Optional — without base_url _MEMORY_CONFIG stays empty → memory off (hooks inert).
-    _MEMORY_CONFIG = {}                       # pure-from-base: re-derive fresh from file + env each reload (no stale keys, S3b)
+    _MEMORY_CONFIG = copy.deepcopy(cfg.get("memory") or {})
     _mem_cfg_path = Path("conf/memory/memory.json")
     if _mem_cfg_path.exists():
-        try:
-            _MEMORY_CONFIG = json.loads(_mem_cfg_path.read_text(encoding="utf-8"))
-        except Exception:
-            pass
+        # An external component seam: MemoryManager owns its own field handling + fallbacks (incl. the
+        # legacy `timeout` key), so a memory.json may legitimately carry extra/legacy keys. Merge it
+        # tolerantly — the env memory config is already typed via _apply_env + the boot validate — rather
+        # than hard-refusing an out-of-schema file key (which main accepted and the component still reads).
+        _MEMORY_CONFIG = _deep_merge(_MEMORY_CONFIG, _read_json_dict(_mem_cfg_path))
     _mem_url = os.environ.get("GX10_MEMORY_URL")
     if _mem_url:
         _MEMORY_CONFIG = {**(_MEMORY_CONFIG or {}), "base_url": _mem_url}
         _MEMORY_CONFIG.setdefault("enabled", True)
         _MEMORY_CONFIG.setdefault("agent_id", os.environ.get("GX10_MEMORY_AGENT", "ironclad"))
-    # B3 switches (optional; only apply with configured memory): chunk long feedback losslessly
-    # instead of truncating + recency tiebreak in retrieval. Default OFF → today's behaviour.
-    _mem_bool = lambda v: str(v).strip().lower() in ("1", "true", "yes", "on")
-    _mem_chunk = os.environ.get("GX10_MEMORY_CHUNKING")
-    if _mem_chunk not in (None, ""):
-        _MEMORY_CONFIG = {**(_MEMORY_CONFIG or {}), "chunk_long_artifacts": _mem_bool(_mem_chunk)}
-    _mem_rec = os.environ.get("GX10_MEMORY_RECENCY")
-    if _mem_rec not in (None, ""):
-        _MEMORY_CONFIG = {**(_MEMORY_CONFIG or {}), "recency_tiebreak": _mem_bool(_mem_rec)}
-
     # Warm tier config (B0): file (conf/warm/warm.json) OR env (GX10_WARM_URL).
     # Optional — without a url _WARM_CONFIG stays empty → warm tier off (no-op, fail-soft).
-    _WARM_CONFIG = {}                         # pure-from-base: re-derive fresh from file + env each reload (S3b)
+    _WARM_CONFIG = copy.deepcopy(cfg.get("warm") or {})
     _warm_cfg_path = Path("conf/warm/warm.json")
     if _warm_cfg_path.exists():
-        try:
-            _WARM_CONFIG = json.loads(_warm_cfg_path.read_text(encoding="utf-8"))
-        except Exception:
-            pass
+        # External seam (WarmTier owns its field handling) — merge the file tolerantly, same rationale as
+        # the memory seam above; the env warm config is already typed via _apply_env + the boot validate.
+        _WARM_CONFIG = _deep_merge(_WARM_CONFIG, _read_json_dict(_warm_cfg_path))
     _warm_url = os.environ.get("GX10_WARM_URL")
     if _warm_url:
         _WARM_CONFIG = {**(_WARM_CONFIG or {}), "url": _warm_url}
         _WARM_CONFIG.setdefault("enabled", True)
 
     WATCHER_FEEDBACK_DIR = wa["feedback_dir"]
-    # Config can no longer independently arm the watcher; it follows the /auto runtime state.
-    _WATCHER_ENABLED     = bool(_WATCHER_ENABLED and AUTOPILOT_ENABLED and AUTOPILOT_AUTOPLAN)
     RECONCILER_INTERVAL  = float(wa.get("interval", RECONCILER_INTERVAL))
 
     SPINNER_FRAMES      = ui["spinner_frames"]
@@ -12434,74 +13245,195 @@ def _apply_config(cfg: Dict[str, Any]):
         _UI_MAX_LINES = new_max
         _UI_LINES = deque(_UI_LINES, maxlen=new_max)
 
-    if _decoupled():
-        connect_effective = LLM_CONNECT_TIMEOUT_S or LLM_REQUEST_TIMEOUT_S
-        if not (connect_effective <= LLM_REQUEST_TIMEOUT_S <= TURN_IDLE_TIMEOUT_S < LLM_FIRST_TOKEN_TIMEOUT_S):
-            print(col("  [WARN] timeout ordering should be "
-                      f"connect({connect_effective:g}) <= request({LLM_REQUEST_TIMEOUT_S:g}) <= "
-                      f"idle({TURN_IDLE_TIMEOUT_S:g}) < first_token({LLM_FIRST_TOKEN_TIMEOUT_S:g})",
-                      C.YELLOW))
+    # The typed schema enforces the one unambiguous timeout invariant (connect <= request); request,
+    # idle-watchdog, and first-token bound DIFFERENT things and are independently tuned per deployment
+    # (#1131/#1397), so no cross-ordering between them is asserted or warned here.
+    warnings: List[str] = []
 
-    _apply_notify(cfg)             # #1083: (un)register the escalation → webhook notifier (default-off)
-    _apply_ace(cfg)                # epic #855 ACE-WIRE (#863): the ALWAYS-ON ACE loop-intelligence core —
-                                   # registers the PlaybookStore provider + the post_feedback ACE consumer +
-                                   # the background ReflectionWorker, and SUPERSEDES the #602 string lessons
-                                   # (_apply_lessons_provider/_apply_lessons_consumer) + Process-SC consumer
-                                   # (_apply_process_consumer): those #602 reflection seams are no longer wired.
-    _apply_quality_breaker(cfg)    # epic #602 SUB-9: build/clear the opt-in quality breaker
-    _apply_ambiguity(cfg)          # #1066: register/clear the Variant-B ambiguity pre-flight (pre_handover)
-    _apply_verifier(cfg)           # epic #602 SUB-4/2.1: register/clear the opt-in pre_handover Verifier
-    _apply_quality_consumer(cfg)   # epic #602 SUB-9/2.7: register/clear the post_handover quality consumer
-    _apply_strategy(cfg)           # epic #602 SUB-3/2.4: capture strategy.enabled for the failure recorder
-    _apply_design_gate(cfg)        # S5 (#1227): capture design_gate.enabled (opt-in; DEV-1 enforces no blind coding)
-    _apply_constraint_gate(cfg)    # constraint_gate.enabled (optional framing-note capture + injection)
-    _apply_constraint_conflict_detect(cfg)  # retired product flag; default-off no-op
-    _apply_advance_gate(cfg)       # S2 (#1224): capture advance_gate.enabled (opt-in; DEV-1 no blind advance)
-    _apply_automation(cfg)         # S7 (#1229): capture automation.decoupled (watcher/autopilot disentangle)
-    _apply_heartbeat(cfg)          # S7 (#1229): capture heartbeat.stall_seconds (task-scoped progress heartbeat)
+    FRAMING_NOTES_ENABLED = cfg["framing_notes"]["enabled"]
+    AUTOMATION_DECOUPLED = cfg["automation"]["decoupled"]
+    HEARTBEAT_STALL_S = float(cfg["heartbeat"]["stall_seconds"])
+    _VERIFY_GROUNDING_THRESHOLD = float(cfg["verify"]["grounding_threshold"])
+    from ack.validated_emit import MAX_RETRY_BUDGET
+    _STRATEGY_BUDGET = min(int(cfg["strategy"]["budget"]), MAX_RETRY_BUDGET)
+    _QUALITY_BREAKER, _QUALITY_TRIPPED = _derive_quality_breaker_state(cfg)
+
+    derived_locals = locals()
+    values = {name: derived_locals[name] for name in _CONFIG_DERIVED_GLOBALS}
+    return _DerivedConfigState(MappingProxyType(values), tuple(warnings))
+
+
+_CONFIG_RECONFIG_GLOBALS = (
+    "_NOTIFY_CONSUMER", "_ACE_STORE", "_ACE_WORKER", "_ACE_MIGRATED", "_ACE_FORK_MPR",
+    "_ACE_FORK_WORKER",
+)
+
+
+@dataclass(frozen=True)
+class _ConfigRuntimeSnapshot:
+    """Exact pre-transaction runtime and reversible integration state."""
+
+    globals: "Mapping[str, Any]"
+    hooks: "Optional[Dict[str, tuple]]"
+    lesson_provider: Any
+    ace_store: Any
+    ace_store_attrs: "Optional[Dict[str, Any]]"
+    ace_fork_inflight: frozenset
+
+
+def _snapshot_config_runtime() -> _ConfigRuntimeSnapshot:
+    names = _CONFIG_DERIVED_GLOBALS + _CONFIG_RECONFIG_GLOBALS
+    runtime_globals = MappingProxyType({name: globals().get(name) for name in names})
+    hooks_snapshot = None
+    lesson_provider = None
+    try:
+        from ack import hooks as _hooks
+        with _hooks._LOCK:
+            hooks_snapshot = dict(_hooks._HOOKS)
+    except Exception:  # noqa: BLE001 -- an absent optional bus has no state to snapshot
+        pass
+    try:
+        from ack import lessons as _lessons
+        lesson_provider = _lessons.get_provider()
+    except Exception:  # noqa: BLE001 -- an absent optional provider has no state to snapshot
+        pass
+    store = globals().get("_ACE_STORE")
+    store_attrs = None
+    if store is not None and hasattr(store, "__dict__"):
+        # Shallow-copy the attr dict, then deep-copy ONLY the one nested-mutable attr the ACE
+        # reconfiguration touches in place: PlaybookStore.configure/set_transports mutate scalars
+        # (_max/_top_k/_chat/_embed/_budget/_eval_fn) plus `self._config` (AdaptConfig.max_bullets).
+        # Scalars restore by rebind; `_config` needs the deep copy. A blanket deepcopy is NOT usable —
+        # `self._lock` is a threading.Lock (not deep-copyable). If a future reconfig method mutates any
+        # OTHER nested-mutable attr in place, add it to this deep-copy set so rollback stays exact.
+        store_attrs = dict(store.__dict__)
+        if "_config" in store_attrs:
+            store_attrs["_config"] = copy.deepcopy(store_attrs["_config"])
+    return _ConfigRuntimeSnapshot(
+        runtime_globals,
+        hooks_snapshot,
+        lesson_provider,
+        store,
+        store_attrs,
+        frozenset(globals().get("_ACE_FORK_INFLIGHT", ())),
+    )
+
+
+def _restore_config_runtime(snapshot: _ConfigRuntimeSnapshot) -> None:
+    """Restore globals and integration registries after a failed runtime commit."""
+    for name in ("_ACE_WORKER", "_ACE_FORK_WORKER"):
+        current = globals().get(name)
+        previous = snapshot.globals.get(name)
+        if current is not None and current is not previous:
+            try:
+                current.stop()
+            except Exception:  # noqa: BLE001 -- restoration continues through every remaining seam
+                pass
+    globals().update(snapshot.globals)
+    if snapshot.ace_store is not None and snapshot.ace_store_attrs is not None:
+        snapshot.ace_store.__dict__.clear()
+        snapshot.ace_store.__dict__.update(snapshot.ace_store_attrs)
+    inflight = globals().get("_ACE_FORK_INFLIGHT")
+    if isinstance(inflight, set):
+        inflight.clear()
+        inflight.update(snapshot.ace_fork_inflight)
+    try:
+        from ack import lessons as _lessons
+        _lessons.set_provider(snapshot.lesson_provider)
+    except Exception:  # noqa: BLE001 -- restoration continues through every remaining seam
+        pass
+    if snapshot.hooks is not None:
+        try:
+            from ack import hooks as _hooks
+            with _hooks._LOCK:
+                _hooks._HOOKS.clear()
+                _hooks._HOOKS.update(snapshot.hooks)
+        except Exception:  # noqa: BLE001 -- globals are still restored if an optional bus disappeared
+            pass
+
+
+def _commit_config_state(derived: _DerivedConfigState) -> None:
+    """Publish one completely derived module-global state. Caller holds ``_CONFIG_LOCK``."""
+    globals().update(derived.values)
+
+
+def _apply_config_reconfiguration(cfg: Dict[str, Any], *, strict: bool) -> None:
+    """Apply reversible hooks/stores/threads after the derived globals are committed."""
+    _apply_notify(cfg, strict=strict)
+    _apply_quality_consumer(cfg, strict=strict)
+    # ACE is last: it is the only reconfiguration that may start/stop workers. A later core step can
+    # therefore never fail after an existing worker has been stopped.
+    _apply_ace(cfg, strict=strict)
+
+
+def _apply_config(cfg: Dict[str, Any]):
+    """Fast startup apply: normalize, validate, derive, commit, then wire integrations."""
+    with _CONFIG_LOCK:
+        _normalize_config_for_apply(cfg)
+        _validate_config_projection(cfg)
+        derived = _derive_config_state(cfg)
+        _commit_config_state(derived)
+        _apply_config_reconfiguration(cfg, strict=False)
+        for warning in derived.warnings:
+            print(col(warning, C.YELLOW))
+
+
+def _config_set_atomic(key: str, value: Any) -> Optional[str]:
+    """Clone-validate-derive-commit one runtime leaf, or return a refusal with no live mutation."""
+    global _EFFECTIVE_CFG
+    with _CONFIG_LOCK:
+        if _EFFECTIVE_CFG is None:
+            return "no live config to set (start the server first)"
+        if key in _FROZEN_CONFIG_KEYS:
+            return f"'{key}' is boot-only -- set it in config and restart"
+        original = _EFFECTIVE_CFG
+        root = key.split(".", 1)[0]
+        if root not in original:
+            return f"unknown configuration key '{key}'"
+        core_roots = set(config_schema.defaults_tree())
+        if root in core_roots and key not in config_schema.LEAVES:
+            return f"{key}: unknown configuration leaf"
+        try:
+            candidate = copy.deepcopy(original)
+            _cfg_set(candidate, key, value)
+            _normalize_config_for_apply(candidate)
+            _validate_config_projection(candidate)
+            derived = _derive_config_state(candidate)
+        except Exception as exc:  # noqa: BLE001 -- every candidate/derivation failure is one refusal
+            return str(exc) or type(exc).__name__
+
+        snapshot = _snapshot_config_runtime()
+        try:
+            _commit_config_state(derived)
+            _apply_config_reconfiguration(candidate, strict=True)
+        except Exception as exc:  # noqa: BLE001 -- restore every seam before reporting the refusal
+            _restore_config_runtime(snapshot)
+            _EFFECTIVE_CFG = original
+            return f"runtime apply failed: {exc}"
+
+        _EFFECTIVE_CFG = candidate
+        for warning in derived.warnings:
+            print(col(warning, C.YELLOW))
+        return None
 
 
 def _as_bool(v: object) -> bool:
-    """Strict config boolean: JSON true or an explicit case-insensitive true string."""
-    return v is True or (isinstance(v, str) and v.strip().lower() in {"true", "1", "yes", "on"})
+    """Return an actual config boolean; never apply Python truthiness."""
+    if type(v) is not bool:
+        raise config_schema.ConfigError(f"expected bool, got {type(v).__name__}")
+    return v
 
 
-def _apply_design_gate(cfg: Dict[str, Any]) -> None:
-    """S5 (#1227): capture ``design_gate.enabled`` for the pre-code design→impl gate. Default OFF →
-    byte-identical (the shared engine + every non-DEV-1 flow are unaffected); DEV-1 turns it on. Fail-soft."""
-    global DESIGN_GATE_ENABLED
-    try:
-        DESIGN_GATE_ENABLED = _as_bool(_cfg_get(cfg, "design_gate.enabled"))
-    except Exception:   # noqa: BLE001 — advisory wiring: default to off
-        DESIGN_GATE_ENABLED = False
-
-
-def _apply_constraint_gate(cfg: Dict[str, Any]) -> None:
-    """Capture ``constraint_gate.enabled`` for optional framing-note capture and injection.
+def _apply_framing_notes(cfg: Dict[str, Any]) -> None:
+    """Capture ``framing_notes.enabled`` for optional framing-note capture and tool exposure.
 
     S1 retired the product presence gate; absent/invalid remains False for byte-identical defaults.
     """
-    global CONSTRAINT_GATE_ENABLED
+    global FRAMING_NOTES_ENABLED
     try:
-        CONSTRAINT_GATE_ENABLED = _as_bool(_cfg_get(cfg, "constraint_gate.enabled"))
+        FRAMING_NOTES_ENABLED = _as_bool(_cfg_get(cfg, "framing_notes.enabled"))
     except Exception:  # noqa: BLE001 -- advisory wiring: default to off
-        CONSTRAINT_GATE_ENABLED = False
-
-
-def _apply_constraint_conflict_detect(cfg: Dict[str, Any]) -> None:
-    """Retired product constraint-conflict flag; retained as a default-off no-op for config compatibility."""
-    global CONSTRAINT_CONFLICT_DETECT
-    CONSTRAINT_CONFLICT_DETECT = False
-
-
-def _apply_advance_gate(cfg: Dict[str, Any]) -> None:
-    """S2 (#1224): capture ``advance_gate.enabled`` for the basic no-blind-advance gate. Default OFF →
-    byte-identical (the shared engine + every non-DEV-1 flow are unaffected); DEV-1 turns it on. Fail-soft."""
-    global ADVANCE_GATE_ENABLED
-    try:
-        ADVANCE_GATE_ENABLED = _as_bool(_cfg_get(cfg, "advance_gate.enabled"))
-    except Exception:   # noqa: BLE001 — advisory wiring: default to off
-        ADVANCE_GATE_ENABLED = False
+        FRAMING_NOTES_ENABLED = False
 
 
 def _apply_automation(cfg: Dict[str, Any]) -> None:
@@ -12515,75 +13447,29 @@ def _apply_automation(cfg: Dict[str, Any]) -> None:
 
 
 def _apply_heartbeat(cfg: Dict[str, Any]) -> None:
-    """S7 (#1229): capture ``heartbeat.stall_seconds`` (task-scoped detect-progress heartbeat). Default 0.0 =
-    off → byte-identical; DEV-1 sets it > 0. Fail-soft."""
+    """Capture positive finite ``heartbeat.stall_seconds`` tuning; invalid values restore 900 seconds."""
     global HEARTBEAT_STALL_S
     try:
-        HEARTBEAT_STALL_S = float(_cfg_get(cfg, "heartbeat.stall_seconds") or 0.0)
-    except Exception:   # noqa: BLE001 — advisory wiring: default to off
-        HEARTBEAT_STALL_S = 0.0
+        raw = _cfg_get(cfg, "heartbeat.stall_seconds")
+        if isinstance(raw, bool):
+            raise ValueError("heartbeat.stall_seconds must be a positive finite number")
+        value = float(raw)
+        if not math.isfinite(value) or value <= 0:
+            raise ValueError("heartbeat.stall_seconds must be a positive finite number")
+        HEARTBEAT_STALL_S = value
+    except Exception:   # noqa: BLE001 — invalid tuning cannot disable the protection
+        HEARTBEAT_STALL_S = 900.0
 
 
 def _apply_lessons_provider(cfg: Dict[str, Any]) -> None:
-    """Register (or clear) the project-private lesson distiller per ``lessons.enabled`` (epic #602 SUB-5).
-
-    Runs on every config application (boot + ``/config set`` + ``/switch``). OPT-IN: when on and no provider
-    is wired, registers an :class:`~engine.lesson_store.EngineLessonStore` (persisting under
-    ``ironclad_home()/lessons``); when off, clears it — but ONLY our own store, so a richer extension that
-    registered its own provider is never clobbered (mirrors the dev-process driver's let-the-richer-one-win
-    rule). Lazy-imports ``ack`` (never at the gx10 top level) + the store. Fail-soft — a registration hiccup
-    must never fail config application; default-off keeps the seam a byte-identical no-op."""
-    try:
-        from ack import lessons as _lessons              # lazy: never import ack at gx10 top-level (S6b lesson)
-        from lesson_store import EngineLessonStore        # bare engine-sibling import (like project_registry)
-    except Exception:   # noqa: BLE001 — seam/store unavailable ⇒ leave the no-op default
-        return
-    try:
-        enabled = _as_bool(_cfg_get(cfg, "lessons.enabled"))
-        current = _lessons.get_provider()
-        if enabled:
-            # Pass the RAW cap straight through — the store's _safe_cap coerces it (bad/overflow/None ⇒
-            # default), so there is no int() here that could raise and derail registration. The DISABLE
-            # branch reads no cap at all, so a malformed cap can never leave a store wired while off.
-            raw_cap = _cfg_get(cfg, "lessons.max_per_scope")
-            if current is None:                          # don't clobber a foreign provider (richer wins)
-                from project_registry import ironclad_home
-                _lessons.set_provider(EngineLessonStore(ironclad_home() / "lessons", max_per_scope=raw_cap))
-            elif isinstance(current, EngineLessonStore):  # already ours ⇒ apply a live cap change
-                current.configure(max_per_scope=raw_cap)
-        elif isinstance(current, EngineLessonStore):     # off ⇒ clear only OUR store (raise-free path)
-            _lessons.set_provider(None)
-    except Exception:   # noqa: BLE001 — advisory wiring: never break config application
-        return
-
-
-def _lessons_consumer_hook(ctx) -> None:
-    """`post_feedback` consumer (#602 2.3 / #804): on a FRESH task completion, report the completion feedback
-    as a scoped, actionable loop-lesson via the registered `ack.lessons` provider — the #601 S14-4 write
-    re-homed from the inline advance site onto the Hook-Bus (one consistent reflection path, outside the vault
-    lock). Gates on the completion result so it never fires on an already-done re-advance or an error, and on a
-    registered provider + a non-empty archived feedback file (BYTE-IDENTICAL no-op when none is wired — no file
-    read). **Fail-soft** (never raises — a lesson write must never break a turn)."""
-    try:
-        ctx = ctx or {}
-        if not str(ctx.get("result") or "").startswith("OK: pipeline advanced"):
-            return                                   # only a fresh completed advance (not already-done / error)
-        from ack import lessons as _lessons          # lazy: never import ack at gx10 top-level (S6b lesson)
-        if _lessons.get_provider() is None:          # no backend wired ⇒ zero extra work (byte-identical)
-            return
-        task_id = str(ctx.get("task_id") or ""); agent = str(ctx.get("agent") or "")
-        vfb = archive_feedback_dir() / f"{task_id}_{agent}-feedback.md"   # feedback is archived by step 2 of the advance
-        _fb = vfb.read_text(encoding="utf-8").strip() if vfb.exists() else ""
-        if _fb:
-            _lessons.report_lesson(_active_mem_ns(), _fb, {"task_id": task_id, "source": "task_completion"})
-    except Exception:   # noqa: BLE001 — advisory: a lesson write must never break a turn
-        return
+    """Deprecated compatibility seam; ACE owns provider registration and legacy-lesson migration."""
+    return
 
 
 _NOTIFY_CONSUMER = None   # #1083: the currently-registered escalation → webhook consumer (None = none)
 
 
-def _apply_notify(cfg: Dict[str, Any]) -> None:
+def _apply_notify(cfg: Dict[str, Any], *, strict: bool = False) -> None:
     """#1083: (un)register the `escalation` → webhook notifier per `notify.webhook` (a deploy secret via
     GX10_NOTIFY_WEBHOOK — never a URL literal in core). DEFAULT-OFF: an empty URL removes the consumer, so a
     dispatch is an O(1) no-op → byte-identical. Idempotent — tracks the registered consumer so a URL change
@@ -12599,29 +13485,10 @@ def _apply_notify(cfg: Dict[str, Any]) -> None:
             import notify as _notify
             _NOTIFY_CONSUMER = _notify.make_escalation_consumer(url)
             _hooks.register_hook("escalation", _NOTIFY_CONSUMER)
-    except Exception:   # noqa: BLE001 — notification wiring must never break config application
+    except Exception:   # noqa: BLE001 — boot stays fail-soft; runtime transactions must roll back
         _NOTIFY_CONSUMER = None
-
-
-def _apply_lessons_consumer(cfg: Dict[str, Any]) -> None:
-    """Register (or unregister) the `post_feedback` Lessons consumer per **provider presence** (#602 2.3 /
-    #804) — NOT a config flag: this mirrors the inline write it replaces, which fired whenever a provider was
-    registered (a foreign provider stays honoured even with `lessons.enabled` off). Runs AFTER
-    `_apply_lessons_provider` in `_apply_config`, so when `lessons.enabled` flips the provider is wired/cleared
-    first and the consumer follows. OPT-IN: no provider ⇒ the hook is removed (dispatch O(1) no-op →
-    byte-identical default). Idempotent (dedup by identity). Lazy-imports ``ack`` (S6b). Fail-soft."""
-    try:
-        from ack import hooks as _hooks       # lazy: never import ack at gx10 top-level (S6b lesson)
-        from ack import lessons as _lessons
-    except Exception:   # noqa: BLE001 — bus/seam unavailable ⇒ leave the no-op default
-        return
-    try:
-        if _lessons.get_provider() is not None:
-            _hooks.register_hook("post_feedback", _lessons_consumer_hook)
-        else:
-            _hooks.unregister_hook("post_feedback", _lessons_consumer_hook)
-    except Exception:   # noqa: BLE001 — advisory wiring: never break config application
-        return
+        if strict:
+            raise
 
 
 # ═══ ACE (epic #855 ACE-WIRE / #863): the always-on Agentic Context Engineering loop-intelligence core ═══
@@ -13364,7 +14231,7 @@ def _ace_scan_fork_resolutions(payloads: "Any" = None, chain_errors: "Any" = Non
         return 0
 
 
-def _apply_ace(cfg: Dict[str, Any]) -> None:
+def _apply_ace(cfg: Dict[str, Any], *, strict: bool = False) -> None:
     """Register the always-on ACE PlaybookStore provider + the `post_feedback` ACE consumer + the background
     ReflectionWorker, SUPERSEDING the #602 string-lesson + Process-SC consumers. Runs on every config
     application (boot + ``/config set`` + ``/switch``). NO enable flag — ACE is the core mechanic. Keeps the
@@ -13380,7 +14247,9 @@ def _apply_ace(cfg: Dict[str, Any]) -> None:
         from playbook_store import PlaybookStore, migrate_lessons   # bare engine-sibling import
         from lesson_store import EngineLessonStore
         from project_registry import ironclad_home
-    except Exception:   # noqa: BLE001 — seam/store unavailable ⇒ leave the (no-ACE) state untouched
+    except Exception:   # noqa: BLE001 — boot is fail-soft; a runtime transaction must roll back
+        if strict:
+            raise
         return
     try:
         ace = (cfg.get("ace") or {})
@@ -13393,7 +14262,7 @@ def _apply_ace(cfg: Dict[str, Any]) -> None:
         top_k = _int("top_k", 8)                      # #905: the context_for injection cap — now actually threaded
         # M5-2 (#883): the gated MPR-at-fork OPTION — `ace.fork_mpr.enabled` (default OFF). Gate OFF ⇒ the
         # fork scan is a no-op ⇒ byte-identical to today's STOP-and-ask.
-        _ACE_FORK_MPR = bool((ace.get("fork_mpr") or {}).get("enabled", False))
+        _ACE_FORK_MPR = (ace.get("fork_mpr") or {}).get("enabled", False)
         current = _lessons.get_provider()
         # Supersede the built-in (None / the #602 EngineLessonStore / OUR OWN store on re-apply). #905: never
         # clobber a FOREIGN PlaybookStore — the faithful check is identity (`current is _ACE_STORE`), not type.
@@ -13402,8 +14271,7 @@ def _apply_ace(cfg: Dict[str, Any]) -> None:
                 ironclad_home() / "ace_playbooks", max_bullets=max_bullets,
                 config=AdaptConfig(rounds=rounds, max_bullets=max_bullets, cost=cost))
             store.set_transports(chat=_ace_chat_adapter(), embed=_ace_embed_adapter())
-            store.configure(max_bullets=max_bullets, top_k=top_k,
-                            safe_promote=bool(ace.get("safe_promote", False)))   # #1070 learned-state safety
+            store.configure(max_bullets=max_bullets, top_k=top_k)
             if current is not store:
                 _lessons.set_provider(store)
             _ACE_STORE = store
@@ -13417,7 +14285,7 @@ def _apply_ace(cfg: Dict[str, Any]) -> None:
                         marker.write_text("1", encoding="utf-8")
                 except Exception:   # noqa: BLE001 — migration is best-effort; a hiccup must not block wiring
                     pass
-        # Wire the consumer iff OUR store owns the provider; retire the #602 lesson/process consumers either way.
+        # Wire the consumer iff OUR store owns the provider.
         if _lessons.get_provider() is _ACE_STORE and _ACE_STORE is not None:
             _hooks.register_hook("post_feedback", _ace_consumer_hook)
             if _ACE_WORKER is None:
@@ -13438,9 +14306,9 @@ def _apply_ace(cfg: Dict[str, Any]) -> None:
                 _ACE_FORK_INFLIGHT.clear()
         else:                                        # a foreign provider won ⇒ ACE steps back
             _hooks.unregister_hook("post_feedback", _ace_consumer_hook)
-        _hooks.unregister_hook("post_feedback", _lessons_consumer_hook)    # superseded (#804)
-        _hooks.unregister_hook("post_feedback", _process_consumer_hook)    # superseded (#803)
-    except Exception:   # noqa: BLE001 — advisory wiring: never break config application
+    except Exception:   # noqa: BLE001 — boot is fail-soft; a runtime transaction must roll back
+        if strict:
+            raise
         return
 
 
@@ -13464,36 +14332,44 @@ def _loop_profile(task_type=None):
         return SimpleNamespace(max_iterations=MAX_ITERATIONS, retry_budget=3, effort="medium", eval_verifiers=())
 
 
-def _apply_quality_breaker(cfg: Dict[str, Any]) -> None:
-    """Build (or clear) the SEPARATE quality breaker per ``quality.enabled`` (epic #602 SUB-9). Runs on every
-    config application (boot + ``/config set`` + ``/switch``). OPT-IN: when on and none exists, build a
-    ``QualityBreaker`` from the config (keeping an already-built one so its accumulated streak survives a
-    re-apply); when off, clear it. Lazy-imports ``ack`` (never at the gx10 top level). **Fail-soft** — a
-    hiccup never breaks config application; default-off keeps it a byte-identical no-op."""
-    global _QUALITY_BREAKER
-    try:
-        enabled = _as_bool(_cfg_get(cfg, "quality.enabled"))
-        if not enabled:
-            _QUALITY_BREAKER = None
-            return
-        if _QUALITY_BREAKER is None:
-            from ack.quality import QualityBreaker   # lazy: never import ack at gx10 top-level (S6b lesson)
-            q = (_cfg_get(cfg, "quality") or {}) if isinstance(_cfg_get(cfg, "quality"), dict) else {}
-            # `.get(key, default)` (not _cfg_get) so a PARTIAL quality block falls back to the code defaults
-            # rather than passing None (which would coerce threshold to a never-trip 0.0).
-            _QUALITY_BREAKER = QualityBreaker(
+def _derive_quality_breaker_state(cfg: Dict[str, Any]):
+    """Build an unpublished quality-breaker replacement while retaining compatible live history."""
+    from ack.quality import QualityBreaker   # lazy: never import ack at gx10 top-level (S6b lesson)
+    q = (_cfg_get(cfg, "quality") or {}) if isinstance(_cfg_get(cfg, "quality"), dict) else {}
+    candidate = QualityBreaker(
+        threshold=q.get("threshold", 0.5),
+        min_consecutive=q.get("min_consecutive", 3),
+        window=q.get("window", 20),
+    )
+    with _QUALITY_LOCK:
+        current = _QUALITY_BREAKER
+        if current is not None:
+            old = current.snapshot()
+            new = candidate.snapshot()
+            old_window = getattr(getattr(current, "_scores", None), "maxlen", None)
+            new_window = getattr(getattr(candidate, "_scores", None), "maxlen", None)
+            if (old.threshold, old.min_consecutive, old_window) == (
+                    new.threshold, new.min_consecutive, new_window):
+                return current, _QUALITY_TRIPPED
+            rebuilt = current.reconfigure(
                 threshold=q.get("threshold", 0.5),
                 min_consecutive=q.get("min_consecutive", 3),
                 window=q.get("window", 20),
             )
-    except Exception:   # noqa: BLE001 — advisory wiring: never break config application
-        return
+        else:
+            rebuilt = candidate
+        snapshot = rebuilt.snapshot()
+        return rebuilt, snapshot if snapshot.tripped else None
+
+
+def _apply_quality_breaker(cfg: Dict[str, Any]) -> None:
+    """Atomically apply live quality tuning while retaining history and the breaker's live latch state."""
+    global _QUALITY_BREAKER, _QUALITY_TRIPPED
+    _QUALITY_BREAKER, _QUALITY_TRIPPED = _derive_quality_breaker_state(cfg)
 
 
 def _quality_breaker():
-    """The process-global quality breaker (#602 SUB-9), or ``None`` when ``quality.enabled`` is off (the
-    default → no-op byte-identical). Consumers feed it verifier scores via ``.record(score)`` and surface
-    ``.tripped`` / ``.snapshot()`` — advisory only."""
+    """The always-on process-global output-quality breaker (#602 SUB-9)."""
     return _QUALITY_BREAKER
 
 
@@ -13508,137 +14384,18 @@ def _set_last_verdict(v) -> None:
 
 
 def _last_verdict():
-    """The most recent mark-only Verifier :class:`~ack.verify.VerdictResult` (#602 2.1), or ``None`` when the
-    Verifier is off / has not run yet. Consumed by the Quality breaker (#602 SUB-9 / 2.7) — advisory only."""
+    """The most recent handover :class:`~ack.verify.VerdictResult`, consumed once by Quality."""
     return _LAST_VERDICT
 
 
-def _verifier_hook(ctx) -> None:
-    """Mark-only Verifier for a staged handover (#602 2.1) — a ``pre_handover`` Hook-Bus subscriber. Evaluates
-    the task with deterministic BEHAVIORAL rules over ``task_json`` and (when a memory tier is up) GROUNDING of
-    the handover's claims against the cold store, then stores a combined :class:`~ack.verify.VerdictResult` for
-    the Quality breaker. **MARK-ONLY** (never gates a handover) and **fail-soft** (never raises; the bus also
-    swallows). The opt-in LLM-judge is a SEPARATE explicit activation (it charges the budget ledger) and is not
-    run here. Registered only while ``verify.enabled`` (see :func:`_apply_verifier`)."""
-    try:
-        from ack.verify import verify_rules, verify_grounding, VerdictResult   # lazy: never import ack at top
-        td = ctx if isinstance(ctx, dict) else {}
-        raw = td.get("task_json")
-        if isinstance(raw, dict):
-            fields = raw
-        elif isinstance(raw, str) and raw.strip():
-            try:
-                fields = json.loads(raw)
-            except Exception:   # noqa: BLE001 — a non-JSON task_json → no field rules; grounding still runs
-                fields = {}
-        else:
-            fields = {}
-        if not isinstance(fields, dict):
-            fields = {}
-        handover_md = str(td.get("handover_md") or "")
-
-        # 8b — which mark-only verifiers run for THIS task's type (`LoopProfile.eval_verifiers`); empty → the
-        # DEFAULT rules + grounding set (the operator decision). The async LLM-judge is a SEPARATE opt-in
-        # consumer (validated_emit's `strategist` / a future async eval-gate), not run by this sync hook.
-        try:
-            evs = tuple(_loop_profile(fields.get("type")).eval_verifiers or ())
-        except Exception:   # noqa: BLE001 — profile hiccup → the default set
-            evs = ()
-        run_rules = ("rules" in evs) if evs else True
-        run_grounding = ("grounding" in evs) if evs else True
-
-        verdicts = []
-        if run_rules:
-            # BEHAVIORAL (beyond-schema) quality rules — advisory; the ACK gate already enforces schema validity.
-            rules = [
-                ("description_substantive", lambda f: len(str((f or {}).get("description", "")).strip()) >= 40),
-                ("title_specific",          lambda f: len(str((f or {}).get("title", "")).split()) >= 3),
-            ]
-            verdicts.append(verify_rules(fields, rules))
-
-        # GROUNDING — only when selected AND a memory tier is up; its OWN try so a memory hiccup drops ONLY
-        # grounding and never discards the rules verdict. Capped (12 claims) to bound the sync cold-store lookups.
-        if run_grounding:
-            try:
-                if _MEMORY is not None and _MEMORY.is_available():
-                    claims = [ln.strip() for ln in handover_md.splitlines()
-                              if len(ln.strip()) >= 30 and not ln.lstrip().startswith("#")][:12]
-                    if claims:
-                        verdicts.append(verify_grounding(
-                            claims,
-                            lambda c: bool(_MEMORY.search(c, limit=3)),
-                            threshold=_VERIFY_GROUNDING_THRESHOLD,
-                        ))
-            except Exception:   # noqa: BLE001 — a memory hiccup drops only grounding; the rules verdict survives
-                pass
-
-        if verdicts:
-            score = sum(v.score for v in verdicts) / len(verdicts)
-            passed = all(v.passed for v in verdicts)
-            reason = "; ".join(f"{v.verifier} {v.score:.2f}" for v in verdicts)
-            _set_last_verdict(VerdictResult(passed, score, reason, "handover"))
-    except Exception:   # noqa: BLE001 — mark-only + fail-soft: a Verifier hiccup never breaks a handover
-        pass
-
-
-def _ambiguity_hook(ctx) -> None:
-    """#1066 (Variant-B): pre-flight ambiguity auto-detector — a ``pre_handover`` Hook-Bus subscriber. Scans
-    the handover's requirement (``handover_md``) for underspecification / ambiguity and, on a hit, SURFACES a
-    halt-to-ask ForkSignal (warn) so an autonomous agent that did NOT notice the ambiguity is stopped, not
-    left to guess. Observer-only (mark/warn, never gates the fail-closed path) + fail-soft (never raises; the
-    bus swallows too). Registered only while ``safety.ambiguity_detect`` (see :func:`_apply_ambiguity`)."""
-    try:
-        from ack.ace.fork import detect_ambiguity   # lazy: never import ack at gx10 top-level (S6b lesson)
-        td = ctx if isinstance(ctx, dict) else {}
-        sig = detect_ambiguity(str(td.get("handover_md") or ""), unit=str(td.get("task_id") or ""))
-        if sig is not None and not sig.is_empty():
-            _ui_print(col(f"  [ambiguity] {sig.question}", C.YELLOW))
-            _ui_print(col(f"  [ambiguity] options: {' | '.join(sig.options)}", C.GRAY))
-    except Exception:   # noqa: BLE001 — the detector must never break a handover
-        pass
-
-
-def _apply_ambiguity(cfg: Dict[str, Any]) -> None:
-    """#1066: register (or unregister) the Variant-B ambiguity pre-flight on the ``pre_handover`` event per
-    ``safety.ambiguity_detect`` (default OFF → no hook → dispatch O(1) no-op → byte-identical). Idempotent
-    (dedup by identity); lazy-imports ``ack`` (S6b); fail-soft (never breaks config application)."""
-    try:
-        from ack import hooks as _hooks       # lazy: never import ack at gx10 top-level (S6b lesson)
-    except Exception:   # noqa: BLE001 — bus unavailable ⇒ leave the no-op default
-        return
-    try:
-        if bool(((cfg or {}).get("safety") or {}).get("ambiguity_detect", False)):
-            _hooks.register_hook("pre_handover", _ambiguity_hook)
-        else:
-            _hooks.unregister_hook("pre_handover", _ambiguity_hook)
-    except Exception:   # noqa: BLE001 — advisory wiring: never break config application
-        pass
-
-
 def _apply_verifier(cfg: Dict[str, Any]) -> None:
-    """Register (or unregister) the mark-only Verifier on the ``pre_handover`` Hook-Bus event per
-    ``verify.enabled`` (#602 2.1). Runs on every config application (boot + ``/config set`` + ``/switch``).
-    OPT-IN: when off the hook is removed (dispatch O(1) no-op → byte-identical); when on it is registered
-    (additive + idempotent — dedup by identity, so a re-apply never double-registers, and it never clobbers a
-    sibling hook). Lazy-imports ``ack.hooks`` (never at the gx10 top level). Fail-soft — a hiccup never breaks
-    config application."""
-    try:
-        from ack import hooks as _hooks   # lazy: never import ack at gx10 top-level (S6b lesson)
-    except Exception:   # noqa: BLE001 — bus unavailable ⇒ leave the no-op default
-        return
+    """Capture bounded advisory-grounding tuning for the always-on synchronous verifier."""
     global _VERIFY_GROUNDING_THRESHOLD
-    try:   # capture the grounding threshold at apply-time (the verifier reads the flag, not _EFFECTIVE_CFG)
+    try:
         th = _cfg_get(cfg, "verify.grounding_threshold")
         _VERIFY_GROUNDING_THRESHOLD = float(th) if isinstance(th, (int, float)) and not isinstance(th, bool) else 0.5
-    except Exception:   # noqa: BLE001 — bad value → the safe default
+    except Exception:
         _VERIFY_GROUNDING_THRESHOLD = 0.5
-    try:
-        if _as_bool(_cfg_get(cfg, "verify.enabled")):
-            _hooks.register_hook("pre_handover", _verifier_hook)
-        else:
-            _hooks.unregister_hook("pre_handover", _verifier_hook)
-    except Exception:   # noqa: BLE001 — advisory wiring: never break config application
-        return
 
 
 # ─── epic #602 SUB-9 / 2.7: Quality breaker CONSUMER — feed Verifier scores, surface a trip ────────
@@ -13646,78 +14403,95 @@ _QUALITY_TRIPPED = None
 
 
 def _quality_tripped():
-    """The latest :class:`~ack.quality.QualitySnapshot` from a tripped quality breaker (#602 2.7), or ``None``
-    when untripped / off. Advisory + observability only — a trip NEVER hard-aborts a turn."""
+    """The latest latched tripped :class:`~ack.quality.QualitySnapshot`, or ``None`` when untripped."""
     return _QUALITY_TRIPPED
 
 
 def _quality_consumer_hook(ctx) -> None:
-    """`post_handover` consumer (#602 2.7): feed the latest mark-only Verifier score (`_last_verdict()`) into
-    the quality breaker and SURFACE a sustained-degradation trip — advisory (escalate/surface), NEVER a gate.
-    No-op when the breaker is off (`quality.enabled`) or no verdict is present; **fail-soft** (never raises)."""
+    """Feed the latest Verifier score into Quality, surface a trip, and reset a latch on a passing score.
+
+    No-op when no verdict is present; **fail-soft** (never raises).
+    """
     global _QUALITY_TRIPPED
     try:
-        qb = _quality_breaker()
-        v = _last_verdict()
-        if qb is None or v is None:
-            return
-        was_tripped = _QUALITY_TRIPPED is not None
-        tripped = qb.record(v.score)
-        _set_last_verdict(None)   # feed-once: consume the verdict so a later handover can't re-feed it stale
-        if tripped:
-            _QUALITY_TRIPPED = qb.snapshot()
-            if not was_tripped:   # surface only on the not-tripped → tripped transition (no re-print while latched)
-                _ui_print(col(f"  [quality] output-quality breaker tripped — {_QUALITY_TRIPPED.reason}", C.YELLOW))
-        else:
-            _QUALITY_TRIPPED = None
+        with _QUALITY_LOCK:
+            qb = _quality_breaker()
+            v = _last_verdict()
+            if qb is None or v is None:
+                return
+            was_tripped = _QUALITY_TRIPPED is not None
+            tripped = qb.record(v.score)
+            _set_last_verdict(None)   # feed-once: consume the verdict so a later handover can't re-feed it stale
+            score = float(v.score)
+            recovered = math.isfinite(score) and score >= qb.snapshot().threshold
+            if recovered:
+                qb.reset()
+                _QUALITY_TRIPPED = None
+            elif tripped:
+                _QUALITY_TRIPPED = qb.snapshot()
+                if not was_tripped:   # surface only on the not-tripped → tripped transition (no re-print while latched)
+                    _ui_print(col(f"  [quality] output-quality breaker tripped — {_QUALITY_TRIPPED.reason}", C.YELLOW))
+            else:
+                _QUALITY_TRIPPED = None
     except Exception:   # noqa: BLE001 — mark-only + fail-soft: a quality hiccup never breaks a handover
         return
 
 
-def _apply_quality_consumer(cfg: Dict[str, Any]) -> None:
-    """Register (or unregister) the `post_handover` quality consumer per ``quality.enabled`` (#602 2.7). When
-    on, the breaker is fed the Verifier scores and a trip is surfaced; when off the hook is removed (dispatch
-    O(1) no-op → byte-identical). Idempotent (dedup by identity). Lazy-imports ``ack.hooks`` (S6b). Fail-soft."""
+def _apply_quality_consumer(cfg: Dict[str, Any], *, strict: bool = False) -> None:
+    """Register the always-on ``post_handover`` quality consumer (#602 2.7)."""
     try:
         from ack import hooks as _hooks   # lazy: never import ack at gx10 top-level (S6b lesson)
-    except Exception:   # noqa: BLE001 — bus unavailable ⇒ leave the no-op default
+    except Exception:   # noqa: BLE001 — boot is fail-soft; a runtime transaction must roll back
+        if strict:
+            raise
         return
     try:
-        if _as_bool(_cfg_get(cfg, "quality.enabled")):
-            _hooks.register_hook("post_handover", _quality_consumer_hook)
-        else:
-            _hooks.unregister_hook("post_handover", _quality_consumer_hook)
-    except Exception:   # noqa: BLE001 — advisory wiring: never break config application
+        _hooks.register_hook("post_handover", _quality_consumer_hook)
+    except Exception:   # noqa: BLE001 — boot is fail-soft; a runtime transaction must roll back
+        if strict:
+            raise
         return
 
 
 # ─── epic #602 SUB-3 / 2.4: FailureClass at the code-agent failover (the Strategy consumer's input) ───
 _LAST_FAILURE_CLASS = None
-_STRATEGY_ENABLED = False
 _STRATEGY_BUDGET = 3
 _FAILURE_ATTEMPTS: "Dict[str, int]" = {}   # per-task code-agent failure counter (#602 2.5); reset on success
 _LAST_STRATEGY = None
 
 
 def _apply_strategy(cfg: Dict[str, Any]) -> None:
-    """Capture ``strategy.enabled`` + ``strategy.budget`` at config-application time (#602 2.4/2.5), mirroring
-    the other `_apply_*` seams. Runtime (the server feedback path) reads the `_STRATEGY_ENABLED` /
-    `_STRATEGY_BUDGET` flags — NOT `_EFFECTIVE_CFG`, which only the config-tree loader sets, not
-    `_apply_config`. Default OFF → byte-identical. Fail-soft — never breaks config application."""
-    global _STRATEGY_ENABLED, _STRATEGY_BUDGET
+    """Capture bounded ``strategy.budget`` tuning for the always-on finite failure strategy."""
+    global _STRATEGY_BUDGET
     try:
-        _STRATEGY_ENABLED = _as_bool(_cfg_get(cfg, "strategy.enabled"))
         b = _cfg_get(cfg, "strategy.budget")
-        _STRATEGY_BUDGET = b if isinstance(b, int) and not isinstance(b, bool) and b >= 1 else 3
-    except Exception:   # noqa: BLE001 — advisory wiring: default to off
-        _STRATEGY_ENABLED = False
+        if (isinstance(b, bool) or not isinstance(b, (int, float))
+                or not math.isfinite(float(b)) or float(b) <= 0 or not float(b).is_integer()):
+            raise ValueError("strategy.budget must be a positive finite integer")
+        from ack.validated_emit import MAX_RETRY_BUDGET
+        _STRATEGY_BUDGET = min(int(b), MAX_RETRY_BUDGET)
+    except Exception:   # noqa: BLE001 — invalid tuning cannot disable or unbound the strategy
         _STRATEGY_BUDGET = 3
 
 
 def _last_strategy():
     """The most recent :class:`~ack.strategy.Strategy` from the failover consumer (#602 2.5), or ``None``.
-    Advisory / observability — never gates."""
+    Observability only; the feedback handler gates directly on the fresh action returned by
+    :func:`_revise_on_failure`."""
     return _LAST_STRATEGY
+
+
+def _strategy_escalated(action: Any) -> bool:
+    """Return whether a strategy action is the terminal retry-budget signal."""
+    return action == "human_escalation"
+
+
+def _mark_strategy_escalated(task_id: str, result_cls: Any) -> str:
+    """Persist and return the canonical terminal retry-budget reason for *task_id*."""
+    attempts = _FAILURE_ATTEMPTS.get(task_id, 0)
+    reason = f"retry budget spent after {attempts} attempts ({result_cls})"
+    _store().mark_blocked(task_id, kind="escalated", reason=reason)
+    return reason
 
 
 def _failover_budget(task_id) -> int:
@@ -13747,14 +14521,16 @@ def _failover_budget(task_id) -> int:
 
 
 def _revise_on_failure(task_id, result_cls):
-    """#602 2.5 / #806: consult the Strategy Revisor on a code-agent run result and **surface** a
-    ``HUMAN_ESCALATION`` when the per-task attempt budget is spent — instead of an endless silent failover.
-    Uses the FRESH ``result_cls`` (never a stale ``_last_failure_class``); a successful run RESETS the task's
-    attempt counter. **OPT-IN** per ``strategy.enabled`` (default OFF → ``None``, byte-identical). Returns the
-    chosen ``StrategyAction`` value (or ``None``). **Fail-soft** — never breaks the feedback path."""
+    """Apply the always-on finite strategy and durably block a task when its retry budget is spent.
+
+    Uses the fresh ``result_cls`` (never a stale ``_last_failure_class``); success resets the per-task
+    counter. The returned action is the feedback handler's terminal signal. Strategy calculation remains
+    fail-soft, while a spent-budget persistence failure still returns the escalation signal so automatic
+    failover stops at the protected boundary.
+    """
     global _LAST_STRATEGY
     try:
-        if not _STRATEGY_ENABLED or not task_id:
+        if not task_id:
             return None
         from providers import code_agent_strategy, RESULT_OK   # bare engine-sibling import
         if result_cls == RESULT_OK:
@@ -13768,14 +14544,25 @@ def _revise_on_failure(task_id, result_cls):
         if strat is None:
             return None
         _LAST_STRATEGY = strat
-        if getattr(strat, "escalate", False):
-            _ui_print(col(f"  [strategy] human escalation after {n} attempt(s) on {task_id} "
-                          f"({result_cls}) → {strat.action.value}", C.YELLOW))
-            _emit_hook("escalation", {"task_id": task_id, "attempts": n,   # #1083: reach an off-duty human
-                                      "result_cls": result_cls, "action": strat.action.value})
-        return strat.action.value
-    except Exception:   # noqa: BLE001 — advisory: a strategy hiccup must never break the feedback path
+    except Exception:   # noqa: BLE001 — strategy calculation is fail-soft
         return None
+    action = strat.action.value
+    if getattr(strat, "escalate", False):
+        try:
+            _mark_strategy_escalated(task_id, result_cls)
+        except Exception:   # noqa: BLE001 — caller retries persistence and still stops automatic failover
+            pass
+        try:
+            _ui_print(col(f"  [strategy] human escalation after {n} attempt(s) on {task_id} "
+                          f"({result_cls}) → {action}", C.YELLOW))
+        except Exception:   # noqa: BLE001 — observability must not mask the terminal signal
+            pass
+        try:
+            _emit_hook("escalation", {"task_id": task_id, "attempts": n,  # #1083: off-duty human
+                                      "result_cls": result_cls, "action": action})
+        except Exception:   # noqa: BLE001 — notifier failures do not reopen automatic retries
+            pass
+    return action
 
 
 def _last_failure_class():
@@ -13786,14 +14573,11 @@ def _last_failure_class():
 
 def _record_failure_class(result_cls):
     """On a code-agent run result, record + return the shared FailureClass (#602 2.4 / #805) so the Strategy
-    consumer (2.5) can act on WHY a run failed. **OPT-IN per ``strategy.enabled``** (default OFF → ``None``,
-    byte-identical: nothing recorded, no response field). Returns the FailureClass string value, or ``None``
-    for ``RESULT_OK`` / an unknown result / when off. **Fail-soft** — classifying a failure must never break
-    the feedback path."""
+    consumer (2.5) can act on WHY a run failed. Classification is always on. Returns the FailureClass string
+    value, or ``None`` for ``RESULT_OK`` / an unknown result. **Fail-soft** — classifying a failure must never
+    break the feedback path."""
     global _LAST_FAILURE_CLASS
     try:
-        if not _STRATEGY_ENABLED:
-            return None
         from providers import result_failure_class   # bare engine-sibling import (like project_registry)
         fc = result_failure_class(result_cls)
         if fc is None:
@@ -13804,93 +14588,28 @@ def _record_failure_class(result_cls):
         return None
 
 
-# ─── epic #602 SUB-6: Process-Level Self-Correction (post_feedback → pre_turn) ─────────────────────
+# ─── epic #602 SUB-6: optional ACE-backed pre-turn process hints ───────────────────────────────────
 def _concrete_lesson_provider():
-    """The registered lesson provider IFF it exposes the TYPED ``record``/``by_category`` surface; ``None``
-    otherwise. Process-SC reads/writes TYPED process-lessons through this surface — the string-only
-    ``ack.lessons`` seam can't round-trip them. DUCK-TYPED (#863): since ACE supersedes the #602
+    """The registered lesson provider IFF it exposes the typed ``by_category`` surface; ``None`` otherwise.
+
+    Process hints read typed entries through this surface; the string-only ``ack.lessons`` seam cannot provide
+    them. DUCK-TYPED (#863): since ACE supersedes the #602
     ``EngineLessonStore`` with the :class:`~engine.playbook_store.PlaybookStore` (which implements the SAME
-    typed surface over the bullet playbook), the check is a capability probe, not an ``isinstance`` — so
-    Process-SC keeps working against whichever concrete backend is wired and NEVER silently breaks. Never raises."""
+    read surface over the bullet playbook), the check is a capability probe, not an ``isinstance``. Never raises."""
     try:
         from ack import lessons as _lessons     # lazy: never import ack at gx10 top-level (S6b lesson)
         p = _lessons.get_provider()
-        return p if (callable(getattr(p, "record", None))
-                     and callable(getattr(p, "by_category", None))) else None
+        return p if callable(getattr(p, "by_category", None)) else None
     except Exception:   # noqa: BLE001 — advisory: a lookup hiccup → no concrete provider
         return None
 
 
-def _record_process_lesson(existing, agent: str = "") -> None:
-    """At task completion, distill a TYPED process-lesson from the workflow signal and store it via the
-    concrete provider (#602 SUB-6). OPT-IN: a no-op when ``process.enabled`` is off OR no concrete
-    EngineLessonStore is registered (byte-identical). Fail-soft — never raises, never breaks a turn."""
-    try:
-        cfg = _EFFECTIVE_CFG if _EFFECTIVE_CFG is not None else _code_defaults()
-        if not _as_bool(_cfg_get(cfg, "process.enabled")):
-            return
-        provider = _concrete_lesson_provider()
-        if provider is None:
-            return
-        scope = _active_mem_ns()
-        if not scope:    # no project bound (base partition) → no-op, byte-identical
-            return
-        from ack.process import ProcessSignal, ProcessLessonKind, distill_process_lesson
-        from lesson_store import LessonCategory
-        task_type = str((existing or {}).get("type") or "") if isinstance(existing, dict) else ""
-        lesson = distill_process_lesson(ProcessSignal(task_type=task_type, succeeded=True, agent=str(agent or "")))
-        if lesson is None:
-            return
-        cat = (LessonCategory.BEST_KNOWN_PATH if lesson.kind == ProcessLessonKind.WORKING_PATH
-               else LessonCategory.LAST_FAILURE_REASON)
-        provider.record(scope, lesson.text, cat, {"source": "process_sc", "kind": lesson.kind.value})
-    except Exception:   # noqa: BLE001 — advisory: process-SC must never break a turn
-        return
-
-
-def _process_consumer_hook(ctx) -> None:
-    """`post_feedback` consumer (#602 2.2 / #803): on a FRESH task completion, distill + store a TYPED
-    process-lesson via the concrete provider — the Process-SC write re-homed from the inline advance site onto
-    the Hook-Bus (one consistent reflection path, outside the vault lock). Gates on the completion result so it
-    never fires on an already-done re-advance or an error; `_record_process_lesson` keeps its own
-    `process.enabled` + concrete-provider + bound-scope gates (byte-identical no-op by default). **Fail-soft**
-    (never raises — a process-SC hiccup must not break a turn)."""
-    try:
-        ctx = ctx or {}
-        if not str(ctx.get("result") or "").startswith("OK: pipeline advanced"):
-            return                                   # only a fresh completed advance (not already-done / error)
-        task_id = str(ctx.get("task_id") or "")
-        existing = _store().get(task_id) if task_id else None
-        _record_process_lesson(existing, str(ctx.get("agent") or ""))
-    except Exception:   # noqa: BLE001 — advisory: process-SC must never break a turn
-        return
-
-
-def _apply_process_consumer(cfg: Dict[str, Any]) -> None:
-    """Register (or unregister) the `post_feedback` Process-SC consumer per ``process.enabled`` (#602 2.2 /
-    #803), mirroring the other `_apply_*` consumer seams. OPT-IN: when off the hook is removed (dispatch O(1)
-    no-op → byte-identical); when on it is registered (additive + idempotent — dedup by identity, never
-    clobbers a sibling). Lazy-imports ``ack.hooks`` (never at the gx10 top level, S6b). Fail-soft — a wiring
-    hiccup never breaks config application."""
-    try:
-        from ack import hooks as _hooks   # lazy: never import ack at gx10 top-level (S6b lesson)
-    except Exception:   # noqa: BLE001 — bus unavailable ⇒ leave the no-op default
-        return
-    try:
-        if _as_bool(_cfg_get(cfg, "process.enabled")):
-            _hooks.register_hook("post_feedback", _process_consumer_hook)
-        else:
-            _hooks.unregister_hook("post_feedback", _process_consumer_hook)
-    except Exception:   # noqa: BLE001 — advisory wiring: never break config application
-        return
-
-
 def _process_hint() -> str:
-    """A pre-turn hint of known working approaches (process-lessons) for the active scope (#602 SUB-6), or
-    ``""`` (byte-identical) when ``process.enabled`` is off / no concrete provider / none recorded. Fail-soft."""
+    """An ACE-backed pre-turn hint of known working approaches for the active scope, or ``""`` when disabled,
+    no typed provider is registered, or none are recorded. Fail-soft."""
     try:
         cfg = _EFFECTIVE_CFG if _EFFECTIVE_CFG is not None else _code_defaults()
-        if not _as_bool(_cfg_get(cfg, "process.enabled")):
+        if not _as_bool(_cfg_get(cfg, "process.hints_enabled")):
             return ""
         provider = _concrete_lesson_provider()
         if provider is None:

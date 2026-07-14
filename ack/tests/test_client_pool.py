@@ -22,14 +22,53 @@ import client  # noqa: E402
 import pytest  # noqa: E402
 
 
+def _patch_handover_popen(monkeypatch, fake_run):
+    """Adapt the pre-#1491 run-style fakes to the handover's real Popen contract."""
+    class _FakePopen:
+        pid = 4242
+
+        def __init__(self, argv, **kwargs):
+            result = fake_run(argv, **kwargs)
+            self.returncode = result.returncode
+            self._stderr = getattr(result, "stderr", "") or ""
+
+        def communicate(self, timeout=None):
+            return None, self._stderr
+
+        def kill(self):
+            return None
+
+    monkeypatch.setattr(client.subprocess, "Popen", _FakePopen)
+
+
+@pytest.fixture(autouse=True)
+def _authorized_default_launch_policy(monkeypatch):
+    """Positive handover tests run with the same policy derived at engine boot."""
+    import gx10
+    from ack.tooling_envelope import load_tooling_envelope_policy
+    monkeypatch.setattr(gx10, "TOOLING_ENVELOPE_POLICY",
+                        load_tooling_envelope_policy(gx10._code_defaults()))
+
+
 class _FakeServer:
     def __init__(self, pending):
         self._pending = pending
         self.uploaded = []
+        self.signals = []
         self._lock = threading.Lock()
 
     def pending(self):
         return list(self._pending)
+
+    def claim(self, task_id, agent):
+        with self._lock:
+            self.signals.append(("claim", task_id, agent))
+        return {"ok": True, "status": "in_progress"}
+
+    def unclaim(self, task_id):
+        with self._lock:
+            self.signals.append(("unclaim", task_id))
+        return {"ok": True, "status": "pending"}
 
     def feedback(self, task_id, agent, content, exit_code=None, stderr=""):   # #455: accept the run signal
         with self._lock:
@@ -94,8 +133,7 @@ def test_build_argv_codex_template_drops_claude_only_flags():
 
 
 def test_run_handover_passes_permission_mode(tmp_path, monkeypatch):
-    """Regression: the headless code-agent MUST get a non-interactive permission mode,
-    else claude --print can't write files (it silently exits without doing the work)."""
+    """The headless code-agent receives the least-privilege permission default."""
     captured = {}
 
     class _R:
@@ -110,17 +148,58 @@ def test_run_handover_passes_permission_mode(tmp_path, monkeypatch):
         fb.write_text("## Result\ndone", encoding="utf-8")
         return _R()
 
-    monkeypatch.setattr(client.subprocess, "run", _fake_run)
+    _patch_handover_popen(monkeypatch, _fake_run)
     item = {"id": "KGC-7", "agent": "OPUS",
             "handover_file": "KGC-7_OPUS.md", "handover": "do the thing"}
     out, _meta = client._run_handover(item, tmp_path, log=lambda *_: None)
     assert out and "done" in out
     argv = captured["argv"]
     assert "--permission-mode" in argv
-    # the mode value follows the flag and is non-interactive (not "default")
+    # the mode value follows the flag and does not bypass the CLI's permission checks
     mode = argv[argv.index("--permission-mode") + 1]
-    assert mode and mode != "default"
+    assert mode == "default"
+    assert "--dangerously-skip-permissions" not in argv
     assert "--print" in argv and "--model" in argv
+
+
+def test_run_handover_refuses_permission_bypass_without_agent_capability(tmp_path, monkeypatch):
+    called = False
+
+    def _run(*args, **kwargs):
+        nonlocal called
+        called = True
+
+    _patch_handover_popen(monkeypatch, _run)
+    item = {
+        "id": "KGC-8", "agent": "OPUS", "handover": "do the thing",
+        "permission": "bypassPermissions", "permission_bypass": False,
+    }
+
+    out, meta = client._run_handover(item, tmp_path, log=lambda *_: None)
+
+    assert out is None and called is False
+    assert "capabilities.permission_bypass=true" in meta["stderr_tail"]
+
+
+def test_run_handover_prompt_requires_first_line_status_contract(tmp_path, monkeypatch):
+    captured = {}
+
+    class _R:
+        returncode = 0
+        stderr = ""
+
+    def _fake_run(argv, **kw):
+        captured["argv"] = argv
+        return _R()
+
+    _patch_handover_popen(monkeypatch, _fake_run)
+    item = {"id": "KGC-7", "agent": "OPUS", "handover_file": "KGC-7_OPUS.md", "handover": "x"}
+
+    client._run_handover(item, tmp_path, log=lambda *_: None)
+
+    prompt = next(arg for arg in captured["argv"] if "Autonomously read" in arg)
+    assert "The FIRST line of that file must be `status: done`" in prompt
+    assert "`status: blocked`" in prompt and "`status: clarification_needed`" in prompt
 
 
 def test_run_handover_launches_in_shipped_project_cwd(tmp_path, monkeypatch):
@@ -140,7 +219,7 @@ def test_run_handover_launches_in_shipped_project_cwd(tmp_path, monkeypatch):
         captured["cwd"] = kw.get("cwd")
         return _R()
 
-    monkeypatch.setattr(client.subprocess, "run", _fake_run)
+    _patch_handover_popen(monkeypatch, _fake_run)
     item = {"id": "KGC-7", "agent": "OPUS", "handover_file": "KGC-7_OPUS.md",
             "handover": "do the thing", "cwd": str(proj)}
     client._run_handover(item, tmp_path, log=lambda *_: None)
@@ -165,7 +244,7 @@ def test_run_handover_cwd_falls_back_to_codedir(tmp_path, monkeypatch):
         captured["cwd"] = kw.get("cwd")
         return _R()
 
-    monkeypatch.setattr(client.subprocess, "run", _fake_run)
+    _patch_handover_popen(monkeypatch, _fake_run)
     item = {"id": "KGC-7", "agent": "OPUS", "handover_file": "KGC-7_OPUS.md", "handover": "x"}
     client._run_handover(item, tmp_path, log=lambda *_: None)
     assert captured["cwd"] == str(tmp_path)
@@ -184,7 +263,7 @@ def test_run_handover_unusable_shipped_cwd_falls_back_to_codedir(tmp_path, monke
         captured["cwd"] = kw.get("cwd")
         return _R()
 
-    monkeypatch.setattr(client.subprocess, "run", _fake_run)
+    _patch_handover_popen(monkeypatch, _fake_run)
     ghost = str(tmp_path / "does_not_exist_on_this_host")
     item = {"id": "KGC-7", "agent": "OPUS", "handover_file": "KGC-7_OPUS.md", "handover": "x", "cwd": ghost}
     client._run_handover(item, tmp_path, log=lambda *_: None)
@@ -198,7 +277,7 @@ def test_run_handover_uses_server_shipped_tooling_envelope_without_global_config
         calls.append((args, kwargs))
         raise AssertionError("subprocess must not be reached")
 
-    monkeypatch.setattr(client.subprocess, "run", _fake_run)
+    _patch_handover_popen(monkeypatch, _fake_run)
     item = {
         "id": "KGC-7",
         "agent": "OPUS",
@@ -229,7 +308,7 @@ def test_run_handover_server_shipped_tooling_envelope_authorized_spawns(tmp_path
         captured["argv"] = argv
         return _R()
 
-    monkeypatch.setattr(client.subprocess, "run", _fake_run)
+    _patch_handover_popen(monkeypatch, _fake_run)
     item = {
         "id": "KGC-7",
         "agent": "OPUS",
@@ -247,7 +326,7 @@ def test_run_handover_server_shipped_tooling_envelope_authorized_spawns(tmp_path
     assert meta["exit_code"] == 0
 
 
-def test_run_handover_without_server_policy_uses_global_default_off(tmp_path, monkeypatch):
+def test_run_handover_without_server_policy_refuses_unconfigured_tuple(tmp_path, monkeypatch):
     captured = {}
 
     class _R:
@@ -258,7 +337,7 @@ def test_run_handover_without_server_policy_uses_global_default_off(tmp_path, mo
         captured["argv"] = argv
         return _R()
 
-    monkeypatch.setattr(client.subprocess, "run", _fake_run)
+    _patch_handover_popen(monkeypatch, _fake_run)
     item = {
         "id": "KGC-7",
         "agent": "OPUS",
@@ -268,8 +347,9 @@ def test_run_handover_without_server_policy_uses_global_default_off(tmp_path, mo
         "cmd_template": "{bin} wrapper.py {prompt}",
     }
     _out, meta = client._run_handover(item, tmp_path, log=lambda *_: None)
-    assert captured["argv"][0:2] == ["python", "wrapper.py"]
-    assert meta["exit_code"] == 0
+    assert "argv" not in captured
+    assert meta["exit_code"] is None
+    assert "unauthorized coder command" in meta["stderr_tail"]
 
 
 def test_build_argv_feedback_token_substitutes():
@@ -309,7 +389,7 @@ def test_run_handover_falls_back_to_captured_message(tmp_path, monkeypatch):
         cap.write_text("captured final message", encoding="utf-8")
         return _R()
 
-    monkeypatch.setattr(client.subprocess, "run", _fake_run)
+    _patch_handover_popen(monkeypatch, _fake_run)
     assert client._run_handover(_ho_item(), tmp_path, log=lambda *_: None)[0] == "captured final message"
 
 
@@ -325,7 +405,7 @@ def test_run_handover_feedback_file_wins_over_capture(tmp_path, monkeypatch):
         (d / "T9_CODEX-output.md").write_text("captured message", encoding="utf-8")
         return _R()
 
-    monkeypatch.setattr(client.subprocess, "run", _fake_run)
+    _patch_handover_popen(monkeypatch, _fake_run)
     assert client._run_handover(_ho_item(), tmp_path, log=lambda *_: None)[0] == "the real feedback"
 
 
@@ -334,7 +414,7 @@ def test_run_handover_no_feedback_no_capture_is_none(tmp_path, monkeypatch):
     class _R:
         returncode = 1
 
-    monkeypatch.setattr(client.subprocess, "run", lambda argv, **kw: _R())
+    _patch_handover_popen(monkeypatch, lambda argv, **kw: _R())
     assert client._run_handover(_ho_item(), tmp_path, log=lambda *_: None)[0] is None
 
 
@@ -348,7 +428,7 @@ def test_run_handover_ignores_stale_capture_from_prior_run(tmp_path, monkeypatch
     class _R:
         returncode = 1
 
-    monkeypatch.setattr(client.subprocess, "run", lambda argv, **kw: _R())  # writes nothing this run
+    _patch_handover_popen(monkeypatch, lambda argv, **kw: _R())  # writes nothing this run
     assert client._run_handover(_ho_item(), tmp_path, log=lambda *_: None)[0] is None
 
 
@@ -363,7 +443,7 @@ def test_run_handover_whitespace_capture_is_none(tmp_path, monkeypatch):
         cap.write_text("   \n  ", encoding="utf-8")
         return _R()
 
-    monkeypatch.setattr(client.subprocess, "run", _fake_run)
+    _patch_handover_popen(monkeypatch, _fake_run)
     assert client._run_handover(_ho_item(), tmp_path, log=lambda *_: None)[0] is None
 
 
@@ -379,6 +459,7 @@ def test_dispatch_claims_and_runs_each_once(monkeypatch, tmp_path):
     assert sorted(ran) == ["KGC-1", "KGC-2"]
     assert claimed == {"KGC-1", "KGC-2"}
     assert sorted(u[0] for u in srv.uploaded) == ["KGC-1", "KGC-2"]
+    assert sorted(s[1] for s in srv.signals if s[0] == "claim") == ["KGC-1", "KGC-2"]
 
 
 def test_already_claimed_not_resubmitted(monkeypatch, tmp_path):
@@ -423,6 +504,7 @@ def test_failure_unclaims_for_retry(monkeypatch, tmp_path):
     # #455: the client now POSTS the run signal even with no feedback (so the server can classify a
     # budget-exhausted run + fail over) — but with EMPTY content, so no feedback file is written.
     assert srv.uploaded == [("KGC-1", "OPUS", "")]
+    assert srv.signals == [("claim", "KGC-1", "OPUS"), ("unclaim", "KGC-1")]
 
 
 def test_exception_unclaims(monkeypatch, tmp_path):
@@ -438,3 +520,26 @@ def test_exception_unclaims(monkeypatch, tmp_path):
     assert claimed == set()
     # the job must NOT kill the whole loop — _process_one catches it
     assert all(f.result() is False for f in results.done)
+
+
+def test_claim_and_unclaim_transport_errors_are_fail_soft(monkeypatch, tmp_path):
+    srv = _FakeServer(_items("KGC-1"))
+    logs = []
+
+    def _offline(*_args):
+        raise OSError("server unavailable")
+
+    srv.claim = _offline
+    monkeypatch.setattr(client, "_run_handover",
+                        lambda item, codedir, log=print: ("feedback", {}))
+    assert client._process_one(srv, tmp_path, _items("KGC-1")[0], {"KGC-1"}, logs.append) is True
+    assert srv.uploaded == [("KGC-1", "OPUS", "feedback")]
+    assert any("/claim failed (continuing)" in line for line in logs)
+
+    srv.unclaim = _offline
+    monkeypatch.setattr(client, "_run_handover",
+                        lambda item, codedir, log=print: (None, {}))
+    claimed = {"KGC-1"}
+    assert client._process_one(srv, tmp_path, _items("KGC-1")[0], claimed, logs.append) is False
+    assert claimed == set()
+    assert any("/unclaim failed (continuing)" in line for line in logs)

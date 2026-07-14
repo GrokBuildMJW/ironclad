@@ -11,6 +11,8 @@ read path (`_process_hint`) therefore keeps working against the new backend.
 """
 from __future__ import annotations
 
+from design_test_support import approve_active_design
+
 import sys
 import types
 from pathlib import Path
@@ -30,7 +32,8 @@ from ack import lessons as L
 from lesson_store import LessonCategory
 from playbook_store import PlaybookStore
 
-_TASK = '{"type":"feature","priority":"high","title":"Build X","description":"do it"}'
+_TASK = ('{"type":"feature","priority":"high","title":"Build the process feature",'
+         '"description":"Build the complete process feature through the validated staging pipeline."}')
 _SCOPE = "proj_sc::track::main"
 
 
@@ -71,9 +74,11 @@ def _drive_to_completion(tmp_path, monkeypatch, cfg):
     gx10.STORE = None
     monkeypatch.chdir(tmp_path)
     gx10._dispatch(_FakeAgent(), "initiative new Order Service --type software")
+    approve_active_design(gx10)
     gx10._stage_handover(None, "OPUS", "## Handover\nbuild it", task_json=_TASK, force=True)
     tid = gx10._store().list("pending")[0]["id"]
-    (gx10.feedback_dir() / f"{tid}_OPUS-feedback.md").write_text("done", encoding="utf-8")
+    (gx10.feedback_dir() / f"{tid}_OPUS-feedback.md").write_text(
+        "status: done\n\ndone", encoding="utf-8")
     return tid, gx10._advance_pipeline(tid, "OPUS")
 
 

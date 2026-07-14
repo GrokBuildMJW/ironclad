@@ -1,6 +1,4 @@
-"""#1068 (epic #1065): prompt-injection defense on the ingestion paths. A precision-first heuristic scan +
-a trust-boundary wrap (data-not-instructions), wired default-off at the ingestion choke point (#1046) so an
-autonomous agent reading untrusted file/search/web/tool content can't be silently steered by it."""
+"""#1464 F3b: mandatory prompt-injection fencing for every untrusted model tool result."""
 from __future__ import annotations
 
 import sys
@@ -50,7 +48,60 @@ def test_wrap_warns_when_injection_detected():
     assert "ignore previous instructions" in w                       # content preserved inside the fence
 
 
-def test_ingestion_tools_are_covered_and_flag_present():
+def test_character_cap_and_untrusted_result_classes_are_distinct():
     import gx10
     assert {"read_file", "search_files", "execute_command", "fetch_url"} <= gx10._INGESTION_TOOLS
-    assert hasattr(gx10, "INJECTION_DEFENSE") and gx10.INJECTION_DEFENSE is False   # default-off
+    assert {"web_search", "parallel_reason", "query_memory", "deep_query_memory"} <= gx10._UNTRUSTED_RESULT_TOOLS
+    assert "web_search" not in gx10._INGESTION_TOOLS
+    assert not hasattr(gx10, "INJECTION_DEFENSE")
+    assert "use_skill" not in gx10._UNTRUSTED_RESULT_TOOLS
+    assert "use_prompt" not in gx10._UNTRUSTED_RESULT_TOOLS
+    assert gx10._is_untrusted_result("use_skill") is False
+    assert gx10._is_untrusted_result("use_prompt") is False
+    assert gx10._fence_untrusted_result("use_skill", "PLAYBOOK-BODY") == "PLAYBOOK-BODY"
+
+
+def test_every_source_class_is_fenced_exactly_once(monkeypatch):
+    import gx10
+    calls = []
+    monkeypatch.setattr(injection, "wrap_untrusted",
+                        lambda text, source: calls.append((source, text)) or f"FENCED:{source}:{text}")
+    gx10._PLUGIN_TOOLS["mpr_research"] = {"schema": {}, "handler": lambda: "x"}
+    sources = [
+        "read_file", "fetch_url", "web_search", "parallel_reason", "query_memory",
+        "deep_query_memory", "mpr_research",
+    ]
+    for source in sources:
+        assert gx10._fence_untrusted_result(source, f"raw-{source}") == f"FENCED:{source}:raw-{source}"
+    assert [source for source, _ in calls] == sources
+
+
+def test_fence_wrapper_failure_never_exposes_raw_bytes(monkeypatch):
+    import gx10
+    secret = "RAW-UNTRUSTED-SENTINEL"
+    monkeypatch.setattr(injection, "wrap_untrusted",
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("broken")))
+    out = gx10._fence_untrusted_result("web_search", secret)
+    assert out.startswith("ERROR: web_search result withheld")
+    assert secret not in out and "broken" not in out
+
+
+def test_injection_config_and_env_are_tombstones(monkeypatch, capsys):
+    import gx10
+    cfg = gx10._code_defaults()
+    cfg["security"]["injection_defense"] = False
+    gx10._apply_config(cfg)
+    assert "injection_defense" not in cfg["security"]
+    assert "injection fencing is always on" in capsys.readouterr().out
+
+    monkeypatch.setenv("GX10_INJECTION_DEFENSE", "0")
+    cfg2 = gx10._apply_env(gx10._code_defaults())
+    assert "injection_defense" not in cfg2["security"]
+    assert "GX10_INJECTION_DEFENSE" in capsys.readouterr().out
+
+    lines = []
+    gx10._EFFECTIVE_CFG = gx10._code_defaults()
+    monkeypatch.setattr(gx10, "_ui_print", lambda value, *a, **k: lines.append(str(value)))
+    gx10._dispatch(None, "config set security.injection_defense false")
+    assert "injection_defense" not in gx10._EFFECTIVE_CFG["security"]
+    assert any("retired and cannot be set" in line for line in lines)

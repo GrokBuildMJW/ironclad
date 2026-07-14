@@ -33,18 +33,17 @@ _LIFECYCLE_MANAGED_ACE_GLOBALS = {
 
 
 def _apply_config_globals() -> set[str]:
-    """Globals explicitly rebound by gx10._apply_config must be fixture-snapshotted."""
+    """Globals published by config commit/reconfiguration must be fixture-snapshotted."""
     gx10_path = Path(__file__).resolve().parents[2] / "engine" / "gx10.py"
     tree = ast.parse(gx10_path.read_text(encoding="utf-8"))
+    found = set()
     for node in tree.body:
-        if isinstance(node, ast.FunctionDef) and node.name == "_apply_config":
-            return {
-                name
-                for stmt in ast.walk(node)
-                if isinstance(stmt, ast.Global)
-                for name in stmt.names
-            }
-    raise AssertionError("gx10._apply_config not found")
+        if not isinstance(node, ast.Assign):
+            continue
+        names = {target.id for target in node.targets if isinstance(target, ast.Name)}
+        if names & {"_CONFIG_DERIVED_GLOBALS", "_CONFIG_RECONFIG_GLOBALS"}:
+            found.update(ast.literal_eval(node.value))
+    return found
 
 
 def test_gx10_state_attrs_cover_apply_config_rebindings():
@@ -53,6 +52,59 @@ def test_gx10_state_attrs_cover_apply_config_rebindings():
     # ACE globals are lifecycle-managed: teardown stops live workers and hard-clears the globals instead of
     # snapshot-restoring stale refs that can orphan daemon threads.
     assert set(_GX10_STATE_ATTRS) >= (globals_ - _LIFECYCLE_MANAGED_ACE_GLOBALS)
+
+
+def _iter_target_names(target):
+    if isinstance(target, ast.Name):
+        yield target.id
+    elif isinstance(target, (ast.Tuple, ast.List)):
+        for elt in target.elts:
+            yield from _iter_target_names(elt)
+
+
+def _derive_state_assigned_module_globals() -> set[str]:
+    """Module globals assigned inside `_derive_config_state`.
+
+    These are exactly the config-owned globals the function must hand to `_commit_config_state` via
+    `_CONFIG_DERIVED_GLOBALS`. Guards the code→list direction: a new derived global omitted from the list
+    would be silently neither committed, snapshotted for rollback, nor fixture-isolated (the runtime
+    ``values = {n: locals[n] for n in _CONFIG_DERIVED_GLOBALS}`` only guards list→code)."""
+    gx10_path = Path(__file__).resolve().parents[2] / "engine" / "gx10.py"
+    tree = ast.parse(gx10_path.read_text(encoding="utf-8"))
+    module_globals: set[str] = set()
+    for node in tree.body:                                    # module-level bindings
+        if isinstance(node, ast.Assign):
+            for t in node.targets:
+                module_globals.update(_iter_target_names(t))
+        elif isinstance(node, ast.AnnAssign) and node.value is not None:
+            module_globals.update(_iter_target_names(node.target))
+    for node in ast.walk(tree):                               # + names rebound via `global`
+        if isinstance(node, ast.Global):
+            module_globals.update(node.names)
+    derive = next((n for n in ast.walk(tree)
+                   if isinstance(n, ast.FunctionDef) and n.name == "_derive_config_state"), None)
+    assert derive is not None, "_derive_config_state not found"
+    assigned: set[str] = set()
+    for node in ast.walk(derive):
+        if isinstance(node, ast.Assign):
+            for t in node.targets:
+                assigned.update(_iter_target_names(t))
+        elif isinstance(node, ast.AnnAssign):
+            assigned.update(_iter_target_names(node.target))
+    return assigned & module_globals
+
+
+def test_derive_config_state_globals_are_all_declared():
+    import gx10
+    assigned = _derive_state_assigned_module_globals()
+    assert assigned                                          # non-vacuous: the scan found real globals
+    declared = set(gx10._CONFIG_DERIVED_GLOBALS)
+    missing = assigned - declared
+    assert not missing, (
+        f"_derive_config_state assigns module global(s) {sorted(missing)} absent from "
+        "_CONFIG_DERIVED_GLOBALS — they would be neither committed by _commit_config_state, nor "
+        "snapshotted for rollback, nor fixture-isolated. Add them to the tuple."
+    )
 
 
 def test_ace_isolation_stops_live_worker_started_by_apply_config(tmp_path, monkeypatch):

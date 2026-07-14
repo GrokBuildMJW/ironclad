@@ -5,6 +5,8 @@ the bounded record/take map, and the `_ace_consumer_hook` gate (success / genuin
 """
 from __future__ import annotations
 
+from design_test_support import approve_active_design
+
 import sys
 import types
 from pathlib import Path
@@ -152,8 +154,9 @@ def test_stage_handover_records_injected_bullets(monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)
     with pc.use(ProjectContext("p", str(tmp_path), "ns")):
         gx10._dispatch(_FakeAgent(), "initiative new Order Service --type software")
+        approve_active_design(gx10)
         gx10._stage_handover(None, "OPUS", "## Handover\nbuild it",
-                             task_json='{"type":"feature","priority":"high","title":"Build X","description":"do it"}',
+                             task_json='{"type":"feature","priority":"high","title":"Build the feedback feature","description":"Build the complete feedback feature through the validated staging pipeline."}',
                              force=True)
         tid = gx10._store().list("pending")[0]["id"]
     # the seeded bullet was injected into the handover → its id is recorded against the task

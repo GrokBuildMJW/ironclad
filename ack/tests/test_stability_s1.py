@@ -27,9 +27,15 @@ def test_agent_client_gets_request_timeout_and_retries(monkeypatch, tmp_path):
     cap = {}
     monkeypatch.setattr(gx10, "OpenAI", lambda **kw: cap.update(kw) or object())
     gx10.GX10(base_url="http://x/v1", api_key="k", model="m", prompt_path="")
-    assert cap.get("timeout") == gx10.LLM_REQUEST_TIMEOUT_S       # bounded, not the SDK ~600s default
+    timeout = cap.get("timeout")
+    assert timeout.connect == gx10.LLM_CONNECT_TIMEOUT_S
+    assert timeout.read == gx10.LLM_FIRST_TOKEN_TIMEOUT_S
+    assert timeout.write == gx10.LLM_REQUEST_TIMEOUT_S
+    assert timeout.pool == gx10.LLM_REQUEST_TIMEOUT_S
     assert cap.get("max_retries") == gx10.LLM_MAX_RETRIES
-    assert isinstance(cap["timeout"], float) and cap["timeout"] > 0
+    assert all(value is not None and value > 0 for value in (
+        timeout.connect, timeout.read, timeout.write, timeout.pool,
+    ))
 
 
 def test_llm_timeout_config_default_and_env_override(monkeypatch):

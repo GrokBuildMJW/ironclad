@@ -305,9 +305,20 @@ def test_index_store_none_returns_none():
 
 
 # ── §9 retention ─────────────────────────────────────────────────────────────────────────────────
-def _make_run(root, name, created_at, *, violations=False):
+def _make_run(root, name, created_at, *, violations=False, manifest="valid"):
     d = root / name
     d.mkdir(parents=True, exist_ok=True)
+    if manifest == "missing":
+        return d
+    if manifest == "corrupt":
+        (d / "manifest.json").write_text("not-json", encoding="utf-8")
+        return d
+    if manifest == "no_violations":  # a provenance dict WITHOUT the violations key — unprovable
+        (d / "manifest.json").write_text(
+            __import__("json").dumps({"run_id": name, "created_at": created_at,
+                                      "provenance": {}, "task_id": f"KGC-{name[-1]}"}),
+            encoding="utf-8")
+        return d
     m = {"run_id": name, "created_at": created_at,
          "provenance": {"violations": [{"x": 1}] if violations else []},
          "task_id": f"KGC-{name[-1]}"}
@@ -343,6 +354,50 @@ def test_violation_protected_from_prune(tmp_path):
     assert (tmp_path / "mpr-20260101T000000Z-violated0").exists()   # violation survives rotation
 
 
+def test_corrupt_manifest_protected_from_prune(tmp_path):
+    from mpr.audit import prune_runs
+    corrupt = _make_run(tmp_path, "mpr-20260101T000000Z-corrupt00", "2026-01-01T00:00:00Z",
+                        manifest="corrupt")
+    _make_run(tmp_path, "mpr-20260102T000000Z-clean0001", "2026-01-02T00:00:00Z")
+    _make_run(tmp_path, "mpr-20260103T000000Z-clean0002", "2026-01-03T00:00:00Z")
+    deleted = prune_runs(tmp_path, keep_runs=1, keep_days=None, protect_violations=True)
+    assert corrupt.name not in deleted
+    assert corrupt.exists()
+
+
+def test_missing_manifest_protected_from_prune(tmp_path):
+    from mpr.audit import prune_runs
+    missing = _make_run(tmp_path, "mpr-20260101T000000Z-missing00", "2026-01-01T00:00:00Z",
+                        manifest="missing")
+    _make_run(tmp_path, "mpr-20260102T000000Z-clean0001", "2026-01-02T00:00:00Z")
+    _make_run(tmp_path, "mpr-20260103T000000Z-clean0002", "2026-01-03T00:00:00Z")
+    deleted = prune_runs(tmp_path, keep_runs=1, keep_days=None, protect_violations=True)
+    assert missing.name not in deleted
+    assert missing.exists()
+
+
+def test_provenance_without_violations_key_protected_from_prune(tmp_path):
+    # #1495 (review F1): a provenance DICT that lacks the `violations` key is unprovable (schema drift /
+    # tampering) — fail-closed protects it too, not just a corrupt/missing manifest.
+    from mpr.audit import prune_runs
+    unprovable = _make_run(tmp_path, "mpr-20260101T000000Z-noviol00", "2026-01-01T00:00:00Z",
+                           manifest="no_violations")
+    _make_run(tmp_path, "mpr-20260102T000000Z-clean0001", "2026-01-02T00:00:00Z")
+    _make_run(tmp_path, "mpr-20260103T000000Z-clean0002", "2026-01-03T00:00:00Z")
+    deleted = prune_runs(tmp_path, keep_runs=1, keep_days=None, protect_violations=True)
+    assert unprovable.name not in deleted
+    assert unprovable.exists()
+
+
+def test_corrupt_manifest_deleted_when_protection_disabled(tmp_path):
+    from mpr.audit import prune_runs
+    corrupt = _make_run(tmp_path, "mpr-20260101T000000Z-corrupt00", "2026-01-01T00:00:00Z",
+                        manifest="corrupt")
+    deleted = prune_runs(tmp_path, keep_runs=0, keep_days=None, protect_violations=False)
+    assert deleted == [corrupt.name]
+    assert not corrupt.exists()
+
+
 def test_prune_keep_days(tmp_path):
     from mpr.audit import prune_runs
     _make_run(tmp_path, "mpr-20260101T000000Z-old00000", "2026-01-01T00:00:00Z")
@@ -357,3 +412,16 @@ def test_prune_deletes_taskstore_entry(tmp_path):
     deleted_ids = []
     prune_runs(tmp_path, keep_runs=0, keep_days=None, store_delete=deleted_ids.append)
     assert deleted_ids == ["KGC-0"]                                 # store entry removed too
+
+
+def test_failed_rmtree_not_reported_or_removed_from_taskstore(tmp_path, monkeypatch):
+    from mpr import audit
+    run_dir = _make_run(tmp_path, "mpr-20260101T000000Z-x0000000", "2026-01-01T00:00:00Z")
+    deleted_ids = []
+    # *a, **k so it matches BOTH the new `rmtree(dir)` AND the old buggy `rmtree(dir, ignore_errors=True)` —
+    # a true regression guard: against the pre-fix code (unconditional append) these assertions would FAIL.
+    monkeypatch.setattr(audit.shutil, "rmtree", lambda *_a, **_k: None)
+    deleted = audit.prune_runs(tmp_path, keep_runs=0, keep_days=None, store_delete=deleted_ids.append)
+    assert run_dir.name not in deleted
+    assert run_dir.exists()
+    assert deleted_ids == []

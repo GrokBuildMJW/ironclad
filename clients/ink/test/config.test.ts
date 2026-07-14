@@ -71,13 +71,12 @@ test('missing config file falls back to defaults (no throw)', () => {
   });
 });
 
-test('coder permission default allows running tests (#1308)', () => {
+test('coder permission default is least privilege', () => {
   const saved = process.env.GX10_CLAUDE_PERMISSION_MODE;
   delete process.env.GX10_CLAUDE_PERMISSION_MODE;
   try {
     withEnv({GX10_CONFIG: join(tmpdir(), 'definitely-absent-iron-config.json')}, () => {
-      // headless coder default must allow commands (bypassPermissions), else it can't run its own tests
-      assert.equal(loadConfig().claudePermissionMode, 'bypassPermissions');
+      assert.equal(loadConfig().claudePermissionMode, 'default');
     });
   } finally {
     if (saved === undefined) delete process.env.GX10_CLAUDE_PERMISSION_MODE;

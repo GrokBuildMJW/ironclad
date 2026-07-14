@@ -6,10 +6,9 @@
 > :class:`~ack.verify.VerdictResult` scores and trips on **sustained degradation** — so the engine can
 > escalate / surface to the operator instead of silently churning out low-quality work.
 
-:class:`QualityBreaker` is **MARK-ONLY**: a trip is advisory. The consumer surfaces it (pause-autoplan is an
-opt-in operator choice) — it is **never a hard-abort** and never gates the fail-closed core. The breaker is
-also **fail-open-safe**: every method *never raises*, and any hiccup leaves it *untripped* (no worse than
-today). Pure (in-memory, no transport/model/I/O), snapshot-testable; imports only the stdlib.
+:class:`QualityBreaker` is a pure trend recorder: it never performs mutations or raises. The engine consumes
+its latched trip as a pre-write staging hold, while other callers may use the snapshot for observability.
+Pure (in-memory, no transport/model/I/O), snapshot-testable; imports only the stdlib.
 
 Trip rule: ``min_consecutive`` scores in a row below ``threshold`` (a sustained downward trend) → tripped;
 an at/above-threshold score resets the streak. A trip stays **latched until** :meth:`QualityBreaker.reset`
@@ -86,8 +85,8 @@ class QualitySnapshot:
 class QualityBreaker:
     """A SEPARATE, agent-agnostic, per-task output-QUALITY breaker (#602 SUB-9). NOT an extension of the
     availability breaker. Feed it verifier scores via :meth:`record`; read :attr:`tripped` /
-    :meth:`snapshot` to surface sustained degradation. MARK-ONLY (advisory) + fail-open-safe (never raises;
-    a hiccup leaves it untripped)."""
+    :meth:`snapshot` to consume sustained degradation. The recorder itself is fail-open-safe (never raises;
+    a hiccup leaves it untripped); the engine applies the protected-boundary hold."""
 
     def __init__(self, *, threshold: float = 0.5, min_consecutive: int = 3, window: int = 20) -> None:
         # A garbage threshold → 0.0 (a score is never "< 0.0" → the breaker simply never trips: fail-open).
@@ -118,6 +117,33 @@ class QualityBreaker:
         except Exception:   # noqa: BLE001 — fail-open-safe: a record hiccup never trips and never raises
             pass
         return self._tripped
+
+    def reconfigure(self, *, threshold: float, min_consecutive: int, window: int) -> "QualityBreaker":
+        """Return a breaker with new tuning while preserving bounded history and the live latch state.
+
+        Only the retained history's *trailing* low-score streak is relevant after a rebuild: an earlier run
+        may already have been acknowledged by a later recovery score. An existing latch remains latched;
+        otherwise the rebuilt breaker trips only when the trailing streak satisfies the new rule. Never
+        raises — a rebuild hiccup returns a safely constructed breaker with the previous live latch state.
+        """
+        rebuilt = QualityBreaker(threshold=threshold, min_consecutive=min_consecutive, window=window)
+        try:
+            new_window = rebuilt._scores.maxlen
+            history = list(self._scores)
+            if isinstance(new_window, int):
+                history = history[-new_window:]
+            rebuilt._scores.extend(history)
+
+            trailing_low = 0
+            for score in reversed(history):
+                if score >= rebuilt._threshold:
+                    break
+                trailing_low += 1
+            rebuilt._consecutive_low = trailing_low
+            rebuilt._tripped = self._tripped or trailing_low >= rebuilt._min
+        except Exception:   # noqa: BLE001 — live reconfiguration is fail-open-safe and never raises
+            rebuilt._tripped = self._tripped
+        return rebuilt
 
     @property
     def tripped(self) -> bool:

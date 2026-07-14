@@ -33,7 +33,7 @@ def _run_one_tool_turn(monkeypatch, g, command, stdout):
     turn. Captures every _ui_print line (the DISPLAY stream)."""
     display = []
     monkeypatch.setattr(gx10, "_ui_print", lambda *a, **k: display.append(a[0] if a else ""))
-    monkeypatch.setattr(gx10.subprocess, "run",
+    monkeypatch.setattr(gx10, "_run_model_command_process",
                         lambda *a, **k: types.SimpleNamespace(returncode=0, stdout=stdout, stderr=""))
     calls = [
         ("", [{"id": "c1", "name": "execute_command",
@@ -45,7 +45,7 @@ def _run_one_tool_turn(monkeypatch, g, command, stdout):
     return display
 
 
-def test_model_context_is_ansi_stripped_display_keeps_colour(monkeypatch, tmp_path):
+def test_model_context_is_ansi_stripped_display_keeps_colour(monkeypatch, tmp_path, model_sandbox_backend):
     g = _agent(monkeypatch, tmp_path)
     (tmp_path / "d0").mkdir()
     (tmp_path / "f0.txt").write_text("")
@@ -60,7 +60,8 @@ def test_model_context_is_ansi_stripped_display_keeps_colour(monkeypatch, tmp_pa
     # a deterministic count header on line 1 + the localized Answer directly under it (exact numbers
     # vary — the engine seeds its own state dirs under tmp_path; the point is the SHAPE survives the strip)
     lines = tool_msg["content"].split("\n")
-    assert gx10._LISTING_HEADER_RE.fullmatch(lines[0]) and lines[1].startswith("Answer: ")
+    header_i = next(i for i, line in enumerate(lines) if gx10._LISTING_HEADER_RE.fullmatch(line))
+    assert lines[header_i + 1].startswith("Answer: ")
 
     # DISPLAY stream: at least one streamed line still carries the raw SGR colour (native ls look).
     assert any("\x1b[" in str(ln) for ln in display), "display lost the colour"
@@ -70,13 +71,13 @@ def test_model_context_is_ansi_stripped_display_keeps_colour(monkeypatch, tmp_pa
                                   for ln in coloured_lines)
 
 
-def test_non_ansi_tool_result_is_byte_identical(monkeypatch, tmp_path):
-    """A tool result with NO ANSI is unchanged on both paths — the #1196 split is a no-op without colour."""
+def test_non_ansi_tool_result_is_fenced_without_ansi(monkeypatch, tmp_path, model_sandbox_backend):
+    """A plain command result is unchanged inside the mandatory untrusted-data fence."""
     g = _agent(monkeypatch, tmp_path)
     (tmp_path / "only.txt").write_text("")
     display = _run_one_tool_turn(monkeypatch, g, "echo hi", "hi")
     tool_msg = next(m for m in g.messages if m.get("role") == "tool")
-    assert tool_msg["content"] == "hi"                    # echo is not a listing → no header, no colour, plain
+    assert "UNTRUSTED CONTENT" in tool_msg["content"] and "\nhi\n" in tool_msg["content"]
     assert not any("\x1b[01" in str(ln) for ln in display)
 
 
@@ -95,4 +96,5 @@ def test_ansi_strip_is_scoped_to_execute_command_not_read_file(monkeypatch, tmp_
     monkeypatch.setattr(g, "_generate", lambda think: calls.pop(0))
     g.run("read it")
     tool_msg = next(m for m in g.messages if m.get("role") == "tool")
-    assert "\x1b[31m" in tool_msg["content"]              # escape bytes preserved for the model (read_file scope)
+    assert "UNTRUSTED CONTENT" in tool_msg["content"]
+    assert "\x1b[31m" in tool_msg["content"]              # escape bytes preserved inside the read_file fence

@@ -73,9 +73,8 @@ class RouteDecision(BaseModel):
                                                   # None (no exclusion requested). Snapshot-stable.
 
 
-# ── Scoring SSOT (module constants). NOTE: providers.scoring is a RESERVED config seam — it exists in the
-#    config tree but the router does NOT yet read it; it applies these fixed built-ins (see config-runtime.md,
-#    "treat it as reserved until it is wired"). SCORING-1 (#503). ────────────────────────────────────────
+# ── Scoring SSOT (module constants). Configurable scoring is retired until it is actually wired; the router
+#    honestly applies these fixed built-ins. SCORING-1 (#503). ────────────────────────────────────────────
 EFFORT_RANK = {"low": 0, "medium": 1, "high": 2, "xhigh": 3}
 EFFORT_MAX_TOKENS = {"low": 512, "medium": 1024, "high": 2048, "xhigh": 4096}
 W_COST = 1.0

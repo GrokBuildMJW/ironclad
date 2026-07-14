@@ -58,6 +58,10 @@ metadata** as its manifest (the fields above — no separate registry file to dr
 **discover** (`build_catalogue([(root, provenance), …])`), **install** (copy a skill into the
 active `skills/` dir), and **update** (replace only when the source has a newer semver), with
 **versioning + provenance** and built-in vs user libraries — no mandatory external marketplace.
+Install and update fully stage a replacement beside the live skill before atomically swapping it
+into place; a copy or swap failure retains the working version — rolled back in place, or (if a swap
+AND its restore both fail) preserved in the backup path rather than destroyed. Discovery skips hidden
+(`.`-prefixed) directories, so a leftover staging/backup copy never shadows the live skill.
 It layers over `Registry.discover_skills` (tools) + `discover_playbooks` (playbooks).
 
 ## Generation — *available (#33)*

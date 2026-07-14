@@ -12,11 +12,11 @@ decision #9). The spec exists so the friendly-UX layers can be *derived* from ON
 Because a hand-authored parallel list drifts (lifecycle/fork/ace already fell out of both client
 registries before this epic), the ONLY thing that keeps it honest is the ``spec ↔ dispatch`` parity guard
 (#940, ``scripts/ci/check_command_spec_parity.py``): it derives the verb set from ``_dispatch`` *source*,
-imports the real ``_FROZEN_CONFIG_KEYS``, and introspects ``ack.generator.build_parser`` — asserting this
-spec matches all three. Keep this module in sync with ``_dispatch``; the guard fails the build otherwise.
+compares boot-only metadata with the typed schema, and introspects ``ack.generator.build_parser`` — asserting
+this spec matches all three. Keep this module in sync with ``_dispatch``; the guard fails the build otherwise.
 
-This module is PURE DATA (no ``gx10`` / ``generator`` import) so it stays import-light and boundary-clean;
-every live cross-check lives in the guard.
+This module remains import-light (no ``gx10`` / ``generator`` import); its boot-only tuple comes from the
+pure stdlib schema, and every live cross-check lives in the guard.
 
 Danger tiers (#930), authoritative + never model-graded — a verb's tier is the MAX danger of its forms:
   * ``read_only``  — no state change (help, status, discovery, config get, context, ls, cat, fork view).
@@ -31,6 +31,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Optional, Tuple
+
+import config_schema
 
 # ── danger tiers (#930) ───────────────────────────────────────────────────────────────────────────
 READ_ONLY = "read_only"
@@ -88,8 +90,8 @@ COMMAND_SPECS: Tuple[CommandSpec, ...] = (
     CommandSpec("config set", MUTATING, "Set one runtime config value by dotted key.",
                 flags=(FlagSpec("<dotted.key>", required=True),
                        FlagSpec("<value>", "coerced: on/off→bool, int, float, else str", required=True)),
-                boot_only_keys=("setup.type", "security.profile", "security.web_in_sealed",
-                                "search.enabled", "search.adapter", "search.api_key_env")),
+                boot_only_keys=tuple(sorted(config_schema.BOOT_ONLY_KEYS))),
+    CommandSpec("quality reset", MUTATING, "Clear a latched output-quality staging hold."),
     CommandSpec("read", MUTATING, "Read a file INTO the model context.",
                 flags=(FlagSpec("<file>", required=True),)),
     CommandSpec("write", MUTATING, "Write the last model reply to a path.",
@@ -118,14 +120,14 @@ COMMAND_SPECS: Tuple[CommandSpec, ...] = (
                 flags=(FlagSpec("<project_id>", "from /project list", required=True),)),
     CommandSpec("design", COSTLY,
                 "Ask the model for explicit design proposal variants with trade-offs; the operator picks "
-                "one later with /approve design <id>. Requires design_gate.enabled.",
+                "one later with /approve design <id>.",
                 flags=(FlagSpec("--options [N]", "number of proposal variants; range 2..8, default 2",
                                 required=True),)),
     CommandSpec("approve", MUTATING,
-                "Approve a design (bare /approve, or /approve design [<slug>]; under design_gate "
+                "Approve a design (bare /approve promotes the sole proposal; "
                 "/approve design [<id>] promotes a specific proposal variant).",
                 subcommands=("design",),
-                flags=(FlagSpec("[slug]", "design: the unit to approve (default: active); under design_gate a proposal variant id to promote (e.g. 2/design-2)", required=False),
+                flags=(FlagSpec("[id]", "proposal variant id to promote (e.g. 2/design-2)", required=False),
                        )),
     CommandSpec("board", MUTATING,
                 "Render the task board (all units grouped pending/in_progress/done) to BOARD.md and show it (S6).",
@@ -159,8 +161,8 @@ COMMAND_SPECS: Tuple[CommandSpec, ...] = (
                        FlagSpec("<json-args | text>", "text maps to the first required parameter"))),
 )
 
-#: the boot-only config keys the spec declares (guard asserts == gx10._FROZEN_CONFIG_KEYS, #940b).
-SPEC_FROZEN_CONFIG_KEYS = frozenset(next(c for c in COMMAND_SPECS if c.verb == "config set").boot_only_keys)
+#: Boot-only config keys derived from the typed config schema (guard asserts gx10 parity, #940b).
+SPEC_FROZEN_CONFIG_KEYS = config_schema.BOOT_ONLY_KEYS
 
 
 def verbs() -> "frozenset[str]":

@@ -68,7 +68,7 @@ export const COMMANDS: readonly Command[] = [
   {name: 'project', scope: 'server', usage: 'list [--all] | new <name> [--type mpr|software] [--path <dir>] | active | track new|use|list | delete <id> [--purge] | archive|unarchive <id>', desc: 'manage isolated projects (the guided setup command; /initiative is a deprecated alias)'},
   {name: 'switch', scope: 'server', usage: '<project_id>', desc: 'rebind the engine to a project (own paths + memory partition)'},
   {name: 'design', scope: 'server', usage: '--options [N]', desc: 'ask for 2..8 design proposal variants with pros/cons (default 2)'},
-  {name: 'approve', scope: 'server', usage: 'design [<slug>|<id>] | [slug]', desc: "approve a design (bare /approve or /approve design)"},
+  {name: 'approve', scope: 'server', usage: 'design [<id>]', desc: "approve a design (bare /approve or /approve design [<proposal-id>])"},
   {name: 'board', scope: 'server', usage: '[slug]', desc: 'render the task board (pending/in_progress/done) to BOARD.md and show it'},
   {name: 'generate', scope: 'server', usage: '[--kind case|prompt] --domain <d> --case <c> --description <text> [--prefix x] [--dry-run]', desc: 'scaffold a paved-road capability into the active project library'},
   // #952: complete the server-verb subset so it covers command_spec (guarded by check_ink_command_parity.py).
@@ -76,6 +76,7 @@ export const COMMANDS: readonly Command[] = [
   {name: 'lifecycle', scope: 'server', usage: 'gate [--slug <s>] [--tree <sha>] [--ledger <p>] [--stages tests,reviews,delivery]', desc: 'run the DELIVER-leg lifecycle-completeness gate'},
   {name: 'fork', scope: 'server', usage: 'list | [unit]', desc: 'list M5 architecture-fork MPR proposals'},
   {name: 'ace', scope: 'server', usage: 'warmup|eval [--ledger <path>]', desc: 'ACE playbook ops (warm-start / efficiency diagnostic)'},
+  {name: 'quality', scope: 'server', usage: 'reset', desc: 'reset the output-quality breaker after a sustained-degradation staging hold'},
 ];
 
 /** Handled on THIS (client) side — derived from the registry (no duplication). */

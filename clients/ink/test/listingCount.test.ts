@@ -18,6 +18,7 @@ import {
   shlexSplit,
 } from '../src/tools/listingCount.js';
 import {runTool} from '../src/tools/runTool.js';
+import {withSandboxShim} from './sandboxFixture.js';
 
 /** ≙ test_listing_count._mk: a temp dir with n dirs + m files. */
 async function mk(nDirs: number, nFiles: number): Promise<string> {
@@ -119,15 +120,19 @@ test('bridged execute_command prepends the header on a real listing', async () =
   try {
     process.chdir(d);
     // the shell that actually runs differs per platform/install — pick a listing verb both resolve
-    const cmd = process.platform === 'win32' ? 'Get-ChildItem' : 'ls -la';
-    const out = await runTool('execute_command', {command: cmd});
-    assert.ok(out.startsWith('2 directories, 3 files\n'), `missing header: ${out.slice(0, 80)}`);
-    // #1202: line 2 is the machine AnswerData the SERVER renders into the localized `Answer:` reply
-    const line2 = out.split('\n')[1] ?? '';
-    assert.ok(line2.startsWith('AnswerData: '), `missing AnswerData: ${line2.slice(0, 60)}`);
-    const data = JSON.parse(line2.slice('AnswerData: '.length)) as {dirs: string[]; files: string[]};
-    assert.deepEqual([...data.dirs].sort(), ['d0', 'd1']);
-    assert.deepEqual([...data.files].sort(), ['f0.txt', 'f1.txt', 'f2.txt']);
+    if (process.platform === 'win32') {
+      const refused = await runTool('execute_command', {command: 'Get-ChildItem'});
+      assert.match(refused, /refused.*Windows.*fails closed/);
+    } else {
+      const out = await withSandboxShim(() => runTool('execute_command', {command: 'ls -la'}));
+      assert.ok(out.startsWith('2 directories, 3 files\n'), `missing header: ${out.slice(0, 80)}`);
+      // #1202: line 2 is the machine AnswerData the SERVER renders into the localized `Answer:` reply
+      const line2 = out.split('\n')[1] ?? '';
+      assert.ok(line2.startsWith('AnswerData: '), `missing AnswerData: ${line2.slice(0, 60)}`);
+      const data = JSON.parse(line2.slice('AnswerData: '.length)) as {dirs: string[]; files: string[]};
+      assert.deepEqual([...data.dirs].sort(), ['d0', 'd1']);
+      assert.deepEqual([...data.files].sort(), ['f0.txt', 'f1.txt', 'f2.txt']);
+    }
   } finally {
     process.chdir(cwd);
   }
@@ -139,10 +144,14 @@ test('bridged listing ships the machine AnswerData only up to the transport cap 
   const cwd = process.cwd();
   try {
     process.chdir(big);
-    const cmd = process.platform === 'win32' ? 'Get-ChildItem' : 'ls -la';
-    const out = await runTool('execute_command', {command: cmd});
-    assert.ok(out.startsWith('0 directories, 201 files\n'), `header: ${out.slice(0, 40)}`);
-    assert.ok(!out.includes('AnswerData:'), 'over-cap must ship the header only (no name-list JSON)');
+    if (process.platform === 'win32') {
+      const refused = await runTool('execute_command', {command: 'Get-ChildItem'});
+      assert.match(refused, /refused.*Windows.*fails closed/);
+    } else {
+      const out = await withSandboxShim(() => runTool('execute_command', {command: 'ls -la'}));
+      assert.ok(out.startsWith('0 directories, 201 files\n'), `header: ${out.slice(0, 40)}`);
+      assert.ok(!out.includes('AnswerData:'), 'over-cap must ship the header only (no name-list JSON)');
+    }
   } finally {
     process.chdir(cwd);
   }
@@ -166,10 +175,14 @@ test('a failed or non-listing command gets no header', async () => {
   const cwd = process.cwd();
   try {
     process.chdir(d);
-    const hi = await runTool('execute_command', {command: 'echo hi'});
-    assert.equal(hi, 'hi'); // non-listing success — untouched
-    const bad = await runTool('execute_command', {command: 'ls --definitely-not-a-flag'});
-    assert.ok(!bad.startsWith('2 directories'), `header on a FAILED listing: ${bad.slice(0, 80)}`);
+    if (process.platform === 'win32') {
+      assert.match(await runTool('execute_command', {command: 'echo hi'}), /refused.*Windows/);
+    } else {
+      const hi = await withSandboxShim(() => runTool('execute_command', {command: 'echo hi'}));
+      assert.equal(hi, 'hi'); // non-listing success — untouched
+      const bad = await withSandboxShim(() => runTool('execute_command', {command: 'ls --definitely-not-a-flag'}));
+      assert.ok(!bad.startsWith('2 directories'), `header on a FAILED listing: ${bad.slice(0, 80)}`);
+    }
   } finally {
     process.chdir(cwd);
   }
@@ -177,6 +190,12 @@ test('a failed or non-listing command gets no header', async () => {
 });
 
 test('a silent success keeps the (exit 0, no output) placeholder', async () => {
-  const out = await runTool('execute_command', {command: 'cd .'});
+  if (process.platform === 'win32') {
+    assert.match(await runTool('execute_command', {command: 'cd .'}), /refused.*Windows/);
+    return;
+  }
+  const d = await mk(0, 0);
+  const out = await withSandboxShim(() => runTool('execute_command', {command: 'cd .'}));
   assert.equal(out, '(exit 0, no output)');
+  await fs.rm(d, {recursive: true, force: true});
 });

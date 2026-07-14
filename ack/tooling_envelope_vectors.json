@@ -14,6 +14,27 @@
     "expected_authorized": true
   },
   {
+    "name": "bare bin matches Windows cmd executable stem",
+    "bin": "claude.cmd",
+    "cmd_template": "{bin} --print {prompt}",
+    "allow_list": [{"bin": "claude", "cmd_template": "{bin} --print {prompt}"}],
+    "expected_authorized": true
+  },
+  {
+    "name": "bare bin matches Windows exe executable stem",
+    "bin": "claude.exe",
+    "cmd_template": "{bin} --print {prompt}",
+    "allow_list": [{"bin": "claude", "cmd_template": "{bin} --print {prompt}"}],
+    "expected_authorized": true
+  },
+  {
+    "name": "bare bin refuses a different Windows executable stem",
+    "bin": "claude-evil.exe",
+    "cmd_template": "{bin} --print {prompt}",
+    "allow_list": [{"bin": "claude", "cmd_template": "{bin} --print {prompt}"}],
+    "expected_authorized": false
+  },
+  {
     "name": "pinned path refuses same named impostor",
     "bin": "/tmp/attacker/claude",
     "cmd_template": "{bin} --print {prompt}",
@@ -224,10 +245,10 @@
     "expected_authorized": false
   },
   {
-    "name": "disabled policy allows byte identical off path",
+    "name": "disabled policy cannot bypass mandatory authorization",
     "bin": "python",
     "cmd_template": "anything",
     "policy": {"enabled": false, "allow_list": []},
-    "expected_authorized": true
+    "expected_authorized": false
   }
 ]

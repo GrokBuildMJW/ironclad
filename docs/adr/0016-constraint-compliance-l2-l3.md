@@ -2,15 +2,27 @@
 
 ## Status
 
-Accepted — foundational plumbing (#1341 / epic #1344 S5), L2 detect + durable fork-envelope emission
+Historical decision — foundational plumbing (#1341 / epic #1344 S5), L2 detect + durable fork-envelope emission
 (#1337 / S3), L2 operator surface + durable project-scoped MPR worker + decide→learn
 (#1340 / S4), L3 fail-closed typed hard-check at the implementation boundary
-(#1342 / S6), **and** the L2/L3 real-dispatch E2E capstone (#1359 / S7). Default off.
+(#1342 / S6), **and** the L2/L3 real-dispatch E2E capstone (#1359 / S7).
 
-**Status: Superseded (in part) by ADR-0006 (#1414)** — the product presence gate / L2 conflict-fork /
-L3 typed HARD-floor described here was retired in S1; `record_constraints` is now optional non-gating
-framing-note capture; build enforcement is the approved-design anti-drift. The build-boundary hard-check
-and verbatim injection survive.
+**Status: Superseded by ADR-0006 (#1414), except for the approved-design build boundary.** The product
+presence gate, L2 constraint-conflict fork, and constraint-ledger HARD floor described historically below
+were retired. `record_constraints` is now optional non-gating framing-note capture. The surviving mandatory
+boundary validates and injects the approved design standard; it has no enable switch.
+
+Completion is a separate always-on protected boundary (#1463). After feedback-file presence is established,
+`advance_pipeline` requires the selected artifact to be readable, non-empty, and explicitly normalized to
+`status: done` before egress checks or the task transition. No absent, malformed, unknown, blocked, or
+clarification-needed signal is equivalent to completion. The retired `advance_gate.enabled` key is only a
+warning tombstone and cannot restore the former bypass.
+
+Egress is also a separate always-on protected boundary (#1464). Its only policy input is the approved
+design's `## Build policy`: no section is non-build-enforcing, explicit `network: open` skips analyzers, and
+`network: none|declared` runs them. A present section with a missing/invalid posture, no usable code root, or
+an analyzer/import/internal failure under a restrictive posture refuses advance. The retired
+`security.egress_analysis.enabled` key and `GX10_EGRESS_ANALYSIS_ENABLED` alias are tombstones, not switches.
 
 ## Context
 
@@ -24,9 +36,9 @@ presence gate, and verbatim handover injection. That is necessary but not suffic
 - Model-heuristic extractions must not gate until an operator promotes them; provenance must be
   explicit and shared across L2 (advisory conflict fork) and L3 (structured hard-check).
 
-Epic #1344 therefore adds **L2** (advisory conflict fork via ACE/MPR) and **L3** (typed hard-check).
-This unit is the **shared foundation**: typed allow-list, capture plumbing, hard/soft classifier,
-and default-off flags — without detector, worker surface, compare, or gate.
+Epic #1344 originally added **L2** (advisory conflict fork via ACE/MPR) and **L3** (typed hard-check).
+The remainder of this ADR records that historical design. Current behavior is governed by the supersession
+notice above and the reconciliation notes in D6-D8 below.
 
 ## Decision
 
@@ -64,7 +76,9 @@ pre-filter S3 and S6 will read.
 `TaskSpec` declares optional `language: Optional[str]` and `network: Optional[bool]` because
 `extra="forbid"`. Absent keys validate exactly as today. No conditional-required logic yet (S6).
 
-### D6 — Default-off; detect is opt-in (S3); surface + worker are S4
+### D6 — Historical opt-in detector and worker (superseded)
+
+The following was the original #1344 behavior. It is not the current switch surface:
 
 S5 plumbs data + provenance + flags only. **S3 (#1337)** wires L2 detect under
 `CONSTRAINT_CONFLICT_DETECT`: on a typed HARD mismatch at `record_design`, a pure
@@ -100,25 +114,22 @@ S5 plumbs data + provenance + flags only. **S3 (#1337)** wires L2 detect under
   suggested → hard.
 - decide→learn feeds ACE from the envelope resolution (fail-soft, off hot path).
 
-Both flags off ⇒ **byte-identical** (no worker, `/fork` falls through to M5 unit proposals, no
-`/approve` blocking, no hard-check).
+This coupling was removed by the superseding design. The former detector key is now a tombstone and cannot
+disable or restore any build protection. The surviving `ace.fork_mpr.enabled` switch controls only the
+architecture-fork recommendation worker; framing-note capture and approved-design enforcement are separate.
 
 ### D6b — L3 hard-check at the implementation boundary (S6 / #1342)
 
-Pure `ack.ace.constraint_conflict.hardcheck(constraint_typed, provided_typed, *, require_present)`
-returns a frozen `Violation` (`kind=missing|mismatch`) for the first `TYPED_KEYS` HARD-floor
-failure, or `None`. Distinct from `detect_conflict`: omission is a violation when
-`require_present=True` (closes the omission bypass). Engine thin wrapper
-`_constraint_hardcheck` returns an ERROR string or `None`; flag off / no HARD typed floor →
-`None` (byte-identical).
+Pure `ack.ace.constraint_conflict.hardcheck(required, provided, *, require_present)` returns a frozen
+`Violation` (`kind=missing|mismatch`) for the first required typed field, or `None`. The always-on engine
+wrapper `_design_build_check` deliberately passes only the approved design's normalized `language` field;
+omission is a violation when `require_present=True`. Design `network` is never part of this hard-check and
+remains solely an explicit egress posture under `## Build policy`.
 
 **Hard floor sites** (IMPLEMENTATION boundary only):
 
-1. **`/approve design`** — after the S4 pending-fork block, before stamping `approved: true`;
-   design typed fields via `parse_typed(design.md)`.
-2. **Impl `stage_handover`** (create + re-hand) — PRE-write; task typed fields from TaskSpec
-   `language`/`network` on the real task object (not design frontmatter alone).
-3. **`plan_units` children** — PRE-write, atomic; same task-typed compare; `force` does not bypass.
+1. **Impl `stage_handover`** (create + re-hand) — PRE-write; task `language` comes from the real TaskSpec.
+2. **`plan_units` children** — PRE-write, atomic; same language compare; `force` does not bypass.
 
 **Advisory only:** `record_design` still only emits the L2 fork (S3) and records the proposal —
 a conflicting design can be recorded but cannot be approved or implemented until consistent.
@@ -126,21 +137,20 @@ Couples with S4 decide: `keep` leaves the floor unchanged and makes `design.md` 
 or clearing the rejected counter; `counter` overrides the floor to the design's value and promotes the
 counter body (approval proceeds).
 
-### D7 — Flag split (detect vs MPR worker)
+### D7 — Reconciled live switch surface
 
-| Flag | Config | Default | Role |
+| Historical/runtime name | Config | State | Current role |
 |------|--------|---------|------|
-| `CONSTRAINT_CONFLICT_DETECT` | `safety.constraint_conflict_detect` | `false` | Gates L2 **detect** (S3) and L3 **hard-check** (S6). Strict `_as_bool`. |
-| `_ACE_FORK_MPR` (existing) | `ace.fork_mpr.enabled` | `false` | Gates the **MPR worker** path (M5 fork signals **and** S4 constraint envelopes + decide→learn). Reused — not a new flag. |
+| `CONSTRAINT_CONFLICT_DETECT` | `safety.constraint_conflict_detect` | retired tombstone | No live read and no replacement toggle. Legacy values warn and are ignored. |
+| `_ACE_FORK_MPR` | `ace.fork_mpr.enabled` | live switch, default `false` | Gates only the optional architecture-fork MPR recommendation/learn worker. It does not gate framing notes or approved-design enforcement. |
 
-Both default-off ⇒ public installs remain byte-identical. Detect-without-MPR and MPR-without-detect are
-independent; operators enable each deliberately.
+The mandatory approved-design implementation check and completion/egress boundaries have no enable rows.
 
 ### D8 — Schema surface
 
-New tool parameters are **optional**. With flags off and params omitted, lifecycle behaviour and
-constraint frontmatter match L1. The model may see the optional properties on `record_design` (always
-offered) and on `record_constraints` (only when `constraint_gate.enabled` exposes that tool).
+New tool parameters remain optional. `record_design` offers the approved-design fields. `record_constraints`
+is exposed only when the live `framing_notes.enabled` capture switch is on; it writes non-gating framing
+notes. `constraint_gate.enabled` is a one-release alias for that capture switch, not a protection gate.
 
 ## Scope map (epic #1344)
 
@@ -158,9 +168,9 @@ offered) and on `record_constraints` (only when `constraint_gate.enabled` expose
 - **R1** Pure ACK classifier/normalizer; engine is a thin persist/read layer.
 - **R2** Invalid typed input fails closed at capture; missing typed input is not an error.
 - **R3** Suggested never enters `_constraint_typed` until promotion (S4).
-- **R4** Default-off flags; strict boolean coercion (no `bool("false")` trap).
+- **R4 (historical)** The retired detector used strict boolean coercion; it is no longer a live flag.
 - **R5** English-only, boundary-clean export; no private literals.
-- **R6** No silent behaviour change when flags are off and typed params are absent (byte-identical).
+- **R6 (historical)** No silent behavior change when the original optional fields were absent.
 
 ## Consequences
 
@@ -170,8 +180,8 @@ offered) and on `record_constraints` (only when `constraint_gate.enabled` expose
   (keep vs counter) is the operator path that aligns the floor or the design before the hard
   floor opens.
 - S4 owns promotion of `suggested → hard` (`/approve constraint`) and the operator command surface.
-- Deployments that never enable `safety.constraint_conflict_detect` / `ace.fork_mpr.enabled` keep
-  L1-only behaviour.
+- `safety.constraint_conflict_detect` is retired and cannot change behavior. `ace.fork_mpr.enabled` affects
+  only the optional architecture-fork worker.
 - Extending the allow-list later is an explicit contract change (new key + normalize + tests + ADR note).
 
 ## References

@@ -39,7 +39,9 @@ def test_hint_none_when_a_task_is_pending(monkeypatch, tmp_path):
     # a non-implementation handover creates a pending task WITH a handover → work in flight
     gx10._stage_handover(None, "OPUS", "body",
                          json.dumps({"type": "architecture", "priority": "high",
-                                     "title": "design it", "description": "x"}))
+                                     "title": "design the service architecture",
+                                     "description": "Design the service architecture with clear module "
+                                                    "boundaries, interfaces, and persistence."}))
     assert gx10._store().list("pending")            # a task IS pending
     assert gx10._empty_pipeline_hint() is None      # → no hint (the loop has work to do)
 

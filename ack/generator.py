@@ -32,6 +32,9 @@ rendered template): a template-only change upgrades, a local-only edit is
 preserved, identical changes collapse, genuine divergence is wrapped in conflict
 markers and the run reports non-zero. New files are created; a pre-existing
 untracked file is skipped unless ``--force``. Identical re-run = idempotent no-op.
+A non-dry run decides every file first, then commits all changed targets and the
+state baseline as one rollback-protected write set; a failed write restores the
+pre-run files and state.
 
 USAGE
 -----
@@ -59,12 +62,15 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import re
 import sys
 from dataclasses import dataclass, field
 from datetime import date
 from difflib import SequenceMatcher
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 # Templates ship bundled next to the generator (package-relative); output lands
 # under a generic, cwd-relative "cases/" dir by default (override via --output-root).
@@ -312,6 +318,7 @@ def generate(
     state = _load_state(state_path)
     base_files: dict[str, str] = state.get("files", {})
     new_base: dict[str, str] = dict(base_files)
+    writes: list[tuple[Path, str]] = []
 
     for rel, src in iter_template_files(template_root):
         out_rel = render_path(rel, ctx, result.unknown_tokens)
@@ -350,16 +357,68 @@ def generate(
         if action == "conflict":
             result.conflicts += 1
         new_base[rel_key] = rendered  # template baseline tracks the latest render
-        if not dry_run and action in ("created", "upgraded", "conflict"):
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_text(content, encoding="utf-8")
+        if action in ("created", "upgraded", "conflict"):
+            writes.append((target, content))
         result.files.append(FileResult(rel_key, action, detail))
 
     if not dry_run:
-        domain_dir.mkdir(parents=True, exist_ok=True)
-        state["answers"] = ctx
-        state["files"] = new_base
-        state_path.write_text(json.dumps(state, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        rollback: list[tuple[Path, bytes | None]] = []
+        created_dirs: list[Path] = []
+        state_original: bytes | None = None
+        state_snapshot_taken = False
+
+        def ensure_dir(path: Path) -> None:
+            missing: list[Path] = []
+            current = path
+            while not current.exists():
+                missing.append(current)
+                if current.parent == current:
+                    break
+                current = current.parent
+            # Create top-down, recording each level AS it is made — so a mkdir that fails partway up a fresh
+            # hierarchy still leaves every already-created dir tracked, and rollback restores a byte-identical
+            # tree (the old `extend(reversed(missing))` ran only AFTER a bulk parents=True mkdir succeeded).
+            for directory in reversed(missing):
+                directory.mkdir(exist_ok=True)
+                created_dirs.append(directory)
+
+        try:
+            state_original = state_path.read_bytes() if state_path.exists() else None
+            state_snapshot_taken = True
+
+            for target, content in writes:
+                original = target.read_bytes() if target.exists() else None
+                rollback.append((target, original))
+                ensure_dir(target.parent)
+                target.write_text(content, encoding="utf-8")
+
+            ensure_dir(domain_dir)
+            state["answers"] = ctx
+            state["files"] = new_base
+            state_path.write_text(json.dumps(state, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        except Exception:
+            for target, original in reversed(rollback):
+                try:
+                    if original is not None:
+                        target.write_bytes(original)
+                    else:
+                        target.unlink(missing_ok=True)
+                except Exception:  # noqa: BLE001 — best-effort rollback must never mask the original error
+                    logger.warning("generate: rollback could not restore %s — the tree may be partial", target)
+            if state_snapshot_taken:
+                try:
+                    if state_original is not None:
+                        state_path.write_bytes(state_original)
+                    else:
+                        state_path.unlink(missing_ok=True)
+                except Exception:  # noqa: BLE001 — same: surface, never mask
+                    logger.warning("generate: rollback could not restore the state file %s", state_path)
+            for directory in reversed(created_dirs):
+                try:
+                    directory.rmdir()
+                except Exception:  # noqa: BLE001 — a created dir left non-empty by a restore is kept, not forced
+                    pass
+            raise
 
     return result
 
