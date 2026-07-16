@@ -85,6 +85,21 @@ def test_chunks_edge_cases():
     assert memory.MemoryManager._chunks("abc", 0, 0) == ["abc"]   # size<=0 → whole text
 
 
+def test_chunks_degenerate_overlap_is_bounded():
+    # #1550: an overlap >= size (from a tolerantly-merged component overlay) must NOT clamp the step to 1
+    # and emit ~len(text) full-size chunks (O(len·size) memory). The overlap is capped at size//2 so the
+    # chunk count stays O(len/size), not O(len).
+    text = "x" * 100_000
+    for overlap in (100, 200, 500):                          # >= size (100) → degenerate
+        chunks = memory.MemoryManager._chunks(text, 100, overlap)
+        assert len(chunks) <= 2 * (len(text) // 100) + 2     # bounded ~2x, not ~len(text)
+        assert all(len(c) <= 100 for c in chunks)
+        assert chunks and chunks[-1].endswith("x")           # still covers the whole text
+    # a normal sub-50% overlap is unchanged (step = size - overlap)
+    normal = memory.MemoryManager._chunks("y" * 1000, 100, 20)
+    assert normal[0][-20:] == normal[1][:20]
+
+
 # ── chunk_and_store ────────────────────────────────────────────────────────────
 def test_chunk_and_store_posts_every_chunk(monkeypatch):
     captured: dict = {}

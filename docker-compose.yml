@@ -126,7 +126,13 @@ services:
     logging: *default-logging
     restart: unless-stopped
     ports:
-      - "8800:8000"                    # orchestrator reaches it at localhost:8800
+      # Loopback only by default (safe — a co-located/host-network orchestrator reaches it at
+      # localhost:8800). memory-api has NO built-in auth (any caller can read /scopes and POST
+      # /delete_all or /promote), so never publish it on the LAN as-is. To serve a local-mode
+      # orchestrator on ANOTHER machine, do NOT edit this public default — layer a separate
+      # deploy-local compose override (kept outside the synced tree so a re-deploy can't wipe it)
+      # that binds the LAN behind a firewall-pin AND an authenticating reverse proxy.
+      - "127.0.0.1:8800:8000"          # orchestrator reaches it at localhost:8800
     extra_hosts:
       - "host.docker.internal:host-gateway"   # reach the host-network vLLM from this bridge container
     environment:

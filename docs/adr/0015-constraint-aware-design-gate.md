@@ -4,8 +4,8 @@
 
 Accepted — delivered incrementally, default off.
 
-**Status: Superseded (in part) by ADR-0006 (#1414)** — the product presence gate / L2 conflict-fork /
-L3 typed HARD-floor described here was retired in S1; `record_constraints` is now optional non-gating
+**Status: Superseded (in part) by ADR-0006** — the product presence gate / L2 conflict-fork /
+L3 typed HARD-floor described here was retired; `record_constraints` is now optional non-gating
 framing-note capture; build enforcement is the approved-design anti-drift. The build-boundary hard-check
 and verbatim injection survive.
 
@@ -25,18 +25,18 @@ feature is enabled.
 
 Adopt a three-part L1 design, delivered through separate increments:
 
-1. **Capture and status (S1 #1338 — shipped).** `record_constraints` writes the single canonical
+1. **Capture and status (shipped).** `record_constraints` writes the single canonical
    `<unit>/decisions/constraints.md` document. The document has closed frontmatter with `type: decision`,
    `stage: constraints`, a consistent `declared_none` boolean, and a title. Empty/whitespace content or the
    case-insensitive `none` sentinel records `CAPTURED_NONE`; otherwise the body is `CAPTURED` and is preserved
    verbatim apart from leading and trailing blank lines. The bounded tri-state reader returns `UNCAPTURED` for
    missing, unreadable, oversized, malformed, inconsistent, or marker-poisoned documents and never raises.
-2. **Presence gate (S2 #1339 — shipped).** Before design work proceeds, the lifecycle requires either
+2. **Presence gate (shipped).** Before design work proceeds, the lifecycle requires either
    `CAPTURED` or `CAPTURED_NONE`. `UNCAPTURED` blocks `record_design`, `plan_units`, and implementation
    `stage_handover` (create and re-hand). This is a presence decision only; it does not rank, interpret, or
    rewrite constraints. `force` does not bypass. Design/analysis/documentation handovers stay ungated (they
    produce the design).
-3. **Verbatim injection (S2 #1339 — shipped).** A captured body is injected as one bounded block delimited by
+3. **Verbatim injection (shipped).** A captured body is injected as one bounded block delimited by
    the reserved `<!-- IRONCLAD:CONSTRAINTS -->` and `<!-- /IRONCLAD:CONSTRAINTS -->` markers. An explicit
    no-constraints capture injects no body (and strips a stale block). Capture refuses those marker literals in
    authored content, and the reader treats a document containing them as untrusted. Each staging call takes
@@ -74,5 +74,5 @@ never repaired implicitly.
   (including the explicit none-decision); coders always see the authored body when it exists.
 - Default-off deployments receive no new prompt text, steering text, model tool, gate, or injection.
 - L2/L3 compliance (typed fields, hard/soft provenance, conflict fork, structured hard-check) is specified
-  in ADR-0016 / epic #1344; L1 stores and injects the authored body and remains the presence floor those
+  in ADR-0016; L1 stores and injects the authored body and remains the presence floor those
   layers build on.

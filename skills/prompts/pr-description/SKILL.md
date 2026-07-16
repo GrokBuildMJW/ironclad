@@ -8,7 +8,7 @@ languages: [en, de]
 variables: [changes, issue, testing]
 required: [changes]
 ask.changes: Summarize what this PR changes (paste the diff summary or a short list).
-ask.issue: Linked issue/ticket (e.g. #146)? Leave blank to omit.
+ask.issue: Linked issue/ticket reference? Leave blank to omit.
 ask.testing: How was it tested? Leave blank to omit.
 desc.issue: Optional linked issue reference
 desc.testing: Optional note on how the change was tested

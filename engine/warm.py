@@ -52,6 +52,10 @@ class WarmTier:
         self._tried = True
         try:
             import redis  # MIT client; optional — only imported when the warm tier is configured
+        except Exception:  # noqa: BLE001 — missing dep → permanently disabled; keep the latch (no repeated import)
+            self._client = None
+            return None
+        try:
             self._client = redis.Redis.from_url(
                 self.url,
                 socket_timeout=self.timeout,
@@ -59,8 +63,11 @@ class WarmTier:
                 decode_responses=True,
             )
             self._client.ping()  # surface an unreachable server now → fall back to no-op
-        except Exception:  # noqa: BLE001 — missing dep / unreachable → disabled
+        except Exception:  # noqa: BLE001 — unreachable/transient failure → clear the latch so a later _conn()
+            # re-dials the URL instead of no-op'ing forever after a first-connect blip (#1556; the ping-failure
+            # path in is_available already does this, but a failed INITIAL connect never reached it).
             self._client = None
+            self._tried = False
         return self._client
 
     def is_available(self) -> bool:

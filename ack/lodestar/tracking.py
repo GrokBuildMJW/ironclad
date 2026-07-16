@@ -180,11 +180,16 @@ def deps_satisfied(feat: dict[str, Any], bucket_by_id: dict[str, str], implement
 
 def build_backlog(features: list[dict[str, Any]], bucket_by_id: dict[str, str],
                   cap_by_key: dict[str, dict[str, list[str]]], domain_key: str,
-                  title: str, tracking_stem: str, today: str) -> str:
-    implemented_keys = {
-        f["key"] for f in features
-        if compute_status(f, bucket_by_id, cap_by_key).startswith("✅")
-    }
+                  title: str, tracking_stem: str, today: str,
+                  implemented_keys: Optional[set[str]] = None) -> str:
+    # #1534: a `depends_on` capability key is GLOBAL — a dependency implemented in any domain satisfies it
+    # (matching the doctor's cross-mapping resolution). ``run`` passes the global implemented-capability set;
+    # when it is not supplied (a direct/legacy caller) fall back to this domain's own implemented keys.
+    if implemented_keys is None:
+        implemented_keys = {
+            f["key"] for f in features
+            if compute_status(f, bucket_by_id, cap_by_key).startswith("✅")
+        }
     ready, blocked = [], []
     for f in features:
         s = compute_status(f, bucket_by_id, cap_by_key)
@@ -246,8 +251,27 @@ def build_backlog(features: list[dict[str, Any]], bucket_by_id: dict[str, str],
 # --------------------------------------------------------------------------- #
 # Per-domain processing + entry points
 # --------------------------------------------------------------------------- #
+def _domain_features(tracking_path: Path) -> list[dict[str, Any]]:
+    """Parse just the MAPPING ``features`` of a gap-tracking file (fail-soft → ``[]``).
+
+    Used by :func:`run` to collect every domain's capabilities up front so the global implemented set can
+    be computed before any backlog is rendered (#1534)."""
+    try:
+        text = tracking_path.read_text(encoding="utf-8")
+    except OSError:
+        return []
+    m = _MAPPING_RE.search(text)
+    if not m:
+        return []
+    try:
+        return json.loads(m.group(1)).get("features", []) or []
+    except json.JSONDecodeError:
+        return []
+
+
 def process_domain(tracking_path: Path, bucket_by_id: dict[str, str],
-                   cap_by_key: dict[str, dict[str, list[str]]], today: str) -> Optional[dict[str, Any]]:
+                   cap_by_key: dict[str, dict[str, list[str]]], today: str,
+                   implemented_keys: Optional[set[str]] = None) -> Optional[dict[str, Any]]:
     text = tracking_path.read_text(encoding="utf-8")
     m = _MAPPING_RE.search(text)
     if not m:
@@ -276,7 +300,8 @@ def process_domain(tracking_path: Path, bucket_by_id: dict[str, str],
 
     # Write the sibling backlog.
     backlog_path = tracking_path.with_name(tracking_path.name.replace("-gap-tracking", "-backlog"))
-    backlog = build_backlog(features, bucket_by_id, cap_by_key, domain_key, title, tracking_stem, today)
+    backlog = build_backlog(features, bucket_by_id, cap_by_key, domain_key, title, tracking_stem, today,
+                            implemented_keys=implemented_keys)
     backlog_path.write_text(backlog, encoding="utf-8")
 
     st = lambda p: sum(1 for f in features if compute_status(f, bucket_by_id, cap_by_key).startswith(p))
@@ -296,9 +321,16 @@ def run(root: Path, *, today: Optional[str] = None) -> dict[str, Any]:
     tasks_dir = root / "tasks"
     bucket_by_id, cap_by_key, seen_keys = task_index(tasks_dir)
     tracking_files = sorted(research.glob("**/*-gap-tracking.md")) if research.is_dir() else []
+    # #1534: a `depends_on` capability is satisfied when it is implemented in ANY domain (the task index is
+    # global and the doctor resolves deps globally). Compute the implemented-capability set across every
+    # domain FIRST, then render each backlog against it — so a cross-domain dependency is never left blocked.
+    global_implemented: set[str] = {
+        f["key"] for tf in tracking_files for f in _domain_features(tf)
+        if f.get("key") and compute_status(f, bucket_by_id, cap_by_key).startswith("✅")
+    }
     domains, errors, all_known = [], [], set()
     for tf in tracking_files:
-        res = process_domain(tf, bucket_by_id, cap_by_key, today)
+        res = process_domain(tf, bucket_by_id, cap_by_key, today, global_implemented)
         if not res:
             continue
         if "error" in res:

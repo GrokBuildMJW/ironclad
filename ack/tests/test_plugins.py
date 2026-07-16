@@ -7,6 +7,8 @@ dir and offers it as a tool; calling the tool dispatches to `run`. The core is u
 from __future__ import annotations
 
 import sys
+import threading
+import time
 import types
 from pathlib import Path
 
@@ -92,6 +94,25 @@ def test_duplicate_tool_name_keeps_first(tmp_path):
 def test_plugin_tool_dispatches_to_run(tmp_path):
     gx10._load_plugins(_plugin_dir(tmp_path, "greet.py", _GREET))
     assert gx10.run_tool("greet", {"name": "Ada"}) == "Hello, Ada!"
+
+
+def test_blocking_plugin_tool_observes_turn_cancel():
+    release = threading.Event()
+    gx10._PLUGIN_TOOLS["blocked"] = {"handler": release.wait}
+    gx10._CANCEL_EVENT.clear()
+
+    def _cancel():
+        time.sleep(0.05)
+        gx10._CANCEL_EVENT.set()
+
+    threading.Thread(target=_cancel, daemon=True).start()
+    started = time.monotonic()
+    try:
+        assert gx10.run_tool("blocked", {}) == "ERROR: cancelled"
+        assert time.monotonic() - started < 1.0
+    finally:
+        release.set()
+        gx10._CANCEL_EVENT.clear()
 
 
 def test_no_plugins_dir_is_empty():

@@ -49,10 +49,10 @@ export type StatusFields = Omit<StatusState, 'perf' | 'agent' | 'search'>;
 
 /** One poll: map /health + /tasks into status fields, or `null` on ANY error (→ caller keeps the
  *  previous state and only marks it disconnected — the coalescing guarantee). Never throws. */
-export async function pollStatus(srv: Server): Promise<StatusFields | null> {
+export async function pollStatus(srv: Server, signal?: AbortSignal): Promise<StatusFields | null> {
   try {
-    const h = await srv.health();
-    const tasks = await srv.tasks();
+    const h = await srv.health(signal);
+    const tasks = await srv.tasks(signal);
     const c = (s: string): number => tasks.filter((t) => t['status'] === s).length;
     return {
       connected: Boolean(h['ok']),
@@ -89,9 +89,13 @@ export function useStatusPoller(
 
   useEffect(() => {
     let live = true;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    // #1542: aborts the in-flight health/tasks fetch on teardown so a poll stuck against a black-hole server
+    // never lingers on its 600s request timeout, retaining a socket after the component is gone.
+    const ac = new AbortController();
     wasConnected.current = false;
     const poll = async (): Promise<void> => {
-      const upd = await pollStatus(srv);
+      const upd = await pollStatus(srv, ac.signal);
       if (!live) return;
       const {connected} = nextConnState(wasConnected.current, upd);
       wasConnected.current = connected;
@@ -99,11 +103,20 @@ export function useStatusPoller(
       setSt((s) => (upd === null ? {...s, connected: false} : {...s, ...upd}));
       if (connected) void flushToolResults(srv).catch(() => {}); // channel up → drain buffered results; the 2s poll is the bounded retry timer
     };
-    void poll();
-    const id = setInterval(() => void poll(), intervalMs);
+    // #1542: a SELF-SCHEDULING loop — the next poll is armed only AFTER the current one settles, so at most
+    // one health/tasks request is ever in flight and completions can never land out of order. (The old fixed
+    // `setInterval` fired every intervalMs regardless, so a slow server that pended each request for the 600s
+    // timeout accreted hundreds of simultaneous fetches/sockets, and a late result could clobber newer state.)
+    const tick = async (): Promise<void> => {
+      await poll();
+      if (!live) return;
+      timer = setTimeout(() => void tick(), intervalMs);
+    };
+    void tick();
     return () => {
       live = false;
-      clearInterval(id);
+      if (timer) clearTimeout(timer);
+      ac.abort();
     };
   }, [srv, intervalMs]);
 

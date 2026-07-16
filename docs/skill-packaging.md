@@ -2,7 +2,7 @@
 
 > **Design/planned** — the contract this targets. What actually works **today** is the typed
 > `CASE`+`run` plugin in [`plugin-api.md`](plugin-api.md); the generation engine, the playbook
-> kind, and the catalogue are being built under epic #22. See [ADR-0001](adr/0001-skill-engine-and-library.md)
+> kind, and the catalogue are under active development. See [ADR-0001](adr/0001-skill-engine-and-library.md)
 > for the decisions and [`status.md`](status.md) for current wiring status.
 
 Ironclad supports **two skill kinds**. Both are secret-free, English-only, and export-clean.
@@ -14,7 +14,7 @@ The typed signature is the tool schema. This is the stable contract in
 [`plugin-api.md`](plugin-api.md); nothing here changes it. Scaffold with
 `python -m ack.generator`.
 
-## Kind 2 — playbook (`SKILL.md` package) — *available (#89)*
+## Kind 2 — playbook (`SKILL.md` package) — *available*
 
 A directory the orchestrator reads with **progressive disclosure** (metadata first → body on
 trigger → references on demand). It is loaded by an additive loader path
@@ -51,7 +51,7 @@ frontmatter (playbook):
 | `version` | catalogue | semver; defaults to `0.1.0` for a new skill. |
 | `provenance` | catalogue | `built-in` \| `user` \| a source reference (no credentials). |
 
-## Library catalogue (manifest) — *available (#35)*
+## Library catalogue (manifest) — *available*
 
 `ack.catalogue` builds a self-hosted index over both kinds, reading each skill's **own
 metadata** as its manifest (the fields above — no separate registry file to drift). It supports
@@ -64,7 +64,7 @@ AND its restore both fail) preserved in the backup path rather than destroyed. D
 (`.`-prefixed) directories, so a leftover staging/backup copy never shadows the live skill.
 It layers over `Registry.discover_skills` (tools) + `discover_playbooks` (playbooks).
 
-## Generation — *available (#33)*
+## Generation — *available*
 
 `spec → deterministic scaffold → bounded LLM body → gate → register`. `ack.skillgen`
 (`python -m ack.skillgen --capability … --description … --kind tool|playbook [--param n:t] …`)
@@ -75,7 +75,7 @@ fills:
   remains `ack.generator`.
 - **Playbook:** a `SKILL.md` + `references/` + `scripts/check` (file-first validation) skeleton.
 
-## Quality gate (before registration) — *available (#34)*
+## Quality gate (before registration) — *available*
 
 `ack.gate` (`gate(path)` / `gate_tool` / `gate_playbook`) — required for every generated skill:
 - **Typed tool:** doctor preflight (loads, `CASE`+`capability`, **sync** `run`, derivable schema)
@@ -86,4 +86,4 @@ fills:
 **Opt-in (behavioral):** a skill may additionally ship an `eval/` layer
 (`gate.toml` thresholds, A/B `harness.py`, `judge.py` panel, `rubric.py`, `sets/`+`refs/`) —
 modeled on `skills/mpr/eval/` — run before the merge of a behavior-affecting change, not on
-every commit. `skills/mpr` is the reference built-in and the eval exemplar (#90).
+every commit. `skills/mpr` is the reference built-in and the eval exemplar.

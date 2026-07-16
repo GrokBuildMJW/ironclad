@@ -130,48 +130,51 @@ _JSON_PRIMITIVES: dict[type, str] = {
 }
 
 
-def _annotation_to_schema(annotation: Any) -> tuple[dict[str, Any], bool]:
-    """Map a type annotation to a (schema, required) pair.
+def _annotation_to_schema(annotation: Any) -> dict[str, Any]:
+    """Map a type annotation to its JSON-Schema value type.
 
-    ``required`` is ``False`` when the annotation is ``Optional[...]`` (i.e. a Union
-    that admits ``None``). The produced schema never uses array-cardinality keywords
-    so it stays XGrammar-clean by construction.
+    Describes ONLY the accepted VALUE type — never call-site requiredness, which is derived exclusively
+    from the parameter's default (#1535). The produced schema never uses array-cardinality keywords so it
+    stays XGrammar-clean by construction.
     """
     if annotation is inspect.Parameter.empty or annotation is Any:
-        return {"type": "string"}, True
+        return {"type": "string"}
 
     origin = get_origin(annotation)
 
-    # Optional[X] / Union[..., None] -> not required; describe the non-None arm. ACK-1 (#503): also match
-    # PEP-604 `X | None`, whose get_origin is types.UnionType (NOT typing.Union) — else a modern annotation
-    # fell through to the bare-string + required fallback, giving the public SDK a wrong model-facing schema.
+    # Optional[X] / Union[..., None] / PEP-604 `X | None` (get_origin is types.UnionType, NOT typing.Union).
+    # #1535: an Optional annotation controls the accepted VALUE (it admits null) — it must NOT be conflated
+    # with requiredness. The null arm is preserved (matching pydantic's own Optional rendering `{"anyOf":
+    # [<T>, {"type": "null"}]}`, which is grammar-clean — the XGrammar lint allows anyOf), so passing None
+    # stays schema-valid. Requiredness is decided by the caller from param.default.
     if origin is Union or origin is UnionType:
-        args = [a for a in get_args(annotation) if a is not type(None)]  # noqa: E721
-        optional = len(args) != len(get_args(annotation))
+        all_args = get_args(annotation)
+        args = [a for a in all_args if a is not type(None)]  # noqa: E721
+        admits_none = len(args) != len(all_args)
         if len(args) == 1:
-            inner, _ = _annotation_to_schema(args[0])
-            return inner, not optional
-        # Heterogeneous union -> permissive (untyped); still optional-aware.
-        return {}, not optional
+            inner = _annotation_to_schema(args[0])
+            return {"anyOf": [inner, {"type": "null"}]} if admits_none else inner
+        # Heterogeneous or None-only union -> permissive (untyped); {} already admits null.
+        return {}
 
     if origin in (list, tuple, set, frozenset):
         item_args = get_args(annotation)
-        item_schema, _ = _annotation_to_schema(item_args[0]) if item_args else ({}, True)
+        item_schema = _annotation_to_schema(item_args[0]) if item_args else {}
         # NOTE: no minItems/maxItems/uniqueItems — those 400 under XGrammar V1.
-        return {"type": "array", "items": item_schema or {"type": "string"}}, True
+        return {"type": "array", "items": item_schema or {"type": "string"}}
 
     if origin is dict:
-        return {"type": "object"}, True
+        return {"type": "object"}
 
     if isinstance(annotation, type):
         if annotation in _JSON_PRIMITIVES:
-            return {"type": _JSON_PRIMITIVES[annotation]}, True
+            return {"type": _JSON_PRIMITIVES[annotation]}
         if issubclass(annotation, Enum):
-            return {"enum": [e.value for e in annotation]}, True
+            return {"enum": [e.value for e in annotation]}
         # A pydantic-ish / dataclass object -> opaque object (kept grammar-safe).
-        return {"type": "object"}, True
+        return {"type": "object"}
 
-    return {"type": "string"}, True
+    return {"type": "string"}
 
 
 #: Parameters never exposed in a tool schema (framework-injected, not model-supplied).
@@ -207,9 +210,12 @@ def derive_tool_schema(handler: Callable[..., Any]) -> dict[str, Any]:
         if param.kind in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD):
             continue
         annotation = hints.get(pname, param.annotation)
-        prop_schema, ann_required = _annotation_to_schema(annotation)
-        properties[pname] = prop_schema
-        if ann_required and param.default is inspect.Parameter.empty:
+        properties[pname] = _annotation_to_schema(annotation)
+        # #1535: requiredness follows the SIGNATURE, not the annotation's nullability — a param with no
+        # default is required even when typed Optional[T]/`T | None` (the null arm just makes None a valid
+        # VALUE). Deriving it from the annotation let a required `limit: int | None` be omitted, so the
+        # model could emit {} and dispatch would crash with a missing-argument TypeError.
+        if param.default is inspect.Parameter.empty:
             required.append(pname)
 
     schema: dict[str, Any] = {

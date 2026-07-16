@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import keyword
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -51,11 +52,23 @@ class SkillSpec:
             raise ValueError("description is required")
         if self.kind not in KINDS:
             raise ValueError(f"kind must be one of {KINDS}, got {self.kind!r}")
+        # #1536: reject anything that cannot form a valid Python ``run(...)`` signature — keep the
+        # generator's "schema-valid by construction" contract. ``str.isidentifier()`` alone is not enough:
+        # a reserved keyword (``class``/``def``/``None`` …) passes it yet renders `def run(class: str)` →
+        # SyntaxError, and a duplicated name renders `def run(x: str, x: int)` → "duplicate argument". Both
+        # would import-fail and be silently dropped at discovery. (Soft keywords like ``match``/``type`` are
+        # valid parameter names, so only ``keyword.iskeyword`` — the hard keywords — is rejected.)
+        seen: set[str] = set()
         for n, t in self.params:
             if not n.isidentifier():
-                raise ValueError(f"invalid param name {n!r}")
+                raise ValueError(f"invalid param name {n!r}: not a valid Python identifier")
+            if keyword.iskeyword(n):
+                raise ValueError(f"invalid param name {n!r}: is a reserved Python keyword")
             if t not in _PARAM_TYPES:
                 raise ValueError(f"param {n!r}: type must be one of {sorted(_PARAM_TYPES)}")
+            if n in seen:
+                raise ValueError(f"duplicate param name {n!r}")
+            seen.add(n)
 
 
 def _py_module_name(cap: str) -> str:
@@ -170,11 +183,19 @@ def scaffold(spec: SkillSpec) -> dict[str, str]:
 def write_scaffold(spec: SkillSpec, dest: str | Path, *, force: bool = False) -> list[Path]:
     """Write the scaffold under *dest*. Refuses to overwrite unless *force*. Returns paths."""
     dest = Path(dest)
+    items = list(scaffold(spec).items())
+    # #1537: preflight the COMPLETE target set before writing anything. Writing/refusing one target at a
+    # time meant a conflict on a LATER target (e.g. an existing sibling test) raised only AFTER an earlier
+    # target was already committed, leaving a half-scaffolded destination — a discoverable skill without its
+    # generated test — despite the "refuses to overwrite" contract. Now a single conflict refuses atomically.
+    if not force:
+        for rel, _ in items:
+            target = dest / rel
+            if target.exists():
+                raise FileExistsError(f"refusing to overwrite {target} (use force=True)")
     written: list[Path] = []
-    for rel, content in scaffold(spec).items():
+    for rel, content in items:
         target = dest / rel
-        if target.exists() and not force:
-            raise FileExistsError(f"refusing to overwrite {target} (use force=True)")
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(content, encoding="utf-8")
         written.append(target)

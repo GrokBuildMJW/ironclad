@@ -38,7 +38,7 @@ A failed run is unclaimed for retry;
 claim/unclaim transport failures remain fail-soft. Whatever CLI you use, if it honours those
 four points, it works.
 
-## The agent registry — many agents, config-driven (#449)
+## The agent registry — many agents, config-driven
 
 `GX10_AGENT_CMD` configures **one** agent for every handover. To run **several** agents and let
 the orchestrator pick one per task (e.g. Opus for security/architecture, Sonnet for docs, Codex for
@@ -90,8 +90,10 @@ implementation), declare them in the **code-agent registry** — a config block,
   **failed** run, so the claim is released and the task is retried — on the same agent — up to its retry
   budget before escalating. A timeout is a normal failure, not a budget-exhausted one: it is classified
   `task-failed` (not `agent-unavailable`), so it does **not** trip the circuit-breaker or fail over to a
-  peer. Ink retains only the last 256 KiB of each stdout/stderr stream, with an explicit truncation marker,
-  and writes those bounded tails to the per-task diagnostic log.
+  peer. The Python client continuously drains stderr into a marked 256 KiB rolling byte tail; Ink applies
+  the same byte-accurate bound to each stdout/stderr stream. UTF-8 is decoded only after retention, so neither
+  client can grow memory with an unbounded coder stream. The Windows whole-tree proof is opt-in via
+  `IRONCLAD_WIN_KILL_PROOF=1` because the project has no Windows CI runner.
 - **Budget/quota failover (task-class-scoped).** When an agent's run reports it is out of budget/quota,
   the server classifies the run as `agent-unavailable` (a layered check of a JSON error event → a stderr
   regex → an exit code, with patterns in your `conf/`), trips a process-lifetime circuit-breaker for that
@@ -125,7 +127,7 @@ implementation), declare them in the **code-agent registry** — a config block,
   prompt-free model-list command on an already authorized/resolved registry entry, not a coder handover
   launch. Failed or empty coder runs are also surfaced on the board as `⚠ ERRORED` or `⚠ UNAVAILABLE` with
   captured stderr in both the local lane and the client `/feedback` lane.
-- **Read-only Memory MCP (`mcp_template`, #480).** An MCP-capable CLI can LIVE-query the project memory
+- **Read-only Memory MCP (`mcp_template`).** An MCP-capable CLI can LIVE-query the project memory
   during a handover. Put a `{mcp}` placeholder in the agent's `cmd_template` and an `mcp_template` (the
   per-CLI MCP config — Claude `--mcp-config <json>`, Codex `-c mcp_servers.*`; the `{mcp_cmd}`/`{mcp_script}`
   tokens render to the python invocation of `memory_mcp.py`). The MCP is injected whenever a memory service

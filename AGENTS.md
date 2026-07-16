@@ -29,8 +29,8 @@ a failed check — report the exact error and stop (fail-closed).
    - Check: `python -c "import ack, pydantic; print('ack ok')"`.
 4. **Run the test suite.** `python -m pytest ack/tests -q`.
    - Check: all tests pass. Stop on any failure; report the failing test names.
-5. **Confirm the boundary stays clean** (if `scripts/ci/check_core_boundary.py` is
-   present): `python scripts/ci/check_core_boundary.py`. Must print PASSED.
+5. **Confirm the public boundary stays clean:** `core/` must not import from or hardcode any
+   private path or literal. (A boundary check enforces this in the project's private CI.)
 
 Done-A: `import ack` works and `pytest` is green.
 
@@ -67,7 +67,7 @@ Done-A: `import ack` works and `pytest` is green.
    `GX10_SERVER_URL=http://localhost:8100 python engine/client.py --codedir .` and type a
    short question. (Or, if you installed it in A.6, the recommended client:
    `GX10_SERVER_URL=http://localhost:8100 ironclad`.)
-   - Check: a coherent answer + a `✓ FERTIG`/`DONE` line. Stop if the call errors.
+   - Check: a coherent answer + a `✓ DONE` line. Stop if the call errors.
    - A plain question needs nothing more; to drive an artefact-producing **build** task, first
      `/project new <name> --type software` (fail-closed without one — see
      [`docs/state-and-initiative.md`](docs/state-and-initiative.md)).

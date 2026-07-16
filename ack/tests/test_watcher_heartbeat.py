@@ -126,6 +126,7 @@ def test_reconcile_coupled_runs_feedback_byte_identical(monkeypatch, tmp_path):
 
 def test_autopilot_double_message_only_when_coupled(monkeypatch, tmp_path):
     _setup(monkeypatch, tmp_path)
+    monkeypatch.setattr(gx10, "_EFFECTIVE_CFG", gx10._code_defaults())
     monkeypatch.setattr(gx10, "_WATCHER_ENABLED", False)
     prints: list = []
     monkeypatch.setattr(gx10, "_ui_print", lambda *a, **k: prints.append(str(a[0]) if a else ""))
@@ -144,7 +145,9 @@ def test_autopilot_double_message_only_when_coupled(monkeypatch, tmp_path):
 def test_heartbeat_default_is_finite_and_always_on(monkeypatch, tmp_path):
     _setup(monkeypatch, tmp_path)
     assert gx10._code_defaults()["heartbeat"]["stall_seconds"] == 900
+    assert gx10._code_defaults()["heartbeat"]["claim_lease_seconds"] == 120
     assert gx10.HEARTBEAT_STALL_S == 900.0
+    assert gx10.CLAIM_LEASE_TTL_S == 120.0
     tid = _mk_inprogress()
     _stale_log(tid, age=1000)
     gx10._reconcile_once(gx10._store(), lambda *a: None, {}, set())
@@ -163,8 +166,82 @@ def test_heartbeat_rejects_non_positive_or_non_finite_tuning(invalid):
 def test_heartbeat_honors_positive_finite_tuning():
     cfg = gx10._code_defaults()
     cfg["heartbeat"]["stall_seconds"] = 123.5
-    gx10._apply_heartbeat(cfg)
+    cfg["heartbeat"]["claim_lease_seconds"] = 45.5
+    gx10._apply_config(cfg)
     assert gx10.HEARTBEAT_STALL_S == 123.5
+    assert gx10.CLAIM_LEASE_TTL_S == 45.5
+
+
+def test_claim_lease_reclaims_expired_client_task(monkeypatch, tmp_path):
+    _setup(monkeypatch, tmp_path)
+    monkeypatch.setattr(gx10, "CLAIM_LEASE_TTL_S", 10.0)
+    tid = gx10._store().create(
+        {"type": "feature", "priority": "high", "title": "expired", "description": "y"},
+        force=True,
+    )["id"]
+    gx10.claim_task(tid, "OPUS")
+    gx10._store().stamp_claim(tid, gx10.time.time() - 20.0)
+    lines: list[str] = []
+    monkeypatch.setattr(gx10, "_ui_print", lambda line, *a, **k: lines.append(str(line)))
+    enqueued: set = set()
+
+    gx10._reconcile_once(gx10._store(), lambda *a: None, {}, enqueued)
+
+    task = gx10._store().get(tid)
+    assert task["status"] == "pending"
+    assert "claimed_at" not in task
+    assert f"__lease_{tid}" in enqueued
+    assert any("claim lease expired" in line and "reclaimed to pending" in line for line in lines)
+
+    gx10.claim_task(tid, "OPUS")
+    gx10._reconcile_once(gx10._store(), lambda *a: None, {}, enqueued)
+    assert f"__lease_{tid}" not in enqueued
+    gx10._store().stamp_claim(tid, gx10.time.time() - 20.0)
+    gx10._reconcile_once(gx10._store(), lambda *a: None, {}, enqueued)
+    assert gx10._store().get(tid)["status"] == "pending"
+    assert sum("claim lease expired" in line for line in lines) == 2
+
+
+def test_claim_lease_keeps_fresh_client_task(monkeypatch, tmp_path):
+    _setup(monkeypatch, tmp_path)
+    monkeypatch.setattr(gx10, "CLAIM_LEASE_TTL_S", 100.0)
+    tid = gx10._store().create(
+        {"type": "feature", "priority": "high", "title": "fresh", "description": "y"},
+        force=True,
+    )["id"]
+    gx10.claim_task(tid, "OPUS")
+
+    gx10._reconcile_once(gx10._store(), lambda *a: None, {}, set())
+
+    assert gx10._store().get(tid)["status"] == "in_progress"
+
+
+def test_claim_lease_skips_autopilot_task_without_claim_stamp(monkeypatch, tmp_path):
+    _setup(monkeypatch, tmp_path)
+    monkeypatch.setattr(gx10, "CLAIM_LEASE_TTL_S", 0.01)
+    tid = _mk_inprogress("autopilot task")
+
+    gx10._reconcile_once(gx10._store(), lambda *a: None, {}, set())
+
+    assert gx10._store().get(tid)["status"] == "in_progress"
+
+
+def test_claim_lease_does_not_reopen_blocked_task(monkeypatch, tmp_path):
+    _setup(monkeypatch, tmp_path)
+    monkeypatch.setattr(gx10, "CLAIM_LEASE_TTL_S", 10.0)
+    tid = gx10._store().create(
+        {"type": "feature", "priority": "high", "title": "blocked lease", "description": "y"},
+        force=True,
+    )["id"]
+    gx10.claim_task(tid, "OPUS")
+    gx10._store().stamp_claim(tid, gx10.time.time() - 20.0)
+    gx10._store().mark_blocked(tid, reason="advance gate refused", kind="blocked")
+
+    gx10._reconcile_once(gx10._store(), lambda *a: None, {}, set())
+
+    task = gx10._store().get(tid)
+    assert task["status"] == "in_progress"
+    assert task["blocked_kind"] == "blocked"
 
 
 def test_heartbeat_no_signal_ever_is_not_auto_stalled(monkeypatch, tmp_path):

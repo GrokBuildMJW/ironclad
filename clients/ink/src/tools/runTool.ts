@@ -23,7 +23,9 @@ import {spawn, type ChildProcess} from 'node:child_process';
 import {detectShell, gitBash} from './shell.js';
 import {directoryEntryNames, fmtCount, listingTargetForCommand} from './listingCount.js';
 import {rglob} from './glob.js';
-import {killProcessTree} from './procTree.js';
+import {killProcessTree, waitForChildExit} from './procTree.js';
+import {emitDiagnosticOnce} from './diagnostics.js';
+import {BoundedTail, MAX_CAPTURE_BYTES} from './boundedTail.js';
 
 const MAX_FILE_CHARS = 24000; // gx10.py:102
 const LIST_DIR_HARD_CAP = 200; // gx10.py:103
@@ -142,17 +144,26 @@ export function shellGuard(command: string): string | null {
 type ExecResult = {text: string; code: number | null};
 type SandboxPolicy = 'auto' | 'bwrap' | 'firejail';
 const SANDBOXED_EXEC_WIRE_TOOL = 'execute_command_sandboxed_v1';
+export const POST_KILL_DRAIN_MS = 2000;
+
+export function isBestEffortTeardown(backend: string): boolean {
+  return backend === 'firejail';
+}
 
 async function terminateProcessTree(child: ChildProcess): Promise<void> {
   await killProcessTree(child);
+  await waitForChildExit(child, POST_KILL_DRAIN_MS);
 }
 
 function collectChild(
   child: ChildProcess, timeoutS: number, spawnError: string | null, signal?: AbortSignal,
 ): Promise<ExecResult> {
   return new Promise((resolve) => {
-    const out: Buffer[] = [];
-    const err: Buffer[] = [];
+    // #1540 (defect B): a rolling bounded tail per stream — a model/operator command that prints gigabytes
+    // can no longer OOM the client (the pre-existing unbounded Buffer[] + Buffer.concat allocated the whole
+    // stream twice). Shares the coder-handover capture cap (MAX_CAPTURE_BYTES).
+    const out = new BoundedTail(MAX_CAPTURE_BYTES);
+    const err = new BoundedTail(MAX_CAPTURE_BYTES);
     let done = false;
     let terminating = false;
     let timer: NodeJS.Timeout | undefined;
@@ -169,18 +180,23 @@ function collectChild(
       void terminateProcessTree(child).finally(() => finish(r));
     };
     const abort = (): void => stop({text: 'ERROR: cancelled', code: null});
-    timer = setTimeout(
-      () => stop({text: `ERROR: Timeout after ${timeoutS}s`, code: null}),
-      timeoutS * 1000,
-    );
-    child.stdout?.on('data', (d: Buffer) => out.push(d));
-    child.stderr?.on('data', (d: Buffer) => err.push(d));
+    timer = setTimeout(() => {
+      // #1540 (defect A) / #1491 / #1538: if the child already exited (by code OR signal) but its `close`
+      // event is still draining the stdout pipe, do NOT declare a timeout — step aside and let `close`
+      // deliver the real exit code + buffered output (mirrors spawnAgent in handover.ts). Otherwise a
+      // command that finished exactly at the deadline was reported as a false ERROR: Timeout and its
+      // successful output discarded.
+      if (done || terminating || child.exitCode !== null || child.signalCode !== null) return;
+      stop({text: `ERROR: Timeout after ${timeoutS}s`, code: null});
+    }, timeoutS * 1000);
+    child.stdout?.on('data', (d: Buffer) => out.append(d));
+    child.stderr?.on('data', (d: Buffer) => err.append(d));
     child.on('error', (e) => {
       if (!terminating) finish({text: spawnError ?? `ERROR: ${e.message}`, code: null});
     });
     child.on('close', (code) => {
       if (terminating) return;
-      const combined = (Buffer.concat(out).toString('utf-8') + Buffer.concat(err).toString('utf-8')).trim();
+      const combined = (out.text() + err.text()).trim();
       finish({text: combined, code});
     });
     signal?.addEventListener('abort', abort, {once: true});
@@ -223,6 +239,7 @@ async function findSandboxBackend(policy: SandboxPolicy): Promise<'bwrap' | 'fir
 function execSandboxed(
   backend: 'bwrap' | 'firejail', command: string, timeoutS: number, cwd: string, signal?: AbortSignal,
 ): Promise<ExecResult> {
+  // firejail has no clean die-with-parent equivalent, so its tree teardown is best-effort-only.
   const argv = backend === 'bwrap'
     ? ['--die-with-parent', '--unshare-pid', '--dev-bind', '/', '/', '--proc', '/proc', '--unshare-net', '--', 'sh', '-c', command]
     : ['--quiet', '--net=none', '--', 'sh', '-c', command];
@@ -487,6 +504,12 @@ export async function runTool(
         if (backend === null) {
           return (`ERROR: execute_command refused: no supported sandbox backend is available for policy '${sandboxPolicy}'. `
             + 'Ironclad fails closed; install bwrap or firejail on this Linux host.');
+        }
+        if (isBestEffortTeardown(backend)) {
+          emitDiagnosticOnce(
+            'sandbox-firejail-best-effort',
+            '⚠ sandbox: firejail tree teardown is best-effort-only; bwrap is preferred for complete namespace teardown',
+          );
         }
         let r = await execSandboxed(backend, command, timeoutS, base, signal);
         // #1196 ≙ gx10.py: BSD/macOS `ls` rejects the GNU-only `--color=always` (exit != 0), which would

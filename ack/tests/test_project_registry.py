@@ -108,6 +108,60 @@ def test_ensure_default_is_idempotent(tmp_path):
     assert len([p for p in r.list() if p.id == reg.DEFAULT_PROJECT_ID]) == 1
 
 
+def test_load_corrupt_registry_is_quarantined_not_destroyed(tmp_path):
+    r = _r(tmp_path)
+    project = r.register("alpha", tmp_path / "a")
+    corrupt = r.path.read_bytes()[:-15]
+    r.path.write_bytes(corrupt)
+
+    assert r.load() == {"projects": {}, "active": None}
+    quarantined = list(r.home.glob("registry.json.corrupt.*"))
+    assert len(quarantined) == 1
+    preserved = quarantined[0].read_bytes()
+    assert preserved == corrupt
+    assert b"alpha" in preserved and project.mem_ns.encode() in preserved
+
+    r.ensure_default(tmp_path / "wd")
+    fresh = json.loads(r.path.read_text(encoding="utf-8"))
+    assert reg.DEFAULT_PROJECT_ID in fresh["projects"]
+
+
+def test_load_missing_registry_is_first_run_no_quarantine(tmp_path):
+    r = _r(tmp_path)
+    assert r.load() == {"projects": {}, "active": None}
+    assert list(r.home.glob("registry.json.corrupt.*")) == []
+
+
+def test_load_non_dict_registry_is_quarantined(tmp_path):
+    # Valid JSON whose top level is not an object is corruption, not a first run — it must be quarantined,
+    # not silently reduced to empty and overwritten.
+    r = _r(tmp_path)
+    r.register("alpha", tmp_path / "a")
+    r.path.write_bytes(b"[]")
+
+    assert r.load() == {"projects": {}, "active": None}
+    assert len(list(r.home.glob("registry.json.corrupt.*"))) == 1
+
+
+def test_load_corrupt_registry_fails_closed_when_unmovable(tmp_path, monkeypatch):
+    # If the corrupt file cannot be moved aside but is still present (e.g. a Windows lock), load must FAIL
+    # rather than return empty — otherwise a subsequent _save would overwrite the unrecovered bytes.
+    r = _r(tmp_path)
+    project = r.register("alpha", tmp_path / "a")
+    r.path.write_bytes(r.path.read_bytes()[:-15])
+
+    def _boom(src, dst):
+        raise OSError("locked")
+
+    monkeypatch.setattr(reg.os, "replace", _boom)
+
+    with pytest.raises(OSError):
+        r.load()
+    assert r.path.exists()                                    # corrupt bytes preserved, not clobbered
+    assert b"alpha" in r.path.read_bytes() and project.mem_ns.encode() in r.path.read_bytes()
+    assert list(r.home.glob("registry.json.corrupt.*")) == []
+
+
 def test_concurrent_ensure_default_converges_to_one(tmp_path):
     r = _r(tmp_path)
     wd = tmp_path / "wd"

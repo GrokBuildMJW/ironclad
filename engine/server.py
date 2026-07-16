@@ -3,7 +3,7 @@
 > **The split, in one sentence.** The orchestrator engine (:mod:`gx10`) is reached
 > like the model: plain LAN HTTP, client-initiated. This module drives the engine
 > **headless** (no prompt_toolkit UI) and exposes a tiny HTTP API. The thin client
-> (:mod:`core.engine.client`) connects exactly like the CLI connects to vLLM.
+> (:mod:`engine.client`) connects exactly like the CLI connects to vLLM.
 
 Design (confirmed): the server holds the *reasoning + state* — the GX10 turn loop,
 the TaskStore, ``stage_handover`` / ``advance_pipeline``, and the feedback-side
@@ -63,14 +63,19 @@ from urllib.parse import urlsplit
 #: Hard cap on a request body — bounds per-connection allocation on the threaded server.
 _MAX_BODY_BYTES = 8 * 1024 * 1024
 
-# The engine is run as a standalone script directory (gx10.py puts core/ on
-# sys.path, not as a package). We mirror that: put this dir (core/engine) on the
+#: Hard cap on the number of /fanout prompts. The 8 MiB body cap is a transport bound, not a work bound:
+#: a body of ~2M empty strings would make ReasoningWorkers.fanout allocate one Future + queue entry per
+#: prompt (hundreds of MB) before a single result drains. Env: GX10_MAX_FANOUT_PROMPTS.
+_MAX_FANOUT_PROMPTS = int(os.environ.get("GX10_MAX_FANOUT_PROMPTS") or 256)
+
+# The engine is run as a standalone script directory (gx10.py puts its package
+# root on sys.path, not as a package). We mirror that: put this engine dir on the
 # path, then import gx10 absolutely — works both as a script AND as a module.
 _HERE = Path(__file__).resolve().parent
 if str(_HERE) not in sys.path:
     sys.path.insert(0, str(_HERE))
 
-import gx10  # noqa: E402  (also puts core/ on sys.path → ack importable)
+import gx10  # noqa: E402  (also puts the package root on sys.path → ack importable)
 import providers  # noqa: E402  (#455: result classifier; #449/#452 registry helpers)
 from workers import ReasoningWorkers  # noqa: E402
 from security import SecurityPolicy, SessionRegistry  # noqa: E402
@@ -90,6 +95,9 @@ _AGENT_LOCK = threading.Lock()
 #: after this it gets a 503 "busy" (retryable) instead of an indefinite hang. Env: GX10_AGENT_LOCK_TIMEOUT_S.
 _AGENT_LOCK_TIMEOUT_S = float(os.environ.get("GX10_AGENT_LOCK_TIMEOUT_S") or 45.0)
 
+#: Configurable request socket timeout. Env: GX10_REQUEST_TIMEOUT_S.
+_REQUEST_TIMEOUT_S = float(os.environ.get("GX10_REQUEST_TIMEOUT_S") or 60.0)
+
 
 def _capture_sink(text: str) -> None:
     """``gx10._UI_SINK`` hook. Output produced inside a request that registered an
@@ -97,7 +105,13 @@ def _capture_sink(text: str) -> None:
     /chat/stream); everything else (background threads) goes to the server log."""
     emit = getattr(_CAPTURE, "emit", None)
     if emit is not None:
-        emit(text)
+        # #1524 (security): DISPLAY text must never carry the client's \x00 frame delimiter. An
+        # attacker-controlled tool result (e.g. a read file with an embedded NUL) would otherwise forge a
+        # \x00TR…\x00 control frame that the Ink client executes locally, bypassing the ToolBridge id
+        # correlation, authorization, and the audit ledger. The trusted TR/HB frames are written to the wire
+        # DIRECTLY (ToolBridge._emit / the heartbeat), never through this display sink, so stripping NUL here
+        # closes the forge without ever corrupting a legitimate control frame.
+        emit(text.replace("\x00", "") if "\x00" in text else text)
     else:
         # Background reconciler / queue-consumer output → server stdout (the log).
         try:
@@ -280,10 +294,20 @@ class ToolBridge:
         if _ecwd:
             frame["exec_cwd"] = _ecwd
         self._emit(_TR_PREFIX + json.dumps(frame) + _TR_SUFFIX)
-        if not ev.wait(self._timeout):
-            with self._lock:
-                self._pending.pop(rid, None)
-            return f"ERROR: client tool '{name}' timed out after {self._timeout:.0f}s"
+        # #1553: wait for the /tool-result but ALSO observe cancellation. A bare ev.wait(180) never wakes on
+        # /cancel or a client that dies mid-tool (no /tool-result posted), so the turn thread would hold
+        # _AGENT_LOCK for the full 180s bridge timeout and every concurrent turn 503-busys meanwhile. Poll in
+        # short slices and bail promptly when the turn is cancelled, releasing the lock right away.
+        deadline = time.monotonic() + self._timeout
+        while not ev.wait(0.2):
+            if gx10._CANCEL_EVENT.is_set():
+                with self._lock:
+                    self._pending.pop(rid, None)
+                return f"ERROR: client tool '{name}' cancelled"
+            if time.monotonic() >= deadline:
+                with self._lock:
+                    self._pending.pop(rid, None)
+                return f"ERROR: client tool '{name}' timed out after {self._timeout:.0f}s"
         with self._lock:
             slot = self._pending.pop(rid, {})
         return slot.get("result") or ""
@@ -595,11 +619,13 @@ def _doctor_report() -> Dict[str, Any]:
     """Runtime ACK contract self-check (read-only) over the active workspace — the same
     preflight the doctor CLI runs, exposed live so contract drift surfaces at runtime
     instead of only via tooling. Includes Lodestar's checks when the plugin is enabled."""
-    extra = doctor._load_lodestar_checks(bool(gx10.LODESTAR_ENABLED))
+    enabled = bool(gx10.LODESTAR_ENABLED)
+    extra = doctor._load_lodestar_checks(enabled)
     # B3: the task/handover artifacts live under the active initiative — point the doctor there
     # (fall back to the workdir when no initiative is active, so the read-only check never crashes).
     root = gx10.artifact_root_soft() or Path(os.getcwd())
-    report = doctor.run_doctor(root, extra_checks=extra)
+    report = doctor.run_doctor(root, extra_checks=extra,
+                               capability_spec_cls=doctor._load_capability_spec(enabled))
     return {
         "ok": not report.has_errors(),
         "errors": report.count(doctor.Severity.ERROR),
@@ -612,16 +638,23 @@ def _write_feedback(task_id: str, agent: str, content: str, exit_code=None) -> s
     """Drop ``{task_id}_{AGENT}-feedback.md`` into the active initiative's feedback inbox
     (``<initiative>/.work/feedback``). The server-side reconciler detects it (mtime-stable)
     and advances the task. Fail-closed: requires an active initiative (B3)."""
+    if not gx10._TASK_ID_RE.match(task_id or ""):
+        raise ValueError(f"invalid task_id {task_id!r}")
     d = gx10.feedback_dir()
     d.mkdir(parents=True, exist_ok=True)
     agent_u = (agent or "").upper()            # #449: the /feedback handler validates the agent first
     fb = d / f"{task_id}_{agent_u}-feedback.md"
+    if not fb.resolve().is_relative_to(d.resolve()):
+        raise ValueError(f"feedback path escapes the inbox: {task_id!r}")
     fb.write_text(gx10._stamp_done_if_clean(content, exit_code), encoding="utf-8")
     return str(fb)
 
 
 class _Handler(BaseHTTPRequestHandler):
     server_version = "Ironclad-Orchestrator/0"
+    # Per-connection socket deadline: a slowloris/stalled or dead-client connection is dropped after
+    # this many seconds instead of pinning a thread forever (#1528).
+    timeout = _REQUEST_TIMEOUT_S
 
     # The GX10 agent + config + reasoning workers are injected by the server.
     agent: gx10.GX10
@@ -665,7 +698,10 @@ class _Handler(BaseHTTPRequestHandler):
             return {}
         if n <= 0 or n > _MAX_BODY_BYTES:   # reject absurd/oversized bodies (no huge alloc)
             return {}
-        raw = self.rfile.read(n)
+        try:
+            raw = self.rfile.read(n)
+        except OSError:
+            return {}
         try:
             data = json.loads(raw.decode("utf-8"))
             return data if isinstance(data, dict) else {}
@@ -803,71 +839,77 @@ class _Handler(BaseHTTPRequestHandler):
                 if info and not data.get("confirm"):
                     self._send(200, {"ok": True, "needs_confirm": info})
                     return
+                # #1563: acquire the agent lock BEFORE committing the 200 stream headers — a busy engine
+                # must return a retryable 503 (parity with /chat), not a 200 stream whose "[busy]" text the
+                # client would render as a completed answer with no signal to retry.
+                if not _AGENT_LOCK.acquire(timeout=_AGENT_LOCK_TIMEOUT_S):
+                    self._send(503, {"ok": False, "error": "busy — another turn is still running; try again shortly"})
+                    return
                 # Live: no Content-Length, Connection: close → the client reads until
                 # EOF. Every _ui_print chunk is flushed to the socket immediately.
-                self.send_response(200)
-                self.send_header("Content-Type", "text/plain; charset=utf-8")
-                self.send_header("Cache-Control", "no-cache")
-                self.send_header("Connection", "close")
-                self.end_headers()
-                # Disable Nagle: a small flushed frame (e.g. a tool-call passthrough) must
-                # reach the client IMMEDIATELY, not wait for more data — otherwise the
-                # bridge round-trip deadlocks and live streaming stutters.
-                try:
-                    self.connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-                except OSError:
-                    pass
-
-                # Serialize all writes: a heartbeat frame must never interleave INSIDE a
-                # text chunk or a \x00TR…\x00 tool frame (a stray \x00 would split the
-                # frame and desync the client parser).
-                _write_lock = threading.Lock()
-
-                def _write(text: str) -> None:
-                    with _write_lock:
-                        try:
-                            self.wfile.write(text.encode("utf-8", "replace"))
-                            self.wfile.flush()
-                        except (BrokenPipeError, ConnectionResetError, OSError):
-                            pass  # client gone → the turn finishes server-side
-                # Opt-in: if the client offers local execution (X-Local-Tools: 1), pass
-                # code-tools through to it; otherwise they run server-side as before.
-                local = self.headers.get("X-Local-Tools") == "1"
-                bridge = ToolBridge(_write) if local else None
-                # Keep-alive: a turn can run for minutes with NO output (e.g. a reasoning
-                # panel computing perspectives). Without bytes on the wire the client's HTTP
-                # body stream idles into a timeout ("TypeError: terminated") and the result —
-                # though finished server-side — never reaches the live view. So while the turn
-                # runs we emit a no-op frame \x00HB\x00 every few seconds; the client parser
-                # sees a control frame with no valid TR-JSON and silently drops it (it never
-                # appears in the text). Stops as soon as _dispatch returns.
+                # #1563: the lock is held from here on — a single try/finally guarantees it is released on
+                # EVERY exit path, including a failure while committing the headers (end_headers can raise if
+                # the client vanished mid-write); otherwise a header-write error would leak the global lock
+                # and wedge the whole engine into permanent 503s.
                 _hb_stop = threading.Event()
-
-                def _heartbeat() -> None:
-                    while not _hb_stop.wait(10.0):
-                        _write("\x00HB\x00")
-                hb_thread = threading.Thread(target=_heartbeat, daemon=True)
-                hb_thread.start()
+                hb_thread = None
                 try:
-                    with _Streamed(_write):
-                        if not _AGENT_LOCK.acquire(timeout=_AGENT_LOCK_TIMEOUT_S):   # #1131: bounded wait, then bail
-                            _write("\n[busy — another turn is still running; try again shortly]\n")
-                        else:
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/plain; charset=utf-8")
+                    self.send_header("Cache-Control", "no-cache")
+                    self.send_header("Connection", "close")
+                    self.end_headers()
+                    # Disable Nagle: a small flushed frame (e.g. a tool-call passthrough) must
+                    # reach the client IMMEDIATELY, not wait for more data — otherwise the
+                    # bridge round-trip deadlocks and live streaming stutters.
+                    try:
+                        self.connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                    except OSError:
+                        pass
+
+                    # Serialize all writes: a heartbeat frame must never interleave INSIDE a
+                    # text chunk or a \x00TR…\x00 tool frame (a stray \x00 would split the
+                    # frame and desync the client parser).
+                    _write_lock = threading.Lock()
+
+                    def _write(text: str) -> None:
+                        with _write_lock:
                             try:
-                                gx10.bind_active()  # S5b: this request thread → the active project's ctx
-                                if bridge is not None:
-                                    _ACTIVE_BRIDGE["b"] = bridge
-                                    gx10._LOCAL_TOOL_BRIDGE = bridge
-                                try:
-                                    gx10._dispatch(self.agent, message)
-                                finally:
-                                    gx10._LOCAL_TOOL_BRIDGE = None
-                                    _ACTIVE_BRIDGE["b"] = None
-                            finally:
-                                _AGENT_LOCK.release()
+                                self.wfile.write(text.encode("utf-8", "replace"))
+                                self.wfile.flush()
+                            except (BrokenPipeError, ConnectionResetError, OSError):
+                                pass  # client gone → the turn finishes server-side
+                    # Opt-in: if the client offers local execution (X-Local-Tools: 1), pass
+                    # code-tools through to it; otherwise they run server-side as before.
+                    local = self.headers.get("X-Local-Tools") == "1"
+                    bridge = ToolBridge(_write) if local else None
+                    # Keep-alive: a turn can run for minutes with NO output (e.g. a reasoning
+                    # panel computing perspectives). Without bytes on the wire the client's HTTP
+                    # body stream idles into a timeout ("TypeError: terminated") and the result —
+                    # though finished server-side — never reaches the live view. So while the turn
+                    # runs we emit a no-op frame \x00HB\x00 every few seconds; the client parser
+                    # sees a control frame with no valid TR-JSON and silently drops it (it never
+                    # appears in the text). Stops as soon as _dispatch returns.
+                    def _heartbeat() -> None:
+                        while not _hb_stop.wait(10.0):
+                            _write("\x00HB\x00")
+                    hb_thread = threading.Thread(target=_heartbeat, daemon=True)
+                    hb_thread.start()
+                    with _Streamed(_write):
+                        gx10.bind_active()  # S5b: this request thread → the active project's ctx
+                        if bridge is not None:
+                            _ACTIVE_BRIDGE["b"] = bridge
+                            gx10._LOCAL_TOOL_BRIDGE = bridge
+                        try:
+                            gx10._dispatch(self.agent, message)
+                        finally:
+                            gx10._LOCAL_TOOL_BRIDGE = None
+                            _ACTIVE_BRIDGE["b"] = None
                 finally:
+                    _AGENT_LOCK.release()   # #1563: acquired before the headers; released on every exit path
                     _hb_stop.set()
-                    hb_thread.join(timeout=1.0)
+                    if hb_thread is not None:
+                        hb_thread.join(timeout=1.0)
             elif self.path == "/tool-result":
                 # The client returns the result of a passed-through code-tool.
                 data = self._read_json()
@@ -920,6 +962,9 @@ class _Handler(BaseHTTPRequestHandler):
                 # (exit_code + stderr) so the server can classify it. Require only task_id + agent.
                 if not tid:
                     self._send(400, {"ok": False, "error": "need 'task_id'"})
+                    return
+                if not gx10._TASK_ID_RE.match(tid):
+                    self._send(400, {"ok": False, "error": f"invalid task_id {tid!r}"})
                     return
                 # #449 (review B-6): fail-closed at the boundary — validate the agent against the
                 # config-driven registry instead of silently defaulting an unknown/missing one to OPUS.
@@ -980,7 +1025,11 @@ class _Handler(BaseHTTPRequestHandler):
                                      **({"failure_class": fc} if fc else {}),
                                      **({"strategy": strat} if strat else {})})
                     return
-                path = _write_feedback(tid, agent, content, exit_code=data.get("exit_code"))
+                try:
+                    path = _write_feedback(tid, agent, content, exit_code=data.get("exit_code"))
+                except ValueError as e:
+                    self._send(400, {"ok": False, "error": str(e)})
+                    return
                 self._send(200, {"ok": True, "classification": cls, "feedback_file": path})
             elif self.path == "/coders":
                 # #454: `/coders use <id>` pins the coding agent at runtime (`auto`/null clears it).
@@ -996,6 +1045,10 @@ class _Handler(BaseHTTPRequestHandler):
                 prompts = data.get("prompts")
                 if not isinstance(prompts, list) or not prompts:
                     self._send(400, {"ok": False, "error": "need non-empty 'prompts' list"})
+                    return
+                if len(prompts) > _MAX_FANOUT_PROMPTS:
+                    self._send(400, {"ok": False,
+                                     "error": f"too many prompts ({len(prompts)} > {_MAX_FANOUT_PROMPTS} max)"})
                     return
                 if not all(isinstance(p, str) for p in prompts):
                     self._send(400, {"ok": False, "error": "'prompts' must be strings"})

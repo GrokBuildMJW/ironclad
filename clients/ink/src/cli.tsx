@@ -18,6 +18,11 @@ import {loadConfig, parseArgs} from './config.js';
 import {load as loadSession, exitMessage, statePath} from './state/persist.js';
 import {Server} from './net/server.js';
 import {establishSession} from './net/session.js';
+import {reapCoders} from './agent/handover.js';
+
+// #1541: how long to let a just-killed coder's /feedback + /unclaim POST settle under the still-open session
+// before we close it. Bounded so exit stays prompt even if the server is slow.
+const CODER_DRAIN_MS = 5000;
 
 // The Windows console defaults to a non-UTF-8 OEM code page, which renders our UTF-8 output
 // (box-drawing borders, ◆/●/○ status dots, the █▚▞█ banner, …/≤) as cp1252 mojibake. Force the
@@ -51,6 +56,10 @@ const app = render(<App srv={srv} codedir={workdir} maxAgents={args.maxAgents} r
 // like other code CLIs. Only when there's a non-empty saved session. MEM-19: read this project's
 // per-directory state file (<codedir>/.ironclad-cli/session.json).
 void app.waitUntilExit().then(async () => {
+  // #1541: reap any in-flight /work or /auto coder BEFORE closing the session — kill the child(ren) and await
+  // their processOne cleanup (bounded) so their /unclaim (and any completed /feedback) POST while the session
+  // is still open; otherwise an orphaned coder finishing after session.stop() 401s and leaves the task stuck.
+  await reapCoders(CODER_DRAIN_MS);
   await session.stop(); // INK-SESSION (#503): heartbeat off + session closed on exit (fail-soft)
   const msg = exitMessage(loadSession(statePath(workdir)));
   if (msg) process.stdout.write(`\n${msg}\n`);

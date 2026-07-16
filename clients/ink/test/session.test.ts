@@ -19,8 +19,8 @@ function fakeServer(opts: {
   health?: Record<string, unknown>;
   healthThrows?: unknown;
   openThrows?: unknown;
-  openWait?: (call: number) => Promise<void> | void;
-  heartbeat?: () => Promise<boolean> | boolean;
+  openWait?: (call: number, signal?: AbortSignal) => Promise<void> | void;
+  heartbeat?: (signal?: AbortSignal) => Promise<boolean> | boolean;
   onClose?: (call: number) => void;
 }): {srv: Server; calls: Calls; state: {liveSessions: number}} {
   const calls: Calls = {open: 0, heartbeat: 0, close: 0};
@@ -31,17 +31,19 @@ function fakeServer(opts: {
       if (opts.healthThrows) throw opts.healthThrows;
       return opts.health ?? {};
     },
-    async sessionOpen() {
+    // #1539: the session methods now accept a lifecycle/shutdown AbortSignal (mirrors the real Server); the
+    // fake threads it to the controllable hooks so a test can prove a stuck heartbeat is actually aborted.
+    async sessionOpen(signal?: AbortSignal) {
       calls.open++;
       if (opts.openThrows) throw opts.openThrows;
-      await opts.openWait?.(calls.open);
+      await opts.openWait?.(calls.open, signal);
       this.sessionId = 'sess-abcdef123456';
       state.liveSessions++;
       return {session_id: this.sessionId};
     },
-    async sessionHeartbeat() {
+    async sessionHeartbeat(signal?: AbortSignal) {
       calls.heartbeat++;
-      return (await opts.heartbeat?.()) ?? true;
+      return (await opts.heartbeat?.(signal)) ?? true;
     },
     async sessionClose() {
       calls.close++;
@@ -188,6 +190,27 @@ test('establishSession — stop closes a session reopened by an already-started 
   assert.equal(calls.close, 2);
   assert.equal(state.liveSessions, 0);
   assert.equal(calls.open - calls.close, 0);
+});
+
+test('establishSession — stop() is promptly bounded when a heartbeat hangs against a black hole (#1539)', async () => {
+  const heartbeatStarted = deferred<void>();
+  const {srv, calls} = fakeServer({
+    health: {security: {session: true, heartbeat_s: 0.01}},
+    async heartbeat(signal) {
+      heartbeatStarted.resolve(undefined);
+      // A black-hole server: accept but never respond. Only the lifecycle abort can unblock this — without
+      // it (pre-#1539) stop() would await the full request timeout, leaving the process alive ~10 minutes.
+      await new Promise<void>((_resolve, reject) => {
+        signal?.addEventListener('abort', () => reject(new Error('aborted')), {once: true});
+      });
+      return true;
+    },
+  });
+  const h = await establishSession(srv);
+
+  await expectSignal(heartbeatStarted.promise, 'heartbeat');
+  await expectSignal(h.stop(), 'bounded stop despite a stuck heartbeat'); // rejects if stop() blocks > 500ms
+  assert.equal(calls.close, 1); // the final close still ran (on its own short deadline)
 });
 
 test('establishSession — a heartbeat resolving after stop does not reopen', async () => {

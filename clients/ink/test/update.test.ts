@@ -1,7 +1,20 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {join} from 'node:path';
-import {updatePlan, validateSrcDir, runUpdate, type Exec} from '../src/tools/update.js';
+import {basename, join} from 'node:path';
+import {defaultExec, updatePlan, validateSrcDir, runUpdate, type Exec} from '../src/tools/update.js';
+
+test('#1522 defaultExec force-kills the tree and settles on timeout even if the child ignores SIGTERM', async () => {
+  const started = Date.now();
+  const nodeCommand = process.platform === 'win32' ? basename(process.execPath) : process.execPath;
+  const {code, out} = await defaultExec(
+    nodeCommand,
+    ['-e', "process.stdout.write('ready'); process.on('SIGTERM',()=>{}); setInterval(()=>{}, 1e9)"],
+    {timeoutMs: 300},
+  );
+  assert.equal(code, 1);
+  assert.equal(out, 'ready', 'the real child must start and hold its stdout pipe open');
+  assert.ok(Date.now() - started < 3000, 'defaultExec must settle within the drain bound, not hang');
+});
 
 test('updatePlan — build + install from <src>/clients/ink, git pull only when asked', () => {
   const ink = join('/repo', 'clients', 'ink');

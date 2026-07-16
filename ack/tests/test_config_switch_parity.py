@@ -3,7 +3,9 @@ from __future__ import annotations
 
 import importlib.util
 import sys
+from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -174,3 +176,222 @@ def choose(cfg):
     )
     assert scan.raw_violations == []
     assert scan.read_switches == {"search.enabled"}
+
+
+@pytest.mark.parametrize(
+    "gate",
+    (
+        'getattr(cfg.get("audit", {}), "get")("enabled")',
+        'get_config().get("audit", {}).get("enabled")',
+        'itemgetter("enabled")(cfg["audit"])',
+    ),
+)
+def test_alternate_get_chains_cannot_hide_a_retired_switch_gate(gate):
+    guard = _load(_GUARD, f"_config_switch_alternate_get_{abs(hash(gate))}")
+    schema = guard._load_schema(_REPO / "core" / "engine" / "config_schema.py")
+    source = f"def choose(cfg):\n    if {gate}:\n        return 'bypass'\n"
+    scan = guard.scan_source(
+        source, leaves=schema.LEAVES, tombstones=schema.TOMBSTONES,
+    )
+    assert any("audit.enabled" in problem for problem in scan.raw_violations)
+
+
+def test_getattr_get_live_switch_resolves_without_a_violation():
+    guard = _load(_GUARD, "_config_switch_getattr_live")
+    schema = guard._load_schema(_REPO / "core" / "engine" / "config_schema.py")
+    source = "def choose(cfg):\n    return getattr(cfg, 'get')('search').get('enabled')\n"
+    scan = guard.scan_source(
+        source, leaves=schema.LEAVES, tombstones=schema.TOMBSTONES,
+    )
+    assert scan.raw_violations == []
+    assert scan.read_switches == {"search.enabled"}
+
+
+def test_getattr_get_with_default_cannot_hide_a_retired_switch_read():
+    guard = _load(_GUARD, "_config_switch_getattr_default_tombstone")
+    schema = guard._load_schema(_REPO / "core" / "engine" / "config_schema.py")
+    source = "def choose(cfg):\n    return getattr(cfg, 'get', None)('audit', {}).get('enabled')\n"
+    scan = guard.scan_source(
+        source, leaves=schema.LEAVES, tombstones=schema.TOMBSTONES,
+    )
+    assert any("audit.enabled" in problem and "retired" in problem for problem in scan.raw_violations)
+
+
+def test_getattr_get_with_default_live_switch_resolves_without_a_violation():
+    guard = _load(_GUARD, "_config_switch_getattr_default_live")
+    schema = guard._load_schema(_REPO / "core" / "engine" / "config_schema.py")
+    source = "def choose(cfg):\n    return getattr(cfg, 'get', None)('search', {}).get('enabled')\n"
+    scan = guard.scan_source(
+        source, leaves=schema.LEAVES, tombstones=schema.TOMBSTONES,
+    )
+    assert scan.raw_violations == []
+    assert scan.read_switches == {"search.enabled"}
+
+
+def test_resolvable_tombstone_read_is_flagged_before_a_single_key_rebind_gate():
+    guard = _load(_GUARD, "_config_switch_rebound_tombstone")
+    schema = guard._load_schema(_REPO / "core" / "engine" / "config_schema.py")
+    source = """\
+def choose(cfg):
+    sec = {"enabled": cfg.get("audit", {}).get("enabled")}
+    if sec["enabled"]:
+        return "bypass"
+"""
+    scan = guard.scan_source(
+        source, leaves=schema.LEAVES, tombstones=schema.TOMBSTONES,
+    )
+    assert sum("audit.enabled" in problem for problem in scan.raw_violations) == 1
+    assert any("raw operational config read" in problem for problem in scan.raw_violations)
+
+
+@pytest.mark.parametrize(
+    "body",
+    (
+        'v = get_config().get("audit", {}).get("enabled")',
+        'return get_config().get("audit", {}).get("enabled")',
+    ),
+)
+def test_call_rooted_non_gate_reads_cannot_hide_a_retired_switch(body):
+    guard = _load(_GUARD, f"_config_switch_call_rooted_tombstone_{abs(hash(body))}")
+    schema = guard._load_schema(_REPO / "core" / "engine" / "config_schema.py")
+    source = f"def choose():\n    {body}\n"
+    scan = guard.scan_source(
+        source, leaves=schema.LEAVES, tombstones=schema.TOMBSTONES,
+    )
+    assert any(
+        "raw operational config read 'audit.enabled' is retired" in problem
+        for problem in scan.raw_violations
+    )
+
+
+def test_call_rooted_non_gate_live_switch_does_not_create_a_raw_violation():
+    guard = _load(_GUARD, "_config_switch_call_rooted_live")
+    schema = guard._load_schema(_REPO / "core" / "engine" / "config_schema.py")
+    source = 'def choose():\n    v = get_config().get("search", {}).get("enabled")\n'
+    scan = guard.scan_source(
+        source, leaves=schema.LEAVES, tombstones=schema.TOMBSTONES,
+    )
+    assert scan.raw_violations == []
+    assert scan.unknown_live_reads == set()
+
+
+def test_string_constant_key_resolves_a_retired_switch_gate():
+    guard = _load(_GUARD, "_config_switch_constant_key")
+    schema = guard._load_schema(_REPO / "core" / "engine" / "config_schema.py")
+    source = "def choose(cfg):\n    k = 'enabled'\n    if cfg.get('audit', {}).get(k):\n        return 'bypass'\n"
+    scan = guard.scan_source(
+        source, leaves=schema.LEAVES, tombstones=schema.TOMBSTONES,
+    )
+    assert any("audit.enabled" in problem for problem in scan.raw_violations)
+
+
+def test_walrus_key_cannot_hide_a_retired_switch_read():
+    guard = _load(_GUARD, "_config_switch_walrus_key_tombstone")
+    schema = guard._load_schema(_REPO / "core" / "engine" / "config_schema.py")
+    source = 'def choose(cfg):\n    return cfg.get("audit", {}).get(k := "enabled")\n'
+    scan = guard.scan_source(
+        source, leaves=schema.LEAVES, tombstones=schema.TOMBSTONES,
+    )
+    assert any("audit.enabled" in problem and "retired" in problem for problem in scan.raw_violations)
+
+
+def test_walrus_key_live_switch_resolves_without_a_violation():
+    guard = _load(_GUARD, "_config_switch_walrus_key_live")
+    schema = guard._load_schema(_REPO / "core" / "engine" / "config_schema.py")
+    source = 'def choose(cfg):\n    return cfg.get("search", {}).get(k := "enabled")\n'
+    scan = guard.scan_source(
+        source, leaves=schema.LEAVES, tombstones=schema.TOMBSTONES,
+    )
+    assert scan.raw_violations == []
+    assert scan.read_switches == {"search.enabled"}
+
+
+def test_ambiguous_non_config_key_does_not_create_a_false_positive():
+    guard = _load(_GUARD, "_config_switch_ambiguous_key")
+    schema = guard._load_schema(_REPO / "core" / "engine" / "config_schema.py")
+    source = """\
+def choose(rows, use_enabled):
+    k = "enabled"
+    if not use_enabled:
+        k = "visible"
+    return [row for row in rows if row.get("audit", {}).get(k)]
+"""
+    scan = guard.scan_source(
+        source, leaves=schema.LEAVES, tombstones=schema.TOMBSTONES,
+    )
+    assert scan.raw_violations == []
+
+
+def test_augmented_string_key_is_unresolved_without_a_false_positive():
+    guard = _load(_GUARD, "_config_switch_augmented_key")
+    schema = guard._load_schema(_REPO / "core" / "engine" / "config_schema.py")
+    source = """\
+def choose(cfg):
+    k = "enabled"
+    k += "_x"
+    value = cfg.get("audit", {}).get(k)
+    if cfg.get("audit", {}).get(k):
+        return value
+"""
+    scan = guard.scan_source(
+        source, leaves=schema.LEAVES, tombstones=schema.TOMBSTONES,
+    )
+    assert scan.raw_violations == []
+    assert scan.unknown_live_reads == set()
+
+
+def test_display_only_function_still_reports_retired_config_reads():
+    guard = _load(_GUARD, "_config_switch_display_tombstone")
+    schema = guard._load_schema(_REPO / "core" / "engine" / "config_schema.py")
+    source = "def _render_config(cfg):\n    return cfg.get('audit', {}).get('enabled')\n"
+    scan = guard.scan_source(
+        source, leaves=schema.LEAVES, tombstones=schema.TOMBSTONES,
+    )
+    assert any("audit.enabled" in problem and "retired" in problem for problem in scan.raw_violations)
+
+
+def test_display_only_non_switch_read_is_ignored_and_does_not_count_for_parity():
+    guard = _load(_GUARD, "_config_switch_display_non_switch")
+    schema = guard._load_schema(_REPO / "core" / "engine" / "config_schema.py")
+    source = """\
+def _empty_pipeline_hint(cfg):
+    return bool(cfg.get("paths", {}).get("active_capability_backlog"))
+"""
+    scan = guard.scan_source(
+        source, leaves=schema.LEAVES, tombstones=schema.TOMBSTONES,
+    )
+    assert scan.raw_violations == []
+    assert scan.read_switches == set()
+    assert scan.unknown_live_reads == set()
+
+
+def test_real_schema_external_seams_match_memory_and_warm_environment_bindings():
+    guard = _load(_GUARD, "_config_switch_real_external_seams")
+    schema = guard._load_schema(_REPO / "core" / "engine" / "config_schema.py")
+    assert guard.external_seam_problems(schema) == []
+
+
+def test_undeclared_memory_environment_binding_is_rejected():
+    guard = _load(_GUARD, "_config_switch_external_seam_drift")
+    schema = guard._load_schema(_REPO / "core" / "engine" / "config_schema.py")
+    leaves = dict(schema.LEAVES)
+    leaves["memory.base_url"] = replace(
+        leaves["memory.base_url"],
+        env_names=(*leaves["memory.base_url"].env_names, "GX10_MEMORY_UNDECLARED"),
+    )
+    synthetic = SimpleNamespace(
+        EXTERNAL_SEAMS=schema.EXTERNAL_SEAMS,
+        LEAVES=leaves,
+        SWITCH=schema.SWITCH,
+    )
+    problems = guard.external_seam_problems(synthetic)
+    assert any("GX10_MEMORY_UNDECLARED" in problem for problem in problems)
+
+
+def test_schema_derived_external_seam_region_matches_live_document_bytes():
+    generator = _load(_GENERATOR, "_config_runtime_external_seams")
+    schema = generator._load_schema()
+    document = generator.DOCUMENT.read_text(encoding="utf-8")
+    start = document.index(generator.EXTERNAL_BEGIN)
+    stop = document.index(generator.EXTERNAL_END, start) + len(generator.EXTERNAL_END)
+    assert generator.render_external_seams(schema) == document[start:stop]

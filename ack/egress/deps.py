@@ -112,8 +112,8 @@ def _analyze_python_dependencies(project_root: Path, policy: dict) -> dict:
         network = str(policy.get("network", "open")).strip().lower()
         if network not in {"none", "declared", "open"}:
             network = "open"
-        allow = _canonical_set(policy.get("allow", []))
-        deny = _canonical_set(policy.get("deny", []))
+        allow = _select_ecosystem_names(policy.get("allow", []), "py")
+        deny = _select_ecosystem_names(policy.get("deny", []), "py")
 
         findings = []
         seen: set[tuple[str, str]] = set()
@@ -204,12 +204,27 @@ def _add_finding(findings: list[dict], seen: set[tuple[str, str]], package: str,
     seen.add(key)
 
 
-def _canonical_set(values: object) -> set[str]:
+def _select_ecosystem_names(values: object, ecosystem: str) -> set[str]:
     if isinstance(values, str):
         values = re.split(r"[\s,]+", values)
     if not isinstance(values, Iterable):
         return set()
-    return {name for value in values if (name := canonicalize_name(value))}
+    prefix = f"{str(ecosystem).strip().lower()}:"
+    names: set[str] = set()
+    for value in values:
+        try:
+            text = str(value).strip()
+        except Exception:
+            continue
+        lower = text.lower()
+        if ":" in lower:
+            namespace, name = lower.split(":", 1)
+            if f"{namespace}:" != prefix:
+                continue
+            text = name
+        if name := canonicalize_name(text):
+            names.add(name)
+    return names
 
 
 def _parse_requirements(path: Path) -> tuple[set[str], bool]:

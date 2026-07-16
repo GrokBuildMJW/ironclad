@@ -64,6 +64,16 @@ def test_generate_declares_its_required_flags():
     assert {"--domain", "--case", "--description"} <= flags
 
 
+def test_auto_autoplan_summary_does_not_claim_unbounded():
+    # #1561: the secure default caps autopilot at autopilot.autoplan_max_tasks (default 20); the guidance
+    # must not still claim that omitting N runs unbounded/uncapped (the parity guard checks structure, not
+    # summary semantics, so a stale summary would otherwise slip through).
+    for verb in ("auto", "autoplan"):
+        summary = " ".join(f.summary for f in cs.by_verb(verb).flags).lower()
+        assert "unbounded" not in summary and "uncapped" not in summary, f"{verb}: stale 'unbounded' guidance"
+        assert "default" in summary, f"{verb}: summary should point at the default cap"
+
+
 def test_catalogue_entries_serialize_every_verb():
     # #931: the serialized form served via /catalogue for client-side command generation.
     # #1264: deprecated verbs are excluded from the advertised catalogue, so the count is the non-deprecated

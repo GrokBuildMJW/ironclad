@@ -1,8 +1,7 @@
 # ADR-0014: Per-principal identity + RBAC + multi-tenant memory namespacing
 
 ## Status
-Accepted — foundational increment (epic #1065 / #1071). **Default-off.** Overlaps the Enterprise milestone
-(#20 / #29-31).
+Accepted — foundational increment. **Default-off.** Overlaps the Enterprise milestone.
 
 ## Context
 Ironclad's trust model is single-tenant (open / token / sealed — ONE token for the whole server). There is no
@@ -34,4 +33,4 @@ A core authz foundation (`ack.authz`), pure + default-off:
 - **Memory-service tenant enforcement:** the service currently trusts the caller's `agent_id`; a tenant
   boundary must be enforced server-side, not merely scoped by the caller.
 - Per-tenant model routing + quotas.
-- A principal/token administration surface. This overlaps the Enterprise milestone (#20 / #29-31).
+- A principal/token administration surface. This overlaps the Enterprise milestone.

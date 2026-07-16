@@ -48,6 +48,21 @@ These routes require authorization (and, under `sealed`, a live session):
 /chat  /chat/stream  /tool-result  /fanout  /cancel  /tasks  /pending  /claim  /unclaim  /feedback  /doctor
 ```
 
+Every accepted connection has a 60-second socket read/write deadline, configurable with
+`GX10_REQUEST_TIMEOUT_S`, so stalled request lines, headers, or bodies and dead clients cannot retain a
+handler thread indefinitely. `/chat/stream` remains safe for multi-minute turns because its 10-second
+heartbeat keeps a healthy connection active well within that deadline.
+
+`POST /feedback` additionally accepts only canonical engine task IDs (`<prefix>-[A-Za-z0-9_]+`). The
+route rejects any other shape with HTTP 400, and the feedback writer independently validates both the ID
+and resolved inbox containment before creating a file.
+
+`GET /chat/stream` multiplexes model/tool **display** text and the local-tool bridge's `\x00TR…\x00`
+(tool) / `\x00HB\x00` (heartbeat) **control** frames on one wire, delimited by NUL. Only the trusted
+server-side bridge originates those frames (written to the wire directly); all display text is stripped of
+NUL at the capture sink first, so an attacker-controlled tool result (e.g. a read file with an embedded NUL)
+can never forge a control frame that the client would execute locally.
+
 `/health` and `/session/open|heartbeat|close` are **not** gated — `/health` is the pre-auth handshake (it
 advertises the profile shape, never the token) and `/session/open` checks the token itself. The gate checks
 **token first** (cheap, no info leak), then the session:

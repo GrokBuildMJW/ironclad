@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import sys
+import logging
 from pathlib import Path
 
 _CORE = Path(__file__).resolve().parents[2]
@@ -10,6 +11,12 @@ for p in (str(_CORE), str(_CORE / "engine")):
         sys.path.insert(0, p)
 
 import sandbox as sb  # noqa: E402
+
+
+def test_best_effort_teardown_identifies_only_firejail():
+    assert sb.is_best_effort_teardown("firejail") is True
+    for backend in ("bwrap", "", "auto", "unknown"):
+        assert sb.is_best_effort_teardown(backend) is False
 
 
 def test_available_backend_specific_preference(monkeypatch):
@@ -67,6 +74,32 @@ def test_sandbox_command_wraps_when_backend_present_else_typed_refusal(monkeypat
 def test_engine_sandbox_policy_defaults_auto():
     import gx10
     assert gx10.SANDBOX == "auto"
+
+
+def test_engine_firejail_advisory_is_log_only_and_emitted_once(monkeypatch, caplog):
+    import gx10
+    monkeypatch.setattr(gx10, "PLATFORM", "linux")
+    monkeypatch.setattr(gx10, "_SANDBOX_BEST_EFFORT_WARNED", False)
+    monkeypatch.setattr(sb, "sandbox_command", lambda *a, **k: ("wrapped-command", "firejail"))
+
+    with caplog.at_level(logging.WARNING, logger="gx10"):
+        assert gx10._sandbox_model_command("echo one") == ("wrapped-command", None)
+        assert gx10._sandbox_model_command("echo two") == ("wrapped-command", None)
+
+    records = [r for r in caplog.records if "best-effort-only" in r.getMessage()]
+    assert len(records) == 1
+
+
+def test_engine_bwrap_emits_no_best_effort_advisory(monkeypatch, caplog):
+    import gx10
+    monkeypatch.setattr(gx10, "PLATFORM", "linux")
+    monkeypatch.setattr(gx10, "_SANDBOX_BEST_EFFORT_WARNED", False)
+    monkeypatch.setattr(sb, "sandbox_command", lambda *a, **k: ("wrapped-command", "bwrap"))
+
+    with caplog.at_level(logging.WARNING, logger="gx10"):
+        assert gx10._sandbox_model_command("echo safe") == ("wrapped-command", None)
+
+    assert not [r for r in caplog.records if "best-effort-only" in r.getMessage()]
 
 
 def test_engine_no_backend_never_reaches_subprocess(monkeypatch):

@@ -1,7 +1,7 @@
 # LessonStore / LessonProvider API (`ack.lessons`)
 
 The curated, versioned delegation seam for **scope-partitioned actionable lessons** — the
-"loop-intelligence" tier layered on the memory substrate (ADR-0011 AD-10). Ironclad owns the
+"loop-intelligence" tier layered on the memory substrate (ADR-0011). Ironclad owns the
 substrate + this API; the lesson **semantics** (distillation, ranking, persistence) are supplied by a
 registered **provider**. This is the only surface a lesson backend integrates against — it never touches
 `mem_ns` internals or the Valkey/Mem0 keys.
@@ -39,7 +39,7 @@ These run on the hot path and are **fail-soft**: with no provider wired they are
 writes nothing), and a provider error is swallowed — a lesson backend's absence or failure can never
 break a turn.
 
-## Redaction-gated promotion (AD-9)
+## Redaction-gated promotion
 
 ```python
 from ack.lessons import promote

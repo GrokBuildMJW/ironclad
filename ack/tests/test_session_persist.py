@@ -7,9 +7,12 @@
 """
 from __future__ import annotations
 
+import json
 import sys
 import types
 from pathlib import Path
+
+import pytest
 
 sys.modules.setdefault("openai", types.SimpleNamespace(OpenAI=lambda **kw: object()))
 
@@ -43,6 +46,108 @@ def test_save_load_roundtrip(tmp_path, monkeypatch):
     n = gx10.GX10.load_session(dst)
     assert n == 2  # user + assistant (system is filtered out of the persisted set)
     assert [m["content"] for m in dst.messages if m["role"] != "system"] == ["hallo", "hi"]
+
+
+def test_load_session_retains_rolling_summary_after_current_base_prompt(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    persisted = {
+        "messages": [
+            {"role": "system", "content": "old base prompt"},
+            {"role": "system", "content": gx10._SUMMARY_MARKER + "\nevicted conversation"},
+            {"role": "user", "content": "current question"},
+            {"role": "assistant", "content": "current answer"},
+        ]
+    }
+    path = gx10.session_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(persisted), encoding="utf-8")
+
+    agent = gx10.GX10.__new__(gx10.GX10)
+    agent.messages = [{"role": "system", "content": "current base prompt"}]
+
+    assert agent.load_session() == 2
+    assert agent.messages == [
+        {"role": "system", "content": "current base prompt"},
+        {"role": "system", "content": gx10._SUMMARY_MARKER + "\nevicted conversation"},
+        {"role": "user", "content": "current question"},
+        {"role": "assistant", "content": "current answer"},
+    ]
+
+
+def test_load_session_without_summary_replaces_only_base_prompt(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    persisted = {
+        "messages": [
+            {"role": "system", "content": "old base prompt"},
+            {"role": "user", "content": "current question"},
+            {"role": "assistant", "content": "current answer"},
+        ]
+    }
+    path = gx10.session_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(persisted), encoding="utf-8")
+
+    agent = gx10.GX10.__new__(gx10.GX10)
+    agent.messages = [{"role": "system", "content": "current base prompt"}]
+
+    assert agent.load_session() == 2
+    assert agent.messages == [
+        {"role": "system", "content": "current base prompt"},
+        {"role": "user", "content": "current question"},
+        {"role": "assistant", "content": "current answer"},
+    ]
+
+
+def test_failed_save_preserves_previous_session(tmp_path, monkeypatch, capsys):
+    monkeypatch.chdir(tmp_path)
+
+    class A:
+        _sanitize_messages = staticmethod(gx10.GX10._sanitize_messages)
+
+    prior = A()
+    prior.messages = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "prior question"},
+        {"role": "assistant", "content": "prior answer"},
+    ]
+    gx10.GX10.save_session(prior)
+    sp = tmp_path / gx10.session_path()
+    original = sp.read_text(encoding="utf-8")
+
+    prior.messages.append({"role": "user", "content": "new turn"})
+    replace_args = []
+
+    def fail_replace(src, dst):
+        replace_args.append((Path(src), Path(dst)))
+        raise OSError("disk full")
+
+    monkeypatch.setattr(gx10.os, "replace", fail_replace)
+    gx10.GX10.save_session(prior, strict=False)
+
+    assert "[WARN] session not saved: disk full" in capsys.readouterr().out
+    assert replace_args[0][0].parent == sp.parent
+    assert replace_args[0][1].resolve() == sp
+    assert sp.read_text(encoding="utf-8") == original
+    assert json.loads(original)["messages"][-1]["content"] == "prior answer"
+    restored = A()
+    restored.messages = [{"role": "system", "content": "sys"}]
+    assert gx10.GX10.load_session(restored) == 2
+    assert [m["content"] for m in restored.messages if m["role"] != "system"] == [
+        "prior question", "prior answer"
+    ]
+    assert not list(sp.parent.glob(f"{sp.name}.*.tmp"))
+
+
+def test_failed_save_strict_raises(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+
+    class A:
+        messages = [{"role": "user", "content": "turn"}]
+
+    monkeypatch.setattr(gx10.os, "replace", lambda *args: (_ for _ in ()).throw(OSError("disk full")))
+    with pytest.raises(OSError, match="disk full"):
+        gx10.GX10.save_session(A(), strict=True)
+    assert not list((tmp_path / gx10.session_path()).parent.glob("*.tmp"))
 
 
 class _FakeAgent:

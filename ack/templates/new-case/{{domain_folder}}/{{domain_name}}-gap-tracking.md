@@ -34,7 +34,7 @@ tags: {{tags_yaml}}
 ```json
 {
   "features": [
-    {"key": "{{capability_key}}", "feature": "{{case_title}}", "phase": "{{phase}}", "tier": "{{tier}}", "type": "{{type}}", "assignee": "{{assignee}}", "effort": "{{effort}}", "non_negotiable": {{non_negotiable}}, "task_ids": [], "sources": [], "anchors": [], "depends_on": [], "notes": "{{description}}"}
+    {"key": "{{capability_key}}", "feature": "{{case_title}}", "phase": "{{phase}}", "tier": "{{tier}}", "type": "{{type}}", "assignee": "{{assignee}}", "effort": "{{effort}}", "non_negotiable": {{non_negotiable}}, "task_ids": [], "sources": [], "anchors": [], "depends_on": [], "notes": {{description|tojson}}}
   ]
 }
 ```

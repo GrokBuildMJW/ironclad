@@ -114,6 +114,47 @@ class TombstoneSpec:
     alias: bool = False
 
 
+@dataclass(frozen=True)
+class ExternalSeam:
+    name: str
+    kind: str
+    meaning: str
+
+
+EXTERNAL_SEAMS = (
+    ExternalSeam(
+        "conf/memory/memory.json",
+        "file",
+        "Component-owned MemoryManager overlay; tolerantly merged over the typed `memory.*` block.",
+    ),
+    ExternalSeam(
+        "GX10_MEMORY_URL",
+        "environment",
+        "Overrides `memory.base_url` and enables the cold-memory seam when non-empty.",
+    ),
+    ExternalSeam(
+        "GX10_MEMORY_AGENT",
+        "environment",
+        "Supplies the cold-memory base `agent_id` when `GX10_MEMORY_URL` activates the seam.",
+    ),
+    ExternalSeam(
+        "conf/warm/warm.json",
+        "file",
+        "Component-owned WarmTier overlay; tolerantly merged over the typed `warm.*` block.",
+    ),
+    ExternalSeam(
+        "GX10_WARM_URL",
+        "environment",
+        "Overrides `warm.url` and enables the warm tier when non-empty.",
+    ),
+    ExternalSeam(
+        "GX10_SESSION_ID",
+        "environment",
+        "Selects the warm session key; an empty value resolves to `main`.",
+    ),
+)
+
+
 def _get(config: Mapping[str, Any], dotted: str) -> Any:
     node: Any = config
     for part in dotted.split("."):
@@ -499,6 +540,7 @@ _SPECS = [
     _leaf("watcher.interval", (int, float), 3.0, minimum=0, minimum_exclusive=True, lifecycle=BOOT_ONLY),
     _leaf("automation.decoupled", bool, False, classification=SWITCH),
     _leaf("heartbeat.stall_seconds", (int, float), 900, minimum=0, minimum_exclusive=True),
+    _leaf("heartbeat.claim_lease_seconds", (int, float), 120, minimum=0, minimum_exclusive=True),
     _leaf("ui.max_lines", int, 5000, minimum=1),
     _leaf("ui.refresh_interval", (int, float), 0.1, minimum=0, minimum_exclusive=True),
     _leaf("ui.spinner_frames", str, "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"),
@@ -669,8 +711,8 @@ def validate(
 
 
 __all__ = [
-    "BOOT_ONLY", "BOOT_ONLY_KEYS", "CONTAINER_DEFAULTS", "ConfigError", "DEPRECATIONS", "ENV_BINDINGS", "ENV_NAME", "LEAVES",
-    "LeafSpec", "PUBLIC", "REDACT", "RUNTIME", "SCHEMA", "SWITCH", "TOMBSTONES", "TUNING",
+    "BOOT_ONLY", "BOOT_ONLY_KEYS", "CONTAINER_DEFAULTS", "ConfigError", "DEPRECATIONS", "ENV_BINDINGS", "ENV_NAME",
+    "EXTERNAL_SEAMS", "ExternalSeam", "LEAVES", "LeafSpec", "PUBLIC", "REDACT", "RUNTIME", "SCHEMA", "SWITCH", "TOMBSTONES", "TUNING",
     "TombstoneSpec", "defaults_tree", "parse_env_bool", "tombstone_for", "validate", "validate_leaf",
     "boot_only_keys",
 ]

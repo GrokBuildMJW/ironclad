@@ -346,6 +346,7 @@ def test_clear_context_no_warm_is_fine(monkeypatch, tmp_path):
 def test_rag_toggle_via_dispatch(monkeypatch, tmp_path):
     # MEM-13: `rag off`/`rag on` flips RAG_ENABLED through the server dispatcher.
     g = _mk_agent(monkeypatch, tmp_path)
+    monkeypatch.setattr(gx10, "_EFFECTIVE_CFG", gx10._code_defaults())
     monkeypatch.setattr(gx10, "RAG_ENABLED", True)
     gx10._dispatch(g, "rag off")
     assert gx10.RAG_ENABLED is False

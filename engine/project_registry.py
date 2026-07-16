@@ -9,8 +9,9 @@ Secret-free: the installation home resolves from ``GX10_HOME`` / a per-user defa
 hard-coded. Durability: atomic temp+fsync+replace (with a parent-dir fsync where supported) under an
 **OS file lock** (``fcntl``/``msvcrt`` — released by the kernel on process death, so there is no stale
 sentinel to reclaim and no cross-process mutual-exclusion race). The index is reconstructable from
-on-disk project dirs (``reconcile``), so a lost/corrupt registry self-heals; one bad entry never bricks a
-read. ``mem_ns`` is a minted >=64-bit memory-partition key, registry-verified unique, re-minted on a
+on-disk project dirs (``reconcile``), so a lost registry self-heals and a corrupt registry is quarantined
+for recovery; one bad entry never bricks a read. ``mem_ns`` is a minted >=64-bit memory-partition key,
+registry-verified unique, re-minted on a
 duplicate or a low-entropy value — a copied project dir must never silently share a partition.
 """
 from __future__ import annotations
@@ -19,6 +20,7 @@ import json
 import os
 import re
 import secrets
+import sys
 import time
 from dataclasses import asdict, dataclass, field
 from datetime import date
@@ -229,9 +231,13 @@ class Registry:
     def load(self) -> dict:
         try:
             raw = json.loads(self.path.read_text(encoding="utf-8"))
-        except (FileNotFoundError, json.JSONDecodeError):
+        except FileNotFoundError:
+            return {"projects": {}, "active": None}
+        except json.JSONDecodeError:
+            self._quarantine_corrupt()
             return {"projects": {}, "active": None}
         if not isinstance(raw, dict):
+            self._quarantine_corrupt()
             return {"projects": {}, "active": None}
         entries = raw.get("projects")
         projects: Dict[str, Project] = {}
@@ -244,6 +250,21 @@ class Registry:
         if active not in projects:
             active = None
         return {"projects": projects, "active": active}
+
+    def _quarantine_corrupt(self) -> None:
+        dest = self.path.with_name(
+            f"{self.path.name}.corrupt.{os.getpid()}.{secrets.token_hex(4)}"
+        )
+        try:
+            os.replace(self.path, dest)
+            print(f"warning: corrupt project registry quarantined at {dest}", file=sys.stderr)
+        except OSError:
+            # Fail closed (#1526): if the corrupt file could NOT be moved aside but is STILL present
+            # (e.g. a Windows share/AV lock), do not let the caller return an empty state that a later
+            # _save would write over the unrecovered bytes — that would re-open the data loss. Surface
+            # the failure instead. A peer that already moved it (path now absent) is the benign race.
+            if self.path.exists():
+                raise
 
     def list(self) -> List[Project]:
         return list(self.load()["projects"].values())

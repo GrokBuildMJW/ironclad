@@ -244,14 +244,20 @@ def extract_tool_call(
     if tool_calls:
         chosen = None
         for call in tool_calls:
-            fn = (call or {}).get("function", {})
+            # #1558: a malformed element (a non-dict, or {"function": null}) must not crash the parser with
+            # an AttributeError that escapes emit_validated's retry — it is simply not a usable tool call.
+            fn = call.get("function") if isinstance(call, dict) else None
+            if not isinstance(fn, dict):
+                continue
             if tool_name is None or fn.get("name") == tool_name:
                 chosen = fn
                 break
         if chosen is None:
+            names = [c.get("function", {}).get("name")
+                     for c in tool_calls
+                     if isinstance(c, dict) and isinstance(c.get("function"), dict)]
             raise ConstrainedEmissionError(
-                f"no tool_call for {tool_name!r} in response (got "
-                f"{[ (c or {}).get('function', {}).get('name') for c in tool_calls ]})"
+                f"no tool_call for {tool_name!r} in response (got {names})"
             )
         return _loads_object(chosen.get("arguments"), where="tool_call.arguments")
 

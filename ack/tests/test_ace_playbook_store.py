@@ -71,6 +71,49 @@ def test_forget_purges_the_scope(tmp_path):
     assert s.get_lessons(_SCOPE) == [] and s.forget(_SCOPE) is False   # idempotent
 
 
+def test_forget_also_purges_history_and_quarantine(tmp_path):
+    # #1552: forget must remove the version-history and quarantine side files too, so a forgotten lesson
+    # cannot be recovered via versions()/rollback().
+    s = _store(tmp_path)
+    s.report_lesson(_SCOPE, "secret lesson")
+    v = s.snapshot(_SCOPE)["version"]                     # creates <hash>.history.json
+    assert s.get_lessons(_SCOPE) == ["secret lesson"]
+    assert s.versions(_SCOPE)                             # history present before forget
+    assert s.forget(_SCOPE) is True
+    assert s.get_lessons(_SCOPE) == []
+    assert s.versions(_SCOPE) == []                       # history file gone → nothing to roll back to
+    base = tmp_path / "ace_playbooks"
+    assert not list(base.glob("*.history.json")) and not list(base.glob("*.quarantine.json"))  # side files purged
+    s.rollback(_SCOPE, v)                                 # rolling back to the forgotten version restores nothing
+    assert s.get_lessons(_SCOPE) == []
+
+
+def test_rollback_surfaces_a_persistence_failure(tmp_path, monkeypatch):
+    # #1551: if persisting the restored playbook fails (read-only ACE dir / full disk), rollback must return an
+    # error — NOT a false success naming the target version — so the operator never believes an unsafe playbook
+    # was removed while the harmful active JSON is in fact unchanged on disk.
+    s = _store(tmp_path)
+    s.report_lesson(_SCOPE, "v1 safe lesson")
+    v1 = s.snapshot(_SCOPE)["version"]
+    s.report_lesson(_SCOPE, "v2 harmful lesson")   # the current (harmful) active state
+    monkeypatch.setattr(s, "_save", lambda scope, pb: False)   # the restored playbook never reaches disk
+    res = s.rollback(_SCOPE, v1)
+    assert "error" in res and "rolled_back_to" not in res      # honest failure, not a false success
+    assert "could not persist" in res["error"]
+    assert "v2 harmful lesson" in _store(tmp_path).get_lessons(_SCOPE)   # active playbook UNCHANGED (no rollback)
+
+
+def test_rollback_surfaces_a_history_persistence_failure(tmp_path, monkeypatch):
+    # #1551: the playbook saved but its version history did not — still an error, never a clean success.
+    s = _store(tmp_path)
+    s.report_lesson(_SCOPE, "v1")
+    v1 = s.snapshot(_SCOPE)["version"]
+    s.report_lesson(_SCOPE, "v2")
+    monkeypatch.setattr(s, "_save_history", lambda scope, hist: False)
+    res = s.rollback(_SCOPE, v1)
+    assert "error" in res and "rolled_back_to" not in res
+
+
 def test_persistence_across_instances(tmp_path):
     _store(tmp_path).report_lesson(_SCOPE, "persisted lesson")
     assert _store(tmp_path).get_lessons(_SCOPE) == ["persisted lesson"]   # one JSON file per scope

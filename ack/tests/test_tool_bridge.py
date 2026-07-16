@@ -198,7 +198,9 @@ def test_python_client_drops_permanent_tool_result_rejection_without_retry(monke
 def test_python_client_drops_tool_result_after_bounded_transient_retries(monkeypatch):
     attempts = []
     sleeps = []
+    monotonic = iter((0.0, 1.0, 2.0, client._TOOL_RESULT_POST_DEADLINE_S)).__next__
     monkeypatch.setattr(gx10, "run_tool", lambda _name, _args, **_kw: "OK")
+    monkeypatch.setattr(client.time, "monotonic", monotonic)
     monkeypatch.setattr(client.time, "sleep", sleeps.append)
     cli = client.Server.__new__(client.Server)
 
@@ -208,12 +210,58 @@ def test_python_client_drops_tool_result_after_bounded_transient_retries(monkeyp
 
     cli._req = _req
     cli._run_passthrough_tool('TR{"id":"r3","name":"read_file","args":{"path":"a"}}')
-    assert len(attempts) == client._TOOL_RESULT_POST_ATTEMPTS
+    assert len(attempts) == 3
     assert sleeps == [
         client._TOOL_RESULT_POST_BACKOFF_S,
         client._TOOL_RESULT_POST_BACKOFF_S * 2,
-        client._TOOL_RESULT_POST_BACKOFF_S * 3,
     ]
+
+
+def test_python_client_reopens_session_and_retries_on_401(monkeypatch):
+    attempts = []
+    reopened = []
+    monkeypatch.setattr(gx10, "run_tool", lambda _name, _args, **_kw: "OK")
+    monkeypatch.setattr(client.time, "sleep", lambda _seconds: None)
+    cli = client.Server.__new__(client.Server)
+    cli.session_id = "expired"
+
+    def _req(method, path, body):
+        attempts.append((method, path, body))
+        if len(attempts) == 1:
+            raise urllib.error.HTTPError(path, 401, "no live session", None, None)
+        return {}
+
+    def _session_open():
+        reopened.append(True)
+        cli.session_id = "fresh"
+        return {"session_id": cli.session_id}
+
+    cli._req = _req
+    cli.session_open = _session_open
+    cli._run_passthrough_tool('TR{"id":"r5","name":"read_file","args":{"path":"a"}}')
+    assert reopened == [True]
+    assert attempts == [
+        ("POST", "/tool-result", {"id": "r5", "result": "OK"}),
+        ("POST", "/tool-result", {"id": "r5", "result": "OK"}),
+    ]
+
+
+def test_python_client_survives_transient_beyond_four_attempts(monkeypatch):
+    attempts = []
+    monkeypatch.setattr(gx10, "run_tool", lambda _name, _args, **_kw: "OK")
+    monkeypatch.setattr(client.time, "sleep", lambda _seconds: None)
+    cli = client.Server.__new__(client.Server)
+
+    def _req(method, path, body):
+        attempts.append((method, path, body))
+        if len(attempts) <= 6:
+            raise urllib.error.HTTPError(path, 503, "temporarily unavailable", None, None)
+        return {}
+
+    cli._req = _req
+    cli._run_passthrough_tool('TR{"id":"r6","name":"read_file","args":{"path":"a"}}')
+    assert len(attempts) == 7
+    assert attempts[-1] == ("POST", "/tool-result", {"id": "r6", "result": "OK"})
 
 
 def test_nonlocal_tool_not_routed(tmp_path, monkeypatch):

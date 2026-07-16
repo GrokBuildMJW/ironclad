@@ -12,8 +12,10 @@ memory) and switch between them within a running engine.
   (`%LOCALAPPDATA%/ironclad` on Windows, `~/.ironclad` elsewhere; override with `GX10_HOME`) lists every
   registered project and the **persisted active pointer** (continuity across reboots). Writes are atomic
   (temp + fsync + replace) under an **OS file lock** released by the kernel on process death, so there is
-  no stale lock to reclaim. The index self-heals: a malformed entry is skipped, a duplicate/low-entropy
-  memory key is re-minted, and projects can be reconstructed from on-disk roots.
+  no stale lock to reclaim. A corrupt registry is atomically quarantined as a non-clobbering
+  `registry.json.corrupt.*` sidecar before boot creates a fresh registry, preserving project roots and
+  memory keys for operator recovery. The index self-heals: a malformed entry is skipped, a
+  duplicate/low-entropy memory key is re-minted, and projects can be reconstructed from on-disk roots.
 - **Project.** `id` · `slug` · `root` (absolute) · `mem_ns` (a ≥64-bit memory-partition key, registry-
   verified unique) · `tracks`/`active_track` · `created`.
 - **Active is single-active per process.** The engine reads the persisted active pointer **once at boot**

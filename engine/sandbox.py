@@ -17,8 +17,8 @@ import shutil
 from dataclasses import dataclass
 from typing import Union
 
-#: Supported backends, in auto-detect preference order. bubblewrap + firejail are the well-supported,
-#: unprivileged Linux sandboxes; a full container runtime is remaining scope (ADR-0013).
+#: Supported backends, in auto-detect preference order. bwrap stays first because its PID namespace
+#: provides complete descendant teardown; firejail is the best-effort fallback (ADR-0013).
 BACKENDS = ("bwrap", "firejail")
 
 
@@ -28,6 +28,11 @@ class SandboxRefusal:
 
     preference: str
     reason: str
+
+
+def is_best_effort_teardown(backend: str) -> bool:
+    """Whether *backend* cannot guarantee complete descendant teardown."""
+    return (backend or "").strip().lower() == "firejail"
 
 
 def available_backend(preference: str = "auto") -> str:
@@ -60,6 +65,7 @@ def wrap_command(command: str, *, backend: str, net: bool = False) -> str:
     b = (backend or "").strip().lower()
     inner = _q(command)
     if b == "firejail":
+        # firejail has no clean die-with-parent equivalent; tree teardown is best-effort-only.
         parts = ["firejail", "--quiet"]
         if not net:
             parts.append("--net=none")           # the containment win: no network for the child

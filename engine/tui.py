@@ -268,7 +268,7 @@ def _worker(srv: Server, codedir: Path, q: "Queue[str]", app: "Application",
                     auto["stop"].set(); auto["stop"] = None
                     log(gx10.col("  [AUTO] poller OFF", gx10.C.YELLOW))
                 else:
-                    log(gx10.col(f"  [AUTO] {'AN' if auto.get('stop') else 'AUS'}  |  /auto on / /auto off",
+                    log(gx10.col(f"  [AUTO] {'ON' if auto.get('stop') else 'OFF'}  |  /auto on / /auto off",
                                  gx10.C.GRAY))
             continue
         # kind in ("server", "turn") → stream to the orchestrator (command without / or a turn).

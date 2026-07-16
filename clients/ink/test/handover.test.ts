@@ -4,7 +4,7 @@ import {promises as fs} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {setTimeout as delay} from 'node:timers/promises';
-import {shlexSplit, buildAgentArgv, resolveLaunch, runHandover, processOne, Pool, authorizeLaunch, DEFAULT_AGENT_CMD, MAX_CAPTURE_BYTES, spawnAgent, type HandoverCfg} from '../src/agent/handover.js';
+import {shlexSplit, buildAgentArgv, resolveLaunch, runHandover, processOne, Pool, dispatchPending, reapCoders, authorizeLaunch, DEFAULT_AGENT_CMD, MAX_CAPTURE_BYTES, spawnAgent, readCapped, FEEDBACK_MAX_BYTES, type HandoverCfg} from '../src/agent/handover.js';
 import {Server, type Json} from '../src/net/server.js';
 
 const baseCfg: HandoverCfg = {
@@ -81,6 +81,61 @@ test('runHandover — timeout kills a spawned descendant tree', {
   await fs.access(ready);
   await delay(1000);
   await assert.rejects(fs.access(sentinel));
+});
+
+test('spawnAgent — a signal-terminated coder whose close is deferred is not misclassified as timedOut (#1538)', {
+  skip: process.platform === 'win32' ? 'POSIX signal + inherited-pipe race' : false,
+}, async () => {
+  const dir = await fs.mkdtemp(join(tmpdir(), 'ink-ho-sig-'));
+  const coder = join(dir, 'coder.cjs');
+  // Spawn a grandchild that INHERITS our stdout (fd 1) and holds it open ~900ms — this defers spawnAgent's
+  // `close` event. Then SIGTERM ourselves at ~150ms: signalCode='SIGTERM' + exitCode=null while `close`
+  // is still pending. The 500ms timer fires in that window. Pre-#1538 the guard only checked exitCode, so
+  // it declared a timeout and killed the tree; now it steps aside and `close` resolves the real result.
+  await fs.writeFile(coder, [
+    "const {spawn} = require('child_process');",
+    "spawn(process.execPath, ['-e', 'setTimeout(() => {}, 900)'], {stdio: ['ignore', 1, 'ignore']});",
+    "setTimeout(() => process.kill(process.pid, 'SIGTERM'), 150);",
+  ].join('\n'), 'utf8');
+
+  const res = await spawnAgent([process.execPath, coder], dir, process.env, 500);
+  assert.equal('enoent' in res, false);
+  if ('enoent' in res) return;
+  assert.notEqual(res.timedOut, true);   // the real signal exit won — NOT a false timeout that discards feedback
+});
+
+test('reapCoders kills + unclaims an in-flight coder before session close (#1541)', {
+  // reap works on all platforms (killProcessTree uses taskkill /T on Windows, process-group SIGTERM on POSIX)
+}, async () => {
+  const dir = await fs.mkdtemp(join(tmpdir(), 'ink-ho-reap-'));
+  const sleeper = join(dir, 'sleep.cjs');
+  await fs.writeFile(sleeper, 'setTimeout(() => {}, 30_000);', 'utf8'); // never finishes on its own
+  const template = `{bin} ${sleeper.replace(/\\/g, '/')}`;
+  const calls: string[] = [];
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async (input) => {
+    const p = new URL(String(input)).pathname;
+    calls.push(p);
+    const payload = p === '/pending'
+      ? {pending: [{id: 'REAP1', agent: 'OPUS', handover: 'long', bin: process.execPath,
+                    cmd_template: template, tooling_envelope: envelopeFor(template)}]}
+      : {ok: true, status: 'pending'};
+    return new Response(JSON.stringify(payload), {status: 200});
+  }) as typeof fetch;
+  try {
+    const srv = new Server('http://engine.test');
+    const jobs = await dispatchPending(srv, dir, baseCfg, new Pool(1), new Set(), () => {});
+    assert.equal(jobs.length, 1); // the long-running coder is in flight
+    const started = Date.now();
+    await reapCoders(4000);       // the exit path kills the child + awaits its /unclaim (re-kills across the race)
+    // PROMPT proves the reap actually KILLED the coder (its sleeper is 30s) rather than the /unclaim assertion
+    // passing on natural completion; reapCoders returns only once no job is in flight (or the deadline hits).
+    assert.ok(Date.now() - started < 3000, `reap must be prompt, took ${Date.now() - started}ms`);
+    // the reaped coder RELEASED its task (POST /unclaim) instead of being left stuck in_progress after close
+    assert.ok(calls.includes('/unclaim'), `expected /unclaim, saw ${calls.join(',')}`);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 });
 
 test('shlexSplit — whitespace splits; single/double quotes group', () => {
@@ -567,4 +622,14 @@ test('Pool — caps concurrency at max', async () => {
     });
   await Promise.all([job(), job(), job(), job(), job()]);
   assert.ok(peak <= 2, `peak concurrency ${peak} must be ≤ 2`);
+});
+
+test('#1543 readCapped bounds a giant coder result file', async () => {
+  const dir = await fs.mkdtemp(join(tmpdir(), 'ink-ho-cap-'));
+  const p = join(dir, 'big.md');
+  await fs.writeFile(p, 'status: done\n' + 'x'.repeat(FEEDBACK_MAX_BYTES * 2));
+  const out = await readCapped(p);
+  assert.equal(out.length, FEEDBACK_MAX_BYTES);   // truncated to the cap, not the full 2x
+  assert.ok(out.startsWith('status: done'));      // the first line (pipeline signal) is kept
+  await fs.rm(dir, {recursive: true, force: true});
 });

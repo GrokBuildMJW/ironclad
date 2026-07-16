@@ -27,6 +27,7 @@ def test_demo_vessel_passes_doctor():
     report = doctor.run_doctor(
         _DEMO,
         extra_checks=doctor._load_lodestar_checks(True),   # capability/gap-tracking checks
+        capability_spec_cls=doctor._load_capability_spec(True),   # #1531: validate capability records vs CapabilityTaskSpec
         validate_tasks=True,
         include_done=True,
     )

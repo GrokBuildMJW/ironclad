@@ -30,6 +30,7 @@ import {splitToolBlocks} from './toolBlocks.js';
 import {ToolCall} from './ToolCall.js';
 import {runPassthroughTool} from '../tools/bridge.js';
 import {runOperatorShell} from '../tools/runTool.js';
+import {setDiagnosticSink} from '../tools/diagnostics.js';
 import {runUpdate} from '../tools/update.js';
 import {Pool, dispatchPending, type HandoverCfg} from '../agent/handover.js';
 import {loadConfig, VERSION} from '../config.js';
@@ -154,6 +155,7 @@ export function App({
   useEffect(() => {
     if (didInit.current) return;
     didInit.current = true;
+    setDiagnosticSink((m) => commit(<Text color={DIM}>{`  ${m}`}</Text>));
     commit(
       <Text bold color={ACCENT}>
         █▀▄▀█ Ironclad <Text color={DIM}>· Orchestrator Client</Text>

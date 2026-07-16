@@ -191,6 +191,21 @@ def test_no_tool_calls_and_no_content_raises():
         extract_tool_call(resp, tool_name=TOOL)
 
 
+def test_malformed_tool_call_raises_constrained_not_attributeerror():
+    # #1558: a non-dict element or {"function": null} must become a ConstrainedEmissionError (so
+    # emit_validated can re-ask), not an AttributeError that escapes the bounded retry loop.
+    for tool_calls in ([{"function": None}], [{"function": "not-a-dict"}], ["not-a-dict"], [None]):
+        resp = {"choices": [{"message": {"tool_calls": tool_calls}}]}
+        with pytest.raises(ConstrainedEmissionError, match="no tool_call"):
+            extract_tool_call(resp, tool_name=TOOL)
+    # a well-formed call AFTER a malformed one is still selected (the malformed element is skipped)
+    good = {"choices": [{"message": {"tool_calls": [
+        {"function": None},
+        {"function": {"name": TOOL, "arguments": "{}"}},
+    ]}}]}
+    assert extract_tool_call(good, tool_name=TOOL) == {}
+
+
 # --------------------------------------------------------------------------- #
 # ops grounding — vLLM launch flags per model family
 # --------------------------------------------------------------------------- #

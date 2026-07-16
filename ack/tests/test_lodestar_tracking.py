@@ -93,3 +93,45 @@ def test_backlog_ready_blocked_and_ranking(tmp_path):
 
     # Required capability field is advertised for each open entry.
     assert '"capability": "feat-open"' in open_section
+
+
+def _gap(domain: str, mapping: dict) -> str:
+    return (
+        "---\n"
+        f"domain: {domain}\n"
+        f'title: "{domain} — Gap-Tracking"\n'
+        "updated: 2000-01-01\n"
+        "---\n"
+        f"# {domain}\n"
+        "<!-- MAPPING-START -->\n"
+        "```json\n" + json.dumps(mapping) + "\n```\n"
+        "<!-- MAPPING-END -->\n\n"
+        "## Status\n"
+        "<!-- TABLES-START -->\nOLD\n<!-- TABLES-END -->\n"
+    )
+
+
+def test_cross_domain_dependency_is_satisfied_when_implemented_elsewhere(tmp_path):
+    # #1534: cap-b (domain b) depends on cap-a, implemented by a done task in domain a. The capability space
+    # is global (like the doctor's resolution), so cap-b must be READY — not parked in b's Blocked section
+    # forever just because cap-a is not a *local* feature.
+    for bucket in ("pending", "in_progress", "done"):
+        (tmp_path / "tasks" / bucket).mkdir(parents=True)
+    (tmp_path / "tasks" / "done" / "A-1.json").write_text(
+        json.dumps({"type": "implementation", "priority": "high",
+                    "title": "x", "description": "y", "capability": "cap-a"}), encoding="utf-8")
+    research = tmp_path / "vault" / "Research"
+    (research / "A").mkdir(parents=True)
+    (research / "B").mkdir(parents=True)
+    (research / "A" / "a-gap-tracking.md").write_text(
+        _gap("a", {"features": [{"key": "cap-a", "feature": "A", "phase": "MVP"}]}), encoding="utf-8")
+    (research / "B" / "b-gap-tracking.md").write_text(
+        _gap("b", {"features": [{"key": "cap-b", "feature": "B", "phase": "MVP", "depends_on": ["cap-a"]}]}),
+        encoding="utf-8")
+
+    tracking.run(tmp_path, today=TODAY)
+    backlog_b = (research / "B" / "b-backlog.md").read_text(encoding="utf-8")
+    open_section, _, blocked_section = backlog_b.partition("## ⏸ Blocked")
+    order = re.findall(r"^### \d+\. `([^`]+)`", open_section, re.M)
+    assert "cap-b" in order                       # ready: its cross-domain dependency is implemented
+    assert "cap-b" not in blocked_section         # was: parked as blocked, waiting on cap-a forever

@@ -56,7 +56,7 @@ initiative (fail-closed). Pure conversational turns (no artifacts) need none.
 /initiative reconcile [slug]                rebuild INDEX.md + [[links]] (see below)
 ```
 
-- There is **one** initiative type, `software` (#984). It seeds `tasks/`, `decisions/`, `proposals/`,
+- There is **one** initiative type, `software`. It seeds `tasks/`, `decisions/`, `proposals/`,
   `reviews/`, a `runs/` home, and the hidden `.work/` plumbing — the full task → handover → feedback →
   done pipeline, plus `runs/` for the **embedded MPR** architecture-decision panel. MPR is a
   dev-process function invoked at an architecture fork (`/fork`, gated by `ace.fork_mpr.enabled` /

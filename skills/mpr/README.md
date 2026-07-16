@@ -1,7 +1,7 @@
 # MPR — Multi-Perspective Reasoning (ironclad core built-in)
 
 > **A public core built-in.** MPR ships under `skills/mpr/` and is exported with the framework as the
-> flagship example skill (ADR-0002 #115). It consumes only the stable ironclad primitives (the P0
+> flagship example skill (ADR-0002). It consumes only the stable ironclad primitives (the P0
 > dispatcher, `_WORKERS.fanout`, `_reduce_worker_results`, `_atomic_write`, `TaskStore`) over the public
 > plugin boundary — **no core fork, no core edit**.
 
@@ -13,7 +13,7 @@ memory write path, a full audit trail per run.
 
 ## Gates — loaded vs. active (IMPORTANT)
 
-MPR is a **core built-in** (ADR-0002 #115) — **always loaded**, no load gate. A single **runtime**
+MPR is a **core built-in** (ADR-0002) — **always loaded**, no load gate. A single **runtime**
 switch controls whether it runs; the tool is always registered, but it can be paused live.
 
 | Gate | Source | Default | Effect when OFF | Toggle |
@@ -24,7 +24,7 @@ switch controls whether it runs; the tool is always registered, but it can be pa
 - `mpr.enabled` **on** (default) → the panel runs. **off** → loaded but paused (each call returns the note).
 - Deploy override: set `GX10_MPR_ENABLED=0` to make the runtime default off at boot.
 - `ace.fork_mpr.enabled` **off** (default) → ACE's MPR-at-fork option is dormant. **on** → when the dev-loop
-  declares an architecture fork (a `ForkSignal` on the ledger, epic #855 / M5), the engine runs MPR's
+  declares an architecture fork (a `ForkSignal` on the ledger), the engine runs MPR's
   `architecture-decision` panel **off the hot path** (a background worker), pre-informed by the playbook's
   prior fork decisions, and produces a decision-matrix as a well-founded proposal for the human ask. Requires
   `mpr.enabled` **on** + an active project; any failure degrades to a no-op (the ask still surfaces). MPR
@@ -56,21 +56,21 @@ Value coercion: `on|true|yes → True`, `off|false|no → False`, else a number 
 ## Panel mode (`mpr.panel_mode`)
 
 The in-engine panel execution has two tuned paths. Background: qwen3.6-35b is a **reasoning model** — with
-thinking on, the `<think>` block eats the whole completion under a tight budget (live bug #3: empty
-`perspective_NN.md`). Hence the switchable mode:
+thinking on, the `<think>` block eats the whole completion under a tight budget (an observed failure
+mode: empty `perspective_NN.md`). Hence the switchable mode:
 
 | `panel_mode` | Thinking | Token budget per perspective | When |
 |--------------|----------|-------------------------------|------|
 | **`direct`** (default, stable) | **off** | flat `4096` | analysis goes straight at the budget, no `<think>` starvation, full fan-out concurrency, fast |
 | **`deep`** | **on** | per-effort (low 2048 … xhigh 16384) | deeper reasoning; the governor throttles the concurrency |
 
-The classifier/router path always runs thinking-off (a fixed 768-token cap; live bug #1).
+The classifier/router path always runs thinking-off (a fixed 768-token cap).
 
 ---
 
 ## All `mpr.*` config keys
 
-SSOT of the defaults: `skills/mpr/mpr_config.py` (`MprConfig`), aligned with spec 09 §2.1.
+SSOT of the defaults: `skills/mpr/mpr_config.py` (`MprConfig`).
 The global precedence is ironclad's: **code defaults < file/conf < env < CLI (`/config set`)**.
 
 | Key | Type | Default | Meaning |
@@ -78,7 +78,7 @@ The global precedence is ironclad's: **code defaults < file/conf < env < CLI (`/
 | `mpr.enabled` | bool | `true` | **RUNTIME gate** (see above) — on by default; `/config set mpr.enabled off` pauses it |
 | `mpr.panel_mode` | `direct`\|`deep` | `direct` | panel execution depth (see above) |
 | `mpr.audit_level` | str | `full-per-perspective` | audit granularity (`full-per-perspective`\|`manifest-only`) |
-| `mpr.runs_dir` | str | `runs/mpr` | config fallback. **STATE layout (B3):** a run routes to the active project → `vault/<slug>/runs/<run_id>/`; with no active project `mpr_research` is fail-closed (no write into the root). |
+| `mpr.runs_dir` | str | `runs/mpr` | config fallback. **STATE layout:** a run routes to the active project → `vault/<slug>/runs/<run_id>/`; with no active project `mpr_research` is fail-closed (no write into the root). |
 | `mpr.sovereignty.default_policy` | str | `offloadable` | default data policy per item (`offloadable`\|`local-only`) |
 | `mpr.sovereignty.internal_is_local_only` | bool | `true` | never offload internal/sensitive data |
 | `mpr.sovereignty.fail_closed` | bool | `true` | when in doubt keep it **local** (never spill) |
@@ -91,7 +91,7 @@ The global precedence is ironclad's: **code defaults < file/conf < env < CLI (`/
 | `mpr.providers.routing.spill_when_spark_busy` | bool | `true` | offload when the Spark is busy |
 | `mpr.providers.routing.effort_to_provider` | dict | see `DEFAULT_ROUTING` | effort→provider mapping |
 | `mpr.router.*` | — | see `config.py` | router sub-config (e.g. `min_panel`) |
-| `mpr.roles` / `mpr.registry.*` | — | see `registry/config.py` | **Reserved** — role/registry sub-config (`roles.max`, effort table, distinctness): loaded + validated but **not yet read** by the resolver (#503 MPR-REG-1) |
+| `mpr.roles` / `mpr.registry.*` | — | see `registry/config.py` | **Reserved** — role/registry sub-config (`roles.max`, effort table, distinctness): loaded + validated but **not yet read** by the resolver |
 
 > **Boundary:** the pool holds **no** private literals (no Spark IP, no hostname). Endpoints come from
 > `connection.*`; secrets only as `*_api_key_env` **names** (never the value).

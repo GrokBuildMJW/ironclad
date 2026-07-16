@@ -1,6 +1,6 @@
 # Prompt library & generator (design spec)
 
-> **Design/planned** — the contract this targets (epic #105). Built on the **core base**
+> **Design/planned** — the contract this targets. Built on the **core base**
 > ([ADR-0002](adr/0002-core-always-on-skills.md)): always-on built-ins, `ack.i18n`,
 > `ack.playbook`, `ack.catalogue`, `ack.gate`. See [ADR-0003](adr/0003-prompt-library.md) and
 > [`status.md`](status.md). A prompt is a **core built-in — no plugin**.
@@ -10,7 +10,7 @@ few guided questions, and get a finished prompt in your target language. Add a n
 **dropping a file** under `skills/` (no engine code change) — it is discovered always-on,
 indexed by the catalogue, and validated by the gate.
 
-## A prompt item (`kind: prompt`) — *available (#108)*
+## A prompt item (`kind: prompt`) — *available*
 
 ```
 skills/<prompt>/
@@ -35,11 +35,11 @@ The body is the **template** (placeholders for the variables). It reuses the `ac
 parser; it is a distinct **kind** from `playbook` (instructions the model reads) — a prompt is a
 template the user fills to *produce* a prompt.
 
-## Generation flow — *available (#109/#110/#148)*
+## Generation flow — *available*
 
 Two surfaces drive the **same** `ack.promptgen.run_prompt` state machine (deterministic, LLM-free):
 
-- **Direct, model-free** (`/<prompt-name>`, #148) — list items with `/prompts`; invoke one with
+- **Direct, model-free** (`/<prompt-name>`) — list items with `/prompts`; invoke one with
   `/<name> [var=value …] [--lang xx]`. A single positional value (whole rest) fills the lone required
   variable (so `/explain-code <code>` works, `=`/`--lang` inside the value preserved); explicit
   `var=value` tokens set named variables. When all required values are present it **assembles** in
@@ -53,15 +53,15 @@ Two surfaces drive the **same** `ack.promptgen.run_prompt` state machine (determ
   returns a previewed prompt. The orchestrator drives the turn-by-turn Q&A.
 
 Both render through `ack.i18n` (target language, source-language fallback). **Save** as a reusable
-library item is the curated-library step (#111).
+library item is the curated-library step.
 
-## Multilingual — *available (#109)*
+## Multilingual — *available*
 
 Built on the shared core **`ack.i18n`** (`Localizer(<item>/locales)`): source/target language
 selection; a missing language falls back to the source. Add a language = drop a
 `locales/<lang>.json` (no code change).
 
-## Registration gate — *wired (#111)*
+## Registration gate — *wired*
 
 A prompt item passes `ack.gate.gate_prompt` before it is trusted: frontmatter schema valid
 (`ack.prompt`, incl. `variables`/`languages`); every **required** variable actually appears as a

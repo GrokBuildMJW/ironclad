@@ -1,7 +1,7 @@
 # Documentation guide — where does this go?
 
-Ironclad's docs have **one responsibility each, no overlap**. This keeps them honest and lets the
-`doc-reality-audit` enforce the boundaries mechanically. Design: [ADR-0006](adr/0006-docs-ia-and-drift-proof-roadmap.md).
+Ironclad's docs have **one responsibility each, no overlap**. This keeps them honest and lets an
+automated audit enforce the boundaries mechanically. Design: [ADR-0006](adr/0006-docs-ia-and-drift-proof-roadmap.md).
 
 ## One responsibility per doc
 
@@ -18,24 +18,25 @@ Ironclad's docs have **one responsibility each, no overlap**. This keeps them ho
 
 - **"We built X / X works now"** → `status.md` (wiring row) + a `CHANGELOG` `[Unreleased]` entry. **Not** the roadmap.
 - **"We plan to build X"** → it belongs to a **milestone** (a roadmap phase); the phase appears in `roadmap.md` **automatically** (generated from the open milestone's description). Open an epic for the concrete work; don't hand-write it into the roadmap.
-- **"A whole phase is delivered"** → **close its milestone** → the phase **drops from the roadmap automatically**; record the delivery in `status.md` + `CHANGELOG` (this is the C2 prune-on-close gate).
+- **"A whole phase is delivered"** → **close its milestone** → the phase **drops from the roadmap automatically**; record the delivery in `status.md` + `CHANGELOG` (this is the prune-on-close gate).
 - **"Why did we choose Y?"** → a new ADR under `docs/adr/`.
 - **"How do I do Z?"** → a guide under `docs/` (Diátaxis: tutorial / how-to / reference / explanation).
 
 ## The roadmap is generated
 
-`docs/roadmap.md` is produced by `scripts/ci/gen_roadmap.py` from the **open milestones** (the
+`docs/roadmap.md` is produced by a private CI generator from the **open milestones** (the
 roadmap phases): one section per open milestone, its **description** as the phase narrative. A
 delivered phase disappears automatically when its **milestone is closed** — so realized work can
-never linger there. Regenerate it when milestones change; CI (`roadmap-generated`) verifies the
+never linger there. Regenerate it when milestones change; a CI check verifies the
 committed file matches a fresh regeneration. To put planned work on the roadmap, give the milestone
 a description (and open an epic for the concrete work); to retire a phase, close its milestone.
 
 ## Enforcement
 
-`scripts/ci/doc_reality_audit.py` gates the machine-checkable slice: internal links/anchors,
+A private CI audit gates the machine-checkable slice: internal links/anchors,
 version consistency, banned stale phrases, cross-doc number agreement, required docs present, and
-the **per-doc responsibility lint** above (roadmap-forward-only + status-now-only). Plus `scripts/ci/process_doctor.py` asserts the live-state invariants (incl. an open milestone with
-work but no description -> invisible on the roadmap, warned), and the release gate (`promote.sh`) runs
-`gen_roadmap.py --check` so a release can never ship a stale roadmap. The full audit procedure (the
-human, semantic part) lives in `vault/Plan/doc-reality-audit.md` (private).
+the **per-doc responsibility lint** above (roadmap-forward-only + status-now-only). Plus a private
+invariant checker asserts the live-state invariants (incl. an open milestone with
+work but no description -> invisible on the roadmap, warned), and the private release gate runs
+the roadmap generator in check mode so a release can never ship a stale roadmap. The full audit
+procedure (the human, semantic part) lives in a private planning doc.

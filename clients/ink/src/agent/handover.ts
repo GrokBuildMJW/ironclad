@@ -8,12 +8,16 @@
  * async pool (= max parallel agents). The "no-polling" memory forbids polling background-task
  * completion; `await`-ing a child's exit (and the spec'd /auto 5s poller) is the contract.
  */
-import {spawn} from 'node:child_process';
+import {spawn, type ChildProcess} from 'node:child_process';
 import {promises as fs} from 'node:fs';
 import * as fsSync from 'node:fs';
 import path from 'node:path';
 import type {Server, Json} from '../net/server.js';
 import {killProcessTree} from '../tools/procTree.js';
+import {BoundedTail, MAX_CAPTURE_BYTES} from '../tools/boundedTail.js';
+
+// Re-exported for back-compat: the coder-capture cap lives with the shared BoundedTail now (#1540).
+export {MAX_CAPTURE_BYTES};
 
 type Item = Record<string, unknown>;
 const str = (v: unknown, d = ''): string => (v === undefined || v === null ? d : String(v));
@@ -27,9 +31,20 @@ const WINDOWS_EXECUTABLE_EXTENSIONS = new Set(['.exe', '.cmd', '.bat', '.com', '
 /** #455: how much of a code-agent's stderr to upload for the server-side exhausted classifier. */
 const STDERR_TAIL_CHARS = 4000;
 const CODER_TIMEOUT_DEFAULT_S = 1800;
-export const MAX_CAPTURE_BYTES = 256 * 1024;
-const TRUNCATED_MARKER = Buffer.from('…(truncated)…', 'utf-8');
+// A coder-controlled feedback / capture file is a short summary; read at most this many bytes so a coder
+// that writes a multi-GB file can never OOM the client (#1543). The status: line is first, so a tail cut is safe.
+export const FEEDBACK_MAX_BYTES = 1024 * 1024;
 
+export async function readCapped(filePath: string, cap: number = FEEDBACK_MAX_BYTES): Promise<string> {
+  const fh = await fs.open(filePath, 'r');
+  try {
+    const buf = Buffer.alloc(cap);
+    const {bytesRead} = await fh.read(buf, 0, cap, 0);
+    return buf.subarray(0, bytesRead).toString('utf-8');
+  } finally {
+    await fh.close();
+  }
+}
 export interface HandoverCfg {
   // #449/INK-HANDOVER-1 (#503): an EXPLICIT client-side override (GX10_CLAUDE_BIN / GX10_AGENT_CMD or
   // the config file) — the documented single-agent BYO path — beats the server's per-agent spec; null
@@ -251,28 +266,37 @@ type SpawnResult = {enoent: true} | {
   timedOut?: boolean;
 };
 
-class BoundedTail {
-  private tail: Buffer = Buffer.alloc(0);
-  private truncated = false;
+// #1541: the spawned coder children + their in-flight processOne jobs, tracked module-wide so the CLI can
+// reap them on exit. Exiting during /work or /auto used to leave a coder running past session.stop(): when
+// it finished, its /feedback + /unclaim hit 401 on the closed session, so the result was lost and the task
+// stayed stuck `in_progress`. The exit path now kills the children and awaits their (now-prompt) cleanup
+// while the session is STILL open — so a completed run uploads and a killed one unclaims, none orphaned.
+const _activeCoders = new Set<ChildProcess>();
+const _inFlightJobs = new Set<Promise<unknown>>();
 
-  append(chunk: Buffer): void {
-    if (chunk.length >= MAX_CAPTURE_BYTES) {
-      this.tail = chunk.subarray(chunk.length - MAX_CAPTURE_BYTES);
-      this.truncated = true;
-      return;
+/** Reap every in-flight /work or /auto coder on exit: kill each child (whole tree) and await its processOne
+ *  cleanup (/feedback + /unclaim). Loops so a job that a just-freed Pool slot started (a queued handover) is
+ *  killed too, until no job remains in flight or `timeoutMs` elapses. Call BEFORE closing the session so the
+ *  cleanup POSTs run under the still-open session; otherwise an orphaned coder finishing after the close
+ *  401s and leaves its task stuck `in_progress`. Never rejects; exits promptly on a slow/black-hole server. */
+export async function reapCoders(timeoutMs: number): Promise<void> {
+  const start = Date.now();
+  while (_inFlightJobs.size > 0 && Date.now() - start < timeoutMs) {
+    for (const child of _activeCoders) void killProcessTree(child);
+    let timer: NodeJS.Timeout | undefined;
+    try {
+      // settle when the current jobs finish OR after a short tick — then re-check + re-kill any queued job
+      // that spawned into a freed slot in the meantime.
+      await Promise.race([
+        Promise.allSettled([..._inFlightJobs]),
+        new Promise<void>((resolve) => {
+          timer = setTimeout(resolve, 100);
+          timer.unref?.();
+        }),
+      ]);
+    } finally {
+      if (timer) clearTimeout(timer);
     }
-    const overflow = this.tail.length + chunk.length - MAX_CAPTURE_BYTES;
-    if (overflow > 0) {
-      this.tail = Buffer.concat([this.tail.subarray(overflow), chunk], MAX_CAPTURE_BYTES);
-      this.truncated = true;
-    } else {
-      this.tail = Buffer.concat([this.tail, chunk], this.tail.length + chunk.length);
-    }
-  }
-
-  text(): string {
-    const retained = this.truncated ? Buffer.concat([TRUNCATED_MARKER, this.tail]) : this.tail;
-    return retained.toString('utf-8');
   }
 }
 
@@ -290,6 +314,7 @@ export function spawnAgent(
       if (!done) {
         done = true;
         if (timer) clearTimeout(timer);
+        _activeCoders.delete(child);   // #1541: no longer reapable once it has settled
         resolve(r);
       }
     };
@@ -300,6 +325,7 @@ export function spawnAgent(
       env,
       detached: process.platform !== 'win32',
     });
+    _activeCoders.add(child);   // #1541: tracked so the CLI can kill it on exit before the session closes
     child.stdout?.on('data', (d: Buffer) => {
       stdoutTail.append(d);
     });
@@ -320,7 +346,11 @@ export function spawnAgent(
       // #1491 (Grok review): if the coder already exited this tick (`exitCode` set) but its `close` event
       // hasn't been delivered yet, do NOT declare a timeout — step aside and let `close` resolve with the
       // real result, so a just-finished run whose feedback file is written is never discarded by the timer.
-      if (done || terminating || child.exitCode !== null) return;
+      // #1538: a SIGNAL exit sets `signalCode` (not `exitCode`, which stays null), so the guard must check
+      // both — matching waitForChildExit/procTree. Otherwise a coder that wrote its feedback and exited via
+      // SIGTERM just before the deadline (while a descendant briefly holds an inherited pipe, deferring
+      // `close`) was misclassified as timedOut and its valid feedback discarded.
+      if (done || terminating || child.exitCode !== null || child.signalCode !== null) return;
       terminating = true;
       void killProcessTree(child).finally(() => fin({
         rc: null,
@@ -463,13 +493,13 @@ export async function runHandover(
   const meta = {exit_code: res.rc, stderr: res.stderr.slice(-STDERR_TAIL_CHARS)};
 
   try {
-    return {fb: await fs.readFile(fbPath, 'utf-8'), meta};
+    return {fb: await readCapped(fbPath), meta};
   } catch {
     /* no feedback file — fall through to the {feedback} captured final message */
   }
   // #443 hybrid fallback: the agent didn't write the feedback file — use its captured final message.
   try {
-    const cap = await fs.readFile(capPath, 'utf-8');
+    const cap = await readCapped(capPath);
     if (cap.trim()) {
       log(`  ⓘ no feedback file ${fbName}; using the captured final message ${capName}`);
       return {fb: cap, meta};
@@ -581,7 +611,12 @@ export async function dispatchPending(
     const tid = str(item['id']);
     if (!tid || claimed.has(tid)) continue;
     claimed.add(tid); // claim immediately → no double-launch on an overlapping poll
-    jobs.push(pool.run(() => processOne(srv, item, codedir, cfg, claimed, log)));
+    // #1541: track the job so the CLI can await its /feedback + /unclaim cleanup on exit (before it closes
+    // the session). Deregister on settle so the set only ever holds genuinely in-flight work.
+    const job = pool.run(() => processOne(srv, item, codedir, cfg, claimed, log));
+    _inFlightJobs.add(job);
+    void job.finally(() => _inFlightJobs.delete(job));
+    jobs.push(job);
   }
   return jobs;
 }

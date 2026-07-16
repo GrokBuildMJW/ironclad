@@ -29,6 +29,30 @@ def test_spec_rejects_bad_kind_and_param():
         skillgen.SkillSpec(capability="x", description="d", params=[("n", "complex")])
 
 
+def test_spec_rejects_python_keyword_param_name():
+    # #1536: a reserved keyword passes str.isidentifier() but renders `def run(class: str)` → SyntaxError,
+    # which import-fails and is then silently dropped at discovery.
+    for kw in ("class", "def", "return", "None", "import", "lambda"):
+        with pytest.raises(ValueError):
+            skillgen.SkillSpec(capability="x", description="d", params=[(kw, "str")])
+
+
+def test_spec_rejects_duplicate_param_names():
+    # #1536: `def run(x: str, x: int)` → SyntaxError "duplicate argument 'x'"
+    with pytest.raises(ValueError):
+        skillgen.SkillSpec(capability="x", description="d", params=[("x", "str"), ("x", "int")])
+
+
+def test_spec_allows_soft_keyword_param_names():
+    # soft keywords (match/case/type/_) ARE valid Python parameter names — they must not be over-rejected.
+    spec = skillgen.SkillSpec(capability="x", description="d",
+                              params=[("match", "str"), ("type", "int"), ("_", "bool")])
+    assert [n for n, _ in spec.params] == ["match", "type", "_"]
+    for relpath, content in skillgen.render_tool(spec).items():
+        if relpath.endswith(".py"):
+            compile(content, relpath, "exec")   # the rendered run(...) is valid Python
+
+
 def test_capability_is_slugified():
     s = skillgen.SkillSpec(capability="CSV Summarize!", description="d")
     assert s.capability == "csv-summarize"
@@ -76,6 +100,17 @@ def test_write_refuses_overwrite_then_force(tmp_path):
         skillgen.write_scaffold(spec, tmp_path)
     # force overwrites cleanly
     assert skillgen.write_scaffold(spec, tmp_path, force=True)
+
+
+def test_write_scaffold_refuses_atomically_leaving_nothing_partial(tmp_path):
+    # #1537: a conflict on a LATER target must refuse BEFORE any earlier target is written — no half-scaffold.
+    spec = skillgen.SkillSpec(capability="foo", description="d", kind="tool")
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "test_foo.py").write_text("pre-existing", encoding="utf-8")   # the later target
+    with pytest.raises(FileExistsError):
+        skillgen.write_scaffold(spec, tmp_path)                       # force=False
+    assert not (tmp_path / "skills" / "foo.py").exists()              # the earlier target was NOT written
+    assert (tmp_path / "tests" / "test_foo.py").read_text(encoding="utf-8") == "pre-existing"  # untouched
 
 
 def test_cli_writes_a_playbook(tmp_path):

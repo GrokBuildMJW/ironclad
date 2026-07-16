@@ -11,6 +11,7 @@ from __future__ import annotations
 import importlib.util
 from pathlib import Path
 
+from mpr import i18n
 from mpr.registry.loader import PanelRegistry
 from mpr.registry.resolve import resolve_policy
 from mpr.registry.schema import ProviderPolicy
@@ -44,6 +45,21 @@ def test_each_role_has_nonempty_lens_prompt():
         assert panel.roles  # non-empty panel
         for role in panel.roles:
             assert role.lens_prompt.strip(), f"{dom}/{role.role} has an empty lens_prompt"
+
+
+def test_every_start_panel_role_resolves_a_german_lens():
+    resolved = 0
+    reg = _registry()
+    for dom in _EXPECTED:
+        panel = reg.resolve(dom)
+        assert panel is not None
+        for role in panel.roles:
+            german_lens = i18n.role_lens(panel.domain, role.role, role.lens_prompt, "de")
+            assert isinstance(german_lens, str)
+            assert german_lens.strip(), f"{dom}/{role.role} has an empty German lens_prompt"
+            assert german_lens != role.lens_prompt, f"{dom}/{role.role} fell back to English"
+            resolved += 1
+    assert resolved == 23
 
 
 def test_risk_assessment_slug_is_binding():

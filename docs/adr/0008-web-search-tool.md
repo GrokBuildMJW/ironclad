@@ -1,8 +1,8 @@
 # ADR-0008 — Web search as a vendor-neutral adapter seam, trust-gated
 
-- **Status:** Accepted — implemented under epic #505. For what ships see [`web-search.md`](../web-search.md) + [`status.md`](../status.md).
+- **Status:** Accepted. For what ships see [`web-search.md`](../web-search.md) + [`status.md`](../status.md).
 - **Date:** 2026-06-26
-- **Context sources:** the clean-room web-search spec (4 building blocks: tool-def, prompt, renderer, provider-adapter), a code-grounded integration audit of the existing engine, and a C0 adversarial review that surfaced four operator decisions.
+- **Context sources:** the clean-room web-search spec (4 building blocks: tool-def, prompt, renderer, provider-adapter), a code-grounded integration audit of the existing engine, and an adversarial review that surfaced four operator decisions.
 
 ## Context
 
@@ -13,7 +13,7 @@ configured), no domain filters, no structured output, and — a verified gap —
 domain filters, structured results, mandatory sources, a progress indicator, and a trust gate — while
 keeping `core/` standalone, secret-free, vendor-neutral and English-only.
 
-The C0 review left four decisions to the operator; they were settled as below.
+The review left four decisions to the operator; they were settled as below.
 
 ## Decisions
 
@@ -35,7 +35,7 @@ meaningful wildcard surface.
 `urllib.request` (the established `core/` precedent), not httpx/requests, so the standalone wheel
 stays pydantic-only. All vendor literals are confined to that one module.
 
-**D4 — Native search is local-only.** Under `server` mode (the Spark) `web_search` falls back to the
+**D4 — Native search is local-only.** Under `server` mode `web_search` falls back to the
 CLI-delegate; the native HTTP adapter runs only on a local setup. This avoids new outbound egress
 from a sovereign deployment and keeps the secret on the host that actually searches.
 

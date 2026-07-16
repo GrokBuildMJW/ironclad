@@ -15,7 +15,7 @@ its own runner: it **resolves to `server` or `local`** at boot from the `base_ur
 |--------------|-------------------------------|----------------|-------------|--------|
 | **`server`** (engine code default) | the model host (e.g. a GPU server, containerized) | local to that host | — (in-engine only; external agents deferred) | **byte-identical to a no-provider deployment** |
 | **`local`** | natively on the user's machine (the engine + agents run here) | **remote** over the network (the model host keeps the GPU model) | local subprocess (`claude --print`) | engine + agents co-located on the user's machine |
-| **`auto`** (desktop launcher default) | derived at boot from `base_url` | — | — | a **loopback** `base_url` ⇒ `server` (fully in-box), a **remote** `base_url` ⇒ `local`; so a fresh default install boots without baking a model host into the repo (INSTALL-1) |
+| **`auto`** (desktop launcher default) | derived at boot from `base_url` | — | — | a **loopback** `base_url` ⇒ `server` (fully in-box), a **remote** `base_url` ⇒ `local`; so a fresh default install boots without baking a model host into the repo |
 
 **Two fixed poles, regardless of the value:** the **model and the _Cold_ memory (Mem0) always live on the
 model host** (both are GPU-/LLM-coupled — Mem0's embedder/graph extraction run there), and the **terminal
@@ -47,7 +47,7 @@ silently degrading when the mode can't be honored:
   is remote, then applies that mode's rules above (so an `auto`→`local` install still needs a reachable
   CLI). This is the desktop launcher's default: it ships a loopback `base_url`, so a fresh install boots
   in-engine, and pointing `GX10_BASE_URL` at a remote model switches it to the LAN-offload `local` topology
-  — no host baked into the repo (INSTALL-1).
+  — no host baked into the repo.
 - An unknown value → fails closed.
 
 **`setup.type` is the single boot control for dispatcher activation.** Whether the provider dispatcher

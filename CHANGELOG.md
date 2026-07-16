@@ -26,6 +26,11 @@ Released versions are listed below.
 
 ### Fixed
 
+- **Bounded server-side edit reads (#1498):** `edit_file` now shares the #1488 byte-bounded full-text
+  reader on its read-modify-write path, refusing a multi-GB target before allocation while preserving complete
+  under-cap content and newline normalization. The model-facing `review(paths=...)` reader and user-project
+  vault document scanner use the same bound; `edit_file` remains server-side only with no Ink twin.
+
 - **Release hygiene:** raised the build-system `setuptools` floor to `>=77` to match the PEP 639 SPDX
   `license` metadata the package uses, and corrected public documentation — the MPR README now reflects MPR as
   an always-on core built-in (default on; no separate deploy step) instead of the retired loadable-plugin flow.

@@ -14,7 +14,8 @@ dispatch, reconcile with the real completion-token cost afterwards.
 """
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor
+from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Semaphore
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
@@ -329,25 +330,37 @@ class ProviderDispatcher:
             for d in cli:
                 results[d.index] = self._unroutable(d.index, "no-cli-runner")
             return
-        sems: Dict[str, Semaphore] = {}
+        # #1562: one executor PER PROVIDER (sized to that provider's cap) so a saturated provider never
+        # consumes threads an idle provider needs; a shared gate enforces the global max_agents cap fairly
+        # across providers (blocking on the GLOBAL cap is the intended limit — not per-provider head-of-line).
+        by_provider: Dict[str, list] = defaultdict(list)
         for d in cli:
-            pid = d.provider_id
-            if pid not in sems:
-                cap = plan_pool_concurrency(len(cli), self._max_agents, by_id[pid].rate_limit.max_concurrent)
-                sems[pid] = Semaphore(cap)
+            by_provider[d.provider_id].append(d)
+        gate = Semaphore(max(1, int(self._max_agents)))
 
         def _do(d):
             spec = by_id[d.provider_id]
-            try:                                       # isolate EVERYTHING (runner + _attach) — pool.map re-raises
-                with sems[spec.provider_id]:
+            try:
+                with gate:
                     base = self._runner(spec, items[d.index], effort=reqs[d.index].effort, max_tokens=d.est_max_tokens)
                 return d.index, self._attach(base, spec, d, reqs[d.index], spilled=False)
-            except Exception as e:  # noqa: BLE001 — one bad CLI call ≠ batch failure, never throws out of dispatch()
+            except Exception as e:  # noqa: BLE001 — one bad CLI call ≠ batch failure
                 return d.index, self._unroutable(d.index, repr(e))
 
-        with ThreadPoolExecutor(max_workers=self._max_agents, thread_name_prefix="cli") as pool:
-            for idx, res in pool.map(_do, cli):
+        pools = []
+        futures = []
+        try:
+            for pid, ds in by_provider.items():
+                cap = plan_pool_concurrency(len(cli), self._max_agents, by_id[pid].rate_limit.max_concurrent)
+                pool = ThreadPoolExecutor(max_workers=max(1, min(cap, len(ds))), thread_name_prefix="cli")
+                pools.append(pool)
+                futures.extend(pool.submit(_do, d) for d in ds)
+            for f in as_completed(futures):
+                idx, res = f.result()
                 results[idx] = res
+        finally:
+            for pool in pools:
+                pool.shutdown(wait=True)
 
     def _spill_failed_to_local(self, results, decisions, reqs, items, ctxs, by_id, system, temperature, think) -> None:
         if self._workers is None:

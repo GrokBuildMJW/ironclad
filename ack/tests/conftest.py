@@ -4,13 +4,19 @@ Puts ``core/`` on ``sys.path`` so the tests can ``import ack`` (and ``ack.lodest
 regardless of the invocation directory.
 """
 import sys
+import os
 import copy
 import base64
+import shutil
 import subprocess
 from collections import deque
 from pathlib import Path
 
 import pytest
+
+collect_ignore = []
+if not os.environ.get("IRONCLAD_REAL_SANDBOX_TEST") or shutil.which("bwrap") is None:
+    collect_ignore = ["test_real_bwrap_sandbox.py"]
 
 # ack/tests/conftest.py → parents[2] == core/
 CORE_DIR = Path(__file__).resolve().parents[2]
@@ -50,6 +56,7 @@ _GX10_STATE_ATTRS = (
     "AUDIT_SCOPE",
     "_AUDIT_DEGRADED",
     "SANDBOX",
+    "_SANDBOX_BEST_EFFORT_WARNED",
     "MULTI_TENANT",
     "TOOLING_ENVELOPE_POLICY",
     "ALERT_ENABLED",
@@ -123,6 +130,7 @@ _GX10_STATE_ATTRS = (
     "FRAMING_NOTES_ENABLED",
     "AUTOMATION_DECOUPLED",
     "HEARTBEAT_STALL_S",
+    "CLAIM_LEASE_TTL_S",
     "_NOTIFY_CONSUMER",
     "_QUALITY_BREAKER",
     "_LAST_VERDICT",

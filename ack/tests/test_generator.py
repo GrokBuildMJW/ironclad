@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import json
 from pathlib import Path
 
@@ -392,3 +393,67 @@ def test_kind_prompt_assembles_in_de_with_substituted_input(tmp_path):
     assert "MARKER-XYZ" in out_de
     assert "MARKER-XYZ" in out_en
     assert out_de != out_en  # the German overlay is a real translation, not the source verbatim
+
+
+# ── #1533: per-context escaping so an operator description can't break the generated syntax ────────────
+from ack.playbook import _coerce_scalar, parse_frontmatter   # the SHIPPED frontmatter consumer
+
+_NASTY = 'Summarize "VIP" rows'   # unescaped, this breaks quoted Python/JSON
+_UNICODE = 'Résumé "café" — 100%'  # non-ASCII + quotes; must round-trip literally (ensure_ascii=False)
+
+
+def test_tojson_renders_valid_python_json_and_round_trips_through_the_frontmatter_reader():
+    for value in (_NASTY, _UNICODE):
+        ctx = {"description": value}
+        # a quoted-Python / quoted-JSON sink drops its hand-written quotes; tojson supplies a full quoted scalar
+        line = g.render_str('    "description": {{description|tojson}},', ctx)
+        ast.parse("_ = {\n" + line + "\n}")                   # a valid Python dict entry (compiles)
+        row = g.render_str('{"notes": {{description|tojson}}}', ctx)
+        assert json.loads(row)["notes"] == value             # a valid JSON object, round-trips
+        # the YAML frontmatter scalar must round-trip through the SHIPPED reader (_coerce_scalar), not just
+        # be a byte string — a raw `s[1:-1]` strip would corrupt the escaped quotes (the Grok-caught defect)
+        yaml_line = g.render_str("description: {{description|tojson}}", ctx)
+        assert _coerce_scalar(yaml_line.split(":", 1)[1].strip()) == value
+
+
+def test_tojson_is_byte_identical_for_an_ordinary_value():
+    # moving the quotes into the filter must not change output for a plain description (no drift on the paved road)
+    ctx = {"description": "Summarize rows"}
+    assert g.render_str('    "description": {{description|tojson}},', ctx) == '    "description": "Summarize rows",'
+
+
+def test_render_filterless_token_is_byte_identical():
+    # the escaping is opt-in per placeholder — a filterless token behaves exactly as before
+    assert g.render_str("x {{description}} y", {"description": _NASTY}) == "x " + _NASTY + " y"
+
+
+def test_nasty_description_renders_a_syntactically_valid_case_scaffold(tmp_path):
+    # the end-to-end repro: a quoted description must produce a compilable skill and a parseable MAPPING row
+    parser = g.build_parser()
+    args = parser.parse_args(
+        ["--domain", "audit-demo", "--case", "vip-rows", "--description", _NASTY, "--prefix", "p"])
+    ctx = g.build_context(args)
+    out = tmp_path / "lib"
+    res = g.generate(ctx, template_root=g.template_root_for(args), output_root=out)
+    assert res.ok
+    skill = next(out.rglob("skills/*.py"))
+    ast.parse(skill.read_text(encoding="utf-8"))              # was: SyntaxError on the unescaped quote
+    gap = next(out.rglob("*-gap-tracking.md"))
+    rows = [ln.strip() for ln in gap.read_text(encoding="utf-8").splitlines() if ln.strip().startswith('{"key"')]
+    assert rows, "expected a MAPPING JSON row"
+    for r in rows:
+        assert json.loads(r)["notes"] == _NASTY              # was: JSONDecodeError on the unescaped quote
+
+
+def test_nasty_description_renders_a_valid_prompt_scaffold(tmp_path):
+    # the prompt (YAML frontmatter) sink: parse_prompt must recover the exact description, quotes and all
+    from ack.prompt import parse_prompt
+    parser = g.build_parser()
+    args = parser.parse_args(
+        ["--domain", "writing", "--case", "blog", "--description", _NASTY, "--kind", "prompt", "--prefix", "w"])
+    out = tmp_path / "lib"
+    g.generate(g.build_context(args), template_root=g.template_root_for(args), output_root=out)
+    skill_md = next(out.rglob("SKILL.md"))
+    meta, _ = parse_frontmatter(skill_md.read_text(encoding="utf-8"))
+    assert meta["description"] == _NASTY                      # was: corrupted by the literal-strip reader
+    assert parse_prompt(skill_md).description == _NASTY       # and through the full prompt parser

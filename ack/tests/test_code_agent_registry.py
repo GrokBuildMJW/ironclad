@@ -18,6 +18,7 @@ mechanism without baking a specific private backend into the public suite (the r
 """
 from __future__ import annotations
 
+import os
 import sys
 import time
 import types
@@ -233,7 +234,8 @@ def test_schema_enum_tracks_config_added_agent(monkeypatch):
 
 
 # ── _do_launch (autopilot): byte-identical Claude shape + feedback path for templated agents ─────
-def _capture_launch_argv(monkeypatch, tmp_path, agent, *, frontmatter, reg_cfg=None, cfg=None):
+def _capture_launch_argv(monkeypatch, tmp_path, agent, *, frontmatter, reg_cfg=None, cfg=None,
+                         return_popen_kwargs=False):
     gx10._apply_config(cfg if cfg is not None else gx10._code_defaults())
     gx10.STORE = None
     # _do_launch spawns a monitor thread that _ui_prints a ✓ on completion; on a cp1252 test console
@@ -256,11 +258,14 @@ def _capture_launch_argv(monkeypatch, tmp_path, agent, *, frontmatter, reg_cfg=N
 
     def _fake_popen(a, *args, **kw):
         captured["argv"] = list(a)
+        captured["kwargs"] = kw
         return _FakeProc()
 
     monkeypatch.setattr(gx10.subprocess, "Popen", _fake_popen)
     gx10._autopilot_reserve()
     gx10._do_launch(tid, agent)
+    if return_popen_kwargs:
+        return captured.get("argv"), tid, captured.get("kwargs")
     return captured.get("argv"), tid
 
 
@@ -317,6 +322,15 @@ def test_do_launch_default_claude_keeps_stream_plumbing(tmp_path, monkeypatch):
     assert "--output-format" in argv and "stream-json" in argv
 
 
+def test_do_launch_starts_child_in_own_process_group(tmp_path, monkeypatch):
+    _argv, _tid, popen_kwargs = _capture_launch_argv(
+        monkeypatch, tmp_path, "OPUS", frontmatter="---\nto: OPUS\n---\nho", return_popen_kwargs=True,
+    )
+    expected_creationflags = gx10.subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
+    assert popen_kwargs["creationflags"] == expected_creationflags
+    assert popen_kwargs["start_new_session"] is (os.name != "nt")
+
+
 def test_do_launch_streams_log_before_child_exits(tmp_path, monkeypatch):
     code = "import time; print('coder-live-line', flush=True); time.sleep(5)"
     _tid, proc, logfile = _launch_python_log_child(monkeypatch, tmp_path, code)
@@ -348,6 +362,55 @@ def test_do_launch_drainer_survives_invalid_stdout_bytes(tmp_path, monkeypatch):
     try:
         assert proc.wait(timeout=2) == 0
         assert _eventually(lambda: logfile.exists() and "\ufffd\ufffd partial" in logfile.read_text(encoding="utf-8"))
+    finally:
+        _stop_proc(proc)
+
+
+def test_do_launch_timeout_kills_child_releases_slot_and_surfaces_failure(tmp_path, monkeypatch):
+    surfaced = []
+    monkeypatch.setattr(gx10, "_code_agent_timeout_s", lambda: 0.3)
+    monkeypatch.setattr(gx10, "_surface_coder_result", lambda *args: surfaced.append(args))
+    tid, proc, _logfile = _launch_python_log_child(monkeypatch, tmp_path,
+                                                   "import time; time.sleep(30)")
+    try:
+        assert _eventually(lambda: proc.poll() is not None and gx10._autopilot_active() == 0
+                           and tid not in gx10._AUTOPILOT_PROCS and bool(surfaced), timeout=3)
+        assert surfaced[0][2] != 0
+        gx10._autopilot_reserve()
+        assert gx10._autopilot_active() == 1
+        gx10._autopilot_release()
+    finally:
+        _stop_proc(proc)
+
+
+def test_do_launch_fast_child_surfaces_success_and_releases_slot(tmp_path, monkeypatch):
+    surfaced = []
+    monkeypatch.setattr(gx10, "_code_agent_timeout_s", lambda: 2)
+    monkeypatch.setattr(gx10, "_surface_coder_result", lambda *args: surfaced.append(args))
+    tid, proc, logfile = _launch_python_log_child(monkeypatch, tmp_path, "print('fast-coder')")
+    try:
+        assert _eventually(lambda: gx10._autopilot_active() == 0 and tid not in gx10._AUTOPILOT_PROCS
+                           and bool(surfaced))
+        assert proc.poll() == 0
+        assert surfaced[0][2] == 0
+        assert _eventually(lambda: logfile.exists() and logfile.read_text(encoding="utf-8") == "fast-coder\n")
+    finally:
+        _stop_proc(proc)
+
+
+def test_do_launch_caps_newline_free_log_while_draining_to_exit(tmp_path, monkeypatch):
+    monkeypatch.setattr(gx10, "_LOG_CAP_BYTES", 128)
+    code = "import sys; sys.stdout.write('x' * 4096); sys.stdout.flush()"
+    tid, proc, logfile = _launch_python_log_child(monkeypatch, tmp_path, code)
+    try:
+        assert proc.wait(timeout=2) == 0
+        assert _eventually(lambda: gx10._autopilot_active() == 0 and tid not in gx10._AUTOPILOT_PROCS)
+        assert _eventually(lambda: logfile.exists() and "log truncated at 8 MiB" in
+                           logfile.read_text(encoding="utf-8"))
+        text = logfile.read_text(encoding="utf-8")
+        assert text.count("log truncated at 8 MiB") == 1
+        assert text.startswith("x" * 128)
+        assert len(text) < 256
     finally:
         _stop_proc(proc)
 
@@ -571,9 +634,15 @@ def test_run_handover_precedence_override_vs_server_spec(tmp_path, monkeypatch):
         captured["argv"] = argv
         return _P()
 
+    import io as _io
+
     class _FakePopen:
         def __init__(self, argv, **kw):
             self.returncode = _fake_run(argv, **kw).returncode
+            self.stderr = _io.BytesIO(b"")  # #1502: reader thread drains a binary stderr pipe
+
+        def wait(self, timeout=None):
+            return self.returncode
 
         def communicate(self, timeout=None):
             return None, ""

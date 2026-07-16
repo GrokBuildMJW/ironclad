@@ -130,10 +130,25 @@ def _pep604_handler(a: str, b: int | None = None) -> None:
 
 def test_auto_schema_pep604_optional_not_required():
     # ACK-1 (#503): `X | None` (types.UnionType) must be treated like Optional[X] — not a bare-string
-    # required fallback. Pre-fix the schema gave the public SDK a wrong model-facing shape for `b`.
+    # required fallback. #1535: `b` is optional because it has a DEFAULT (not because it is None-typed), and
+    # its value schema keeps the null arm (matching pydantic's Optional rendering) so None stays valid.
     schema = derive_tool_schema(_pep604_handler)
-    assert schema["required"] == ["a"]                        # b is optional (X | None), not required
-    assert schema["properties"]["b"] == {"type": "integer"}  # the non-None arm, not {"type": "string"}
+    assert schema["required"] == ["a"]                        # b is optional — it has a default
+    assert schema["properties"]["b"] == {"anyOf": [{"type": "integer"}, {"type": "null"}]}
+
+
+def _required_optional_handler(limit: int | None) -> None:
+    # #1535: Optional-typed but NO default → still REQUIRED (module-level for get_type_hints resolution).
+    ...
+
+
+def test_auto_schema_optional_without_default_is_required():
+    # #1535: a parameter with no default is REQUIRED even when typed `int | None` — requiredness follows the
+    # signature, not the annotation. Pre-fix the null-typed annotation dropped `limit` from `required`, so
+    # the model could emit {} and dispatch would crash (TypeError: missing 1 required positional argument).
+    schema = derive_tool_schema(_required_optional_handler)
+    assert schema["required"] == ["limit"]                                       # no default → required
+    assert schema["properties"]["limit"] == {"anyOf": [{"type": "integer"}, {"type": "null"}]}  # None valid
 
 
 class _Mode(str, Enum):

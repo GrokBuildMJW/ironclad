@@ -168,3 +168,29 @@ def test_failed_leaving_save_aborts_switch(_engine):
     r = gx10._switch_command(ag, "acme")
     assert r.startswith("[switch] failed")
     assert gx10._ACTIVE_PROJECT.id == "default"
+
+
+def test_failed_target_config_rederive_restores_runtime_snapshot(_engine, monkeypatch):
+    wd = _engine
+    gx10._REGISTRY.register("acme", str(wd / "acme"))
+    base = gx10._code_defaults()
+    base["context"]["rag_enabled"] = True
+    gx10._BASE_CFG = base
+    gx10._apply_config(base)
+    gx10._EFFECTIVE_CFG = base
+    original_apply = gx10._apply_config_reconfiguration
+
+    def fail_for_target(cfg, *, strict):
+        if pc.current().project_id == "acme":
+            gx10.RAG_ENABLED = False
+            raise RuntimeError("target reconfiguration failed")
+        return original_apply(cfg, strict=strict)
+
+    monkeypatch.setattr(gx10, "_apply_config_reconfiguration", fail_for_target)
+    result = gx10._switch_command(FakeGx(), "acme")
+
+    assert result.startswith("[switch] failed")
+    assert gx10._ACTIVE_PROJECT.id == "default"
+    assert pc.current().project_id == "default"
+    assert gx10._EFFECTIVE_CFG == base
+    assert gx10.RAG_ENABLED is True

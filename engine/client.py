@@ -7,7 +7,7 @@
 
 > **Connects exactly like the CLI connects to the model: plain LAN HTTP, this side
 > initiates.** The orchestrator (reasoning + state) lives on the server
-> (:mod:`core.engine.server`, on the Spark). This client holds nothing but the
+> (:mod:`engine.server`, on the Spark). This client holds nothing but the
 > conversation REPL and the *code locality*: project code stays on this machine, and
 > the code-agents (``claude --print``) run HERE, against the local working copy —
 > never on the server.
@@ -80,8 +80,12 @@ CLAUDE_PERMISSION_MODE = os.environ.get("GX10_CLAUDE_PERMISSION_MODE", _SAFE_PER
 DEFAULT_AGENT_CMD = ("{bin} --model {model} --effort {effort} "
                      "--permission-mode {permission} --print {prompt}")
 _CODER_TIMEOUT_DEFAULT = 1800.0
-_TOOL_RESULT_POST_ATTEMPTS = 4
 _TOOL_RESULT_POST_BACKOFF_S = 0.5
+_TOOL_RESULT_POST_DEADLINE_S = float(os.environ.get("GX10_TOOL_RESULT_DEADLINE_S") or 150.0)
+_TOOL_RESULT_POST_MAX_BACKOFF_S = 5.0
+#: Cap on the coder-controlled feedback / capture result file. Feedback is a short summary; the file is
+#: read cap+1 bytes at a time so a coder that writes a multi-GB file can never OOM the client. Env: GX10_FEEDBACK_MAX_BYTES.
+_FEEDBACK_MAX_BYTES = int(os.environ.get("GX10_FEEDBACK_MAX_BYTES") or 1024 * 1024)
 #: #449 (review B round 4): the RAW client-side overrides (None when unset) — an EXPLICIT
 #: ``GX10_AGENT_CMD``/``GX10_CLAUDE_BIN`` is the documented single-agent BYO path and must WIN over the
 #: server-resolved registry spec (otherwise the default server's OPUS/SONNET template would make the
@@ -106,9 +110,58 @@ def _strip_confirm(message: str) -> Tuple[str, bool]:
 
 
 _STDERR_TAIL_CHARS = 4000
+_MAX_CAPTURE_BYTES = 256 * 1024
+_TRUNCATED_MARKER = "…(truncated)…"
+
+
+class _BoundedTail:
+    """Retain only the newest byte-accurate slice of a subprocess stream."""
+
+    def __init__(self) -> None:
+        self._tail = b""
+        self._truncated = False
+
+    def append(self, chunk: bytes) -> None:
+        if len(chunk) >= _MAX_CAPTURE_BYTES:
+            self._tail = chunk[-_MAX_CAPTURE_BYTES:]
+            self._truncated = True
+            return
+        overflow = len(self._tail) + len(chunk) - _MAX_CAPTURE_BYTES
+        if overflow > 0:
+            self._tail = self._tail[overflow:] + chunk
+            self._truncated = True
+        else:
+            self._tail += chunk
+
+    def text(self) -> str:
+        retained = (_TRUNCATED_MARKER.encode("utf-8") + self._tail
+                    if self._truncated else self._tail)
+        return retained.decode("utf-8", errors="replace")
+
+
+def _drain_stderr(pipe, tail: _BoundedTail) -> None:
+    """Continuously drain a binary stderr pipe into a bounded rolling tail."""
+    try:
+        while True:
+            chunk = pipe.read(65536)
+            if not chunk:
+                break
+            tail.append(chunk)
+    except (ValueError, OSError):
+        pass  # A concurrent close / broken pipe (EIO) during teardown is already a completed drain — the
+              # daemon reader must never raise (it would print a stray traceback to the process stderr).
+    finally:
+        try:
+            pipe.close()
+        except (ValueError, OSError):
+            pass
+
+
 #: CLI-3 (#503): serializes the check-then-claim in dispatch_pending so an overlapping /auto poll + /work
 #: (or two poll ticks) can't both claim+launch the same handover.
 _CLAIM_LOCK = threading.Lock()
+# Client-run claim lease renewal; the server's default lease TTL is 120 seconds.
+_CLAIM_RENEW_INTERVAL_S = 30.0
 # #449: the client-side OPUS/SONNET→model table is retired. The server now resolves the agent's
 # full spec (bin/cmd_template/model/effort/permission) from the config-driven registry and ships it
 # in the /pending item; this client only renders what it is sent (see _run_handover).
@@ -349,8 +402,9 @@ class Server:
 
     def _run_passthrough_tool(self, frame: str) -> None:
         """Execute a passed-through code-tool LOCALLY and post the result to the server.
-        ``frame`` is ``TR{json}`` with the json carrying id/name/args. Transient result-post
-        failures are retried with bounded backoff; permanent 4xx rejections are dropped."""
+        ``frame`` is ``TR{json}`` with the json carrying id/name/args. Results are resent with
+        capped backoff, reopening an expired session, until delivered, stale-dropped on 410,
+        or the result-post deadline expires."""
         try:
             payload = json.loads(frame[2:]) if frame.startswith("TR") else json.loads(frame)
             rid, name, args = payload["id"], payload["name"], payload.get("args") or {}
@@ -372,22 +426,35 @@ class Server:
                                    sandbox_policy=sandbox_policy)
         except Exception as e:  # noqa: BLE001 — never break the stream on a tool error
             result = f"ERROR: {e!r}"
-        for attempt in range(_TOOL_RESULT_POST_ATTEMPTS):
+        deadline = time.monotonic() + _TOOL_RESULT_POST_DEADLINE_S
+        backoff = _TOOL_RESULT_POST_BACKOFF_S
+        while True:
             try:
                 self._req("POST", "/tool-result", {"id": rid, "result": result})
                 return
             except urllib.error.HTTPError as e:
-                if 400 <= e.code < 500:
-                    return  # permanent (stale / bridge moved on) — drop, matching the Ink client
-                # 5xx is transient: fall through to the bounded retry.
+                if e.code == 410:
+                    return  # stale bridge — the server moved on; stop resending
+                if e.code in (401, 403):
+                    # The session expired mid-turn. Reopen it so the completed result can still reach
+                    # the bridge before its timeout; a failed reopen is retried with the result post.
+                    try:
+                        self.session_open()
+                    except Exception:  # noqa: BLE001 — a failed reopen just means we retry again
+                        pass
+                elif 400 <= e.code < 500:
+                    return  # other client errors are not recoverable — drop
+                # 5xx is transient: fall through to the capped retry.
             except OSError:
                 # transient transport failure — retry below. OSError (not just URLError) so a read-phase
                 # socket.timeout / ConnectionResetError on resp.read() (NOT a URLError subclass) can't escape
                 # and break the stream (the very failure this retry exists to absorb). HTTPError is caught
                 # above, so this never swallows an HTTP status.
                 pass
-            if attempt + 1 < _TOOL_RESULT_POST_ATTEMPTS:
-                time.sleep(_TOOL_RESULT_POST_BACKOFF_S * (attempt + 1))
+            if time.monotonic() >= deadline:
+                return
+            time.sleep(backoff)
+            backoff = min(backoff * 2, _TOOL_RESULT_POST_MAX_BACKOFF_S)
 
     def cancel(self) -> Dict[str, Any]:
         """Abort the turn currently running on the server (sets its cancel event)."""
@@ -532,6 +599,15 @@ def _read_input(prompt: str) -> str:
     return "\n".join(lines)
 
 
+def _read_capped(path: Path, cap: int = _FEEDBACK_MAX_BYTES) -> str:
+    """Read at most *cap* bytes from a coder-controlled result file (a cap+1 probe bounds the allocation,
+    so a multi-GB feedback file cannot OOM the client). An oversized file is truncated — the pipeline-
+    driving `status:` line is the FIRST line, so a tail truncation is safe. Decodes UTF-8 fail-soft."""
+    with open(path, "rb") as fh:
+        raw = fh.read(cap + 1)
+    return raw[:cap].decode("utf-8", "replace")
+
+
 def _run_handover(item: Dict[str, Any], codedir: Path, log=print) -> Tuple[Optional[str], Dict[str, Any]]:
     """Run a single staged handover LOCALLY with ``claude --print`` and return the
     feedback text it wrote (or None if it produced none).
@@ -632,7 +708,7 @@ def _run_handover(item: Dict[str, Any], codedir: Path, log=print) -> Tuple[Optio
         # #455: capture stderr (and still surface it) so the server can classify a budget/quota
         # exhausted run as `agent-unavailable` and fail over instead of retrying forever.
         popen_args = dict(cwd=str(launch_cwd), env=env, stdin=subprocess.DEVNULL,
-                          stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace")
+                          stderr=subprocess.PIPE)
         if os.name == "nt":
             popen_args["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
         else:
@@ -642,8 +718,11 @@ def _run_handover(item: Dict[str, Any], codedir: Path, log=print) -> Tuple[Optio
         log(f"  ✗ code-agent binary '{argv[0] if argv else CLAUDE_BIN}' not found "
             f"(set GX10_CLAUDE_BIN / GX10_AGENT_CMD) — handover {tid} skipped")
         return None, {"exit_code": None, "stderr_tail": "binary-not-found"}
+    tail = _BoundedTail()
+    reader = threading.Thread(target=_drain_stderr, args=(proc.stderr, tail), daemon=True)
+    reader.start()
     try:
-        _stdout, stderr = proc.communicate(timeout=timeout_s)
+        proc.wait(timeout=timeout_s)
     except subprocess.TimeoutExpired:
         # A hung coder holds its pool claim forever (#1491). Kill the whole tree and return the run signal:
         # the `timeout …` stderr matches no exhausted pattern → classified `task-failed` (a normal failure,
@@ -651,27 +730,48 @@ def _run_handover(item: Dict[str, Any], codedir: Path, log=print) -> Tuple[Optio
         # the breaker / failing over. Any feedback the coder wrote in its last instant is intentionally
         # dropped — a killed coder's partial result is not trusted as complete.
         proc_tree.kill_process_tree(proc)
-        proc_tree.drain_after_kill(proc, 2.0)
+        reader.join(2.0)
+        try:
+            proc.wait(timeout=2.0)
+        except subprocess.TimeoutExpired:
+            try:
+                proc.kill()
+            except Exception:  # noqa: BLE001 — the process may already have exited
+                pass
+            try:
+                proc.wait(timeout=2.0)
+            except subprocess.TimeoutExpired:
+                pass  # The daemon reader and OS process cleanup remain fail-soft after the bounded reap.
         log(f"  ✗ code-agent {tid} timed out after {timeout_s:.0f}s — killed")
         return None, {"exit_code": None, "stderr_tail": f"timeout after {timeout_s:.0f}s"}
+    reader.join(2.0)
     rc = proc.returncode
-    stderr = stderr or ""
+    stderr = tail.text()
     if stderr.strip():
         log(stderr.rstrip())                                  # keep the agent's stderr visible
     meta = {"exit_code": rc, "stderr_tail": stderr[-_STDERR_TAIL_CHARS:]}
 
     if fb_path.exists():
-        return fb_path.read_text(encoding="utf-8"), meta
+        return _read_capped(fb_path), meta
     # #443 hybrid fallback: the agent didn't write the feedback file — use its captured final message
     # (`-o {feedback}`, written THIS run since we unlinked stale copies above) if present, so a forgotten
     # feedback file no longer yields a silent no-feedback retry.
     if cap_path.exists():
-        text = cap_path.read_text(encoding="utf-8")
+        text = _read_capped(cap_path)
         if text.strip():
             log(f"  ⓘ no feedback file {fb_path.name}; using the captured final message {cap_path.name}")
             return text, meta
     log(f"  ⚠ agent exited (exit {rc}) without a feedback file {fb_path.name} or a captured message")
     return None, meta
+
+
+def _renew_claim(srv: Server, tid: str, agent: str, stop: threading.Event) -> None:
+    """Best-effort lease renewal while a local coder owns the task."""
+    while not stop.wait(_CLAIM_RENEW_INTERVAL_S):
+        try:
+            srv.claim(tid, agent)
+        except Exception:   # noqa: BLE001 — lease loss must never interrupt the coder
+            pass
 
 
 def _process_one(srv: Server, codedir: Path, item: Dict[str, Any], claimed: set,
@@ -680,15 +780,22 @@ def _process_one(srv: Server, codedir: Path, item: Dict[str, Any], claimed: set,
     the task is UNclaimed so the next poll retries it. Returns True on a clean upload."""
     tid = item.get("id") or ""
     agent = (item.get("agent") or "OPUS").upper()
+    renew_stop: Optional[threading.Event] = None
+    renew_thr: Optional[threading.Thread] = None
     try:
         srv.claim(tid, agent)
     except Exception as e:  # noqa: BLE001 — an older/unreachable server must not block a working coder
         log(f"  ⚠ {tid}: /claim failed (continuing): {e}")
+    else:
+        renew_stop = threading.Event()
+        renew_thr = threading.Thread(target=_renew_claim, args=(srv, tid, agent, renew_stop), daemon=True)
+        renew_thr.start()
     try:
         fb, meta = _run_handover(item, codedir, log=log)
         # #455: ALWAYS report the run signal (even with no feedback) so the server can classify a
         # budget-exhausted run → trip the breaker + fail over on the next poll, instead of retrying
-        # the same out-of-budget agent forever.
+        # the same out-of-budget agent forever. The lease is renewed THROUGH the feedback upload so a
+        # slow post can't let it lapse into a double-run (#1525).
         res = srv.feedback(tid, agent, fb or "",
                            exit_code=meta.get("exit_code"), stderr=meta.get("stderr_tail", ""))
         cls = res.get("classification")
@@ -703,6 +810,14 @@ def _process_one(srv: Server, codedir: Path, item: Dict[str, Any], claimed: set,
         log(f"  ✗ {tid}: upload/network failed: {e}")
     except Exception as e:  # noqa: BLE001
         log(f"  ✗ {tid}: code-agent failed: {e!r}")
+    finally:
+        # #1525: stop AND join the lease-renewal thread BEFORE any /unclaim below, so an in-flight
+        # renewal /claim can never land after the release and re-stamp the task in_progress (which would
+        # wedge it until the lease TTL, blocking the immediate retry).
+        if renew_stop is not None:
+            renew_stop.set()
+        if renew_thr is not None:
+            renew_thr.join(timeout=5.0)
     try:
         srv.unclaim(tid)
     except Exception as e:  # noqa: BLE001 — reconciler/stall watchdog remain the backstop
@@ -928,7 +1043,7 @@ def repl(srv: Server, codedir: Path, max_agents: int = DEFAULT_MAX_AGENTS) -> No
                     else:
                         print("  [AUTO] was not active")
                 else:
-                    print(f"  [AUTO] {'AN' if auto_stop else 'AUS'}  |  /auto on / /auto off")
+                    print(f"  [AUTO] {'ON' if auto_stop else 'OFF'}  |  /auto on / /auto off")
             continue
         # kind in ("server", "turn") → to the orchestrator (a server command without / or a turn).
         # Stream so code-tools are passed through to us and run on the LOCAL filesystem.

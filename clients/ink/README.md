@@ -108,8 +108,8 @@ CLI flags (highest precedence): `--server`, `--codedir`, `--max-agents`, and
   a native terminal selection, and conhost's copy/reflow can corrupt the layout/scaling. This is a
   terminal limitation, not a renderer bug. *Workaround:* use **Windows Terminal** (or another modern
   terminal) and **hold `Shift` while dragging** to bypass the app's mouse capture for a native
-  selection + copy; `Ctrl+V` paste is unaffected. Shares the alt-buffer + mouse-tracking class with
-  issue #256 (the client-side teardown fix is tracked there).
+  selection + copy; `Ctrl+V` paste is unaffected. This shares the alt-buffer + mouse-tracking
+  behaviour with a known client-side teardown edge case that the client handles on its shutdown path.
 
 ## Develop
 

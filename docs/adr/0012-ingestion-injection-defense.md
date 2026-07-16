@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted — mandatory and fail-closed (#1464).
+Accepted — mandatory and fail-closed.
 
 ## Context
 

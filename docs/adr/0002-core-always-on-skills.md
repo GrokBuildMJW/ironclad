@@ -1,12 +1,12 @@
 # ADR-0002 — Skill / prompt / MPR engine as core, always-on
 
-- **Status:** Accepted (design) — implementation under epic #112 (sub-issues #107, #114, #115, #116). Records the design; not a claim it ships yet (see [`status.md`](../status.md)).
+- **Status:** Accepted (design) — implementation tracked separately. Records the design; not a claim it ships yet (see [`status.md`](../status.md)).
 - **Date:** 2026-06-21
-- **Context sources:** [ADR-0001](0001-skill-engine-and-library.md) (the #22 skill engine), `skills/mpr/` (the flag-gated plugin being de-plugined), `engine/server.py`+`gx10.py` (loading), `engine/messages.py` + `skills/mpr/i18n.py` (the two i18n layers), `plan_skill_libary.md`.
+- **Context sources:** [ADR-0001](0001-skill-engine-and-library.md) (the skill engine), `skills/mpr/` (the flag-gated plugin being de-plugined), `engine/server.py`+`gx10.py` (loading), `engine/messages.py` + `skills/mpr/i18n.py` (the two i18n layers), an internal research catalogue.
 
 ## Context
 
-The #22 skill engine shipped (v0.0.9) with its algorithms **already in core** (`ack.skillgen` / `ack.catalogue` / `ack.gate` / `ack.playbook` / `ack.registry`). But the **activation model** is plugin-shaped: discovery is gated on `GX10_PLUGINS_DIR`, MPR is a **flag-gated plugin** (`skills/mpr`, `GX10_MPR` off ⇒ no `CASE`/`run`, "byte-identical off"), and there is no always-on core home for built-in skills/prompts. Operator decision: the **skill engine, the prompt library/generator, and MPR** must be **core, always-on** capabilities (invoked via tools); MPR should **consume** the core engine, not carry its own infra. The open plugin surface stays for **3rd-party/user** skills only.
+The skill engine shipped (v0.0.9) with its algorithms **already in core** (`ack.skillgen` / `ack.catalogue` / `ack.gate` / `ack.playbook` / `ack.registry`). But the **activation model** is plugin-shaped: discovery is gated on `GX10_PLUGINS_DIR`, MPR is a **flag-gated plugin** (`skills/mpr`, `GX10_MPR` off ⇒ no `CASE`/`run`, "byte-identical off"), and there is no always-on core home for built-in skills/prompts. Operator decision: the **skill engine, the prompt library/generator, and MPR** must be **core, always-on** capabilities (invoked via tools); MPR should **consume** the core engine, not carry its own infra. The open plugin surface stays for **3rd-party/user** skills only.
 
 ## Decisions
 
@@ -22,16 +22,16 @@ The #22 skill engine shipped (v0.0.9) with its algorithms **already in core** (`
 
 | Existing | Strategy |
 |---|---|
-| `skills/mpr` (plugin, `GX10_MPR` boot-gated) | **MIGRATE → `skills/mpr`** (always-on built-in; flag → runtime `mpr.enabled` default on; consumes core) — #115. 382 tests green. |
+| `skills/mpr` (plugin, `GX10_MPR` boot-gated) | **MIGRATE → `skills/mpr`** (always-on built-in; flag → runtime `mpr.enabled` default on; consumes core). 382 tests green. |
 | `skills/mpr/skills/mpr_research.py` (plugin entry shim) | **DEPRECATE/remove** — replaced by core registration. |
-| `skills/mpr/i18n.py` + `locales/` | **MIGRATE → `ack.i18n`** (#107). |
-| `_load_plugins`/`_load_playbooks` + `GX10_PLUGINS_DIR` | **KEEP (3rd-party only)** + add always-on built-in loading (#114). |
-| `export_core.py` (bundles `skills/mpr` as flagship plugin) | **UPDATE** — ship MPR from `skills/` as a core built-in (#116). |
-| install/deploy scripts (copy `skills/mpr`) + docs (plugin-api/status/README, `GX10_MPR`) | **UPDATE** + `GX10_MPR` **deprecation note** + migration path `GX10_MPR → mpr.enabled` (#116). |
+| `skills/mpr/i18n.py` + `locales/` | **MIGRATE → `ack.i18n`**. |
+| `_load_plugins`/`_load_playbooks` + `GX10_PLUGINS_DIR` | **KEEP (3rd-party only)** + add always-on built-in loading. |
+| the private export pipeline (bundles `skills/mpr` as flagship plugin) | **UPDATE** — ship MPR from `skills/` as a core built-in. |
+| install/deploy scripts (copy `skills/mpr`) + docs (plugin-api/status/README, `GX10_MPR`) | **UPDATE** + `GX10_MPR` **deprecation note** + migration path `GX10_MPR → mpr.enabled`. |
 | `engine/messages.py` (engine chrome i18n) | **ADOPT** — distinct layer, documented; no third i18n. |
-| #22 `ack.*` engine modules | **REUSE** unchanged. |
+| the `ack.*` engine modules | **REUSE** unchanged. |
 
-Downstream: the prompt-library epic **#105** builds on this core base (its prompts are core built-ins too).
+Downstream: the prompt-library work builds on this core base (its prompts are core built-ins too).
 
 ## Boundary / security
 

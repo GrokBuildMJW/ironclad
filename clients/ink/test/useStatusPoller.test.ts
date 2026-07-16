@@ -54,6 +54,60 @@ test('nextConnState: a poll reporting connected:false is not a reconnect', () =>
   });
 });
 
+test('useStatusPoller — a slow poll never overlaps: at most one health/tasks request in flight (#1542)', async () => {
+  let healthCalls = 0;
+  let release: () => void = () => {};
+  const gate = new Promise<void>((r) => {
+    release = r;
+  });
+  const srv = {
+    health: async () => {
+      healthCalls += 1;
+      await gate; // the poll HANGS (a slow/black-hole server) until we release it
+      return {ok: true, model: 'm'};
+    },
+    tasks: async () => [],
+  } as unknown as Server;
+  const Probe = (): null => {
+    useStatusPoller(srv, 10); // a 10ms interval — the OLD setInterval would fire ~10 overlapping polls in 120ms
+    return null;
+  };
+  const mounted = renderToString(React.createElement(Probe), 20, 1);
+  try {
+    await new Promise((r) => setTimeout(r, 120));
+    assert.equal(healthCalls, 1, 'only one poll is in flight while the first is still pending (no overlap)');
+  } finally {
+    release();
+    mounted.unmount();
+  }
+});
+
+test('useStatusPoller — unmount aborts the in-flight poll (#1542)', async () => {
+  let started = false;
+  let aborted = false;
+  const srv = {
+    health: async (signal?: AbortSignal) => {
+      started = true;
+      signal?.addEventListener('abort', () => {
+        aborted = true;
+      }, {once: true});
+      await new Promise((r) => setTimeout(r, 5000)); // hang; only the teardown abort should end it
+      return {ok: true};
+    },
+    tasks: async () => [],
+  } as unknown as Server;
+  const Probe = (): null => {
+    useStatusPoller(srv, 10);
+    return null;
+  };
+  const mounted = renderToString(React.createElement(Probe), 20, 1);
+  const deadline = Date.now() + 1000;
+  while (!started && Date.now() < deadline) await new Promise((r) => setTimeout(r, 5));
+  assert.equal(started, true, 'a poll went in flight');
+  mounted.unmount(); // teardown → ac.abort()
+  assert.equal(aborted, true, 'the in-flight health fetch was aborted on unmount (socket not left on the 600s timeout)');
+});
+
 test('a buffered tool result drains on the next connected poll without a reconnect edge', async () => {
   let healthCalls = 0;
   let postAttempts = 0;

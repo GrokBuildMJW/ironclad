@@ -1,6 +1,6 @@
 # ADR-0011 — Dev-process rework: internal DEV-2/3, public DEV-1, and the project-isolation spine
 
-- **Status:** Accepted (planning ratified; implementation in progress). **Supersedes [ADR-0010](0010-dev-process-substrate-split.md)** (the DEV-2 public-substrate split) and **amends [ADR-0009](0009-dev-process-tiers.md)** (the tier model). Epic #601 (reworks #532).
+- **Status:** Accepted (planning ratified; implementation in progress). **Supersedes [ADR-0010](0010-dev-process-substrate-split.md)** (the DEV-2 public-substrate split) and **amends [ADR-0009](0009-dev-process-tiers.md)** (the tier model).
 - **Date:** 2026-06-27
 - **Context sources:** an operator review of the DEV-2-public direction; a design pass + an independent adversarial review (high effort) of the project-isolation and memory model; and the runtime-context fact that the engine + reconciler run on bare runners with no `ack` on `sys.path`.
 
@@ -10,7 +10,7 @@ ADR-0010 publicized the dev-process **substrate** (`ack.devprocess`) so the fram
 
 ## Decisions
 
-**D1 — Reverse the publicness, keep the engineering.** The dev-process substrate returns to **monorepo-private** (`scripts/devprocess/`), reached by the private dev-loop + reconciler through the existing file-load seam; the wheel returns to `packages = ["ack", "ack.lodestar"]` *(refined by AD-3 / D2 below: the one curated exception — the versioned `ack.devprocess.api` facade — was kept, so the shipped list is `["ack", "ack.lodestar", "ack.devprocess"]`, facade-only; the implementation substrate stays out of the wheel)*; the code-agent runner is private. The already-built modules are **relocated, not rewritten** (the move preserves the engineering; only the *public framing* is undone — none of it had shipped). DEV-2/3 are an **internal extension** of the framework, activated through a thin, secret-gated driver seam; the code stays monorepo-private.
+**D1 — Reverse the publicness, keep the engineering.** The dev-process substrate returns to **monorepo-private** (a private tree), reached by the private dev-loop + reconciler through the existing file-load seam; the wheel returns to `packages = ["ack", "ack.lodestar"]` *(refined by D2 below: the one curated exception — the versioned `ack.devprocess.api` facade — was kept, so the shipped list is `["ack", "ack.lodestar", "ack.devprocess"]`, facade-only; the implementation substrate stays out of the wheel)*; the code-agent runner is private. The already-built modules are **relocated, not rewritten** (the move preserves the engineering; only the *public framing* is undone — none of it had shipped). DEV-2/3 are an **internal extension** of the framework, activated through a thin, secret-gated driver seam; the code stays monorepo-private.
 
 **D2 — Public DEV-1 is data, not API.** The public surface of the dev process is exactly the **three prose prompts** (`dev-process`, `verbatim-scope-audit`, `dev-loop-runner`, EN/DE) shipped as `kind: prompt` built-ins. No public Python dev-process API. The one deliberate future public seam is a curated, [ADR-0004](0004-extension-sdk.md)-versioned `ack.devprocess.api` facade — the sole stable delegation target for generated per-project tools — because private engine internals are unimportable in the clean-room; the isolation substrate itself stays engine-internal (runnable scripts, not the wheel).
 
@@ -30,13 +30,13 @@ ADR-0010 publicized the dev-process **substrate** (`ack.devprocess`) so the fram
 - ADR-0009 and ADR-0010 files are **kept** (history); the inbound statements that asserted the now-reversed public substrate are marked historical where they would mislead.
 - The decomposition executes against this ADR: the relocation as the foundation, then the registry → context → switch → forge → memory → guided-setup → acceptance series.
 
-## Amendment — internal dev-process injection (epic #974)
+## Amendment — internal dev-process injection
 
-The `exec_mode` axis this ADR introduced is realised as a **per-project injection descriptor** (epic #974),
+The `exec_mode` axis this ADR introduced is realised as a **per-project injection descriptor**,
 so an operator can run the tool on a project **with** the internal (GitHub-integrated, extension-driven) dev
 process, while the **normal** (public DEV-1) process is refused on that project — mutually exclusive, stable.
 
-- **Storage & lifecycle.** The descriptor is a runtime side-file `<devloop_home>/dev-target.json` (per-project,
+- **Storage & lifecycle.** The descriptor is a per-project runtime side-file (`dev-target.json`,
   co-located with the ledger), **separate** from the delivery target table (`spec.TARGETS` is untouched) and
   **not in the wheel**. Schema `{project_id, exec_mode∈{github,local}, tier∈{2,3}, plugin_required, plugin_id?,
   health_gate?}` (`devprocess.spec.validate_injection`). It is bound atomically under the project's registry

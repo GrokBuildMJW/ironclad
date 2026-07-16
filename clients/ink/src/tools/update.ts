@@ -10,6 +10,7 @@
  */
 import {spawn, type ChildProcess, type SpawnOptions} from 'node:child_process';
 import {join} from 'node:path';
+import {killProcessTree, waitForChildExit} from './procTree.js';
 
 export interface UpdateStep {
   label: string;
@@ -41,9 +42,16 @@ export type Exec = (command: string, args: string[]) => Promise<{code: number; o
 
 const TIMEOUT_MS = 300_000;
 const MAX_BUFFER = 16 * 1024 * 1024;
+const KILL_DRAIN_MS = 2000;
 
-const defaultExec: Exec = (command, args) =>
-  new Promise((resolve) => {
+export const defaultExec = (
+  command: string,
+  args: string[],
+  opts?: {timeoutMs?: number; maxBuffer?: number},
+): Promise<{code: number; out: string}> => {
+  const timeoutMs = opts?.timeoutMs ?? TIMEOUT_MS;
+  const maxBuffer = opts?.maxBuffer ?? MAX_BUFFER;
+  return new Promise((resolve) => {
     const stdout: Buffer[] = [];
     const stderr: Buffer[] = [];
     let stdoutBytes = 0;
@@ -67,7 +75,7 @@ const defaultExec: Exec = (command, args) =>
         : spawn(command, args, options);
 
       const capture = (target: Buffer[], chunk: Buffer, buffered: number): number => {
-        const remaining = MAX_BUFFER - buffered;
+        const remaining = maxBuffer - buffered;
         if (remaining > 0) {
           const kept = chunk.length > remaining ? chunk.subarray(0, remaining) : chunk;
           target.push(kept);
@@ -75,7 +83,9 @@ const defaultExec: Exec = (command, args) =>
         }
         if (chunk.length > remaining && forcedCode === null) {
           forcedCode = 1;
-          child.kill();
+          void killProcessTree(child)
+            .then(() => waitForChildExit(child, KILL_DRAIN_MS))
+            .finally(() => finish(forcedCode ?? 1));
         }
         return buffered;
       };
@@ -90,12 +100,15 @@ const defaultExec: Exec = (command, args) =>
       child.on('close', (code) => finish(forcedCode ?? code ?? 1));
       timer = setTimeout(() => {
         forcedCode = 1;
-        child.kill();
-      }, TIMEOUT_MS);
+        void killProcessTree(child)
+          .then(() => waitForChildExit(child, KILL_DRAIN_MS))
+          .finally(() => finish(forcedCode ?? 1));
+      }, timeoutMs);
     } catch (error) {
       finish(1, error instanceof Error ? error.message : String(error));
     }
   });
+};
 
 /** Run the update steps in order; stop at the first failure. Never throws — returns a log + ok. */
 export async function runUpdate(

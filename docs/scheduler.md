@@ -1,4 +1,4 @@
-# Operate-phase scheduler — #1064
+# Operate-phase scheduler
 
 The orchestrator's `execute_command` is single-shot (and its deny-list refuses `schtasks` / `start-job`), so
 there is no *in-product* way to run periodic operate-phase jobs — backups, run-artifact pruning, drift

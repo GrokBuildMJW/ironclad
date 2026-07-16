@@ -30,6 +30,32 @@ def test_unique_replace(tmp_path):
     assert f.read_text(encoding="utf-8") == "a = 1\nb = 20\nc = 3\n"
 
 
+def test_edit_file_edits_file_above_char_cap_but_under_byte_cap(tmp_path):
+    f = tmp_path / "large.txt"
+    prefix = "a" * (gx10.MAX_FILE_CHARS + 1)
+    f.write_text(f"{prefix}\nunique marker near end\ntail\n", encoding="utf-8")
+
+    out = gx10.run_tool(
+        "edit_file",
+        {"path": str(f), "old_string": "unique marker near end", "new_string": "edited marker near end"},
+    )
+
+    assert out.startswith("OK: edited")
+    assert f.read_text(encoding="utf-8") == f"{prefix}\nedited marker near end\ntail\n"
+
+
+def test_edit_file_matches_normalized_newlines(tmp_path):
+    f = tmp_path / "crlf.txt"
+    f.write_bytes(b"first\r\nold line\r\nlast\r\n")
+
+    out = gx10.run_tool(
+        "edit_file", {"path": str(f), "old_string": "first\nold line", "new_string": "first\nnew line"}
+    )
+
+    assert out.startswith("OK: edited")
+    assert f.read_bytes() == b"first\nnew line\nlast\n"
+
+
 def test_old_string_not_found(tmp_path):
     f = tmp_path / "x.py"
     f.write_text("hello\n", encoding="utf-8")

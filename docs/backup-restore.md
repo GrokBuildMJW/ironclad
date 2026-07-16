@@ -1,4 +1,4 @@
-# Backup & restore (memory tiers + engine state) — #1062
+# Backup & restore (memory tiers + engine state)
 
 The accumulated memory and engine state are the crown jewels of a self-learning Ironclad deployment — losing
 them is **permanent**. `scripts/backup.sh` captures everything worth keeping; `scripts/restore.sh` puts it
@@ -29,7 +29,7 @@ is applied by `scripts/backup_retention.py` (unit-tested).
 
 ## Schedule it
 
-Until the in-product scheduler ([#1064]) lands, drive it with cron / a systemd timer — e.g. daily at 03:00:
+Until the in-product scheduler lands, drive it with cron / a systemd timer — e.g. daily at 03:00:
 
 ```cron
 0 3 * * *  cd /path/to/ironclad && bash scripts/backup.sh >> ./ironclad-backups/backup.log 2>&1

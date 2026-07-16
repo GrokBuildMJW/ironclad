@@ -25,6 +25,7 @@ Start the system via the server: see SETUP.md.
 """
 
 import os
+import tempfile
 import re
 import sys
 import json
@@ -40,6 +41,7 @@ from contextlib import contextmanager
 import argparse
 import math
 import copy
+import logging
 import urllib.request
 import urllib.error
 import urllib.parse
@@ -50,6 +52,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
 from typing import List, Dict, Any, Optional, Tuple, Callable, Mapping
+
+logger = logging.getLogger(__name__)
 
 # Note: the earlier watchdog-based feedback watcher was replaced by a
 # polling reconciler (more reliable, no dependency required).
@@ -93,8 +97,8 @@ except ImportError:
     _ps = None
 
 # ack.devprocess.api (the curated dev-process facade, ADR-0011 AD-3 / S6) is imported LATE — in
-# _register_devprocess_driver() below, AFTER core/ is placed on sys.path — so the real launch (only
-# core/engine on the path at import time) still resolves it. Until set, the tools call the impls directly.
+# _register_devprocess_driver() below, AFTER the package root is placed on sys.path — so the real launch
+# (only this engine dir on the path at import time) still resolves it. Until set, the tools call the impls directly.
 _devapi = None
 
 try:
@@ -117,9 +121,12 @@ except ImportError:
 # SCRIPT_DIR = where gx10_v3.py + prompts/ live. Separate from this: WORKDIR
 # (where the orchestrator works) — see the config loader / main().
 SCRIPT_DIR = Path(__file__).resolve().parent
+# Original process cwd, where boot-relative conf seams live. The server imports gx10 before bootstrap
+# changes cwd to paths.workdir, so every later config derivation must keep resolving against this anchor.
+_BOOT_CWD = Path.cwd().resolve()
 
-# core/ on sys.path so the ACK package (core/ack) is importable when the
-# engine runs as a script — SCRIPT_DIR is core/engine, its parent is core/.
+# The package root (this engine dir's parent) goes on sys.path so the ACK package
+# (a sibling of this engine dir) is importable when the engine runs as a script.
 _CORE_DIR = SCRIPT_DIR.parent
 if str(_CORE_DIR) not in sys.path:
     sys.path.insert(0, str(_CORE_DIR))
@@ -556,6 +563,18 @@ def _client_timeout():
                          read=LLM_FIRST_TOKEN_TIMEOUT_S,
                          write=LLM_REQUEST_TIMEOUT_S,
                          pool=LLM_REQUEST_TIMEOUT_S)
+
+
+def _total_request_deadline_s() -> float:
+    """The hard WHOLE-request wall-clock budget (#1544). Decoupled mode gives the prefill its
+    first_token budget PLUS the request budget for the rest; non-decoupled uses the request budget.
+    0/negative disables the cap (byte-identical to before)."""
+    req = float(LLM_REQUEST_TIMEOUT_S)
+    if req <= 0:
+        return 0.0
+    if _decoupled():
+        return float(LLM_FIRST_TOKEN_TIMEOUT_S) + req
+    return req
 
 
 def _idle_limit(first_token_seen: bool) -> float:
@@ -1261,8 +1280,10 @@ def _vault_docs(vdir: Path) -> List[Dict[str, Any]]:
         if p.name in ("INDEX.md", LIFECYCLE_FILENAME, BOARD_FILENAME) or (rel.parts and rel.parts[0] == WORKFLOW_DIR):
             continue
         try:
-            text = p.read_text(encoding="utf-8", errors="replace")
+            text, _size = _read_text_capped(p)
         except OSError:
+            continue
+        if text is None:
             continue
         fm = _parse_frontmatter(text)
         out.append({
@@ -1678,6 +1699,8 @@ AUTOMATION_DECOUPLED = False
 # flagged stalled. A task with no signal ever is deliberately excluded so manually managed work is not
 # false-flagged. Positive finite tuning only; the protection has no off state.
 HEARTBEAT_STALL_S = 900.0
+# Client-run claims expire unless the thin client renews this lease through /claim.
+CLAIM_LEASE_TTL_S = 120.0
 DESIGN_STAGE = "design"
 # Task types that PRODUCE CODE — a stage_handover of one of these is REFUSED until the active unit has an
 # APPROVED design. Design/analysis types (architecture, concept, research, documentation, verification,
@@ -3263,7 +3286,7 @@ _UI_PARTIAL: str              = ""
 _UI_LOCK                      = threading.Lock()
 _UI_APP: Optional[Application] = None
 
-# Headless capture hook: set by the server mode (engine/server.py)
+# Headless capture hook: set by the server mode (server.py)
 # when NO prompt_toolkit UI is running (_UI_APP is None). A callable(text:str)->None
 # that taps the output (e.g. into a thread-local request buffer) instead of printing
 # to stdout. Stays None in normal CLI/REPL operation → behaviour unchanged.
@@ -3274,6 +3297,7 @@ _CANCEL_EVENT                 = threading.Event()
 _EXEC_COMMAND_TIMEOUT_S       = 30
 _COMMAND_CANCEL_POLL_S        = 0.05
 _POST_KILL_DRAIN_S            = 2.0   # #1489: bound the reap after a tree kill so a survivor can't hang the tool
+_SANDBOX_BEST_EFFORT_WARNED   = False
 _RELOAD_FLAG                  = False
 _WATCHER_ENABLED              = False   # auto-advance via reconciler; enabled only by /auto on
 RECONCILER_INTERVAL           = 3.0     # polling interval (s)
@@ -3284,6 +3308,7 @@ _LAUNCH_CMD                   = "\x00launch\x00"    # internal autopilot launch 
 _AUTOPILOT_ACTIVE             = 0
 _AUTOPILOT_LOCK               = threading.Lock()
 _AUTOPILOT_PROCS: Dict[str, Any] = {}   # task_id -> Popen (for targeted termination on advance)
+_LOG_CAP_BYTES                = 8 * 1024 * 1024   # Coder logs are diagnostic; cap endless output (#1548).
 
 _status = {"thinking": False, "label": "ready"}
 
@@ -4575,9 +4600,12 @@ def _assemble_review_material(paths_arg) -> Tuple[str, str]:
                 parts.append(f"### {rel}/\n(directory — pass specific files, not a directory)\n")
                 continue
             try:
-                text = p.read_text(encoding="utf-8", errors="replace")
+                text, size = _read_text_capped(p)
             except Exception as e:  # noqa: BLE001
                 parts.append(f"### {rel}\nERROR: read failed: {e!r}\n")
+                continue
+            if text is None:
+                parts.append(f"### {rel}\nERROR: file too large — {size} bytes, cap {_MAX_FILE_BYTES} bytes\n")
                 continue
             usable += 1
             parts.append(f"### {rel}\n```\n{text}\n```\n")
@@ -6067,6 +6095,8 @@ class TaskStore:
                 data = {"id": task_id}
             data["id"]     = task_id
             data["status"] = to_status
+            if to_status != "in_progress":
+                data.pop("claimed_at", None)
             # S7 (#1229): a task that advances is no longer blocked — drop any blocked annotation. No-op (byte-
             # identical) for a task that never carried one.
             for _bk in _BLOCKED_ANNOTATION_KEYS:
@@ -6078,6 +6108,20 @@ class TaskStore:
                 p.unlink()
             self.project_active()
             return data
+
+    def stamp_claim(self, task_id: str, claimed_at: float) -> None:
+        """Persist the client-run claim lease timestamp in place."""
+        with self._lock:
+            p, s = self._find(task_id)
+            if not p:
+                raise KeyError(f"task not found: {task_id}")
+            data = json.loads(p.read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                data = {"id": task_id}
+            data["id"] = task_id
+            data["status"] = s
+            data["claimed_at"] = float(claimed_at)
+            _atomic_write(self._path(task_id, s), json.dumps(data, ensure_ascii=False, indent=2))
 
     def mark_blocked(self, task_id: str, reason: str = "", kind: str = "blocked") -> None:
         """S7 (#1229): annotate a task blocked/stalled IN PLACE (no folder move) so the 3 directory states
@@ -6152,7 +6196,7 @@ def _store() -> "TaskStore":
 
 
 def claim_task(task_id: str, agent: str) -> str:
-    """Atomically claim a client-run task without moving a later state backward."""
+    """Atomically acquire or renew a client-run task lease without moving a later state backward."""
     agent_u = (agent or "").strip().upper()
     registry = _code_agent_registry()
     if not registry.has(agent_u):
@@ -6166,7 +6210,11 @@ def claim_task(task_id: str, agent: str) -> str:
         if _task_is_escalated(task):
             return status
         if status == "pending":
-            return str(store.transition(task["id"], "in_progress")["status"])
+            status = str(store.transition(task["id"], "in_progress")["status"])
+            store.stamp_claim(task["id"], time.time())
+            return status
+        if status == "in_progress":
+            store.stamp_claim(task["id"], time.time())
         return status
 
 
@@ -7613,6 +7661,23 @@ def _derive_ctx_budget(max_model_len: int, max_tokens: int, rag_tokens: int,
     return high, int(high * 0.6)
 
 
+def _read_text_capped(p: Path, max_bytes=_MAX_FILE_BYTES) -> tuple[Optional[str], int]:
+    """Read and decode a complete text file without allocating beyond ``max_bytes`` plus one."""
+    size = p.stat().st_size
+    if size > max_bytes:
+        return None, size
+    with p.open("rb") as fh:
+        raw = fh.read(max_bytes + 1)
+    if len(raw) > max_bytes:
+        try:
+            size = max(size, p.stat().st_size)
+        except OSError:
+            size = len(raw)
+        return None, size
+    text = raw.decode("utf-8", "replace").replace("\r\n", "\n").replace("\r", "\n")
+    return text, size
+
+
 def _read_file_ranged(text: str, *, start=None, end=None, max_chars=None, pattern=None) -> Optional[str]:
     """#1047: return a TARGETED slice of a file's text — a regex `pattern` (a window of lines around the
     first match) OR a 1-based inclusive line range `start`/`end`, capped by `max_chars` (else the live
@@ -7718,6 +7783,7 @@ def _run_tool_dispatch(name: str, args: Dict[str, Any]) -> str:
 
 def _sandbox_model_command(command: str) -> "Tuple[Optional[str], Optional[str]]":
     """Prepare one model-issued command for execution, or return an actionable fail-closed refusal."""
+    global _SANDBOX_BEST_EFFORT_WARNED
     if PLATFORM == "windows":
         return None, (
             "ERROR: execute_command refused: no supported model-command sandbox backend is available "
@@ -7740,6 +7806,12 @@ def _sandbox_model_command(command: str) -> "Tuple[Optional[str], Optional[str]]
                 "ERROR: execute_command refused: sandbox preparation returned no isolated command. "
                 "Ironclad fails closed; install bwrap or firejail on this Linux host."
             )
+        if _sbx.is_best_effort_teardown(backend) and not _SANDBOX_BEST_EFFORT_WARNED:
+            _SANDBOX_BEST_EFFORT_WARNED = True
+            logger.warning(
+                "sandbox: firejail tree teardown is best-effort-only; bwrap is preferred for complete "
+                "namespace teardown"
+            )
         return run_cmd, None
     except Exception:  # noqa: BLE001 — import/wrapper failures must never fall back to the raw command
         return None, (
@@ -7750,6 +7822,36 @@ def _sandbox_model_command(command: str) -> "Tuple[Optional[str], Optional[str]]
 
 class _CommandCancelled(Exception):
     """Internal control flow for a cancelled model command."""
+
+
+def _run_plugin_handler_bounded(name: str, handler, args: Dict[str, Any]):
+    """Run a plugin handler without letting a hung run() hold the turn and agent lock forever (#1545).
+
+    The handler runs in a daemon thread while the caller observes turn cancellation and the idle-watchdog
+    budget. A handler still running after either condition is abandoned so the turn can terminate.
+    """
+    box: Dict[str, Any] = {}
+
+    def _worker():
+        try:
+            box["result"] = handler(**args)
+        except BaseException as exc:  # noqa: BLE001 — surface any handler failure to the caller
+            box["error"] = exc
+
+    thread = threading.Thread(target=_worker, daemon=True)
+    thread.start()
+    cap = float(TURN_IDLE_TIMEOUT_S) if TURN_IDLE_TIMEOUT_S and TURN_IDLE_TIMEOUT_S > 0 else 0.0
+    deadline = time.monotonic() + cap if cap > 0 else None
+    while thread.is_alive():
+        if _CANCEL_EVENT.is_set():
+            raise _CommandCancelled()
+        if deadline is not None and time.monotonic() > deadline:
+            return (f"ERROR: plugin tool '{name}' exceeded its {cap:.0f}s execution budget and was "
+                    "abandoned (a hung run() cannot hold the turn).")
+        thread.join(timeout=0.2)
+    if "error" in box:
+        raise box["error"]
+    return box.get("result")
 
 
 def _kill_command_process_tree(proc, *, windows: "Optional[bool]" = None) -> None:
@@ -7829,25 +7931,10 @@ def _run_tool_dispatch_impl(name: str, args: Dict[str, Any]) -> str:
             p = _resolve_exec_path(args["path"])
             if not p.exists():
                 return f"ERROR: Not found: {args['path']}"
-            size = p.stat().st_size
-            if size > _MAX_FILE_BYTES:
+            text, size = _read_text_capped(p)
+            if text is None:
                 return (f"ERROR: read_file refused: file too large — {size} bytes, "
                         f"cap {_MAX_FILE_BYTES} bytes")
-            # errors="replace": a non-UTF-8 file is read lossily, never crashes the read.
-            # The bounded binary read also closes the stat/open growth race: even if the file grows after
-            # stat(), this path never asks the allocator for more than the fixed byte ceiling plus one.
-            with p.open("rb") as fh:
-                raw_bytes = fh.read(_MAX_FILE_BYTES + 1)
-            if len(raw_bytes) > _MAX_FILE_BYTES:
-                try:
-                    size = max(size, p.stat().st_size)
-                except OSError:
-                    size = len(raw_bytes)
-                return (f"ERROR: read_file refused: file too large — {size} bytes, "
-                        f"cap {_MAX_FILE_BYTES} bytes")
-            # Match read_text()'s universal-newline translation (the bounded binary read replaced it):
-            # CRLF/CR → LF, so callers like the `cat` tool and ranged reads see the same content as before.
-            text = raw_bytes.decode("utf-8", errors="replace").replace("\r\n", "\n").replace("\r", "\n")
             # #1047: a targeted ranged/pattern read returns only the relevant slice; a bad range/pattern
             # returns None → fall through to the existing head+tail cap below.
             if any(args.get(k) is not None for k in ("start", "end", "max_chars", "pattern")):
@@ -7898,7 +7985,10 @@ def _run_tool_dispatch_impl(name: str, args: Dict[str, Any]) -> str:
             new = args.get("new_string", "")
             if not old:
                 return "ERROR: edit_file needs a non-empty old_string (use write_file to create a file)."
-            text = p.read_text(encoding="utf-8", errors="replace")
+            text, size = _read_text_capped(p)
+            if text is None:
+                return (f"ERROR: edit_file refused: file too large — {size} bytes, "
+                        f"cap {_MAX_FILE_BYTES} bytes")
             hits = text.count(old)
             if hits == 0:
                 return f"ERROR: old_string not found in {args['path']} — it must match EXACTLY (whitespace included)."
@@ -8586,7 +8676,9 @@ def _run_tool_dispatch_impl(name: str, args: Dict[str, Any]) -> str:
         elif name in _PLUGIN_TOOLS:
             # Open extension surface: dispatch to a discovered plugin skill's run().
             handler = _PLUGIN_TOOLS[name]["handler"]
-            result = handler(**args)
+            result = _run_plugin_handler_bounded(name, handler, args)
+            if isinstance(result, str) and result.startswith("ERROR: plugin tool '"):
+                return result
             if inspect.iscoroutine(result):
                 result.close()
                 return (f"ERROR: plugin '{name}' is async; the engine tool path needs a "
@@ -8956,10 +9048,20 @@ class GX10:
         try:
             p = session_path()
             p.parent.mkdir(parents=True, exist_ok=True)   # state_root existiert i.d.R. (ensure_dirs); idempotent
-            p.write_text(
-                json.dumps({"messages": self.messages}, ensure_ascii=False, indent=2),
-                encoding="utf-8"
-            )
+            data = json.dumps({"messages": self.messages}, ensure_ascii=False, indent=2)
+            fd, tmp = tempfile.mkstemp(prefix=p.name + ".", suffix=".tmp", dir=str(p.parent))
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    f.write(data)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(tmp, p)
+            except BaseException:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+                raise
         except Exception as e:
             if strict:
                 raise
@@ -9014,10 +9116,17 @@ class GX10:
             return 0
         try:
             data   = json.loads(p.read_text(encoding="utf-8"))
-            loaded = [m for m in data.get("messages", []) if m.get("role") != "system"]
-            loaded = self._sanitize_messages(loaded)
+            raw    = data.get("messages", [])
+            # #1547: retain the generated rolling-summary system message (it captures evicted history) —
+            # only the BASE prompt system message is replaced by the current one. Distinguish by the marker.
+            summary = next(
+                (m for m in raw
+                 if m.get("role") == "system" and str(m.get("content", "")).startswith(_SUMMARY_MARKER)),
+                None,
+            )
+            loaded = self._sanitize_messages([m for m in raw if m.get("role") != "system"])
             system = next((m for m in self.messages if m.get("role") == "system"), None)
-            self.messages = ([system] if system else []) + loaded
+            self.messages = ([system] if system else []) + ([summary] if summary else []) + loaded
             return len(loaded)
         except Exception as e:
             _ui_print(col(f"[WARN] session not loadable: {e}", C.YELLOW))
@@ -9412,6 +9521,9 @@ class GX10:
                 done.set()
 
         t0 = time.time()
+        t0_mono = time.monotonic()                       # #1544: monotonic base for the whole-request cap
+        total_deadline = _total_request_deadline_s()     # #1544
+        total_timed_out = False
         t_first = [None]          # OPT-3: time of the first token
         th = threading.Thread(                                  # bind the active ProjectContext into the worker (S3b):
             target=(_pc.bound_target(_worker) if _pc is not None else _worker), daemon=True)
@@ -9435,6 +9547,19 @@ class GX10:
         while not (done.is_set() and chunk_q.empty()):
             if _CANCEL_EVENT.is_set():
                 cancelled = True
+                break
+            if total_deadline > 0 and time.monotonic() - t0_mono > total_deadline:
+                # #1544: hard whole-request wall-clock cap. A slow-drip stream (a chunk every < idle_limit AND
+                # < the httpx read timeout) evades the idle watchdog + read timeout and would otherwise hold the
+                # turn + agent lock forever. Close the upstream stream to unblock the (possibly httpx-blocked)
+                # worker, then bail with a NAMED cause (never a silent indefinite hold).
+                total_timed_out = True
+                _s = stream_ref[0]
+                if _s is not None:
+                    try:
+                        _s.close()
+                    except Exception:
+                        pass
                 break
             try:
                 delta = chunk_q.get(timeout=0.1)
@@ -9497,6 +9622,15 @@ class GX10:
             "finish_reason":     finish[0],                             # #1048: "length" ⇒ output truncated
             "in_think":          reasoning_open,
         }
+        if total_timed_out:
+            # #1544: the worker unblocks on the stream close and writes its own (stream-closed) err[0]; join it
+            # first (bounded — it unblocks fast) so this NAMED timeout deterministically wins the assignment.
+            th.join(timeout=2.0)
+            err[0] = TimeoutError(
+                f"request exceeded its total wall-clock budget of {total_deadline:.0f}s "
+                f"(connection.request_timeout_s{' + first_token_timeout_s' if _decoupled() else ''}) — "
+                f"the stream never terminated"
+            )
         tool_calls = [tool_acc[i] for i in sorted(tool_acc)]
         return "".join(parts), tool_calls, cancelled, err[0], metrics
 
@@ -10632,10 +10766,19 @@ class _CacheActiveRegistry:
 
 def _switch_apply_config(merged: Dict[str, Any]) -> None:
     """``apply_config`` seam for a ``/switch``: re-derive the engine globals from *merged* AND publish it as
-    ``_EFFECTIVE_CFG`` so ``/config get`` and the rest of the engine see the active project's config."""
+    ``_EFFECTIVE_CFG`` so ``/config get`` and the rest of the engine see the active project's config. A failed
+    re-derive restores the complete pre-switch runtime snapshot before the project switch rolls its context back."""
     global _EFFECTIVE_CFG
-    _apply_config(merged)
-    _EFFECTIVE_CFG = merged
+    with _CONFIG_LOCK:
+        original = _EFFECTIVE_CFG
+        snapshot = _snapshot_config_runtime()
+        try:
+            _apply_config(merged)
+        except Exception:
+            _restore_config_runtime(snapshot)
+            _EFFECTIVE_CFG = original
+            raise
+        _EFFECTIVE_CFG = merged
 
 
 def _project_overlay_for(project) -> Dict[str, Any]:
@@ -11436,16 +11579,15 @@ def _dispatch(agent: GX10, user_input: str):
             except (ValueError, config_schema.ConfigError) as exc:
                 _ui_print(col(f"[AUTO] invalid task cap {n_arg!r}: {exc}", C.RED))
                 return  # type: ignore
-            AUTOPILOT_MAX_TASKS = task_cap
-            if _EFFECTIVE_CFG:
-                _EFFECTIVE_CFG["autopilot"]["autoplan_max_tasks"] = AUTOPILOT_MAX_TASKS
+            for key, value in (("autopilot.autoplan_max_tasks", task_cap),
+                               ("autopilot.enabled", True),
+                               ("autopilot.autoplan", True)):
+                refusal = _config_set_atomic(key, value)
+                if refusal is not None:
+                    _ui_print(col(f"[AUTO] refused — {refusal}", C.RED))
+                    return  # type: ignore
             _WATCHER_ENABLED   = True
-            AUTOPILOT_ENABLED  = True
             _AUTOPLAN_DONE     = 0
-            AUTOPILOT_AUTOPLAN = True
-            if _EFFECTIVE_CFG:
-                _EFFECTIVE_CFG["autopilot"]["enabled"]  = True
-                _EFFECTIVE_CFG["autopilot"]["autoplan"] = True
             cap = (f"max {AUTOPILOT_MAX_TASKS} tasks, stops automatically" if AUTOPILOT_MAX_TASKS > 0
                    else "UNBOUNDED — every unit is a paid coder run; cap it with `auto on N`")
             _ui_print(col(f"[AUTO] FULL automation ON — watcher + autopilot "
@@ -11460,13 +11602,13 @@ def _dispatch(agent: GX10, user_input: str):
                 if _pipeline_hint:
                     _ui_print(col(_pipeline_hint, C.GRAY))
         elif arg == "off":
+            for key in ("autopilot.enabled", "autopilot.autoplan"):
+                refusal = _config_set_atomic(key, False)
+                if refusal is not None:
+                    _ui_print(col(f"[AUTO] refused — {refusal}", C.RED))
+                    return  # type: ignore
             _WATCHER_ENABLED   = False
-            AUTOPILOT_ENABLED  = False
-            AUTOPILOT_AUTOPLAN = False
             _AUTOPLAN_DONE     = 0
-            if _EFFECTIVE_CFG:
-                _EFFECTIVE_CFG["autopilot"]["enabled"]  = False
-                _EFFECTIVE_CFG["autopilot"]["autoplan"] = False
             _ui_print(col("[AUTO] GUIDED mode — nothing fires by itself (advance/launch/planning are "
                           "yours); the engine keeps recommending the next step.", C.YELLOW))
             _pipeline_hint = _empty_pipeline_hint()
@@ -11500,8 +11642,10 @@ def _dispatch(agent: GX10, user_input: str):
     elif cmd.startswith("autopilot"):
         arg = cmd.split()[-1] if len(cmd.split()) > 1 else ""
         if arg == "on":
-            AUTOPILOT_ENABLED = True
-            if _EFFECTIVE_CFG: _EFFECTIVE_CFG["autopilot"]["enabled"] = True
+            refusal = _config_set_atomic("autopilot.enabled", True)
+            if refusal is not None:
+                _ui_print(col(f"[AUTOPILOT] refused — {refusal}", C.RED))
+                return  # type: ignore
             msg = (f"[AUTOPILOT] ON (max_concurrent={AUTOPILOT_MAX_CONCURRENT}); "
                    f"takes effect on the next tick (~{RECONCILER_INTERVAL:.0f}s).")
             if not _WATCHER_ENABLED and not AUTOMATION_DECOUPLED:
@@ -11512,8 +11656,10 @@ def _dispatch(agent: GX10, user_input: str):
             if _pipeline_hint:
                 _ui_print(col(_pipeline_hint, C.GRAY))
         elif arg == "off":
-            AUTOPILOT_ENABLED = False
-            if _EFFECTIVE_CFG: _EFFECTIVE_CFG["autopilot"]["enabled"] = False
+            refusal = _config_set_atomic("autopilot.enabled", False)
+            if refusal is not None:
+                _ui_print(col(f"[AUTOPILOT] refused — {refusal}", C.RED))
+                return  # type: ignore
             _ui_print(col("[AUTOPILOT] OFF — no new auto-starts (running sessions remain)", C.YELLOW))
         else:
             state = col("ON", C.GREEN) if AUTOPILOT_ENABLED else col("OFF", C.YELLOW)
@@ -11530,12 +11676,13 @@ def _dispatch(agent: GX10, user_input: str):
             except (ValueError, config_schema.ConfigError) as exc:
                 _ui_print(col(f"[AUTOPLAN] invalid task cap {n_arg!r}: {exc}", C.RED))
                 return  # type: ignore
-            AUTOPILOT_MAX_TASKS = task_cap
-            if _EFFECTIVE_CFG:
-                _EFFECTIVE_CFG["autopilot"]["autoplan_max_tasks"] = AUTOPILOT_MAX_TASKS
+            for key, value in (("autopilot.autoplan_max_tasks", task_cap),
+                               ("autopilot.autoplan", True)):
+                refusal = _config_set_atomic(key, value)
+                if refusal is not None:
+                    _ui_print(col(f"[AUTOPLAN] refused — {refusal}", C.RED))
+                    return  # type: ignore
             _AUTOPLAN_DONE     = 0   # always reset the counter on activation
-            AUTOPILOT_AUTOPLAN = True
-            if _EFFECTIVE_CFG: _EFFECTIVE_CFG["autopilot"]["autoplan"] = True
             limit_info = f", max {AUTOPILOT_MAX_TASKS} tasks — stops automatically"
             _ui_print(col(
                 f"[AUTOPLAN] continuation ON{limit_info}",
@@ -11551,9 +11698,11 @@ def _dispatch(agent: GX10, user_input: str):
                 if _pipeline_hint:
                     _ui_print(col(_pipeline_hint, C.GRAY))
         elif arg == "off":
-            AUTOPILOT_AUTOPLAN = False
+            refusal = _config_set_atomic("autopilot.autoplan", False)
+            if refusal is not None:
+                _ui_print(col(f"[AUTOPLAN] refused — {refusal}", C.RED))
+                return  # type: ignore
             _AUTOPLAN_DONE     = 0
-            if _EFFECTIVE_CFG: _EFFECTIVE_CFG["autopilot"]["autoplan"] = False
             _ui_print(col("[AUTOPLAN] OFF — pipeline stops when the queue is empty. Counter reset.", C.YELLOW))
         else:
             state     = col("ON", C.GREEN) if AUTOPILOT_AUTOPLAN else col("OFF", C.YELLOW)
@@ -11564,12 +11713,16 @@ def _dispatch(agent: GX10, user_input: str):
         global AUTOPILOT_LOG_TERMINAL
         arg = cmd.split()[-1] if len(cmd.split()) > 1 else ""
         if arg == "on":
-            AUTOPILOT_LOG_TERMINAL = True
-            if _EFFECTIVE_CFG: _EFFECTIVE_CFG["autopilot"]["log_terminal"] = True
+            refusal = _config_set_atomic("autopilot.log_terminal", True)
+            if refusal is not None:
+                _ui_print(col(f"[LOG-TERMINAL] refused — {refusal}", C.RED))
+                return  # type: ignore
             _ui_print(col("[LOG-TERMINAL] ON — the next autopilot start opens a live window (wt / PowerShell)", C.GREEN))
         elif arg == "off":
-            AUTOPILOT_LOG_TERMINAL = False
-            if _EFFECTIVE_CFG: _EFFECTIVE_CFG["autopilot"]["log_terminal"] = False
+            refusal = _config_set_atomic("autopilot.log_terminal", False)
+            if refusal is not None:
+                _ui_print(col(f"[LOG-TERMINAL] refused — {refusal}", C.RED))
+                return  # type: ignore
             _ui_print(col("[LOG-TERMINAL] OFF", C.YELLOW))
         else:
             state = col("ON", C.GREEN) if AUTOPILOT_LOG_TERMINAL else col("OFF", C.YELLOW)
@@ -11580,12 +11733,16 @@ def _dispatch(agent: GX10, user_input: str):
         global RAG_ENABLED
         arg = cmd.split()[-1] if len(cmd.split()) > 1 else ""
         if arg == "on":
-            RAG_ENABLED = True
-            if _EFFECTIVE_CFG: _EFFECTIVE_CFG["context"]["rag_enabled"] = True
+            refusal = _config_set_atomic("context.rag_enabled", True)
+            if refusal is not None:
+                _ui_print(col(f"[RAG] refused — {refusal}", C.RED))
+                return  # type: ignore
             _ui_print(col("[RAG] per-turn retrieval ON", C.GREEN))
         elif arg == "off":
-            RAG_ENABLED = False
-            if _EFFECTIVE_CFG: _EFFECTIVE_CFG["context"]["rag_enabled"] = False
+            refusal = _config_set_atomic("context.rag_enabled", False)
+            if refusal is not None:
+                _ui_print(col(f"[RAG] refused — {refusal}", C.RED))
+                return  # type: ignore
             _ui_print(col("[RAG] per-turn retrieval OFF — answers use only the live window", C.YELLOW))
         else:
             state = col("ON", C.GREEN) if RAG_ENABLED else col("OFF", C.YELLOW)
@@ -11953,7 +12110,9 @@ def _do_launch(task_id: str, agent: str):
         # default project resolves to None → the process workdir, byte-identical to the pre-isolation launch.
         proc = subprocess.Popen(argv, cwd=(_exec_cwd() or "."), stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                 stdin=subprocess.DEVNULL, text=True, encoding="utf-8", errors="replace",
-                                env=_launch_env)
+                                env=_launch_env,
+                                creationflags=(subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0),
+                                start_new_session=(os.name != "nt"))
     except Exception as e:
         try:
             lf.close()
@@ -11964,12 +12123,27 @@ def _do_launch(task_id: str, agent: str):
         return
 
     def _drain_stdout():
+        written = 0
+        capped = False
         try:
             stream = getattr(proc, "stdout", None)
             if stream is not None:
                 for line in stream:
-                    lf.write(line)
-                    lf.flush()
+                    if not capped and written < _LOG_CAP_BYTES:
+                        encoded = line.encode("utf-8", "replace")
+                        remaining = _LOG_CAP_BYTES - written
+                        if len(encoded) <= remaining:
+                            lf.write(line)
+                            written += len(encoded)
+                        else:
+                            chunk = encoded[:remaining].decode("utf-8", "ignore")
+                            lf.write(chunk)
+                            written += len(chunk.encode("utf-8", "replace"))
+                        if written >= _LOG_CAP_BYTES or len(encoded) > remaining:
+                            capped = True
+                            lf.write("\n… [log truncated at 8 MiB — coder still running/producing output] …\n")
+                        lf.flush()
+                    # Keep consuming the stream after the cap so the child's stdout pipe never blocks.
         finally:
             try:
                 stream = getattr(proc, "stdout", None)
@@ -12025,8 +12199,18 @@ def _do_launch(task_id: str, agent: str):
             _ui_print(col(f"  [AUTO] log terminal opened for {task_id}", C.CYAN))
 
     def _wait():
+        timeout_s = _code_agent_timeout_s()
         try:
-            rc = proc.wait()
+            try:
+                rc = proc.wait(timeout=timeout_s if timeout_s and timeout_s > 0 else None)
+            except subprocess.TimeoutExpired:
+                _kill_command_process_tree(proc)
+                try:
+                    rc = proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    rc = None
+                _ui_print(col(f"  ⏱ [AUTO] coder {task_id} exceeded {timeout_s:.0f}s wall-clock — killed",
+                              C.YELLOW))
         finally:
             with _AUTOPILOT_LOCK:
                 _AUTOPILOT_PROCS.pop(task_id, None)
@@ -12189,6 +12373,44 @@ def _reconcile_once(store: "TaskStore", enqueue, seen_mtime: Dict[str, float],
             launched.add(ho_key)
             _autopilot_reserve()              # reserve a slot (worker starts, monitor frees)
             launch_enqueue(tid, agent)
+
+    # Client-run claims are leases renewed through idempotent POST /claim calls. A hard-dead client stops
+    # renewing, so reclaim its task for a later /pending poll. Server-launched/autopilot tasks have no
+    # claimed_at field and are deliberately excluded. Re-read under the store lock before transitioning so
+    # a renewal racing this tick cannot be overwritten from the stale list snapshot.
+    if CLAIM_LEASE_TTL_S > 0:
+        now = time.time()
+        for listed in store.list("in_progress"):
+            tid = listed.get("id") or ""
+            lease_key = f"__lease_{tid}"
+            if not tid:
+                continue
+            reclaimed_age: Optional[float] = None
+            with store._lock:
+                task = store.get(tid)
+                claimed_at = task.get("claimed_at") if task else None
+                blocked = bool(task and task.get("blocked"))
+                try:
+                    claim_stamp = float(claimed_at)
+                    claim_age = now - claim_stamp if math.isfinite(claim_stamp) else -1.0
+                except (TypeError, ValueError):
+                    claim_age = -1.0
+                if (not task or task.get("status") != "in_progress" or blocked
+                        or claimed_at is None or claim_age <= CLAIM_LEASE_TTL_S):
+                    enqueued.discard(lease_key)
+                    continue
+                try:
+                    store.transition(tid, "pending")
+                except Exception:   # noqa: BLE001 — a reclaim hiccup must not break the tick
+                    continue
+                reclaimed_age = claim_age
+            if reclaimed_age is not None and lease_key not in enqueued:
+                enqueued.add(lease_key)
+                secs = int(reclaimed_age)
+                _ui_print(col(
+                    f"  ⚠ [WATCHER] task {tid} claim lease expired ({secs}s) — reclaimed to pending",
+                    C.YELLOW,
+                ))
 
     # S7 (#1229): when decoupled and only autopilot is on, this is a launch-only tick — the feedback-advance
     # side belongs to the watcher concern. Byte-identical when coupled (the loop only runs with watcher on).
@@ -12483,301 +12705,6 @@ def _code_defaults() -> Dict[str, Any]:
     """Return a fresh lowest-precedence tree derived from the typed schema."""
     return config_schema.defaults_tree()
 
-    # The schema is authoritative; the legacy literal below is unreachable during the staged F6a diff.
-    return {
-        "connection": {
-            "base_url":    DEFAULT_BASE_URL,
-            "model":       DEFAULT_MODEL,
-            "api_key_env": API_KEY_ENV,
-            "request_timeout_s": LLM_REQUEST_TIMEOUT_S,   # #1131: per-request LLM bound (fail-soft)
-            "connect_timeout_s": LLM_CONNECT_TIMEOUT_S,
-            "first_token_timeout_s": LLM_FIRST_TOKEN_TIMEOUT_S,
-            "max_retries":       LLM_MAX_RETRIES,         # #1131
-        },
-        # epic #505 S3: minimal web-search seam selector. The FULL surface — env vars, the
-        # frozen/runtime split, max_searches / max_output_chars / default_permission / domains and
-        # boot key resolution — lands in S8 (#513). adapter: "cli" | "brave" | "mock".
-        "search": {
-            "enabled":          True,
-            "adapter":          "cli",                  # backward-compatible default = today's CLI-delegate
-            "api_key_env":      "GX10_SEARCH_API_KEY",  # NAME only; the secret VALUE is read from env at boot
-            "count":            10,                     # results per native (http) search request
-            "max_output_chars": 100_000,                # cap on the model-facing tool result (S5)
-        },
-        "forge": {                                      # #1073: code-host issue filing (default OFF)
-            "enabled":   FORGE_ENABLED,                 # default ON — capability-detected; false = force-off
-            "repo":      FORGE_REPO,                     # optional owner/repo; empty ⇒ gh's cwd default (required for native)
-            "adapter":   FORGE_ADAPTER,                  # #1213: cli (gh) | native (stdlib urllib) | mock
-            "token_env": FORGE_TOKEN_ENV,               # #1213: env var NAME holding the native GitHub token (never a literal)
-        },
-        "review": {                                     # #1221: cross-model second-opinion review tool
-            "agent":     REVIEW_AGENT,                  # default reviewer agent_id; empty ⇒ anti-affinity pick
-            "timeout_s": REVIEW_TIMEOUT_S,              # bounded synchronous CLI runner timeout
-        },
-        "notify": {                                     # #1083: escalation → webhook (default OFF)
-            "webhook": NOTIFY_WEBHOOK,                   # deploy secret via GX10_NOTIFY_WEBHOOK; empty ⇒ off
-        },
-        "audit": {                                      # #1084/#1067: mandatory tamper-evident audit ledger
-            "scope":   AUDIT_SCOPE,                      # #1067: "mutating" (default) | "all" (full tool surface)
-        },
-        "metrics": {                                    # #1060: runtime telemetry — GET /metrics + SLO/anomaly
-            "window_s":          3600,                  # rolling window (s) for the recent-window aggregate
-            "slo_error_rate":    0.2,                   # SLO: max error rate over the window
-            "slo_p95_latency_s": 60.0,                  # SLO: max p95 generation latency (s)
-        },
-        "alert": {                                      # #1061: alerting pipeline (default OFF)
-            "enabled":    ALERT_ENABLED,                # opt-in: periodic SLO/anomaly self-scan → webhook page
-            "interval_s": 300,                          # how often the self-scan evaluates the SLO/anomaly
-        },
-        "safety": {},                                    # #1065: autonomy-safety operational settings
-        "platform": {
-            "mode": PLATFORM_MODE,   # "auto" | "windows" | "linux"
-        },
-        "tasks": {
-            "dedup_threshold": TASKS_DEDUP_THRESHOLD,
-            "id_prefix":       TASK_PREFIX,
-        },
-        "lodestar": {
-            "enabled": LODESTAR_ENABLED,
-        },
-        "loop_profiles": {
-            # epic #602 SUB-8a: per-TaskType loop budgets (max_iterations / retry_budget / effort). EMPTY by
-            # default → resolve_loop_profile falls back to the engine globals (MAX_ITERATIONS + the re-ask
-            # budget) → BYTE-IDENTICAL to today + single-sourced. An operator (or the private monorepo's
-            # conf/loops override layer — NOT core/conf; the boundary forbids it) may add a `default` override
-            # or per-type entries under `by_type` (e.g. {"by_type": {"research": {"max_iterations": 40}}}).
-            "default": {},
-            "by_type": {},
-        },
-        "quality": {
-            # epic #602 SUB-9: a SEPARATE per-task output-quality circuit breaker (distinct from the
-            # availability breaker _CODE_AGENT_BREAKER). Always present and fed from handover verdicts;
-            # a sustained trip holds the next staging write. The leaves below are operational tuning only.
-            "threshold":       0.5,
-            "min_consecutive": 3,
-            "window":          20,
-        },
-        "process": {
-            # Optional pre-turn retrieval of known working approaches from the always-on ACE provider.
-            # This switch controls hints only; ACE reflection and writes are not configurable here.
-            "hints_enabled": False,
-            "max_hints":     3,
-        },
-        "framing_notes": {
-            # Optional capture/exposure only. Design authority and implementation checks are always on.
-            "enabled": False,
-        },
-        "ace": {
-            # epic #855 ACE-WIRE (#863): the always-on Agentic Context Engineering loop-intelligence core.
-            # ACE SUPERSEDES the #602 string lesson + Process-SC consumers (operator decision 2026-06-30) —
-            # it is the engine's loop-intelligence mechanic, ALWAYS ON, there is NO enable flag. A
-            # PlaybookStore is registered as the ack.lessons provider; a post_feedback consumer submits a
-            # Trajectory to a background ReflectionWorker (reflect→curate→refine runs OFF the hot path, never
-            # inline). The keys below are TUNING only; with no orchestrator model reachable, ACE simply
-            # no-ops (fail-soft) and the playbook stays empty. C1 = project-private scope, like #602.
-            "max_bullets": 200,    # per-scope playbook cap — the 32k-window guard (#366); 0/None = uncapped
-            "rounds":      1,      # reflection rounds per online adaptation (L-001)
-            "top_k":       8,      # bullets injected into the Generator handover context (H-001)
-            "cost":        1,      # budget units charged per online adaptation (when a budget is wired)
-            "embed_url":   "",     # the memory-service /embed endpoint (semantic dedup/retrieval); "" ⇒ derive
-                                   # from GX10_MEMORY_URL, else lexical fallback (the dependency-free default)
-        },
-        "verify": {
-            # Required deterministic rules gate staging synchronously. Grounding remains advisory and feeds
-            # the always-on Quality breaker when available. The LLM judge remains a separate explicit opt-in.
-            "grounding_threshold": 0.5,
-        },
-        "strategy": {
-            # epic #602 SUB-3/SUB-7 (2.4-2.5): the always-on finite failure strategy classifies every failed
-            # code-agent run and maps it to a targeted action. The positive bounded attempt budget escalates
-            # to a durable terminal task state when spent, preventing endless silent failover.
-            "budget": 3,
-        },
-        "security": {
-            # Phase-d trust profile (single-tenant): open | token | sealed.
-            # The server (engine/security.py) reads this block; the token VALUE comes
-            # from the env named here, never from config. See docs/roadmap.md.
-            "profile":             "open",
-            "token_env":           "GX10_SERVER_TOKEN",
-            "session_heartbeat_s": 30,
-            "code_locality":       "mount",   # sealed forces "local"
-            "web_in_sealed":       False,     # epic #505 S7: opt-in to allow outbound web_search under sealed
-            "sandbox":             "auto",    # #1464: mandatory OS exec sandbox — auto | bwrap | firejail
-            "multi_tenant":        False,     # #1071: per-principal RBAC + tenant memory isolation (default OFF)
-            "tooling_envelope": {              # ADR-0007: mandatory launch authorization policy
-                # Omitted allow_list derives exact tuples from enabled code_agents.pool entries.
-            },
-        },
-        "setup": {
-            # Boot-fixed deployment topology (docs/setup-types.md). NOT runtime-switchable — a frozen
-            # key (`/config set setup.type` is refused). Orchestrator + agents are ALWAYS co-located; the
-            # setup.type just says on WHICH machine. Generic, secret-free:
-            #   server (default): everything on the model host → in-engine only (external agents deferred);
-            #                     byte-identical to a no-provider deployment.
-            #   local:            engine + agents native on the desktop → offload = local subprocess; the
-            #                     model + memory live remotely (base_url/memory_url point over the network).
-            "type": "server",
-        },
-        "workers": {
-            # Phase-e reasoning fan-out governor (engine/workers.py). CONSERVATIVE,
-            # model-agnostic defaults — safe for an unknown endpoint, NOT tuned. The
-            # private deploy pins the model-matched values in conf/ (our reference model
-            # qwen3.6-35b: concurrency 8 = max_num_seqs). Envelope: concurrency × max_tokens
-            # ≤ max_batch_tokens, so a large max_tokens lowers parallelism (never crashes).
-            "concurrency":      4,
-            "max_tokens":       1024,
-            "max_batch_tokens": 8192,
-            "memory_read":      WORKER_MEMORY,      # §3c MAP: per-item RAG + shared floor (default ON, 06-18)
-            "memory_write":     WORKER_WRITE,       # §3c REDUCE: single-writer cold consolidation (default ON, 06-18)
-            "write_mode":       WORKER_WRITE_MODE,  # "reducer" (default) | "direct" (autonomous agents)
-        },
-        "providers": {
-            # P0 provider router (engine/providers.py + router.py + dispatch.py). setup.type is the single
-            # topology authority. The private deploy supplies the real pool in conf/ — no literals in core.
-            "default_id":  None,
-            "max_agents":  3,                # server CLI-pool cap (own default; NOT == client --max-agents)
-            "cli_timeout_s": None,           # timeout for default_cli_runner (None ⇒ no timeout)
-            "effort_max_tokens": {"low": 512, "medium": 1024, "high": 2048, "xhigh": 4096},
-            "budget":      {"usd_cap": None},
-            "pool":        [],               # no default providers hard-coded (boundary); conf/ fills it
-        },
-        "code_agents": {
-            # #449 (C0R-9): the handover code-AGENT registry — a SEPARATE, ALWAYS-ON surface, independent
-            # of the setup-derived provider-dispatch topology. Each entry is a providers.ProviderSpec
-            # carrying an agent_id (ASCII-letters-only filename token, C0R-1). Ironclad ships OPUS/SONNET
-            # as OVERRIDABLE defaults (public Claude model ids — already used by the handover lane); conf/
-            # re-lists the pool to add its own agents (lists replace on merge). Unknown agent → fail-closed.
-            # The default agent CLI is Claude Code (the documented default backend — same shape as
-            # client.DEFAULT_AGENT_CMD). Fully-specified so the server ships a complete spec; conf/ may
-            # override the bin/template/model freely (or drop these for a different default agent).
-            "pool": [
-                {"provider_id": "claude-opus",   "kind": "cli", "agent_id": "OPUS",
-                 "display": "Claude Opus 4.8",   "model": "claude-opus-4-8", "bin": "claude",
-                 "cmd_template": "{bin} --model {model} --effort {effort} --permission-mode {permission} --print {prompt}",
-                 "effort": "xhigh", "permission_mode": "bypassPermissions",  # #1308: autonomous coder must run its own tests
-                 "cost_per_1k_in": 0.015, "cost_per_1k_out": 0.075},   # #1287: priciest → complex tier only
-                {"provider_id": "claude-sonnet", "kind": "cli", "agent_id": "SONNET",
-                 "display": "Claude Sonnet 5", "model": "claude-sonnet-5", "bin": "claude",
-                 "cmd_template": "{bin} --model {model} --effort {effort} --permission-mode {permission} --print {prompt}",
-                 "effort": "high", "permission_mode": "bypassPermissions",  # #1308: autonomous coder must run its own tests
-                 "cost_per_1k_in": 0.003, "cost_per_1k_out": 0.015},   # #1287: cheaper → standard/routine/analysis
-            ],
-            # #454: runtime operator OVERRIDE — `/coders use <id>` pins one agent so ALL handovers run
-            # on it (the runtime switch); None ⇒ use the orchestrator's task-chosen (staged) agent. An
-            # unknown/disabled pin fails closed (kept None / ignored). task-aware auto-routing is Phase 5.
-            "pinned": None,
-            # #455 (FORK-C=C): signals that mean an agent is OUT OF BUDGET/QUOTA → classify the run as
-            # `agent-unavailable` (trip the circuit-breaker + fail over to the cheapest capable peer),
-            # NOT a normal task failure. Layered JSON→stderr→exit; conservative. GENERIC, public-safe
-            # defaults here; a deployment refines per-agent in conf/ — an agent's EXACT exhausted signal
-            # is calibrated from ONE real run with operator consent (e.g. Kimi at #460).
-            "exhausted": {
-                "stderr_patterns": [
-                    r"(?i)\b(quota|usage limit|rate limit|insufficient (credit|balance|quota))\b",
-                    r"(?i)\b(out of|exceeded)\b.{0,24}\b(quota|credit|budget|tokens?)\b",
-                    r"(?i)\b429\b.{0,20}too many requests",
-                ],
-                "exit_codes": [],
-                "json_event_types": [],
-            },
-            # #1287: task_class (cost TIER) → the coders CAPABLE of it. The DETERMINISTIC primary pick is the
-            # cheapest capable entry by cost_per_1k (`_route_code_agent` at stage_handover); it also scopes
-            # failover (#455) + distinct-reviewer (#457). Public default lists only OPUS/SONNET (complex→OPUS;
-            # everything cheaper→SONNET); conf/ adds the private CODEX/KIMI/GROK. Unknown/missing class ⇒ no
-            # restriction (fail-open). REVERSES the 2026-06-25 "staged pick authoritative" rule per the operator.
-            "classes": {
-                "complex":  ["OPUS"],
-                "standard": ["SONNET", "OPUS"],
-                "routine":  ["SONNET"],
-                "analysis": ["SONNET"],
-            },
-        },
-        "onboarding": {
-            "enabled": ONBOARDING_MODE,
-        },
-        "autopilot": {
-            "enabled":        AUTOPILOT_ENABLED,
-            "claude_bin":     AUTOPILOT_CLAUDE_BIN,
-            "extra_args":     list(AUTOPILOT_EXTRA_ARGS),
-            "default_effort": AUTOPILOT_DEFAULT_EFFORT,
-            "logs_dir":       AUTOPILOT_LOGS_DIR,
-            "max_concurrent": AUTOPILOT_MAX_CONCURRENT,
-            "stream":         AUTOPILOT_STREAM,
-            "terminate_on_advance": AUTOPILOT_TERMINATE_ON_ADVANCE,
-            "autoplan":           AUTOPILOT_AUTOPLAN,
-            "autoplan_max_tasks": AUTOPILOT_MAX_TASKS,
-            "log_terminal":       AUTOPILOT_LOG_TERMINAL,
-        },
-        "paths": {
-            "system_prompt": DEFAULT_PROMPT,
-            "workdir":       DEFAULT_WORKDIR,
-            "state_root":    STATE_ROOT,    # hidden engine machinery (session.json, memory/, …)
-            "vault_root":    VAULT_ROOT,    # visible knowledge root (vault/<slug>/ per initiative)
-            "session_file":  SESSION_FILE,  # basename, resolved under state_root
-            "code_root":     CODE_ROOT,
-            # Open plugin surface: a dir scanned for `skills/*.py` plugins at startup
-            # (GX10_PLUGINS_DIR). Empty = no plugins. See docs/plugin-api.md.
-            "plugins_dir":   "",
-            # ROUTE-1 (#503): optional list of scripts run (fail-soft) after a pipeline advance to
-            # regenerate deployment-specific vault projections. Empty (default) ⇒ no subprocess. A
-            # deploy sets e.g. ["scripts/update_capability_tracking.py", …]; absent scripts are skipped.
-            "post_advance_hooks": [],
-        },
-        "generation": {
-            "temperature":   TEMPERATURE,
-            "max_tokens":    MAX_TOKENS,
-            "finalize_on_truncation": FINALIZE_ON_TRUNCATION,
-            "thinking_mode": "auto",
-            "stream":        True,
-            "retry_backoff": RETRY_BACKOFF,
-            "language":      LANGUAGE,
-        },
-        "context": {
-            "max_iterations":     MAX_ITERATIONS,
-            "max_ctx_chars":      MAX_CTX_CHARS,
-            "trim_target_chars":  TRIM_TARGET_CHARS,
-            "max_model_len":      MAX_MODEL_LEN,    # MEM-9: hard token window (budget source)
-            "token_budget":       TOKEN_BUDGET,     # MEM-9: couple the trim to the window (default ON)
-            "chars_per_token":    CHARS_PER_TOKEN,  # #366: calibrated chars/token FALLBACK (live tokenizer is primary)
-            "thinking_reserve":   THINKING_RESERVE, # #366 D5: output headroom reserved when think=True
-            "min_output_tokens":  MIN_OUTPUT_TOKENS, # #366: floor the adaptive output reserve can shrink to
-            "overflow_safety_tokens": OVERFLOW_SAFETY_TOKENS, # #366: headroom below the wall (estimate slop)
-            "turn_idle_timeout_s": TURN_IDLE_TIMEOUT_S,  # #1132: idle-watchdog bound (no-progress → stalled)
-            "memory_brief_tokens": MEMORY_BRIEF_TOKENS,  # #458 D1: token budget of the handover memory brief
-            "max_file_chars":     MAX_FILE_CHARS,
-            "list_dir_hard_cap":  LIST_DIR_HARD_CAP,
-            "summarize_evicted":  SUMMARIZE_EVICTED,   # B1: default ON (06-18); off → byte-identical trim
-            "summary_max_tokens": SUMMARY_MAX_TOKENS,
-            "emergency_summarize": EMERGENCY_SUMMARIZE,   # #1050 L3: default OFF; ON → summarize-not-truncate on the emergency rung
-            "proactive_roll":     PROACTIVE_ROLL,      # #1051 L3: default OFF; ON → proactive query-aware roll at the soft mark
-            "ingest_soft_frac":   INGEST_SOFT_FRAC,    # #1051 L3: soft-mark fraction of the model window
-            "max_summaries_per_turn": MAX_SUMMARIES_PER_TURN,   # #1051 L3: shared per-turn summarize cap (0 ⇒ unlimited)
-            "rag_enabled":        RAG_ENABLED,         # B2: default ON (06-18); off → user message verbatim
-            "rag_top_k":          RAG_TOP_K,
-            "rag_max_tokens":     RAG_MAX_TOKENS,
-        },
-        "thinking_auto": {
-            "planning_keywords": list(_PLANNING_KW),
-            "routine_keywords":  list(_ROUTINE_KW),
-        },
-        "workspace": {
-            "dirs":        list(WORKSPACE_DIRS),
-            "idle_marker": _IDLE_ACTIVE,
-        },
-        "watcher": {
-            "feedback_dir": WATCHER_FEEDBACK_DIR,
-            "interval":     RECONCILER_INTERVAL,
-        },
-        "heartbeat": {
-            "stall_seconds": 900,
-        },
-        "ui": {
-            "max_lines":        _UI_MAX_LINES,
-            "refresh_interval": UI_REFRESH_INTERVAL,
-            "spinner_frames":   SPINNER_FRAMES,
-        },
-    }
-
 
 def _deep_merge(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
     """Recursive merge: override wins; nested dicts are merged
@@ -12897,118 +12824,6 @@ def _apply_env(cfg: Dict[str, Any]) -> Dict[str, Any]:
             print(col(f"  [WARN] env {name}={raw!r} ignored ({e})", C.YELLOW))
     return cfg
 
-    # The schema mapping is authoritative; the legacy mapping below is unreachable during the staged F6a diff.
-    env = os.environ
-    for name, replacement in _ENV_TOMBSTONES.items():
-        if name in env:
-            print(col(f"  [DEPRECATED] env '{name}' is retired and ignored; {replacement}.", C.YELLOW))
-    def setif(name, section, key, transform=lambda x: x):
-        v = env.get(name)
-        if v not in (None, ""):
-            try:
-                cfg[section][key] = transform(v)
-            except Exception:
-                print(col(f"  [WARN] env {name}={v!r} ignored (invalid)", C.YELLOW))
-    def setif_path(name, section, path, transform=lambda x: x):
-        v = env.get(name)
-        if v not in (None, ""):
-            try:
-                target = cfg[section]
-                for key in path[:-1]:
-                    target = target.setdefault(key, {})
-                target[path[-1]] = transform(v)
-            except Exception:
-                print(col(f"  [WARN] env {name}={v!r} ignored (invalid)", C.YELLOW))
-    _truthy = config_schema.parse_env_bool
-    setif("GX10_BASE_URL",   "connection", "base_url")
-    setif("GX10_MODEL",      "connection", "model")
-    setif("GX10_LLM_TIMEOUT_S",   "connection", "request_timeout_s", float)   # #1131: per-request LLM bound
-    setif("GX10_LLM_CONNECT_TIMEOUT_S", "connection", "connect_timeout_s", float)
-    setif("GX10_LLM_FIRST_TOKEN_TIMEOUT_S", "connection", "first_token_timeout_s", float)
-    setif("GX10_LLM_MAX_RETRIES", "connection", "max_retries",       int)     # #1131
-    setif("GX10_WORKDIR",    "paths",      "workdir")
-    setif("GX10_PROMPT",     "paths",      "system_prompt")
-    setif("GX10_MAX_TOKENS", "generation", "max_tokens", int)
-    setif("GX10_FINALIZE_ON_TRUNCATION", "generation", "finalize_on_truncation", _truthy)
-    setif("GX10_THINKING",   "generation", "thinking_mode")
-    setif("GX10_LANGUAGE",   "generation", "language")
-    setif("GX10_PLATFORM",   "platform",   "mode")
-    setif("GX10_PROFILE",          "security", "profile")
-    setif("GX10_SESSION_HEARTBEAT","security", "session_heartbeat_s", int)
-    setif("GX10_CODE_LOCALITY",    "security", "code_locality")
-    setif("GX10_SETUP_TYPE",       "setup",    "type")    # boot-fixed offload topology (docs/setup-types.md)
-    setif("GX10_PLUGINS_DIR",            "paths",    "plugins_dir")
-    setif("GX10_FANOUT_CONCURRENCY",     "workers", "concurrency",      int)
-    setif("GX10_WORKERS_MAX_TOKENS",     "workers", "max_tokens",       int)
-    setif("GX10_WORKERS_MAX_BATCH_TOKENS","workers", "max_batch_tokens", int)
-    setif("GX10_ONBOARDING", "onboarding", "enabled", _truthy)
-    # epic #505 S8: web-search knobs (the secret VALUE GX10_SEARCH_API_KEY is read from env at boot,
-    # NOT here — non-secret only). search.web_in_sealed lives under security (S7).
-    setif("GX10_SEARCH_ENABLED",          "search", "enabled", _truthy)
-    setif("GX10_FORGE_ENABLED",           "forge",  "enabled", _truthy)   # #1073: opt-in issue filing
-    setif("GX10_FORGE_REPO",              "forge",  "repo")
-    setif("GX10_FORGE_ADAPTER",           "forge",  "adapter")            # #1213: cli | native | mock
-    setif("GX10_FORGE_TOKEN_ENV",         "forge",  "token_env")          # #1213: NAME of the native-token env var
-    setif("GX10_REVIEW_AGENT",            "review", "agent")              # #1221: default reviewer agent_id
-    setif("GX10_REVIEW_TIMEOUT_S",        "review", "timeout_s", float)   # #1221: review CLI timeout
-    setif("GX10_NOTIFY_WEBHOOK",          "notify", "webhook")            # #1083: escalation webhook (deploy secret)
-    setif("GX10_AUDIT_SCOPE",             "audit",  "scope")              # #1067: mutating | all
-    _sandbox_env = env.get("GX10_SANDBOX")
-    if _sandbox_env not in (None, ""):
-        _sandbox_env_l = _sandbox_env.strip().lower()
-        if _sandbox_env_l in _RETIRED_SANDBOX_POLICIES:
-            print(col("  [DEPRECATED] env GX10_SANDBOX=off/none is retired and ignored; model command "
-                      "isolation remains mandatory.", C.YELLOW))
-        else:
-            try:
-                cfg["security"]["sandbox"] = _validated_sandbox_policy(_sandbox_env)
-            except ValueError:
-                print(col(f"  [WARN] env GX10_SANDBOX={_sandbox_env!r} ignored (invalid; expected "
-                          "auto|bwrap|firejail)", C.YELLOW))
-    setif("GX10_MULTI_TENANT",            "security", "multi_tenant", _truthy)        # #1071: per-principal RBAC
-    setif("GX10_ALERT_ENABLED",           "alert",  "enabled", _truthy)   # #1061: opt-in alerting self-scan
-    setif("GX10_SEARCH_ADAPTER",          "search", "adapter")
-    setif("GX10_SEARCH_COUNT",            "search", "count", int)
-    setif("GX10_SEARCH_MAX_OUTPUT_CHARS", "search", "max_output_chars", int)
-    setif("GX10_PROVIDERS_DEFAULT",      "providers", "default_id")           # default provider id
-    setif("GX10_PROVIDERS_BUDGET_USD",   "providers", "budget", lambda v: {"usd_cap": float(v)})  # run budget
-    setif("GX10_PROVIDERS_MAX_AGENTS",   "providers", "max_agents", int)      # server CLI-pool cap
-    setif("GX10_PROVIDERS_CLI_TIMEOUT_S","providers", "cli_timeout_s", int)   # CLI spawn timeout
-    setif("GX10_CONTEXT_SUMMARY",    "context", "summarize_evicted",  _truthy)   # B1 switch
-    setif("GX10_EMERGENCY_SUMMARIZE", "context", "emergency_summarize", _truthy)   # #1050 L3 (default OFF)
-    setif("GX10_PROACTIVE_ROLL",      "context", "proactive_roll",      _truthy)   # #1051 L3 (default OFF)
-    setif("GX10_INGEST_SOFT_FRAC",    "context", "ingest_soft_frac",    float)     # #1051 L3
-    setif("GX10_MAX_SUMMARIES_PER_TURN", "context", "max_summaries_per_turn", int) # #1051 L3 (0 ⇒ unlimited)
-    setif("GX10_SUMMARY_MAX_TOKENS", "context", "summary_max_tokens", int)
-    setif("GX10_CONTEXT_RAG",        "context", "rag_enabled",        _truthy)   # B2 switch
-    setif("GX10_RAG_TOP_K",          "context", "rag_top_k",          int)
-    setif("GX10_RAG_MAX_TOKENS",     "context", "rag_max_tokens",     int)
-    setif("GX10_WORKER_MEMORY",      "workers", "memory_read",        _truthy)   # §3c MAP switch
-    setif("GX10_WORKER_WRITE",       "workers", "memory_write",       _truthy)   # §3c REDUCE switch
-    setif("GX10_WORKER_WRITE_MODE",  "workers", "write_mode")                    # reducer | direct
-    # B4: trim working set re-tunable via env (proportional to a raised model window
-    # IRONCLAD_MAX_MODEL_LEN), without a config-file edit on the Spark. Unset → today's values.
-    setif("GX10_MAX_CTX_CHARS",      "context", "max_ctx_chars",      int)
-    setif("GX10_TRIM_TARGET_CHARS",  "context", "trim_target_chars",  int)
-    # MEM-9: model window as the budget source. IRONCLAD_MAX_MODEL_LEN (deploy/vLLM var) first,
-    # GX10_MAX_MODEL_LEN overrides (more specific). GX10_TOKEN_BUDGET=0 → fixed char thresholds.
-    setif("IRONCLAD_MAX_MODEL_LEN",  "context", "max_model_len",      int)
-    setif("GX10_MAX_MODEL_LEN",      "context", "max_model_len",      int)
-    setif("GX10_TOKEN_BUDGET",       "context", "token_budget",       _truthy)
-    setif("GX10_CHARS_PER_TOKEN",    "context", "chars_per_token",    float)   # #366: calibrated fallback ratio
-    setif("GX10_MEMORY_BRIEF_TOKENS", "context", "memory_brief_tokens", int)   # #458 D1: handover brief budget
-    setif("GX10_THINKING_RESERVE",   "context", "thinking_reserve",   int)     # #366 D5: thinking output reserve
-    setif("GX10_MIN_OUTPUT_TOKENS",  "context", "min_output_tokens",  int)     # #366: adaptive output-reserve floor
-    setif("GX10_OVERFLOW_SAFETY",    "context", "overflow_safety_tokens", int) # #366: estimate-slop headroom below the wall
-    setif("GX10_TURN_IDLE_TIMEOUT_S","context", "turn_idle_timeout_s", float)   # #1132: idle-watchdog bound
-    setif("GX10_AUTOPILOT",  "autopilot",  "enabled", _truthy)
-    setif("GX10_AUTOPILOT_STREAM",    "autopilot", "stream",          _truthy)
-    setif("GX10_AUTOPILOT_TERMINATE", "autopilot", "terminate_on_advance", _truthy)
-    setif("GX10_AUTOPILOT_AUTOPLAN",       "autopilot", "autoplan",           _truthy)
-    setif("GX10_AUTOPILOT_MAX_TASKS",      "autopilot", "autoplan_max_tasks", int)
-    setif("GX10_AUTOPILOT_LOG_TERMINAL", "autopilot", "log_terminal",  _truthy)
-    return cfg
-
 
 def _normalize_config_for_apply(cfg: Dict[str, Any]) -> None:
     """Consume supported legacy boundaries on an unpublished config candidate."""
@@ -13062,7 +12877,7 @@ _CONFIG_DERIVED_GLOBALS = (
     "WARM_SESSION_ID", "_PLANNING_KW", "_ROUTINE_KW", "WORKSPACE_DIRS", "_IDLE_ACTIVE",
     "_MEMORY_CONFIG", "_WARM_CONFIG", "WATCHER_FEEDBACK_DIR", "RECONCILER_INTERVAL",
     "SPINNER_FRAMES", "UI_REFRESH_INTERVAL", "_UI_MAX_LINES", "_UI_LINES",
-    "FRAMING_NOTES_ENABLED", "AUTOMATION_DECOUPLED", "HEARTBEAT_STALL_S",
+    "FRAMING_NOTES_ENABLED", "AUTOMATION_DECOUPLED", "HEARTBEAT_STALL_S", "CLAIM_LEASE_TTL_S",
     "_VERIFY_GROUNDING_THRESHOLD", "_STRATEGY_BUDGET", "_QUALITY_BREAKER", "_QUALITY_TRIPPED",
 )
 
@@ -13210,7 +13025,7 @@ def _derive_config_state(cfg: Dict[str, Any]) -> _DerivedConfigState:
     # Memory config: file (conf/memory/memory.json) OR env (GX10_MEMORY_URL).
     # Optional — without base_url _MEMORY_CONFIG stays empty → memory off (hooks inert).
     _MEMORY_CONFIG = copy.deepcopy(cfg.get("memory") or {})
-    _mem_cfg_path = Path("conf/memory/memory.json")
+    _mem_cfg_path = _BOOT_CWD / "conf" / "memory" / "memory.json"
     if _mem_cfg_path.exists():
         # An external component seam: MemoryManager owns its own field handling + fallbacks (incl. the
         # legacy `timeout` key), so a memory.json may legitimately carry extra/legacy keys. Merge it
@@ -13225,7 +13040,7 @@ def _derive_config_state(cfg: Dict[str, Any]) -> _DerivedConfigState:
     # Warm tier config (B0): file (conf/warm/warm.json) OR env (GX10_WARM_URL).
     # Optional — without a url _WARM_CONFIG stays empty → warm tier off (no-op, fail-soft).
     _WARM_CONFIG = copy.deepcopy(cfg.get("warm") or {})
-    _warm_cfg_path = Path("conf/warm/warm.json")
+    _warm_cfg_path = _BOOT_CWD / "conf" / "warm" / "warm.json"
     if _warm_cfg_path.exists():
         # External seam (WarmTier owns its field handling) — merge the file tolerantly, same rationale as
         # the memory seam above; the env warm config is already typed via _apply_env + the boot validate.
@@ -13253,6 +13068,7 @@ def _derive_config_state(cfg: Dict[str, Any]) -> _DerivedConfigState:
     FRAMING_NOTES_ENABLED = cfg["framing_notes"]["enabled"]
     AUTOMATION_DECOUPLED = cfg["automation"]["decoupled"]
     HEARTBEAT_STALL_S = float(cfg["heartbeat"]["stall_seconds"])
+    CLAIM_LEASE_TTL_S = float(cfg["heartbeat"]["claim_lease_seconds"])
     _VERIFY_GROUNDING_THRESHOLD = float(cfg["verify"]["grounding_threshold"])
     from ack.validated_emit import MAX_RETRY_BUDGET
     _STRATEGY_BUDGET = min(int(cfg["strategy"]["budget"]), MAX_RETRY_BUDGET)
@@ -13384,6 +13200,10 @@ def _config_set_atomic(key: str, value: Any) -> Optional[str]:
     with _CONFIG_LOCK:
         if _EFFECTIVE_CFG is None:
             return "no live config to set (start the server first)"
+        if (key in {"context.max_ctx_chars", "context.trim_target_chars"}
+                and (_EFFECTIVE_CFG.get("context") or {}).get("token_budget")):
+            return (f"{key} is derived from the model token budget while context.token_budget is on — "
+                    "set context.token_budget off first (or GX10_TOKEN_BUDGET=0) to set char sizes directly")
         if key in _FROZEN_CONFIG_KEYS:
             return f"'{key}' is boot-only -- set it in config and restart"
         original = _EFFECTIVE_CFG

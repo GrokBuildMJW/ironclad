@@ -85,7 +85,7 @@ The orchestrator waits for vLLM's healthcheck before starting; host networking l
 reach vLLM on `localhost:8000` and bind `:8100`; the workspace persists in
 `ironclad-workdir/`. Long-term memory (Mem0) stays external — set `GX10_MEMORY_URL`.
 
-> **Reaching it from your workstation (#1469).** The orchestrator binds **loopback only** by default, so
+> **Reaching it from your workstation.** The orchestrator binds **loopback only** by default, so
 > it is not reachable across the network until you explicitly open it. For a trusted LAN, set
 > `GX10_SERVER_HOST=0.0.0.0` **and** `GX10_ALLOW_UNAUTHENTICATED_BIND=1` (both are forwarded into the
 > container by `spark-bootstrap.sh` / compose); for an untrusted network use `GX10_PROFILE=token` +

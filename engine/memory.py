@@ -215,7 +215,12 @@ class MemoryManager:
             return []
         if size <= 0:
             return [text]
-        step = max(1, size - max(0, overlap))
+        # Bound the expansion ratio: an overlap ≥ size (or near it) would clamp the step to 1 and emit
+        # ~len(text) full-size chunks — O(len·size) memory (a 1M-char artifact with size=6000 → ~6 GB).
+        # Cap the overlap at half the chunk size so step ≥ ceil(size/2) and every char lands in ≤ 2 chunks
+        # (total ≤ 2·len(text)); a normal overlap (< 50%) is unchanged. (#1550)
+        overlap = min(max(0, overlap), size // 2)
+        step = max(1, size - overlap)
         out: List[str] = []
         i, n = 0, len(text)
         while i < n:

@@ -16,6 +16,7 @@ in ``docs/skill-packaging.md``.
 """
 from __future__ import annotations
 
+import json
 import logging
 from pathlib import Path
 from typing import Any, Optional
@@ -33,7 +34,15 @@ class PlaybookError(Exception):
 
 def _coerce_scalar(raw: str) -> Any:
     s = raw.strip()
-    if (s.startswith('"') and s.endswith('"')) or (s.startswith("'") and s.endswith("'")):
+    if s.startswith('"') and s.endswith('"'):
+        # #1533: decode a double-quoted scalar so an escaped value the generator wrote via `| tojson`
+        # round-trips (`"a \"b\" c"` → `a "b" c`). Fall back to a literal outer-quote strip when the text
+        # is not valid JSON, preserving the prior behavior for a hand-written non-JSON double-quoted value.
+        try:
+            return json.loads(s)
+        except ValueError:
+            return s[1:-1]
+    if s.startswith("'") and s.endswith("'"):
         return s[1:-1]
     low = s.lower()
     if low in ("true", "false"):

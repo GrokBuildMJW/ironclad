@@ -1,7 +1,7 @@
 ---
 capability: {{capability_key}}
 kind: prompt
-description: {{description}}
+description: {{description|tojson}}
 type: prompt
 domain: {{domain_name}}
 languages: [en, de]

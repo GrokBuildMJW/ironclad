@@ -471,6 +471,13 @@ def promote(r: PromoteReq):
 
 @app.get("/memories")
 def get_all(user_id: str | None = None, agent_id: str | None = None, run_id: str | None = None):
+    """List a partition's memories (ADR-0011 AD-4).
+
+    **Fail-closed (AD-4):** `agent_id` (the `mem_ns` partition) is REQUIRED and `run_id` is rejected as an
+    isolation key — the same guard applied to `/add`, `/add_bulk`, `/search`, and `/delete_all`. Without it an
+    unscoped `GET /memories` returns Mem0's unfiltered collection, leaking records across project partitions."""
+    if (err := scope_guard.require_scope(agent_id, run_id)):
+        raise HTTPException(status_code=400, detail=err)
     return mem.get_all(user_id=user_id, agent_id=agent_id, run_id=run_id)
 
 

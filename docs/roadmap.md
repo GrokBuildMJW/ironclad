@@ -5,7 +5,7 @@
 > docs are organised, see [`docs-guide.md`](docs-guide.md). Items below are directions,
 > not commitments, and may change.
 >
-> **Generated** from the open roadmap phases (open milestones) by `scripts/ci/gen_roadmap.py` —
+> **Generated** from the open roadmap phases (open milestones) —
 > do not edit by hand; a phase drops off automatically once its milestone is closed.
 
 Ironclad runs today as a sovereign, single-operator system — one principal,

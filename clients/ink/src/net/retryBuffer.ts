@@ -29,7 +29,12 @@ export class ToolResultBuffer {
 
   /** Transient = worth retrying (network/timeout/5xx). HTTP 4xx = permanent → drop. */
   private static transient(e: unknown): boolean {
-    if (e instanceof HttpError) return e.status >= 500;
+    if (e instanceof HttpError) {
+      // #1573 (S4-2 parity with client.py): a mid-turn session expiry returns 401/403 — recoverable once the
+      // heartbeat/poller reopens the session, so buffer + retry rather than drop the completed tool result.
+      // 410 Gone (and any other 4xx) are permanent → dropped. 5xx are transient.
+      return e.status >= 500 || e.status === 401 || e.status === 403;
+    }
     return true; // fetch rejected (network/abort/timeout) → transient
   }
 

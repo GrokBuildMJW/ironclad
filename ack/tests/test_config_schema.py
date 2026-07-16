@@ -181,6 +181,8 @@ def test_wrong_container_unknown_leaf_range_and_relationship_are_rejected():
 
     with pytest.raises(schema.ConfigError, match="> 0"):
         schema.validate_leaf("heartbeat.stall_seconds", 0)
+    with pytest.raises(schema.ConfigError, match="> 0"):
+        schema.validate_leaf("heartbeat.claim_lease_seconds", 0)
 
     cfg = schema.defaults_tree()
     cfg["context"]["trim_target_chars"] = cfg["context"]["max_ctx_chars"]
@@ -214,6 +216,37 @@ def test_apply_env_parses_documented_false_before_validation(monkeypatch):
     cfg = gx10._apply_env(schema.defaults_tree())
     assert cfg["context"]["rag_enabled"] is False
     assert type(cfg["context"]["rag_enabled"]) is bool
+
+
+def test_apply_env_consumes_every_schema_binding_including_prompt(monkeypatch):
+    empty_string_values = {
+        "forge.repo": "owner/repo",
+        "memory.base_url": "http://memory.invalid",
+        "notify.webhook": "https://notify.invalid/hook",
+        "paths.plugins_dir": "plugins",
+        "review.agent": "reviewer",
+        "warm.url": "http://warm.invalid",
+    }
+    for env_name in schema.ENV_BINDINGS:
+        monkeypatch.delenv(env_name, raising=False)
+
+    for env_name, spec in schema.ENV_BINDINGS.items():
+        if spec.default is None:
+            raw = "1.5" if spec.key == "providers.budget.usd_cap" else "provider"
+        elif type(spec.default) is bool:
+            raw = "true" if spec.default else "false"
+        elif spec.default == "":
+            raw = empty_string_values[spec.key]
+        else:
+            raw = str(spec.default)
+        expected = spec.env_parser(raw)
+        cfg = schema.defaults_tree()
+        gx10._cfg_set(cfg, spec.key, object())
+        monkeypatch.setenv(env_name, raw)
+        assert gx10._cfg_get(gx10._apply_env(cfg), spec.key) == expected, env_name
+        monkeypatch.delenv(env_name)
+
+    assert "GX10_PROMPT" in schema.ENV_BINDINGS
 
 
 def test_as_bool_rejects_integer_and_string_truthiness():

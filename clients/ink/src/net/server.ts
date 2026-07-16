@@ -35,14 +35,18 @@ export class Server {
     return h;
   }
 
-  async req(method: string, path: string, body?: Json): Promise<Json> {
+  async req(method: string, path: string, body?: Json, signal?: AbortSignal): Promise<Json> {
     const headers: Record<string, string> = {...this.headers()};
     if (body !== undefined) headers['Content-Type'] = 'application/json';
+    // #1539: an optional caller-supplied signal (a session-lifecycle abort or a short shutdown deadline) is
+    // combined with the per-request timeout — whichever fires first wins. This lets session.stop() abort a
+    // stuck in-flight heartbeat immediately instead of waiting out the full 600s request timeout.
+    const timeout = AbortSignal.timeout(this.timeoutMs);
     const res = await fetch(this.base + path, {
       method,
       headers,
       body: body !== undefined ? JSON.stringify(body) : undefined,
-      signal: AbortSignal.timeout(this.timeoutMs),
+      signal: signal ? AbortSignal.any([timeout, signal]) : timeout,
     });
     const raw = await res.text();
     if (!res.ok) {
@@ -60,8 +64,8 @@ export class Server {
     return raw ? (JSON.parse(raw) as Json) : {};
   }
 
-  health(): Promise<Json> {
-    return this.req('GET', '/health');
+  health(signal?: AbortSignal): Promise<Json> {
+    return this.req('GET', '/health', undefined, signal);
   }
 
   /** DOCTOR (#503): gated read-only preflight report — local `/doctor` command (mirrors `/health`). */
@@ -69,8 +73,8 @@ export class Server {
     return this.req('GET', '/doctor');
   }
 
-  async tasks(): Promise<Json[]> {
-    const r = await this.req('GET', '/tasks');
+  async tasks(signal?: AbortSignal): Promise<Json[]> {
+    const r = await this.req('GET', '/tasks', undefined, signal);
     return (r['tasks'] as Json[]) ?? [];
   }
 
@@ -121,28 +125,28 @@ export class Server {
   }
 
   // ── session lifecycle (Phase d; no-op transport-wise on the open profile) ──
-  async sessionOpen(): Promise<Json> {
-    const res = await this.req('POST', '/session/open', {});
+  async sessionOpen(signal?: AbortSignal): Promise<Json> {
+    const res = await this.req('POST', '/session/open', {}, signal);
     this.sessionId = (res['session_id'] as string) ?? null;
     return res;
   }
 
-  async sessionHeartbeat(): Promise<boolean> {
+  async sessionHeartbeat(signal?: AbortSignal): Promise<boolean> {
     if (!this.sessionId) return false;
     try {
-      const r = await this.req('POST', '/session/heartbeat', {session_id: this.sessionId});
+      const r = await this.req('POST', '/session/heartbeat', {session_id: this.sessionId}, signal);
       return Boolean(r['ok']);
     } catch {
       return false;
     }
   }
 
-  async sessionClose(): Promise<void> {
+  async sessionClose(signal?: AbortSignal): Promise<void> {
     if (!this.sessionId) return;
     try {
-      await this.req('POST', '/session/close', {session_id: this.sessionId});
+      await this.req('POST', '/session/close', {session_id: this.sessionId}, signal);
     } catch {
-      /* network gone — nothing to clean up remotely */
+      /* network gone / aborted — nothing more to clean up remotely (server-side session expires at its TTL) */
     }
     this.sessionId = null;
   }

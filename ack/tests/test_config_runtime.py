@@ -114,6 +114,120 @@ def test_runtime_set_refuses_relationship_violation_atomically(monkeypatch, capt
     _assert_atomic_refusal(captured, original, tree_before, globals_before)
 
 
+def test_runtime_set_refuses_budget_derived_char_size_without_mutation(monkeypatch, captured):
+    original = gx10._code_defaults()
+    gx10._apply_config(original)
+    monkeypatch.setattr(gx10, "_EFFECTIVE_CFG", original)
+    tree_before = copy.deepcopy(original)
+    max_before = gx10.MAX_CTX_CHARS
+
+    gx10._dispatch(types.SimpleNamespace(), "config set context.max_ctx_chars 50000")
+
+    assert gx10._EFFECTIVE_CFG is original
+    assert gx10._EFFECTIVE_CFG == tree_before
+    assert gx10.MAX_CTX_CHARS == max_before
+    assert any("context.max_ctx_chars is derived from the model token budget" in line for line in captured)
+    assert not any("[config] set context.max_ctx_chars" in line for line in captured)
+
+
+def test_runtime_set_applies_char_size_when_token_budget_is_off(monkeypatch, captured):
+    original = gx10._code_defaults()
+    original["context"]["token_budget"] = False
+    gx10._apply_config(original)
+    monkeypatch.setattr(gx10, "_EFFECTIVE_CFG", original)
+
+    gx10._dispatch(types.SimpleNamespace(), "config set context.max_ctx_chars 50000")
+
+    assert gx10._EFFECTIVE_CFG is not original
+    assert original["context"]["max_ctx_chars"] == 80000
+    assert gx10._EFFECTIVE_CFG["context"]["max_ctx_chars"] == 50000
+    assert gx10.MAX_CTX_CHARS == 50000
+    assert any("[config] set context.max_ctx_chars = 50000" in line for line in captured)
+
+
+def test_external_memory_and_warm_overlays_stay_anchored_to_boot_cwd(monkeypatch, tmp_path):
+    boot_dir = tmp_path / "install"
+    workdir = tmp_path / "workdir"
+    memory_file = boot_dir / "conf" / "memory" / "memory.json"
+    warm_file = boot_dir / "conf" / "warm" / "warm.json"
+    memory_file.parent.mkdir(parents=True)
+    warm_file.parent.mkdir(parents=True)
+    memory_file.write_text('{"base_url":"http://memory.test:8800"}', encoding="utf-8")
+    warm_file.write_text('{"url":"redis://warm.test:6379/0"}', encoding="utf-8")
+    workdir.mkdir()
+    monkeypatch.chdir(boot_dir)
+    monkeypatch.setattr(gx10, "_BOOT_CWD", Path.cwd().resolve())
+    monkeypatch.delenv("GX10_MEMORY_URL", raising=False)
+    monkeypatch.delenv("GX10_WARM_URL", raising=False)
+    cfg = gx10._code_defaults()
+
+    gx10._apply_config(cfg)
+    assert gx10._MEMORY_CONFIG["base_url"] == "http://memory.test:8800"
+    assert gx10._WARM_CONFIG["url"] == "redis://warm.test:6379/0"
+
+    monkeypatch.chdir(workdir)
+    gx10._apply_config(cfg)
+    assert gx10._MEMORY_CONFIG["base_url"] == "http://memory.test:8800"
+    assert gx10._WARM_CONFIG["url"] == "redis://warm.test:6379/0"
+
+
+@pytest.mark.parametrize(("command", "key", "global_name", "reply"), [
+    ("rag on", "context.rag_enabled", "RAG_ENABLED", "[RAG] per-turn retrieval ON"),
+    ("autopilot on", "autopilot.enabled", "AUTOPILOT_ENABLED", None),
+])
+def test_config_mutating_slash_commands_use_atomic_setter_and_keep_own_reply(
+        monkeypatch, captured, command, key, global_name, reply):
+    original = gx10._code_defaults()
+    original["context"]["rag_enabled"] = False
+    gx10._apply_config(original)
+    monkeypatch.setattr(gx10, "_EFFECTIVE_CFG", original)
+    monkeypatch.setattr(gx10, "_WATCHER_ENABLED", True)
+    monkeypatch.setattr(gx10, "_empty_pipeline_hint", lambda: "")
+    real_set = gx10._config_set_atomic
+    calls = []
+
+    def tracked_set(dotted, value):
+        calls.append((dotted, value))
+        return real_set(dotted, value)
+
+    monkeypatch.setattr(gx10, "_config_set_atomic", tracked_set)
+    gx10._dispatch(types.SimpleNamespace(), command)
+
+    expected_reply = reply or (f"[AUTOPILOT] ON (max_concurrent={gx10.AUTOPILOT_MAX_CONCURRENT}); "
+                               f"takes effect on the next tick (~{gx10.RECONCILER_INTERVAL:.0f}s).")
+    assert calls == [(key, True)]
+    assert gx10._cfg_get(gx10._EFFECTIVE_CFG, key) is True
+    assert getattr(gx10, global_name) is True
+    assert captured == [gx10.col(expected_reply, gx10.C.GREEN) + "\n"]
+
+
+@pytest.mark.parametrize(("command", "key", "global_name", "success_text"), [
+    ("rag on", "context.rag_enabled", "RAG_ENABLED", "per-turn retrieval ON"),
+    ("autopilot on", "autopilot.enabled", "AUTOPILOT_ENABLED", "takes effect on the next tick"),
+])
+def test_config_mutating_slash_commands_refuse_failed_candidate_without_half_apply(
+        monkeypatch, captured, command, key, global_name, success_text):
+    original = gx10._code_defaults()
+    original["context"]["rag_enabled"] = False
+    gx10._apply_config(original)
+    monkeypatch.setattr(gx10, "_EFFECTIVE_CFG", original)
+    tree_before = copy.deepcopy(original)
+    global_before = getattr(gx10, global_name)
+    monkeypatch.setattr(
+        gx10, "_derive_config_state",
+        lambda _cfg: (_ for _ in ()).throw(RuntimeError("candidate rejected")),
+    )
+
+    gx10._dispatch(types.SimpleNamespace(), command)
+
+    assert gx10._EFFECTIVE_CFG is original
+    assert gx10._EFFECTIVE_CFG == tree_before
+    assert gx10._cfg_get(gx10._EFFECTIVE_CFG, key) is False
+    assert getattr(gx10, global_name) is global_before
+    assert sum("refused" in line and "candidate rejected" in line for line in captured) == 1
+    assert not any(success_text in line for line in captured)
+
+
 def test_runtime_set_refuses_missing_required_root_atomically(monkeypatch, captured):
     original = gx10._code_defaults()
     original.pop("automation")

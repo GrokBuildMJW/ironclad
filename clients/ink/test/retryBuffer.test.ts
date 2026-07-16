@@ -60,6 +60,27 @@ test('5xx is transient (buffered), 4xx is permanent (dropped)', async () => {
   assert.equal(b.size, 0);
 });
 
+test('401 (recoverable mid-turn session expiry) is transient — retained, then delivered on recovery (#1573)', async () => {
+  const b = new ToolResultBuffer();
+  const s = new FakeSrv();
+  s.mode = 'http';
+  s.status = 401;
+  await b.send(asSrv(s), {id: '1', result: 'r'});
+  assert.equal(b.size, 1); // 401 → transient (a sealed session expired mid-turn) → BUFFERED, not dropped
+  s.mode = 'ok';           // the poller/heartbeat reopens the session
+  await b.flush(asSrv(s));
+  assert.equal(b.size, 0); // the retained tool result now delivers with the fresh X-Session-Id
+});
+
+test('403 is transient like 401 (#1573)', async () => {
+  const b = new ToolResultBuffer();
+  const s = new FakeSrv();
+  s.mode = 'http';
+  s.status = 403;
+  await b.send(asSrv(s), {id: '1', result: 'r'});
+  assert.equal(b.size, 1); // 403 is also a recoverable session-auth failure → buffered
+});
+
 test('send drains the buffer first, preserving order', async () => {
   const b = new ToolResultBuffer();
   const s = new FakeSrv();

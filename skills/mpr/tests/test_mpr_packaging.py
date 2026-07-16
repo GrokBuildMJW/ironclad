@@ -74,8 +74,10 @@ def test_derived_schema_only_query_required_and_clean():
     props = schema.get("properties") or schema.get("parameters", {}).get("properties", {})
     required = schema.get("required") or schema.get("parameters", {}).get("required", [])
     assert props["query"]["type"] == "string"
-    assert props["files"]["type"] == "array" and props["files"]["items"]["type"] == "string"
-    assert required == ["query"]                                 # only query required
+    # #1535: `files: Optional[List[str]]` keeps its null arm — the value schema is `anyOf: [array, null]`
+    # (matching pydantic's Optional rendering), so passing None is valid; it is optional via its default.
+    assert props["files"] == {"anyOf": [{"type": "array", "items": {"type": "string"}}, {"type": "null"}]}
+    assert required == ["query"]                                 # only query required (no default)
     addl = schema.get("additionalProperties", schema.get("parameters", {}).get("additionalProperties"))
     assert addl is False                                         # grammar-clean, no invented keys
 

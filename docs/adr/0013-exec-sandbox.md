@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted — mandatory and fail-closed (#1464).
+Accepted — mandatory and fail-closed.
 
 ## Context
 
@@ -20,20 +20,32 @@ code-local command to a client.
 - Linux execution uses `bwrap --unshare-net --die-with-parent --unshare-pid` or `firejail --net=none`.
   Commands run in a dedicated process session; on timeout or cancellation the whole process group is killed.
   With **bwrap** the reap is complete: `--die-with-parent` + `--unshare-pid` make bwrap the namespace init, so
-  killing it tears down every descendant — including a `setsid`/daemonized escapee. **firejail** relies on its
-  own default PID-namespace monitor (no explicit die-with-parent flag), so its tree teardown is weaker; bwrap
-  is the preferred `auto` backend. The complete-tree guarantee applies to the normal timeout/cancel paths — an
+  killing it tears down every descendant — including a `setsid`/daemonized escapee. **firejail** tree teardown
+  is explicitly best-effort-only: the engine performs a process-group kill plus a bounded reap, but a `setsid`
+  descendant may survive. PID-death hardening for firejail was assessed and deferred because it has no clean
+  die-with-parent equivalent, and a polling monitor would add races to the non-preferred fallback. Selecting
+  firejail emits one process-deduplicated, non-blocking operator advisory on every topology that can run it:
+  the native/Python-client sandbox preparer emits from `_sandbox_model_command`, while the Ink thin client
+  emits when `findSandboxBackend` resolves firejail client-side. bwrap remains the preferred `auto` backend.
+  The complete-tree guarantee applies to the normal bwrap timeout/cancel paths — an
   abnormal *engine* crash that bypasses the kill path can still orphan a detached sandboxed tree. Import,
   detection, and wrapper errors refuse before subprocess execution.
 - Windows has no supported backend and refuses before Git Bash or PowerShell selection.
 - Bridged model commands use a versioned wire-only name plus the validated backend policy. An older client
   cannot mistake the frame for the legacy direct-shell tool and therefore errors instead of executing.
+- Accepted bridge-ceiling parity edge: near `ToolBridge`'s default 180-second timeout, Ink's bounded
+  post-kill drain can delay its tool result by up to two seconds after the server has already returned the
+  bridge-timeout string. The request id has already been removed, so the late result is a harmless no-op
+  (a stale `410` that the client drops), not a hang; no timeout expansion is made here.
 - Ink `/sh` remains a separate explicit operator channel. It is not a model tool and is never reachable from
   `execute_command`.
 
 The production Linux host must install `bwrap` or `firejail`; `bwrap` is the preferred `auto` backend. Tests
 use an opt-in command-wrapper shim for deterministic positive-path coverage and separately prove the real
-no-backend path never reaches a subprocess. No CI runner provisioning is treated as a security guarantee.
+no-backend path never reaches a subprocess. A real-bwrap `fork()` + `setsid()` descendant-reap proof covers
+both timeout and cancellation only when `IRONCLAD_REAL_SANDBOX_TEST` is set and `bwrap` is present; the file is
+not collected otherwise, so default offline counts and skip semantics stay honest. No CI runner provisioning
+is treated as a security guarantee.
 
 ## Consequences
 

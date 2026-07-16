@@ -1,6 +1,7 @@
 import httpx
 import pytest
 import sys
+import threading
 import types
 from pathlib import Path
 
@@ -35,6 +36,75 @@ def test_client_timeout_decouples_httpx_read_and_connect(monkeypatch):
     assert timeout.read == 600.0
     assert timeout.write == 120.0
     assert timeout.pool == 120.0
+
+
+def test_total_request_deadline_preserves_decoupled_prefill_budget(monkeypatch):
+    monkeypatch.setattr(gx10, "LLM_REQUEST_TIMEOUT_S", 120.0)
+    monkeypatch.setattr(gx10, "LLM_FIRST_TOKEN_TIMEOUT_S", 600.0)
+
+    assert gx10._decoupled() is True
+    assert gx10._total_request_deadline_s() == 720.0
+
+    monkeypatch.setattr(gx10, "LLM_FIRST_TOKEN_TIMEOUT_S", 0.0)
+    assert gx10._decoupled() is False
+    assert gx10._total_request_deadline_s() == 120.0
+
+    monkeypatch.setattr(gx10, "LLM_REQUEST_TIMEOUT_S", 0.0)
+    assert gx10._total_request_deadline_s() == 0.0
+    monkeypatch.setattr(gx10, "LLM_REQUEST_TIMEOUT_S", -1.0)
+    assert gx10._total_request_deadline_s() == 0.0
+
+
+class _BlockingStream:
+    def __init__(self):
+        self.started = threading.Event()
+        self.closed = threading.Event()
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        self.started.set()
+        if not self.closed.wait(timeout=2.0):
+            raise RuntimeError("test stream was not closed")
+        raise RuntimeError("stream closed")
+
+    def close(self):
+        self.closed.set()
+
+
+def test_generate_total_deadline_closes_stream_and_returns_named_error(monkeypatch):
+    agent = gx10.GX10.__new__(gx10.GX10)
+    agent.stream = True
+    blocking_stream = _BlockingStream()
+    monotonic_calls = 0
+
+    def fake_monotonic():
+        nonlocal monotonic_calls
+        monotonic_calls += 1
+        if monotonic_calls == 1:
+            return 0.0
+        assert blocking_stream.started.wait(timeout=1.0)
+        return 2.0
+
+    monkeypatch.setattr(gx10, "LLM_REQUEST_TIMEOUT_S", 1.0)
+    monkeypatch.setattr(gx10, "LLM_FIRST_TOKEN_TIMEOUT_S", 0.0)
+    monkeypatch.setattr(gx10.time, "monotonic", fake_monotonic)
+    monkeypatch.setattr(gx10.GX10, "_make_completion", lambda self, think, stream: blocking_stream)
+    gx10._CANCEL_EVENT.clear()
+
+    content, tool_calls, cancelled, err, metrics = agent._generate(think=False)
+
+    assert content == ""
+    assert tool_calls == []
+    assert cancelled is False
+    assert isinstance(err, TimeoutError)
+    assert str(err) == (
+        "request exceeded its total wall-clock budget of 1s "
+        "(connection.request_timeout_s) — the stream never terminated"
+    )
+    assert metrics["total"] >= 0.0
+    assert blocking_stream.closed.is_set()
 
 
 def test_idle_limit_is_phase_aware_only_when_decoupled(monkeypatch):

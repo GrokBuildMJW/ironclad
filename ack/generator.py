@@ -85,7 +85,29 @@ STATE_FILENAME = ".ack-generator-state.json"
 # Files at the template root that are NOT part of the rendered output.
 TEMPLATE_SKIP = {"copier.yml", "copier.yaml", "TEMPLATE-README.md"}
 
-_TOKEN_RE = re.compile(r"\{\{\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*\}\}")
+#: A placeholder is ``{{ key }}`` with an OPTIONAL ``| filter`` (#1533) that serializes the substituted value
+#: so an operator-supplied string (e.g. a ``--description`` with quotes) can never break a generated file's
+#: syntax. The one filter is ``tojson`` — a Jinja2 built-in, so the template tree stays Copier-renderable — a
+#: fully double-quoted JSON scalar that is simultaneously a valid Python string literal, JSON string, and YAML
+#: scalar. A filterless token is byte-identical to before.
+_TOKEN_RE = re.compile(r"\{\{\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*(?:\|\s*([a-z_]+)\s*)?\}\}")
+
+
+def _apply_filter(name: str, value: str) -> str:
+    """Serialize a substituted value for a placeholder's ``| filter`` (#1533).
+
+    ``tojson`` → ``json.dumps(value)`` — a fully double-quoted scalar (WITH the surrounding quotes) that is a
+    valid Python source string literal, a valid JSON string, AND a valid YAML flow scalar. Named to match the
+    Jinja2 built-in so the same template tree renders identically under ``copier``. The two quoted sinks drop
+    their hand-written quotes and let the filter supply them (byte-identical output for an ordinary value); the
+    YAML sink, previously an unquoted scalar, now emits a quoted one (still valid, parses to the same value).
+    An unknown filter fails soft to the raw value (filters are authored in the built-in templates, so a typo
+    surfaces in the generator tests)."""
+    if name == "tojson":
+        # ensure_ascii=False keeps a non-ASCII description literal (e.g. `café`, not `café`) — still a
+        # valid Python literal / JSON string / YAML scalar, and it round-trips through json.loads on read.
+        return json.dumps(value, ensure_ascii=False)
+    return value
 
 
 # --------------------------------------------------------------------------- #
@@ -157,8 +179,10 @@ def template_root_for(args: argparse.Namespace) -> Path:
 def render_str(text: str, ctx: dict[str, str], unknown: set[str] | None = None) -> str:
     def repl(m: re.Match) -> str:
         key = m.group(1)
+        filt = m.group(2)          # #1533: optional `| filter` → context-aware escaping
         if key in ctx:
-            return str(ctx[key])
+            val = str(ctx[key])
+            return _apply_filter(filt, val) if filt else val
         if unknown is not None:
             unknown.add(key)
         return m.group(0)  # leave verbatim (fail-soft)
@@ -307,7 +331,7 @@ def generate(
     # #601 S10 (ADR-0011): built-in collision guard. The generator writes into a PER-PROJECT library; a
     # generated capability that shadows a core built-in (e.g. `mpr`) would be ambiguous at load time, so it
     # is REFUSED fail-closed before anything is written — never silently overwrite/shadow a built-in. The
-    # reserved set is injected by the engine (the core/skills built-in capabilities); empty/None => no guard
+    # reserved set is injected by the engine (the built-in skills' capabilities); empty/None => no guard
     # (byte-identical to the pre-guard generator).
     cap = ctx.get("capability_key", "")
     if reserved_capabilities and cap in reserved_capabilities:
@@ -454,7 +478,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--dry-run", action="store_true", help="Report actions without writing")
     p.add_argument("--reserved-capabilities", default=None,
                    help="Comma-separated built-in capabilities a generated item may NOT shadow "
-                        "(the engine injects the core/skills built-ins; collision => refused)")
+                        "(the engine injects the built-in skills; collision => refused)")
     return p
 
 

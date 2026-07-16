@@ -212,12 +212,13 @@ def test_auto_on_off_flips_the_three_flags():
     saved = (gx10._WATCHER_ENABLED, gx10.AUTOPILOT_ENABLED, gx10.AUTOPILOT_AUTOPLAN,
              gx10.AUTOPILOT_MAX_TASKS, gx10._AUTOPLAN_DONE, gx10._EFFECTIVE_CFG)
     try:
-        gx10._EFFECTIVE_CFG = {"watcher": {}, "autopilot": {}, "paths": {}}
+        gx10._EFFECTIVE_CFG = gx10._code_defaults()
         gx10._dispatch(None, "auto on 5")
         assert gx10._WATCHER_ENABLED and gx10.AUTOPILOT_ENABLED and gx10.AUTOPILOT_AUTOPLAN
         assert gx10.AUTOPILOT_MAX_TASKS == 5 and gx10._AUTOPLAN_DONE == 0
-        assert gx10._EFFECTIVE_CFG["autopilot"] == {"enabled": True, "autoplan": True,
-                                                    "autoplan_max_tasks": 5}
+        assert gx10._EFFECTIVE_CFG["autopilot"]["enabled"] is True
+        assert gx10._EFFECTIVE_CFG["autopilot"]["autoplan"] is True
+        assert gx10._EFFECTIVE_CFG["autopilot"]["autoplan_max_tasks"] == 5
         gx10._dispatch(None, "auto off")
         assert not (gx10._WATCHER_ENABLED or gx10.AUTOPILOT_ENABLED or gx10.AUTOPILOT_AUTOPLAN)
     finally:
@@ -230,7 +231,7 @@ def test_watcher_command_delegates_to_auto_meta_switch(monkeypatch):
              gx10.AUTOPILOT_MAX_TASKS, gx10._AUTOPLAN_DONE, gx10._EFFECTIVE_CFG)
     try:
         monkeypatch.setattr(gx10, "_ui_print", lambda *a, **k: None)
-        gx10._EFFECTIVE_CFG = {"watcher": {}, "autopilot": {}, "paths": {}}
+        gx10._EFFECTIVE_CFG = gx10._code_defaults()
         gx10._WATCHER_ENABLED = False
         gx10.AUTOPILOT_ENABLED = False
         gx10.AUTOPILOT_AUTOPLAN = False

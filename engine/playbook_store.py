@@ -307,9 +307,17 @@ class PlaybookStore:
                 if restored is None:
                     self._save_history(scope, hist)
                     return {"error": "no such version / nothing earlier to roll back to"}
-                self._save(scope, restored)
+                # #1551: the persistence helpers fail-soft to False on an I/O error (read-only ACE dir / full
+                # disk). If the restored playbook did not actually reach disk, the harmful active JSON is
+                # UNCHANGED — surface an error instead of a false success that tells the operator the unsafe
+                # guidance was removed.
+                if not self._save(scope, restored):
+                    return {"error": "rollback could not persist the restored playbook — the active playbook "
+                                     "is unchanged (read-only ACE dir or full disk?)"}
                 vid = hist.snapshot(restored)             # the restored state is the new tip
-                self._save_history(scope, hist)
+                if not self._save_history(scope, hist):
+                    return {"error": "rollback restored the active playbook but could not persist its version "
+                                     "history"}
                 return {"rolled_back_to": vid, "size": len(restored)}
         except Exception as ex:   # noqa: BLE001
             return {"error": repr(ex)}
@@ -412,16 +420,21 @@ class PlaybookStore:
             return []
 
     def forget(self, scope: str) -> bool:
-        """Delete a scope's playbook file (the optional provider verb the engine's forget delegates to).
-        Returns True iff a file was removed. Fail-soft; never raises."""
+        """Delete EVERY persisted artifact for a scope — the active playbook AND its version-history
+        (`.history.json`) and quarantined-candidate (`.quarantine.json`) side files — so a forgotten lesson
+        cannot be recovered via ``versions()``/``rollback()`` (#1552). Returns True iff at least one file was
+        removed. Fail-soft; never raises."""
         if not _scoped(scope):
             return False
         with self._lock:
-            try:
-                self._path(scope).unlink()
-                return True
-            except Exception:   # noqa: BLE001 — missing file / I/O → not removed, never raises
-                return False
+            removed = False
+            for path in (self._path(scope), self._history_path(scope), self._quarantine_path(scope)):
+                try:
+                    path.unlink()
+                    removed = True
+                except Exception:   # noqa: BLE001 — missing file / I/O → skip, never raises
+                    pass
+            return removed
 
     # ─── ACE engine — query-aware retrieval (the Generator read) + the online adaptation step ─────────
     def context_for(self, scopes: "Sequence[str]", *, query: str, limit: "Optional[int]" = None) -> str:

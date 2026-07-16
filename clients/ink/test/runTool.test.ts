@@ -3,8 +3,18 @@ import assert from 'node:assert/strict';
 import {promises as fs} from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import {EventEmitter} from 'node:events';
+import type {ChildProcess} from 'node:child_process';
 import {setTimeout as delay} from 'node:timers/promises';
-import {runOperatorShell, runTool, winPowershellArgs, shellGuard} from '../src/tools/runTool.js';
+import {
+  isBestEffortTeardown,
+  runOperatorShell,
+  runTool,
+  shellGuard,
+  winPowershellArgs,
+} from '../src/tools/runTool.js';
+import {waitForChildExit} from '../src/tools/procTree.js';
+import {MAX_CAPTURE_BYTES} from '../src/tools/boundedTail.js';
 import {withSandboxShim} from './sandboxFixture.js';
 
 async function tmp(): Promise<string> {
@@ -36,6 +46,40 @@ async function processTreeCommand(d: string): Promise<{command: string; ready: s
 async function exists(p: string): Promise<boolean> {
   return fs.stat(p).then(() => true).catch(() => false);
 }
+
+function fakeChild(exitCode: number | null = null): ChildProcess {
+  return Object.assign(new EventEmitter(), {exitCode, signalCode: null}) as ChildProcess;
+}
+
+test('#1500 isBestEffortTeardown identifies only firejail', () => {
+  assert.equal(isBestEffortTeardown('firejail'), true);
+  for (const backend of ['bwrap', '', 'auto']) assert.equal(isBestEffortTeardown(backend), false);
+});
+
+test('#1500 waitForChildExit resolves immediately for an already-exited child', async () => {
+  const child = fakeChild(0);
+  await waitForChildExit(child, 1000);
+  assert.equal(child.listenerCount('exit'), 0);
+  assert.equal(child.listenerCount('close'), 0);
+});
+
+test('#1500 waitForChildExit resolves on exit and clears its listeners', async () => {
+  const child = fakeChild();
+  const waiting = waitForChildExit(child, 1000);
+  child.emit('exit', 0, null);
+  await waiting;
+  assert.equal(child.listenerCount('exit'), 0);
+  assert.equal(child.listenerCount('close'), 0);
+});
+
+test('#1500 waitForChildExit has a bounded fallback when a child never exits', async () => {
+  const child = fakeChild();
+  const started = Date.now();
+  await waitForChildExit(child, 20);
+  assert.ok(Date.now() - started < 1000, 'bounded wait did not resolve promptly');
+  assert.equal(child.listenerCount('exit'), 0);
+  assert.equal(child.listenerCount('close'), 0);
+});
 
 test('write_file then read_file round-trips with exact OK string', async () => {
   const d = await tmp();
@@ -234,6 +278,47 @@ test('#1489 execute_command timeout kills a spawned descendant tree', {
     assert.equal(await exists(ready), true, 'the descendant was spawned before the timeout');
     await delay(1100);
     assert.equal(await exists(sentinel), false, 'a descendant survived the timed-out process group');
+  } finally {
+    await fs.rm(d, {recursive: true, force: true});
+  }
+});
+
+test('#1540 execute_command that exits at the deadline with a deferred close returns its output, not a false timeout', {
+  skip: process.platform === 'win32',
+}, async () => {
+  const d = await tmp();
+  try {
+    const script = path.join(d, 'boundary.cjs');
+    // exit (~100ms) << timeout (1s, integer — pyInt truncates a float to 0) << grandchild lifetime (~2.5s):
+    // the grandchild inherits stdout (fd 1) and holds it open, deferring this process's `close` past the timer,
+    // so at the deadline exitCode is set but `close` has not fired — exactly the race the guard must handle.
+    await fs.writeFile(script, [
+      "const {spawn} = require('child_process');",
+      "process.stdout.write('BOUNDARY-OK\\n');",
+      "spawn(process.execPath, ['-e', 'setTimeout(() => {}, 2500)'], {stdio: ['ignore', 1, 'ignore']});",
+      "setTimeout(() => process.exit(0), 100);",
+    ].join('\n'), 'utf8');
+    const out = await withSandboxShim(() =>
+      runTool('execute_command', {command: `${process.execPath} ${script}`, timeout: 1}));
+    assert.match(out, /BOUNDARY-OK/);      // the real buffered output survived (pre-fix: false 'ERROR: Timeout')
+    assert.doesNotMatch(out, /Timeout/);
+  } finally {
+    await fs.rm(d, {recursive: true, force: true});
+  }
+});
+
+test('#1540 execute_command output is bounded — a high-volume printer cannot exhaust client memory', {
+  skip: process.platform === 'win32',
+}, async () => {
+  const d = await tmp();
+  try {
+    const script = path.join(d, 'printer.cjs');
+    const bytes = MAX_CAPTURE_BYTES + 200 * 1024;
+    await fs.writeFile(script, `process.stdout.write('x'.repeat(${bytes}));`, 'utf8');
+    const out = await runOperatorShell(`${process.execPath} ${script}`);
+    assert.ok(Buffer.byteLength(out, 'utf8') <= MAX_CAPTURE_BYTES + 64,
+      `output must be tail-capped, was ${Buffer.byteLength(out, 'utf8')} bytes`);
+    assert.match(out, /^…\(truncated\)…/); // the rolling tail keeps only the last MAX_CAPTURE_BYTES + a marker
   } finally {
     await fs.rm(d, {recursive: true, force: true});
   }

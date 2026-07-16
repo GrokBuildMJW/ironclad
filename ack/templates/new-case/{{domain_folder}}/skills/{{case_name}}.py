@@ -14,7 +14,7 @@ CASE: dict = {
     "name": "{{case_name}}",
     "capability": "{{capability_key}}",
     "domain": "{{domain_name}}",
-    "description": "{{description}}",
+    "description": {{description|tojson}},
 }
 
 

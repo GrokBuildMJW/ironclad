@@ -24,6 +24,8 @@ import pytest  # noqa: E402
 
 def _patch_handover_popen(monkeypatch, fake_run):
     """Adapt the pre-#1491 run-style fakes to the handover's real Popen contract."""
+    import io as _io
+
     class _FakePopen:
         pid = 4242
 
@@ -31,6 +33,13 @@ def _patch_handover_popen(monkeypatch, fake_run):
             result = fake_run(argv, **kwargs)
             self.returncode = result.returncode
             self._stderr = getattr(result, "stderr", "") or ""
+            # #1502: _run_handover now drains a BINARY stderr pipe via a reader thread + proc.wait(),
+            # instead of communicate() — the fake must expose a readable/closeable stderr and wait().
+            self.stderr = _io.BytesIO(
+                self._stderr.encode("utf-8") if isinstance(self._stderr, str) else self._stderr)
+
+        def wait(self, timeout=None):
+            return self.returncode
 
         def communicate(self, timeout=None):
             return None, self._stderr
@@ -462,6 +471,48 @@ def test_dispatch_claims_and_runs_each_once(monkeypatch, tmp_path):
     assert sorted(s[1] for s in srv.signals if s[0] == "claim") == ["KGC-1", "KGC-2"]
 
 
+def test_process_one_renews_claim_during_run_and_stops_after(monkeypatch, tmp_path):
+    srv = _FakeServer(_items("KGC-1"))
+    renewed = threading.Event()
+    call_lock = threading.Lock()
+    claim_calls = 0
+    original_claim = srv.claim
+
+    def _claim(task_id, agent):
+        nonlocal claim_calls
+        result = original_claim(task_id, agent)
+        with call_lock:
+            claim_calls += 1
+            if claim_calls > 1:
+                renewed.set()
+        return result
+
+    def _blocking(item, codedir, log=print):
+        assert renewed.wait(2), "claim lease was not renewed while the coder was running"
+        return "feedback", {}
+
+    srv.claim = _claim
+    monkeypatch.setattr(client, "_CLAIM_RENEW_INTERVAL_S", 0.01)
+    monkeypatch.setattr(client, "_run_handover", _blocking)
+    claimed = {"KGC-1"}
+    result: list[bool] = []
+    worker = threading.Thread(
+        target=lambda: result.append(client._process_one(
+            srv, tmp_path, _items("KGC-1")[0], claimed, lambda *_args: None)),
+    )
+    worker.start()
+    worker.join(timeout=3)
+    assert not worker.is_alive()
+    assert result == [True]
+    threading.Event().wait(0.03)   # let any renewal already inside the fake claim return after stop.set()
+    with call_lock:
+        stopped_at = claim_calls
+    assert stopped_at > 1
+    threading.Event().wait(0.05)
+    with call_lock:
+        assert claim_calls == stopped_at
+
+
 def test_already_claimed_not_resubmitted(monkeypatch, tmp_path):
     srv = _FakeServer(_items("KGC-1"))
     calls = []
@@ -543,3 +594,13 @@ def test_claim_and_unclaim_transport_errors_are_fail_soft(monkeypatch, tmp_path)
     assert client._process_one(srv, tmp_path, _items("KGC-1")[0], claimed, logs.append) is False
     assert claimed == set()
     assert any("/unclaim failed (continuing)" in line for line in logs)
+
+
+def test_read_capped_bounds_a_giant_feedback_file(tmp_path):
+    # #1543: a coder-controlled feedback/capture file must be read cap+1 bytes at a time so a multi-GB file
+    # can never OOM the client — an oversized file is truncated to the cap (the status: line is first).
+    big = tmp_path / "fb.md"
+    big.write_bytes(b"status: done\n" + b"x" * (client._FEEDBACK_MAX_BYTES * 2))
+    out = client._read_capped(big)
+    assert len(out) == client._FEEDBACK_MAX_BYTES
+    assert out.startswith("status: done")

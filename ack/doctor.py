@@ -222,6 +222,10 @@ class DoctorContext:
     mappings: list = field(default_factory=list)
     known_caps: set = field(default_factory=set)
     extra: dict = field(default_factory=dict)
+    # Injected when Lodestar is enabled → a capability task record validates against CapabilityTaskSpec
+    # under --validate-tasks; None (Lodestar off) → it validates against the base TaskSpec, whose
+    # extra='forbid' flags a stray `capability` key. Keeps the always-on core check capability-agnostic.
+    capability_spec_cls: Any = None
 
 
 #: A check: pure, read-only, returns findings. May read/write the context.
@@ -395,21 +399,24 @@ def check_task_records_validate(ctx: DoctorContext) -> list[Finding]:
     bad = 0
     checked = 0
     for r in ctx.records:
-        # A record with a `capability` field is a Lodestar CapabilityTaskSpec task — its own doctor checks
-        # validate it (the base TaskSpec forbids `capability`); the core check validates only base records,
-        # so it never double-flags a legitimate capability task.
-        if isinstance(r.data, dict) and "capability" in r.data:
-            continue
         checked += 1
+        # A record with a `capability` field is a Lodestar CapabilityTaskSpec task. When Lodestar is enabled
+        # (ctx.capability_spec_cls set) validate it against that schema so a malformed capability task is
+        # caught; when Lodestar is off, validate against the base TaskSpec, whose extra='forbid' flags the
+        # stray `capability` key. Either way the record IS validated — never silently skipped (#1531).
+        spec_cls = ctx.capability_spec_cls if (isinstance(r.data, dict) and "capability" in r.data) else None
         try:
-            cs.validate_task_json(r.data)
+            if spec_cls is not None:
+                cs.validate_task_json(r.data, spec_cls=spec_cls)
+            else:
+                cs.validate_task_json(r.data)
         except Exception as e:  # noqa: BLE001 — a malformed task is a finding, not a crash
             bad += 1
             findings.append(err(chk, f"task '{r.task_id}' fails TaskSpec: {e}",
                                 field=rel(r.file, ctx.root),
                                 fix="correct the task JSON to satisfy the ACK TaskSpec (run --validate-tasks)"))
     if not bad and checked:
-        findings.append(ok(chk, f"all {checked} base task record(s) validate against TaskSpec"))
+        findings.append(ok(chk, f"all {checked} task record(s) validate against TaskSpec"))
     return findings
 
 
@@ -428,6 +435,7 @@ def run_doctor(
     validate_tasks: bool = False,
     include_done: bool = False,
     extra_checks: Optional[Iterable[Check]] = None,
+    capability_spec_cls: Optional[Any] = None,
 ) -> Report:
     """Run the core checks plus any plugin-contributed ``extra_checks`` (e.g.
     Lodestar's, when enabled), in order, and return the aggregated report.
@@ -435,13 +443,16 @@ def run_doctor(
     The TaskStore is indexed once and shared via the context. ``check_ack_kernel``
     runs first so ``ctx.case_spec`` is available to later checks. Plugin checks are
     appended after the core kernel/index checks so they can read ``ctx.records`` and
-    populate ``ctx.mappings`` / ``ctx.known_caps`` for one another."""
+    populate ``ctx.mappings`` / ``ctx.known_caps`` for one another. ``capability_spec_cls``
+    (Lodestar's ``CapabilityTaskSpec`` when the plugin is enabled) tells the always-on
+    ``--validate-tasks`` check which schema a capability task record is held to (#1531)."""
     ctx = DoctorContext(
         root=root,
         only_domain=only_domain,
         do_dry_run=do_dry_run,
         validate_tasks=validate_tasks,
         include_done=include_done,
+        capability_spec_cls=capability_spec_cls,
     )
     report = Report()
 
@@ -489,14 +500,36 @@ def render_report(report: Report, *, quiet: bool) -> str:
 
 
 def _load_lodestar_checks(enabled: bool) -> list[Check]:
-    """Return Lodestar's doctor checks when the plugin is enabled, else none."""
+    """Return Lodestar's doctor checks when the plugin is enabled, else none.
+
+    #1532: when Lodestar is *requested* (``enabled``) but the plugin cannot be loaded — a packaging
+    omission, a broken install, a ``SyntaxError``, or an init failure in its check factory — return a
+    single check that emits an ERROR Finding rather than an empty list. An empty list is indistinguishable
+    from Lodestar being *disabled*, so the doctor would silently run only the generic checks and report
+    success (exit 0) even though the operator asked for the capability/gap-tracking checks. Failing closed
+    surfaces the load failure as a real error (exit 2)."""
     if not enabled:
         return []
     try:
         from .lodestar.doctor_checks import lodestar_checks
+        return lodestar_checks()
+    except Exception as e:  # noqa: BLE001 — import OR init failure must be VISIBLE, not silently dropped
+        msg = f"Lodestar checks were requested but the plugin failed to load: {e}"
+        return [lambda ctx: [err("lodestar", msg,
+                                 fix="repair or reinstall the ack.lodestar plugin (broken or omitted from this install)")]]
+
+
+def _load_capability_spec(enabled: bool) -> Any:
+    """Return Lodestar's CapabilityTaskSpec when the plugin is enabled (so `--validate-tasks` validates a
+    capability task record against its real schema), else None (the record validates against the base
+    TaskSpec, whose extra='forbid' then flags a stray `capability` key)."""
+    if not enabled:
+        return None
+    try:
+        from .lodestar.spec import CapabilityTaskSpec
     except Exception:
-        return []
-    return lodestar_checks()
+        return None
+    return CapabilityTaskSpec
 
 
 def main(argv: Optional[list[str]] = None) -> int:
@@ -527,6 +560,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             validate_tasks=args.validate_tasks,
             include_done=args.all_tasks,
             extra_checks=_load_lodestar_checks(args.lodestar),
+            capability_spec_cls=_load_capability_spec(args.lodestar),
         )
     except Exception as e:  # doctor itself broke — exit 1, distinct from a failed check
         print(f"[doctor] internal error: {e}", file=sys.stderr)

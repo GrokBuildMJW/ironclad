@@ -51,8 +51,8 @@ PC (client.py)                         Spark (server.py + vLLM)
 ```
 
 The server never reaches into the client; the client initiates every exchange, so
-session-gating and code-locality are structural. **The trust model is selectable (Phase d):**
-`open` (no auth; **binds loopback only by default** since #1469 — a non-loopback `open` bind refuses
+session-gating and code-locality are structural. **The trust model is selectable:**
+`open` (no auth; **binds loopback only by default** — a non-loopback `open` bind refuses
 fail-closed at boot unless you set the explicit `GX10_ALLOW_UNAUTHENTICATED_BIND=1` override), `token`
 (deployment secret over the LAN), or `sealed` (secret + session heartbeat, typically over a
 client-managed tunnel; may bind the LAN under the secret).

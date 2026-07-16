@@ -93,7 +93,7 @@ Found something broken? The same loop fixes it:
 
 ## Letting the agent actually change files (permissions)
 
-The code-agent runs headless, so it can't stop to ask you to approve each action. Since #1469 the
+The code-agent runs headless, so it can't stop to ask you to approve each action. The
 **least-privilege posture is the default**: an agent launches with `permission_mode: default`, which
 auto-denies commands without blocking — the coder can propose file edits but cannot run commands on your
 machine, so it cannot itself run the tests it writes. Nothing runs commands unless you explicitly opt in.

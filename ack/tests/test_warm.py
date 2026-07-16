@@ -117,6 +117,52 @@ def test_dead_client_clears_the_tried_latch_so_conn_retries() -> None:
     assert wt._client is None and wt._tried is False   # dead client dropped AND latch cleared → _conn retries
 
 
+def test_transient_first_connect_clears_the_tried_latch() -> None:
+    # #1556: a failed INITIAL connect (Valkey still booting) must NOT latch the tier off forever — a later
+    # _conn() must re-dial. Distinct from the is_available ping-failure path (which a first-connect fail never
+    # reaches, because _conn returns None before is_available's own retry).
+    import types
+
+    pings = {"n": 0}
+
+    class _Client:
+        def ping(self) -> bool:
+            pings["n"] += 1
+            if pings["n"] == 1:
+                raise ConnectionError("valkey still booting")
+            return True
+
+    fake_redis = types.SimpleNamespace(Redis=types.SimpleNamespace(from_url=lambda *a, **k: _Client()))
+    saved = sys.modules.get("redis")
+    sys.modules["redis"] = fake_redis
+    try:
+        wt = WarmTier({"url": "redis://x", "enabled": True})
+        assert wt.is_available() is False          # first connect: ping raises → unavailable, latch cleared
+        assert wt._tried is False                  # the fix: a transient first-connect blip does not latch off
+        assert wt.is_available() is True           # a later probe re-dials → recovered without a restart
+    finally:
+        if saved is None:
+            sys.modules.pop("redis", None)
+        else:
+            sys.modules["redis"] = saved
+
+
+def test_missing_redis_dep_keeps_the_latch() -> None:
+    # A missing `redis` dep is permanent, not transient — keep the latch so _conn() does not re-attempt the
+    # import on every call.
+    saved = sys.modules.get("redis")
+    sys.modules["redis"] = None  # `import redis` → ImportError
+    try:
+        wt = WarmTier({"url": "redis://x", "enabled": True})
+        assert wt.is_available() is False
+        assert wt._tried is True                   # permanent: latch stays, no repeated import
+    finally:
+        if saved is None:
+            sys.modules.pop("redis", None)
+        else:
+            sys.modules["redis"] = saved
+
+
 def test_public_valkey_default_is_loopback_no_auth() -> None:
     # #488: the PUBLIC docker-compose.yml valkey service MUST keep the safe default — loopback-only bind and
     # NO requirepass. A LAN bind + auth is layered via a deploy-local compose override kept OUTSIDE the synced

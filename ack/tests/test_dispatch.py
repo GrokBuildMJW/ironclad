@@ -7,6 +7,8 @@ ReasoningWorkers and is not retested here.
 from __future__ import annotations
 
 import sys
+import threading
+import time
 from pathlib import Path
 
 _ENGINE = Path(__file__).resolve().parents[2] / "engine"
@@ -66,7 +68,7 @@ import pytest  # noqa: E402
 from types import SimpleNamespace  # noqa: E402
 from dispatch import PROVENANCE_FIELDS, DispatchPolicy, ProviderDispatcher  # noqa: E402
 from providers import load_registry  # noqa: E402
-from router import Budget, LoadSignal, ProviderPolicy, RouteRequest, Sensitivity  # noqa: E402
+from router import Budget, LoadSignal, ProviderPolicy, RouteDecision, RouteRequest, Sensitivity  # noqa: E402
 import client  # noqa: E402
 import gx10  # noqa: E402
 
@@ -230,6 +232,90 @@ def test_spill_routes_cli_in_order():
     assert [r["provider_id"] for r in res] == ["claude-sonnet", "claude-sonnet"]
     assert [r["content"] for r in res] == ["cli:claude-sonnet:a", "cli:claude-sonnet:b"]
     assert wk.calls == []                                # Spark untouched when everything spilled
+
+
+def test_cli_provider_pool_does_not_head_of_line_block_an_idle_provider():
+    provider_a = {**SONNET, "provider_id": "provider-a", "rate_limit": {"max_concurrent": 1}}
+    provider_b = {**SONNET, "provider_id": "provider-b", "rate_limit": {"max_concurrent": 1}}
+    reg = load_registry({"providers": {"pool": [provider_a, provider_b]}})
+    by_id = reg.by_id()
+    items = ["a0", "a1", "a2", "b0"]
+    decisions = [
+        RouteDecision(index=i, provider_id="provider-a" if i < 3 else "provider-b",
+                      reason="cost-fit", est_max_tokens=1024, est_cost_usd=0.0)
+        for i in range(len(items))
+    ]
+    reqs = [RouteRequest(index=i) for i in range(len(items))]
+    results = [None] * len(items)
+    release_a = threading.Event()
+    a_started = threading.Event()
+    b_started = threading.Event()
+    timestamps = {"start": {}, "complete": {}}
+    lock = threading.Lock()
+
+    def runner(spec, prompt, *, effort, max_tokens=None):
+        with lock:
+            timestamps["start"][prompt] = time.monotonic()
+        if spec.provider_id == "provider-a":
+            a_started.set()
+            if not release_a.wait(5):
+                raise TimeoutError("provider A was not released")
+        else:
+            b_started.set()
+        with lock:
+            timestamps["complete"][prompt] = time.monotonic()
+        return {"ok": True, "content": prompt, "error": None,
+                "completion_tokens": None, "latency": 0.0}
+
+    disp = ProviderDispatcher(reg, workers=None, agent_runner=runner, enabled=True, max_agents=3)
+    errors = []
+
+    def run_cli():
+        try:
+            disp._run_cli(decisions, items, reqs, by_id, results)
+        except BaseException as exc:  # propagate a background failure into the test thread
+            errors.append(exc)
+
+    thread = threading.Thread(target=run_cli, daemon=True)
+    thread.start()
+    try:
+        assert a_started.wait(2), "provider A runner did not start"
+        b_started_while_a_blocked = b_started.wait(2)
+    finally:
+        release_a.set()
+        thread.join(5)
+
+    assert not thread.is_alive()
+    assert errors == []
+    assert b_started_while_a_blocked, "idle provider B was blocked behind saturated provider A"
+    assert timestamps["start"]["b0"] < timestamps["complete"]["a0"]
+    assert [r["content"] for r in results] == items
+
+
+def test_cli_single_provider_pool_returns_every_result_once():
+    provider = {**SONNET, "provider_id": "provider-a", "rate_limit": {"max_concurrent": 2}}
+    reg = load_registry({"providers": {"pool": [provider]}})
+    items = ["a0", "a1", "a2"]
+    decisions = [
+        RouteDecision(index=i, provider_id="provider-a", reason="cost-fit",
+                      est_max_tokens=1024, est_cost_usd=0.0)
+        for i in range(len(items))
+    ]
+    reqs = [RouteRequest(index=i) for i in range(len(items))]
+    results = [None] * len(items)
+    calls = []
+
+    def runner(spec, prompt, *, effort, max_tokens=None):
+        calls.append(prompt)
+        return {"ok": True, "content": f"done:{prompt}", "error": None,
+                "completion_tokens": None, "latency": 0.0}
+
+    disp = ProviderDispatcher(reg, workers=None, agent_runner=runner, enabled=True, max_agents=3)
+    disp._run_cli(decisions, items, reqs, reg.by_id(), results)
+
+    assert sorted(calls) == items
+    assert [r["content"] for r in results] == [f"done:{item}" for item in items]
+    assert [r["provider_id"] for r in results] == ["provider-a"] * len(items)
 
 
 def test_sovereignty_sensitive_stays_local_even_busy():

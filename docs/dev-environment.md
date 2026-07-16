@@ -11,7 +11,7 @@ A change is only ready to ship once it **builds and the whole suite is green in 
 container**. One command does both:
 
 ```bash
-# from core/
+# from the directory containing docker-compose.dev.yml
 docker compose -f docker-compose.dev.yml run --rm test
 ```
 

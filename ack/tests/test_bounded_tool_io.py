@@ -31,6 +31,66 @@ def test_read_file_refuses_sparse_file_above_byte_bound_without_read_text(tmp_pa
     assert f"cap {gx10._MAX_FILE_BYTES} bytes" in out
 
 
+def test_edit_file_refuses_sparse_file_above_byte_bound_without_read_text(tmp_path, monkeypatch):
+    target = tmp_path / "oversized.txt"
+    with target.open("wb") as fh:
+        fh.seek(gx10._MAX_FILE_BYTES)
+        fh.write(b"x")
+
+    def _unbounded_read_forbidden(*_args, **_kwargs):
+        raise AssertionError("edit_file must not call Path.read_text")
+
+    monkeypatch.setattr(Path, "read_text", _unbounded_read_forbidden)
+    out = gx10.run_tool(
+        "edit_file", {"path": str(target), "old_string": "x", "new_string": "y"}
+    )
+
+    assert "edit_file refused" in out
+    assert "file too large" in out
+    assert f"{gx10._MAX_FILE_BYTES + 1} bytes" in out
+    assert f"cap {gx10._MAX_FILE_BYTES} bytes" in out
+
+
+def test_review_paths_refuses_sparse_file_above_byte_bound_without_read_text(tmp_path, monkeypatch):
+    oversized = tmp_path / "oversized.txt"
+    with oversized.open("wb") as fh:
+        fh.seek(gx10._MAX_FILE_BYTES)
+        fh.write(b"x")
+    readable = tmp_path / "readable.txt"
+    readable.write_bytes(b"bounded review material\n")
+
+    def _unbounded_read_forbidden(*_args, **_kwargs):
+        raise AssertionError("review paths must not call Path.read_text")
+
+    monkeypatch.setattr(Path, "read_text", _unbounded_read_forbidden)
+    monkeypatch.setattr(gx10, "_resolve_exec_path", lambda path: tmp_path / path)
+    mode, material = gx10._assemble_review_material(["oversized.txt", "readable.txt"])
+
+    assert mode == "paths"
+    assert "file too large" in material
+    assert f"{gx10._MAX_FILE_BYTES + 1} bytes" in material
+    assert f"cap {gx10._MAX_FILE_BYTES} bytes" in material
+    assert "bounded review material" in material
+
+
+def test_vault_docs_skips_sparse_file_above_byte_bound_without_read_text(tmp_path, monkeypatch):
+    oversized = tmp_path / "oversized.md"
+    with oversized.open("wb") as fh:
+        fh.seek(gx10._MAX_FILE_BYTES)
+        fh.write(b"x")
+    readable = tmp_path / "readable.md"
+    readable.write_bytes(b"# Bounded vault document\n")
+
+    def _unbounded_read_forbidden(*_args, **_kwargs):
+        raise AssertionError("vault document scans must not call Path.read_text")
+
+    monkeypatch.setattr(Path, "read_text", _unbounded_read_forbidden)
+    docs = gx10._vault_docs(tmp_path)
+
+    assert [doc["rel"] for doc in docs] == [Path("readable.md")]
+    assert docs[0]["title"] == "Bounded vault document"
+
+
 def test_list_directory_stops_after_cap_plus_one_without_materializing_all(tmp_path, monkeypatch):
     class _Entry:
         def __init__(self, n):

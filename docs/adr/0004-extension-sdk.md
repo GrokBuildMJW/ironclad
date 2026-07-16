@@ -1,22 +1,22 @@
 # ADR-0004 — Public, versioned Extension SDK
 
-- **Status:** Accepted (design + initial cut) — implementation under epic #132 (sub-issue #72; the internal-loading seam is #136). Records the design; for what ships see [`status.md`](../status.md).
+- **Status:** Accepted (design + initial cut) — implementation tracked separately (including a follow-up internal-loading seam). Records the design; for what ships see [`status.md`](../status.md).
 - **Date:** 2026-06-22
-- **Context sources:** the loader/registry in `engine/gx10.py` + `ack/{registry,playbook,prompt,promptgen,gate,catalogue,i18n,doctor,generator}.py`, the contract doc [`plugin-api.md`](../plugin-api.md), `pyproject.toml` packaging, and the plan `vault/Plan/self-extending-architecture.md` (open plugin boundary ↔ inbound-closed core). Supersedes the "publish the surface" framing of epic #132's C0 after an evidence check (below).
+- **Context sources:** the loader/registry in `engine/gx10.py` + `ack/{registry,playbook,prompt,promptgen,gate,catalogue,i18n,doctor,generator}.py`, the contract doc [`plugin-api.md`](../plugin-api.md), `pyproject.toml` packaging, and the internal self-extending-architecture plan (open plugin boundary ↔ inbound-closed core). Supersedes the "publish the surface" framing of the initial scope review after an evidence check (below).
 
 ## Context
 
 Ironclad must be extensible **across a repository boundary**: a separate repo builds a plugin
 against a **stable, published** contract (`pip install ironclad-ai`), gets framework updates, and
 never forks the core. The core stays **inbound-closed** (no upstream PRs into `core/`); the plugin
-boundary is the only open surface (`self-extending-architecture.md` §0/§1.2).
+boundary is the only open surface (per the internal self-extending-architecture plan).
 
-**Evidence check (2026-06-22), correcting C0.** C0 assumed the contract modules were *not*
+**Evidence check (2026-06-22), correcting the initial scope review.** That review assumed the contract modules were *not*
 published. Verified false: `pyproject.toml` ships `packages = ["ack", "ack.lodestar", "ack.devprocess"]`, which
 includes **every flat module under `ack/`** (sub-packages such as `ack.lodestar` / `ack.devprocess`
 must be listed explicitly — a flat list of `["ack"]` alone would drop them; the clean-room import-smoke
-gates this). *(Update, ADR-0011 AD-3: `ack.devprocess` now ships ONLY the curated `ack.devprocess.api`
-facade — the dev-process implementation substrate was relocated to monorepo-private `scripts/devprocess/`;
+gates this). *(Update, ADR-0011: `ack.devprocess` now ships ONLY the curated `ack.devprocess.api`
+facade — the dev-process implementation substrate was relocated to a monorepo-private location;
 the packages list above is still accurate, just thinner in content.)* A fresh `pip install ironclad-ai==0.0.11` from PyPI
 imports `ack.registry`, `ack.playbook`, `ack.prompt`, `ack.promptgen`, `ack.gate`, `ack.catalogue`,
 `ack.i18n`, `ack.doctor`, `ack.skillgen`, `ack.generator` — all succeed. So the real gap is **not
@@ -51,22 +51,22 @@ against and import **only** from `ack.sdk` for a stable contract.
 
 **D4 — Loading is dependency-inverted; the SDK never imports a plugin.** A plugin is discovered,
 never imported by `core/`: today additively via `GX10_PLUGINS_DIR` (a dir of `**/skills/*.py`),
-and — added in **#136** — via the `ironclad.plugins` **entry-point group** so a *packaged* plugin
+and — added in a later cut — via the `ironclad.plugins` **entry-point group** so a *packaged* plugin
 (internal or 3rd-party) is found through the contract with zero path/import coupling. The boundary
 check + export gates guarantee no concrete plugin (and no private literal) ever enters `core/` or
-the public export (proved by the leak-guard test, **#137**).
+the public export (proved by the leak-guard test).
 
 **D5 — Separate-repo workflow is documented + proven.** `plugin-api.md` documents building a
 plugin in its own repo against pinned `ironclad-ai`, validating it with `ack.sdk.gate` before
-shipping, and loading it via entry-points or `GX10_PLUGINS_DIR`. C2 proves it end-to-end: a demo
-plugin in a separate repo builds against the published SDK and is loaded + run (**#138**).
+shipping, and loading it via entry-points or `GX10_PLUGINS_DIR`. It is proven end-to-end: a demo
+plugin in a separate repo builds against the published SDK and is loaded + run.
 
 ## Consequences
 
 - A plugin author has **one** import (`ack.sdk`) and a clear stability contract; the kernel
   namespace stays uncluttered and the internal/contract line is explicit and testable.
 - No packaging change is required to *distribute* the surface (it already ships); the work is the
-  facade, the docs, the policy, and the entry-point seam (#136) — small, low-risk, additive.
+  facade, the docs, the policy, and the entry-point seam — small, low-risk, additive.
 - Pre-1.0 provisional status keeps us free to refine the surface while being honest about it.
 
 ## Alternatives considered
@@ -74,4 +74,4 @@ plugin in a separate repo builds against the published SDK and is loaded + run (
 - **Separate `ironclad-sdk` package** — deferred to ≥1.0 (see D1).
 - **Top-level `ack` re-export** — rejected (over-broad, see D1).
 - **Dir-only loading (`GX10_PLUGINS_DIR`) without entry-points** — kept for dev, but insufficient
-  for a *packaged* private plugin; entry-points (#136) is the robust dependency-inversion seam.
+  for a *packaged* private plugin; entry-points are the robust dependency-inversion seam.

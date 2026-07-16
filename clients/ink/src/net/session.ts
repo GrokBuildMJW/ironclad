@@ -18,6 +18,11 @@ export interface SessionHandle {
 
 const NOOP: SessionHandle = {active: false, async stop() {}};
 
+// #1539: a stuck heartbeat/close must never wait out the full 600s request timeout on shutdown. On stop()
+// the in-flight heartbeat is aborted immediately, and the closing request is bounded to this short deadline
+// (a black-hole server then leaves its session to expire at the server-side TTL rather than hanging the CLI).
+const SHUTDOWN_CLOSE_MS = 3000;
+
 /**
  * GET /health; if `security.session` is set, open a session and keep it alive with a serial heartbeat loop
  * (re-open quietly on loss, mirroring `_heartbeat_loop`). Returns a handle whose `stop()` clears the
@@ -49,6 +54,9 @@ export async function establishSession(
   let stopped = false;
   let timer: NodeJS.Timeout | undefined;
   let inFlight: Promise<void> = Promise.resolve(); // the currently-running tick, so stop() can await it
+  // #1539: aborts a still-in-flight heartbeat/re-open when stop() runs, so the tick can never block shutdown
+  // for the full request timeout. The closing requests use a fresh short deadline instead (see stop()).
+  const ac = new AbortController();
 
   const schedule = (): void => {
     if (stopped) return;
@@ -61,14 +69,14 @@ export async function establishSession(
   const tick = async (): Promise<void> => {
     if (stopped) return;
     try {
-      const ok = await srv.sessionHeartbeat();
+      const ok = await srv.sessionHeartbeat(ac.signal);
       if (stopped) return;
       if (!ok) {
         // session lost server-side (restart / expiry) → try to re-open quietly
-        await srv.sessionOpen().catch(() => undefined);
+        await srv.sessionOpen(ac.signal).catch(() => undefined);
         if (stopped) {
           // a re-open that finished AFTER stop() must not leave a live server session (unsealed until TTL)
-          await srv.sessionClose().catch(() => undefined);
+          await srv.sessionClose(AbortSignal.timeout(SHUTDOWN_CLOSE_MS)).catch(() => undefined);
           return;
         }
       }
@@ -87,11 +95,16 @@ export async function establishSession(
       if (stopped) return;
       stopped = true;
       if (timer) clearTimeout(timer);
-      // await the in-flight tick FIRST so a re-open racing with stop() runs its stopped-guarded compensating
-      // close before we return — the "server ends sealed" guarantee then holds even for a caller that
-      // `process.exit()`s right after `await stop()` (it is not left to a natural event-loop drain).
+      // #1539: abort any in-flight heartbeat/re-open so shutdown is not held for the full 600s request
+      // timeout when the server is a black hole (the pending fetch socket would keep the Node process alive
+      // long after the UI is gone). Then await the (now promptly-settling) tick FIRST so a re-open racing
+      // with stop() runs its stopped-guarded compensating close before we return — the "server ends sealed"
+      // guarantee still holds for a caller that `process.exit()`s right after `await stop()`.
+      ac.abort();
       await inFlight.catch(() => undefined);
-      await srv.sessionClose();
+      // Close on a fresh SHORT deadline (not the aborted ac.signal): attempt the close but never block
+      // shutdown beyond SHUTDOWN_CLOSE_MS; an unclosable session expires at the server-side TTL.
+      await srv.sessionClose(AbortSignal.timeout(SHUTDOWN_CLOSE_MS)).catch(() => undefined);
     },
   };
 }

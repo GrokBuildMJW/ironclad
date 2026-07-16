@@ -103,12 +103,16 @@ COMMAND_SPECS: Tuple[CommandSpec, ...] = (
     CommandSpec("auto", COSTLY,
                 "Automation meta-switch: on = FULL automation (watcher + autopilot + continuation, "
                 "every unit = a paid coder run), off = guided mode (engine recommends, operator drives).",
-                flags=(FlagSpec("on [N] | off", "N caps the task count; on with no N runs unbounded",
+                flags=(FlagSpec("on [N] | off",
+                                "N caps the task count; on with no N uses the default "
+                                "(autopilot.autoplan_max_tasks, default 20)",
                                 choices=("on", "off")),)),
     CommandSpec("watcher", MUTATING, "Deprecated compatibility alias for /auto on|off.", flags=_ON_OFF),
     CommandSpec("autopilot", MUTATING, "Toggle autopilot (auto-launch of agents).", flags=_ON_OFF),
     CommandSpec("autoplan", COSTLY, "Toggle autoplan — a model-driven planning loop (spends tokens).",
-                flags=(FlagSpec("on [N] | off", "N caps the task count; on with no N loops uncapped",
+                flags=(FlagSpec("on [N] | off",
+                                "N caps the task count; on with no N uses the default "
+                                "(autopilot.autoplan_max_tasks, default 20)",
                                 choices=("on", "off")),)),
     CommandSpec("log-terminal", MUTATING, "Toggle the live-log window for the next autopilot start.",
                 flags=_ON_OFF),
