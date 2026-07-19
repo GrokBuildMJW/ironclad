@@ -281,6 +281,37 @@ def test_synth_llm_binding_disables_thinking(monkeypatch):
     assert cap.get("think") is False                    # structured emission → thinking OFF
 
 
+def test_engine_degrade_formatter_is_bound_and_passed_to_synthesize(monkeypatch, tmp_path):
+    import sys
+    from types import SimpleNamespace
+    import mpr.entry as entry
+
+    formatter = lambda results: "bound"  # noqa: E731
+    fake_gx10 = SimpleNamespace(
+        _EFFECTIVE_CFG=None, _format_parallel=formatter, _reduce_worker_results=None,
+        _atomic_write=None, _store=lambda: None, _DISPATCHER=None, _WORKERS=None)
+    monkeypatch.setitem(sys.modules, "gx10", fake_gx10)
+
+    assert entry._engine_deps().degrade_format is formatter
+
+    received = {}
+    real_synthesize = entry.synthesize
+
+    def _spy_synthesize(inp, **kwargs):
+        received["degrade_format"] = kwargs.get("degrade_format")
+        return real_synthesize(inp, **kwargs)
+
+    monkeypatch.setattr(entry, "synthesize", _spy_synthesize)
+    llm = FakeClassifierLLM(run_panel(domain="architecture-decision", route="wide", mode="decision"))
+    deps = _deps(tmp_path, llm, run_id="mpr-degrade-format")
+    deps.degrade_format = formatter
+
+    out = run_mpr("Should we move from a monolith to microservices?", deps=deps)
+
+    assert out.startswith("<<<MPR_REPORT>>>")
+    assert received["degrade_format"] is formatter
+
+
 def test_resolve_store_calls_lazy_accessor():
     # #51: the engine exposes the shared TaskStore via the lazy accessor _store() (gx10.py:1965), NOT a
     # _STORE global. The binding must CALL it (binding the function object made index_in_taskstore no-op →

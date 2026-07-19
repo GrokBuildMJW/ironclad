@@ -30,10 +30,13 @@ export function ToolCall({
   result: string[];
   defaultOpen?: boolean;
 }): React.ReactElement {
-  const [open, setOpen] = useState(defaultOpen);
-  const toggle = (): void => setOpen((o) => !o);
-
   const done = result.length > 0;
+  const phase = `${label}:${done ? 'done' : 'running'}`;
+  const [fold, setFold] = useState({phase, open: defaultOpen});
+  // The result's first line is the existing completion signal. A phase mismatch closes an in-flight
+  // inspection synchronously, so its completed summary replaces the full detail before the turn ends.
+  const open = fold.phase === phase ? fold.open : false;
+  const toggle = (): void => setFold({phase, open: !open});
   const isError = isErrorResult(result);
   const bodyColor = isError ? ERROR : SUBTLE;
   // Relabel a shell tool's header with the shell it actually runs in (per command: PowerShell cmdlets →

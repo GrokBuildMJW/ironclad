@@ -55,6 +55,10 @@ from typing import List, Dict, Any, Optional, Tuple, Callable, Mapping
 
 logger = logging.getLogger(__name__)
 
+# Process-local observation window for durable client claim leases. Wall-clock claim timestamps survive a
+# restart, while this monotonic stamp deliberately does not.
+_PROCESS_STARTED_MONOTONIC = time.monotonic()
+
 # Note: the earlier watchdog-based feedback watcher was replaced by a
 # polling reconciler (more reliable, no dependency required).
 
@@ -285,8 +289,8 @@ def _read_char_cap() -> int:
 #: #1046 (L1-choke, epic #1043): the ingestion tools whose result is INGESTED into the model context and
 #: must be capped to the live per-turn budget at the SINGLE run-loop choke point. `read_file` caps itself,
 #: but `search_files`/`list_directory`/`execute_command` do NOT, and the local-tool bridge returns before
-#: read_file's cap — so ALL of them are capped here. This set controls only the destructive character cap;
-#: already-budgeted or structured web/provider/plugin/memory results stay out of it.
+#: read_file's cap — so ALL are capped here. This set controls only the destructive character cap;
+#: already-budgeted or structured results stay out.
 _INGESTION_TOOLS = frozenset({"read_file", "list_directory", "search_files", "execute_command", "fetch_url", "view_issue", "pr_status", "review"})
 _INGEST_MARKER_SLACK = 512   # a result read_file already capped (cap + its own marker) must pass through here
 
@@ -669,6 +673,9 @@ FORGE_TOKEN_ENV  = "GX10_FORGE_TOKEN"
 REVIEW_AGENT     = ""            # agent_id from code_agents.pool; empty ⇒ distinct-peer pick (#457 SOFT)
 REVIEW_TIMEOUT_S = 180.0         # bounded synchronous call (single agent-lock; never a watch/poll)
 _REVIEW_MATERIAL_CAP = 80_000    # char cap on assembled material before the reviewer prompt
+CODE_REVIEW_MODE = "off"         # off | simple | review_of_review; per-unit checkpoint (#1614)
+CODE_REVIEW_MAX_ROUNDS = 2       # total blocking review attempts before operator escalation
+CODE_REVIEW_AGENT = ""           # empty ⇒ distinct runnable peer
 # #1083: outbound escalation notification. A HUMAN_ESCALATION fires the `escalation` hook; when a webhook is
 # configured (deploy secret via GX10_NOTIFY_WEBHOOK / notify.webhook — NEVER a URL literal in core) the
 # notifier POSTs it to an off-duty human. Empty ⇒ no consumer registered (byte-identical default-off).
@@ -934,6 +941,35 @@ def _msg(key: str, **fmt: object) -> str:
     return msg(key, **fmt)
 
 
+_CONFIG_KEY_SUGGESTION_LIMIT = 5
+
+
+def _config_unknown_key_message(name: str) -> str:
+    """Render the fail-closed unknown-key refusal with a bounded, schema-derived suggestion."""
+    import command_spec as _command_spec  # reuse the #934 zero-cost did-you-mean primitive
+
+    leaves = sorted(config_schema.LEAVES)
+    leaf_matches = [key for key in leaves if key.rsplit(".", 1)[-1] == name]
+    if len(leaf_matches) == 1:
+        suffix = _msg("config.unknown_key_suggestion", candidate=leaf_matches[0])
+    elif leaf_matches:
+        shown = leaf_matches[:_CONFIG_KEY_SUGGESTION_LIMIT]
+        remaining = len(leaf_matches) - len(shown)
+        more = _msg("config.unknown_key_more", n=remaining) if remaining else ""
+        suffix = _msg("config.unknown_key_candidates", candidates=", ".join(shown), more=more)
+    else:
+        closest = min(
+            ((_command_spec._edit_distance(name, key), key) for key in leaves),
+            default=None,
+        )
+        suffix = (
+            _msg("config.unknown_key_suggestion", candidate=closest[1])
+            if closest is not None and closest[0] <= 2
+            else ""
+        )
+    return _msg("config.unknown_key", name=name) + suffix
+
+
 class Initiative:
     """Metadata + paths of an initiative. Persistence lives in vault/<slug>/meta.md (SSOT)."""
 
@@ -1128,6 +1164,34 @@ def archive_feedback_dir(soft: bool = False) -> Optional[Path]:
     """Feedback history <initiative>/.work/archive/feedback."""
     w = _work(soft=soft)
     return (w / "archive" / "feedback") if w is not None else None
+
+
+def _archive_without_clobber(source: Path, archive_dir: Path) -> Path:
+    """Move an inbox artifact into its archive while preserving any prior artifact.
+
+    The copy2-then-unlink sequence is deliberately non-atomic: a crash between the two leaves the source in
+    the inbox, so the next absorb archives it again under a disambiguated name. Duplicate archive copies are
+    accepted; an existing archive is never clobbered, and the already-done task cannot be re-triggered.
+    """
+    archive_dir.mkdir(parents=True, exist_ok=True)
+    target = archive_dir / source.name
+    if target.exists():
+        stamp = int(source.stat().st_mtime)
+        base = f"{source.stem}.redundant-{stamp}"
+        target = archive_dir / f"{base}{source.suffix}"
+        suffix = 1
+        while target.exists():
+            target = archive_dir / f"{base}-{suffix}{source.suffix}"
+            suffix += 1
+    shutil.copy2(str(source), str(target))
+    source.unlink()
+    return target
+
+
+def _reviews_dir(soft: bool = True) -> Optional[Path]:
+    """Visible review artifacts for the active initiative; soft by default for optional checkpoints."""
+    base = artifact_root_soft() if soft else active_initiative_path()
+    return (base / "reviews") if base is not None else None
 
 
 # ─── Self-maintaining vault (Unit C): reconcile_vault, LLM-free ──
@@ -1493,14 +1557,20 @@ def _write_board(slug: "Optional[str]" = None) -> None:
 
 def _board_command(arg: "Optional[str]" = None) -> str:
     """S6 (#1228): render the active (or named) unit's task board to BOARD.md and return it for display.
-    Deterministic, model-free. Friendly message when there is no unit; fail-closed on an unknown slug."""
+    Deterministic, model-free. The persisted managed-block markers stay in ``BOARD.md`` but are omitted from
+    the operator-facing result. Friendly message when there is no unit; fail-closed on an unknown slug."""
     slug = (arg or active_slug() or "").strip()
     if not slug:
         return "No active unit — create or switch to one first (/project), then /board."
     if not (vault_root() / slug / "meta.md").is_file():
         return f"ERROR: no unit {slug!r}."
     _write_board(slug)
-    return _render_board(slug)
+    lines = _render_board(slug).splitlines()
+    if lines and lines[0] == _BOARD_AUTO_START:
+        lines = lines[1:]
+    if lines and lines[-1] == _BOARD_AUTO_END:
+        lines = lines[:-1]
+    return "\n".join(lines)
 
 
 def reconcile_vault(slug: str, *, links: bool = True) -> str:
@@ -1689,10 +1759,9 @@ FRAMING_NOTES_ENABLED = False
 # S2 (#1224/#1463): completion authority is always on. An advance to `done` requires a readable,
 # non-empty feedback artifact with an explicit normalized `status: done`; no other content state advances.
 # S7 (#1229): disentangle /watcher (feedback-advance) from /autopilot (launch) — two orthogonal concerns over
-# ONE reconciler loop. Opt-in (default OFF → byte-identical: the loop is gated on _WATCHER_ENABLED only, launch
-# needs watcher on, and `autopilot on` points the operator at `/auto on`). When ON: autopilot is self-sufficient
-# (the loop runs if EITHER is on; the feedback side stays _WATCHER-gated) and the contradictory double message
-# is suppressed. DEV-1 turns it on via `automation.decoupled`.
+# ONE reconciler loop. Continuation may also keep that loop live, but feedback remains strictly watcher-gated
+# inside the tick. With decoupling ON, autopilot can keep the loop live by itself; with it OFF, `autopilot on`
+# alone points the operator at `/auto on`. DEV-1 turns decoupling on via `automation.decoupled`.
 AUTOMATION_DECOUPLED = False
 # S7 (#1229): task-scoped detect-progress heartbeat (distinct from the per-turn idle-watchdog #1132). Seconds
 # without a progress signal (coder log / feedback mtime) before an in_progress task that has shown progress is
@@ -1702,10 +1771,10 @@ HEARTBEAT_STALL_S = 900.0
 # Client-run claims expire unless the thin client renews this lease through /claim.
 CLAIM_LEASE_TTL_S = 120.0
 DESIGN_STAGE = "design"
-# Task types that PRODUCE CODE — a stage_handover of one of these is REFUSED until the active unit has an
-# APPROVED design. Design/analysis types (architecture, concept, research, documentation, verification,
-# smoke-test, cleanup) are the stage that PRODUCES the design → never gated. (Not `_task_class`, which lumps
-# docs into "coding".)
+# Task types that PRODUCE CODE. The model tool-dispatch refuses an ad-hoc implementation `task_json` outright
+# and steers to plan_units; the programmatic _design_gate still guards unit handovers for an APPROVED design.
+# Design/analysis types (architecture, concept, research, documentation, verification, smoke-test, cleanup)
+# are the stage that PRODUCES the design → never gated. (Not `_task_class`, which lumps docs into "coding".)
 _IMPLEMENTATION_TASK_TYPES = frozenset({
     "implementation", "feature", "backend", "frontend", "fullstack", "integration",
     "refactoring", "bugfix", "optimization", "security", "security-audit",
@@ -1722,6 +1791,25 @@ UNCAPTURED = "UNCAPTURED"
 CAPTURED_NONE = "CAPTURED_NONE"
 CAPTURED = "CAPTURED"
 _CONSTRAINT_MARKERS = ("<!-- IRONCLAD:CONSTRAINTS -->", "<!-- /IRONCLAD:CONSTRAINTS -->")
+# Advisory enrichment blocks are marker-wrapped so a re-handover (which recycles the already-enriched
+# on-disk handover) strips-then-re-adds them rather than stacking a duplicate on every rejection round.
+_MEMORY_BRIEF_MARKERS = ("<!-- IRONCLAD:MEMORY -->", "<!-- /IRONCLAD:MEMORY -->")
+_LESSONS_MARKERS = ("<!-- IRONCLAD:LESSONS -->", "<!-- /IRONCLAD:LESSONS -->")
+_LANGUAGE_GUIDANCE_MARKERS = (
+    "<!-- IRONCLAD:RESPONSE-LANGUAGE -->",
+    "<!-- /IRONCLAD:RESPONSE-LANGUAGE -->",
+)
+
+
+def _strip_marker_block(text: str, markers: "tuple[str, str]") -> str:
+    """Remove a marker-delimited advisory block so re-enrichment stays idempotent (fail-soft)."""
+    open_m, close_m = markers
+    return re.sub(
+        rf"\n*{re.escape(open_m)}.*?{re.escape(close_m)}\n*",
+        "\n",
+        text or "",
+        flags=re.DOTALL,
+    )
 
 
 class GateRefusal(Exception):
@@ -2432,28 +2520,32 @@ def _approve_design(slug: "Optional[str]" = None, *, design_id: "Optional[str]" 
 def _proposal_matches_decision(proposal: Path, decision_text: str) -> bool:
     """True when *proposal* is the variant currently ratified as the decision — i.e. promoting it (stamp
     ``approved: true`` + ``type: decision``, mirroring :func:`_promote_design_proposal`) reproduces
-    *decision_text* exactly (``reconcile_vault(links=False)`` leaves the body untouched, so the match is
-    reliable). Used to keep an ALREADY-promoted proposal out of the 'switch to a newer variant' hint.
-    Fail-soft ``False`` on a read hiccup (the proposal is then treated as genuinely newer — safe)."""
+    *decision_text* exactly after promotion-provenance keys are removed from both sides
+    (``reconcile_vault(links=False)`` leaves the body untouched, so the match is reliable). Used to keep an
+    ALREADY-promoted proposal out of the 'switch to a newer variant' hint. Fail-soft ``False`` on a read
+    hiccup (the proposal is then treated as genuinely newer — safe)."""
     try:
         ptext = proposal.read_text(encoding="utf-8")
     except Exception:  # noqa: BLE001
         return False
-    promoted = _set_frontmatter_flag(ptext, "approved", "true")
+    promoted = _without_frontmatter_keys(ptext, "promoted", "promoted_to", "supersedes")
+    promoted = _set_frontmatter_flag(promoted, "approved", "true")
     promoted = _set_frontmatter_flag(promoted, "type", "decision")
-    return promoted == decision_text
+    decision = _without_frontmatter_keys(decision_text, "promoted", "promoted_to", "supersedes")
+    return promoted == decision
 
 
 def _promote_design_proposal(target: str, design_id: "Optional[str]") -> str:
     """ADR-0006 D5 (#1416 / S3) ON-path design approval: PROMOTE the chosen proposal variant into
     ``decisions/design.md`` as the decision (``approved: true`` · ``type: decision``), preserving the body
     verbatim — including any ``## Build policy`` section (dep/egress guidance the build honours). The
-    promoted proposal file is RETAINED (variant provenance); ``decisions/`` keeps only the approved decision.
+    decision declares a typed ``supersedes`` edge to the promoted proposal; that retained proposal is stamped
+    ``promoted: true`` + ``promoted_to: decisions/design.md``. ``decisions/`` keeps only the approved decision.
 
     Selection: explicit *design_id* → that proposal (else a ``no such design proposal`` ERROR); no id →
     the sole proposal, or (already-approved decision) an idempotent note (+ switch hint when newer proposals
-    exist), or (multiple proposals) a pick-one ERROR, or (legacy unapproved ``decisions/design.md``) stamp it
-    in place, else the no-design ERROR.
+    exist), or (multiple proposals) a pick-one ERROR, else the no-design ERROR. Before promotion,
+    ``_migrate_legacy_design`` moves any legacy unapproved ``decisions/design.md`` to a proposal.
     """
     with _vault_lock():
         _migrate_legacy_design(target)
@@ -2507,13 +2599,22 @@ def _promote_design_proposal(target: str, design_id: "Optional[str]") -> str:
             text = chosen.read_text(encoding="utf-8")
         except Exception as ex:  # noqa: BLE001
             return f"ERROR: could not read the design proposal for {target!r} ({ex!r}). Nothing changed."
-        new = _set_frontmatter_flag(text, "approved", "true")
+        proposal_rel = chosen.relative_to(vdir).as_posix()
+        decision_rel = decision_doc.relative_to(vdir).as_posix()
+        new = _without_frontmatter_keys(text, "promoted", "promoted_to", "supersedes")
+        new = _set_frontmatter_flag(new, "approved", "true")
         new = _set_frontmatter_flag(new, "type", "decision")
+        new = _set_frontmatter_flag(new, "supersedes", f"[{proposal_rel}]")
+        retained = _set_frontmatter_flag(text, "promoted", "true")
+        retained = _set_frontmatter_flag(retained, "promoted_to", decision_rel)
         rel = _display_doc_path((decision_doc.relative_to(vault_root())).as_posix())
         if new == text:
             return f"ERROR: could not stamp approval on the design doc for {target!r} ({rel})."
         try:
-            _atomic_design_write(decision_doc, new)
+            if not decision_doc.is_file() or decision_doc.read_text(encoding="utf-8") != new:
+                _atomic_design_write(decision_doc, new)
+            if retained != text:
+                _atomic_design_write(chosen, retained)
         except Exception as ex:  # noqa: BLE001 -- promotion must not expose a partial ratified decision
             return f"ERROR: could not atomically promote the design for {target!r} ({ex!r}). Nothing changed."
         try:
@@ -2544,6 +2645,17 @@ def _set_frontmatter_flag(text: str, key: str, value: str) -> str:
     else:
         lines.append(f"{key}: {value}")
     return head + "\n".join(lines) + tail + text[m.end():]
+
+
+def _without_frontmatter_keys(text: str, *keys: str) -> str:
+    """Remove flat scalar *keys* from leading frontmatter while preserving every other byte."""
+    m = re.match(r"^(---\s*\n)(.*?)(\n---\s*(?:\n|$))", text, re.DOTALL)
+    if not m:
+        return text
+    wanted = set(keys)
+    lines = [line for line in m.group(2).split("\n")
+             if not (":" in line and line.partition(":")[0].strip() in wanted)]
+    return m.group(1) + "\n".join(lines) + m.group(3) + text[m.end():]
 
 
 def _project_vault_base() -> Path:
@@ -2802,6 +2914,40 @@ def _resolve_exec_path(path: str) -> Path:
     if cwd is None or p.is_absolute():
         return p
     return Path(cwd) / p
+
+
+def _resolve_read_path(path: str) -> Path:
+    """Resolve a read-only tool path at the code root first, then at the active project root."""
+    primary = _resolve_exec_path(path)
+    p = Path(path)
+    project = _project_root()
+    if p.is_absolute() or project is None:
+        return primary
+    try:
+        if primary.exists():
+            return primary
+        candidate = project / p
+        if candidate.resolve().is_relative_to(project.resolve()) and candidate.exists():
+            return candidate
+    except (OSError, ValueError):
+        pass
+    return primary
+
+
+def _vault_read_hint(path: str) -> str:
+    """Return focused guidance when a model-supplied path names the configured vault root."""
+    try:
+        configured_vault = vault_root()
+        if _active_track() != "main":
+            configured_vault = configured_vault.parent.parent
+        vault_name = configured_vault.name
+        parts = Path(path).parts
+        if parts and parts[0] == vault_name:
+            return (f" — dev-loop artifacts live under {vault_name}/<slug>/ (handovers/feedback under "
+                    ".work/); prefer /board or advance_pipeline over hand-built vault paths")
+    except (TypeError, ValueError):
+        pass
+    return ""
 
 
 # ─── Project Registry integration (ADR-0011 AD-1/AD-6 / S5b) ──────────────────
@@ -3303,6 +3449,15 @@ _WATCHER_ENABLED              = False   # auto-advance via reconciler; enabled o
 RECONCILER_INTERVAL           = 3.0     # polling interval (s)
 _ADVANCE_CMD                  = "\x00advance\x00"   # internal structured reconciler command
 _LAUNCH_CMD                   = "\x00launch\x00"    # internal autopilot launch command
+_AUTHOR_CMD                   = "\x00author\x00"    # internal continuation authoring command
+# Unit ids whose continuation authoring turn is queued or executing. The reconciler owns enqueueing;
+# the queue consumer clears the id after consuming the turn. One lock owns the test-and-set plus queue put,
+# so bootstrap, post-advance, and heartbeat callers cannot queue the same paid turn concurrently (#1651).
+_CONTINUATION_AUTHORING: set = set()
+_CONTINUATION_AUTHORING_LOCK  = threading.Lock()
+_CONTINUATION_RECOVERY_MAX_ATTEMPTS = 3
+_CONTINUATION_RECOVERY_ATTEMPTS: Dict[str, int] = {}
+_AUTOMATION_NOTICE            = ""       # current background automation fault, cleared on proven recovery
 
 # Autopilot: counter of reserved/running claude processes (concurrency gate)
 _AUTOPILOT_ACTIVE             = 0
@@ -3314,6 +3469,10 @@ _status = {"thinking": False, "label": "ready"}
 
 # Effectively loaded config + source (set in main()) — for the `config` command.
 _EFFECTIVE_CFG: Optional[Dict[str, Any]] = None
+# Successful runtime writes are session-global operator intent. A project switch rebuilds from the
+# deployment base, then reapplies these dotted leaves above the project overlay; a process restart
+# naturally clears the record.
+_SESSION_OVERRIDES: Dict[str, Any] = {}
 _CONFIG_LOCK = threading.RLock()
 TOOLING_ENVELOPE_POLICY = None
 _CFG_SOURCE: Optional[Path] = None
@@ -3706,6 +3865,9 @@ TOOLS = [
                 "ignored/overwritten). If a task on the same topic already exists, NOTHING "
                 "is created and the existing task is named — then use that one, do not "
                 "force a new one. When creating/handing off ALWAYS use this tool."
+                " IMPLEMENTATION-type work must be created via plan_units (epic + units); "
+                "task_json is for NON-implementation ad-hoc tasks, or hand off an existing "
+                "unit with task_id and no task_json."
             ),
             "parameters": {
                 "type": "object",
@@ -4251,9 +4413,9 @@ def _is_sealed_profile() -> bool:
 
 def _mcp_for_launch(spec) -> Tuple[str, Dict[str, str]]:
     """#480: the (mcp_args, mcp_env) to inject into a code agent's launch — the read-only Memory MCP,
-    ALWAYS ON (#994-S10) when a memory service is configured + the agent's mcp_template — the read-only Memory
-    MCP is no longer sealed-gated. ("", {}) when memory is unconfigured (the agent launches byte-identically).
-    Fail-soft."""
+    ALWAYS ON (#994-S10/#1683) when a memory service is configured. The environment is independent of a
+    per-launch mcp_template so persistently registered CLIs can connect; arguments still require a template.
+    ("", {}) when memory is unconfigured (the agent launches byte-identically). Fail-soft."""
     try:
         import memory_mcp
         cfg = _MEMORY_CONFIG or {}
@@ -4474,6 +4636,15 @@ def _review_available() -> bool:
         return False
 
 
+def _bound_coder_count() -> int:
+    """Return the number of runnable code agents on this box; fail-soft for server-only topologies."""
+    try:
+        from providers import probe_code_agents
+        return sum(1 for resolved in probe_code_agents(_code_agent_registry()).values() if resolved)
+    except Exception:  # noqa: BLE001 — local capability probing must never block a completed unit
+        return 0
+
+
 try:
     _MODEL_PROBE_TIMEOUT_S = float(os.environ.get("GX10_MODEL_PROBE_TIMEOUT_S") or 8.0)
 except Exception:  # noqa: BLE001
@@ -4535,15 +4706,17 @@ def _cached_model_mismatch(agent) -> Optional["ModelCheck"]:
         return None
 
 
-def _pick_reviewer(requested: Optional[str] = None) -> Optional[str]:
+def _pick_reviewer(requested: Optional[str] = None, *, exclude=frozenset()) -> Optional[str]:
     """#1221: resolve the reviewer agent_id. Explicit ``agent`` arg wins (fail-closed if unknown /
     unrunnable) — a deliberate request is honored even if it equals the producer. Config-default /
     no-arg path: prefer config ``review.agent`` when runnable **and** not a self-review against a
     runnable peer; else a SOFT distinct-peer pick that excludes the producer pin (#457 anti-affinity —
     waive and keep the only capable agent when exclusion would empty the set). Returns None when
-    nothing is runnable."""
+    nothing is runnable. ``exclude`` is a hard anti-affinity set used by the automatic review stage;
+    its empty default preserves the manual tool's soft producer-only behavior."""
     from providers import resolve_agent_bin
     reg = _code_agent_registry()
+    excluded = {str(a or "").strip().upper() for a in exclude if str(a or "").strip()}
 
     def runnable(aid: str) -> bool:
         if not aid or not reg.has(aid):
@@ -4552,12 +4725,12 @@ def _pick_reviewer(requested: Optional[str] = None) -> Optional[str]:
 
     req = (requested or "").strip().upper()
     if req:
-        return req if runnable(req) else None
+        return req if runnable(req) and req not in excluded else None
 
     # SOFT distinct-reviewer anti-affinity (#457): never self-review when a peer exists.
     # Applies to the config-default / no-arg path only (explicit arg is already honored above).
     producer = _code_agent_pin()
-    candidates = [a for a in reg.names() if runnable(a)]
+    candidates = [a for a in reg.names() if runnable(a) and a not in excluded]
     if not candidates:
         return None
     peers = [a for a in candidates if a != producer] if producer else list(candidates)
@@ -4652,6 +4825,264 @@ def _review_prompt(focus: str, mode: str, material: str) -> str:
     )
 
 
+def _invoke_reviewer(agent, focus, mode, material) -> Tuple[bool, str]:
+    """Invoke one configured reviewer and return ``(ok, content_or_error)`` without raising."""
+    try:
+        spec = _code_agent_registry().resolve(agent)
+        if spec is None:
+            return False, f"review agent {agent!r} is not in the code-agent registry."
+        try:
+            from tooling_envelope_runtime import _envelope_authorize_spec
+            refused = _envelope_authorize_spec(spec)
+        except Exception:
+            refused = "tooling envelope refused malformed coder command"
+        if refused:
+            return False, str(refused)
+        prompt = _review_prompt(str(focus or ""), str(mode or ""), str(material or ""))
+        try:
+            from client import default_cli_runner
+        except Exception as exc:  # noqa: BLE001
+            return False, f"review runner import failed: {exc!r}"
+        effort = getattr(spec, "effort", None) or "high"
+        try:
+            timeout = float(REVIEW_TIMEOUT_S) if REVIEW_TIMEOUT_S is not None else None
+        except (TypeError, ValueError):
+            timeout = 180.0
+        res = default_cli_runner(spec, prompt, effort=str(effort), timeout=timeout)
+        if not res.get("ok"):
+            return False, str(res.get("error") or "reviewer failed")
+        content = (res.get("content") or "").strip()
+        if not content:
+            return False, "reviewer returned empty output."
+        return True, content
+    except Exception as exc:  # noqa: BLE001 — automatic review is fail-soft by contract
+        return False, f"reviewer invocation failed: {exc!r}"
+
+
+def _parse_review_verdict(text: str) -> Optional[str]:
+    """Parse the structured verdict emitted under a ``Verdict`` heading; unknown output stays
+    non-authoritative. Tolerant of ordinary markdown decoration a real reviewer CLI adds despite the
+    prompt's "use exactly these headings" instruction — any heading level, an inline colon, and leading
+    emphasis/bullet/blockquote markers before the token (``## Verdict: APPROVE``, ``### Verdict``,
+    ``## Verdict\n**APPROVE**``, ``## Verdict\n- APPROVE`` all parse). The token match stays ALL-CAPS to
+    avoid matching a prose "approve"; the search is bounded to a short window after the heading so a later
+    prose mention of another token cannot flip the verdict."""
+    head = re.search(r"(?im)^#{1,6}[ \t]*Verdict\b[ \t:*_>`~-]*", text or "")
+    if head is None:
+        return None
+    window = (text or "")[head.end():head.end() + 200]
+    tok = re.search(r"\b(APPROVE|REQUEST_CHANGES|NEEDS_DISCUSSION)\b", window)
+    return tok.group(1).lower() if tok else None
+
+
+def _code_review_note(message: str) -> None:
+    """Surface a best-effort automatic-review diagnostic without affecting pipeline authority."""
+    try:
+        _ui_print(f"  [code-review] {message}")
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _write_code_review_artifact(task_id: str, reviewer: str, round_no: int, body: str, *,
+                                meta: bool = False, verdict: Optional[str] = None) -> None:
+    """Persist one raw reviewer response in the canonical ``reviews`` lifecycle stage."""
+    root = _reviews_dir()
+    if root is None:
+        return
+    label = "metareview" if meta else "review"
+    path = root / f"{task_id}_{label}_{reviewer}_r{round_no}.md"
+    frontmatter = (
+        "---\n"
+        "stage: reviews\n"
+        f"task_id: {task_id}\n"
+        f"reviewer: {reviewer}\n"
+        f"verdict: {verdict or 'unknown'}\n"
+        f"round: {round_no}\n"
+        "---\n\n"
+    )
+    _atomic_write(path, frontmatter + (body or "") + ("" if (body or "").endswith("\n") else "\n"))
+
+
+_CODE_REVIEW_FINDINGS_MARKER = "<!-- ironclad-code-review-findings -->"
+_CODE_REVIEW_FINDINGS_END = "<!-- /ironclad-code-review-findings -->"
+
+
+def _strip_code_review_findings(handover: str) -> str:
+    """Remove the previously appended findings block so repeated re-handover stays idempotent. The
+    pattern is built from the marker constants (not re-typed literals) so the append site and the strip
+    site cannot drift apart under a rename."""
+    pattern = (r"\n?" + re.escape(_CODE_REVIEW_FINDINGS_MARKER) + r".*?"
+               r"(?:" + re.escape(_CODE_REVIEW_FINDINGS_END) + r"\s*|$)")
+    return re.sub(pattern, "", handover or "", flags=re.DOTALL).rstrip()
+
+
+def _archive_review_feedback(fb: Path) -> None:
+    """Consume a done-feedback trigger using the pipeline's archive-and-unlink convention."""
+    archived = archive_feedback_dir() / fb.name
+    archived.parent.mkdir(parents=True, exist_ok=True)
+    if fb.resolve() != archived.resolve():
+        shutil.copy2(str(fb), str(archived))
+        fb.unlink()
+
+
+def _persist_review_rounds(store, task_id: str, round_no: int) -> None:
+    """Persist the code-review round counter on the task record (additive JSON key)."""
+    task_path, _status = store._find(task_id)
+    if task_path is None:
+        raise KeyError(f"task not found: {task_id}")
+    data = json.loads(task_path.read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        raise ValueError(f"task record is not an object: {task_id}")
+    data["review_rounds"] = round_no
+    _atomic_write(task_path, json.dumps(data, ensure_ascii=False, indent=2))
+
+
+def _code_review_checkpoint(store, task_id: str, agent: str, existing: Dict[str, Any],
+                            fb: Path, fb_text: str) -> Optional[str]:
+    """Run the optional per-unit code-review checkpoint; non-None blocks the current advance.
+
+    Two phases with DIFFERENT failure directions:
+    * decision phase (probe → assemble → review → parse) is **fail-soft** — any error, an unrunnable
+      reviewer, or a reviewer that produced no parseable verdict advances the completed unit (returns
+      None), because absent a clear rejection we must never wedge a legitimate completion;
+    * reject-action phase (re-handover / block) is **fail-CLOSED** — once a rejection is decided, a
+      failure returns a non-None ERROR that stops the advance, never falling through to advance-to-done.
+      The done-feedback trigger is consumed LAST (only after the re-handover is durably staged), so a
+      staging failure leaves the trigger intact for a clean retry."""
+    if CODE_REVIEW_MODE not in ("simple", "review_of_review"):
+        return None
+
+    round_no = 1
+    reason = ""
+    reviewer_a = reviewer_b = None
+    review_a = review_b = ""
+    try:  # ── decision phase: fail-soft (advance the unit on any error / ambiguity) ──
+        if str((existing or {}).get("type", "")).lower() not in _IMPLEMENTATION_TASK_TYPES:
+            return None
+        if _bound_coder_count() < 2:
+            _code_review_note("fewer than two runnable local coders; checkpoint skipped")
+            return None
+
+        reviewer_a = _pick_reviewer(CODE_REVIEW_AGENT or None, exclude=frozenset({agent}))
+        if reviewer_a is None:
+            _code_review_note("no distinct runnable reviewer; checkpoint skipped")
+            return None
+
+        try:
+            rounds = int((existing or {}).get("review_rounds", 0) or 0)
+        except (TypeError, ValueError):
+            rounds = 0
+        round_no = rounds + 1
+        _material_mode, diff = _assemble_review_material(None)
+        if diff.startswith("ERROR:"):
+            # A failed diff assembly (non-git cwd, empty tree, missing git) must not be fed to the
+            # reviewer as the "diff" — that would elicit a spurious rejection and a phantom block.
+            _code_review_note(f"cannot assemble review diff ({diff[:120]}); checkpoint skipped")
+            return None
+        material = f"## Coder feedback for {task_id}\n{fb_text}\n\n## Working diff\n{diff}"
+        if len(material) > _REVIEW_MATERIAL_CAP:
+            material = (material[:_REVIEW_MATERIAL_CAP]
+                        + f"\n\n... [Ironclad: review material truncated at {_REVIEW_MATERIAL_CAP} chars] ...")
+
+        ok_a, review_a = _invoke_reviewer(
+            reviewer_a, f"implementation unit {task_id} correctness/completeness", "diff", material)
+        if not ok_a:
+            _write_code_review_artifact(
+                task_id, reviewer_a, round_no, f"Reviewer error: {review_a}", verdict="reviewer_error")
+            _code_review_note(f"reviewer {reviewer_a} failed; checkpoint skipped")
+            return None
+        verdict_a = _parse_review_verdict(review_a)
+        _write_code_review_artifact(task_id, reviewer_a, round_no, review_a, verdict=verdict_a)
+        if verdict_a is None:
+            # The reviewer ran but emitted no parseable verdict. Consistent with the reviewer-error
+            # path above (and the checkpoint's fail-soft contract), advance rather than false-block a
+            # completed unit on a formatting hiccup.
+            _code_review_note(f"reviewer {reviewer_a} returned no parseable verdict; advancing fail-soft")
+            return None
+
+        verdict_b: Optional[str] = None
+        meta_ran = False
+        if CODE_REVIEW_MODE == "review_of_review":
+            reviewer_b = _pick_reviewer(None, exclude=frozenset({agent, reviewer_a}))
+            if reviewer_b is None:
+                _code_review_note("no third distinct runnable coder; degrading meta-review to simple")
+            else:
+                ok_b, review_b = _invoke_reviewer(
+                    reviewer_b,
+                    f"assess reviewer {reviewer_a}'s review of {task_id} for completeness/correctness",
+                    "paths",
+                    review_a,
+                )
+                meta_ran = True
+                verdict_b = _parse_review_verdict(review_b) if ok_b else None
+                _write_code_review_artifact(
+                    task_id, reviewer_b, round_no,
+                    review_b if ok_b else f"Reviewer error: {review_b}",
+                    meta=True, verdict=verdict_b if ok_b else "reviewer_error",
+                )
+                if not ok_b:
+                    _code_review_note(f"meta-reviewer {reviewer_b} failed; its verdict is ignored")
+
+        passed = verdict_a == "approve"
+        if CODE_REVIEW_MODE == "review_of_review" and meta_ran:
+            passed = passed and verdict_b in (None, "approve")
+        if passed:
+            return None
+
+        reason = f"automatic code review rejected round {round_no}: reviewer {reviewer_a} verdict {verdict_a}"
+        if reviewer_b and verdict_b not in (None, "approve"):
+            reason += f"; meta-reviewer {reviewer_b} verdict {verdict_b}"
+    except Exception as exc:  # noqa: BLE001 — pre-decision: never wedge a legitimate completed unit
+        _code_review_note(f"checkpoint failed soft (pre-decision): {exc!r}")
+        return None
+
+    # ── reject-action phase: fail-CLOSED (a decided rejection must stop the advance) ──
+    try:
+        if round_no >= CODE_REVIEW_MAX_ROUNDS:
+            _persist_review_rounds(store, task_id, round_no)
+            store.mark_blocked(task_id, reason=reason[:200], kind="review_rejected")
+            _archive_review_feedback(fb)
+            return (f"ERROR: code-review rejected (max rounds reached) — {task_id} stays in_progress, "
+                    "blocked for operator review.")
+
+        handover_path = handovers_dir() / f"{task_id}_{agent}.md"
+        if not handover_path.exists():
+            handover_path = active_md_path()
+        try:
+            current_handover = handover_path.read_text(encoding="utf-8") if handover_path.exists() else ""
+        except Exception:  # noqa: BLE001 — findings alone are still a valid recovery handover
+            current_handover = ""
+        findings = [
+            _CODE_REVIEW_FINDINGS_MARKER,
+            f"## Code-review findings (BLOCKING — round {round_no})",
+            "",
+            f"### Reviewer {reviewer_a}",
+            review_a,
+        ]
+        if reviewer_b and review_b:
+            findings.extend(("", f"### Meta-reviewer {reviewer_b}", review_b))
+        findings.extend(("", "Fix these findings and re-emit `status: done`.", _CODE_REVIEW_FINDINGS_END))
+        clean_handover = _strip_code_review_findings(current_handover)
+        rehandover_md = (clean_handover + "\n\n" if clean_handover else "") + "\n".join(findings) + "\n"
+
+        # Stage the re-handover and persist state FIRST; consume the done-feedback trigger LAST, so a
+        # staging failure leaves the trigger intact and the unit cleanly retryable (never advanced).
+        _persist_review_rounds(store, task_id, round_no)
+        staged = _stage_handover(task_id, agent, rehandover_md, task_json=None, set_active=True)
+        if not staged.startswith("OK"):
+            return (f"ERROR: code-review rejected {task_id} (round {round_no}) but re-handover staging "
+                    f"failed: {staged.splitlines()[0] if staged.strip() else 'unknown'} — feedback "
+                    "preserved, unit stays in_progress for operator review.")
+        store.transition(task_id, "pending")
+        _archive_review_feedback(fb)
+        return (f"BLOCKED: code-review rejected {task_id} (round {round_no}) — re-handover staged to "
+                f"{agent} with findings; not advancing.")
+    except Exception as exc:  # noqa: BLE001 — a decided rejection fails CLOSED, never advances
+        _code_review_note(f"checkpoint reject action failed: {exc!r}")
+        return (f"ERROR: code-review rejected {task_id} but the block action failed ({exc!r}); "
+                "unit stays in_progress — operator review required.")
+
+
 def _forge_labels() -> Optional[set]:
     """create_issue label vocabulary (#1130 follow-up): the repo's ACTUAL labels, for validate→reask on the
     `labels` arg — the model must use existing labels, not invent them. Returns None on any error (fail-soft:
@@ -4661,6 +5092,11 @@ def _forge_labels() -> Optional[set]:
         return _forge_transport().list_labels()
     except Exception:  # noqa: BLE001
         return None
+
+
+def _exec_command_available() -> bool:
+    """Offer model shell execution only where the engine or an active local client can serve it."""
+    return PLATFORM != "windows" or _LOCAL_TOOL_BRIDGE is not None
 
 
 def _effective_tools() -> List[Dict[str, Any]]:
@@ -4682,7 +5118,9 @@ def _effective_tools() -> List[Dict[str, Any]]:
     skl = [USE_SKILL_TOOL] if _PLAYBOOKS else []
     prm = [USE_PROMPT_TOOL] if _PROMPTS else []
     con = [CONSTRAINT_TOOL] if FRAMING_NOTES_ENABLED else []
-    return (_tools_with_agent_enum(TOOLS) + con + mem + par + web + iss + rev + fet + plug + skl + prm
+    base = (TOOLS if _exec_command_available() else
+            [t for t in TOOLS if t["function"]["name"] != "execute_command"])
+    return (_tools_with_agent_enum(base) + con + mem + par + web + iss + rev + fet + plug + skl + prm
             + (ONBOARDING_TOOLS if ONBOARDING_MODE else []))
 
 # ─── Macro tool: deterministic pipeline (HV-A) ─────────────
@@ -4757,6 +5195,43 @@ def _normalize_handover_recipient(md: str, agent: str) -> str:
     return "".join(out)
 
 
+def _normalize_handover_meta_id(md: str, tid: str) -> str:
+    """#1622: reconcile the human ``Task ID:`` Meta label with the authoritative store id.
+
+    Only an engine-owned current context slug is eligible as the stale value (the active project track or
+    initiative). This is the Task-ID analogue of the configured-agent guard in
+    :func:`_normalize_handover_recipient`: an arbitrary payload identifier is never rewritten. The literal
+    whitespace between ``Task`` and ``ID`` deliberately excludes the YAML ``task_id`` key. Scope remains the
+    first non-fenced human label so later task payload and fenced examples are never touched.
+    """
+    if not tid:
+        return md
+    known = {_active_track().casefold()}
+    slug = active_slug()
+    if slug:
+        known.add(slug.casefold())
+    pat = re.compile(r"(?i)^(?P<pre>\s*(?:[-*]\s+)?\*{0,2}\s*Task\s+ID\s*\*{0,2}\s*:\s*\*{0,2}\s*)(?P<val>.*)$")
+    out: List[str] = []
+    in_fence = done = False
+    for line in md.splitlines(keepends=True):
+        s = line.lstrip()
+        if s.startswith("```") or s.startswith("~~~"):
+            in_fence = not in_fence
+            out.append(line)
+            continue
+        if not done and not in_fence:
+            content = line.rstrip("\r\n")
+            m = pat.match(content)
+            if m:
+                done = True
+                cur = m.group("val").strip().strip("*").strip().casefold()
+                if cur in known and cur != tid.casefold():
+                    out.append(f"{m.group('pre')}{tid}{line[len(content):]}")
+                    continue
+        out.append(line)
+    return "".join(out)
+
+
 def _inject_code_root_note(md: str) -> str:
     """#1328: when model-driven execution is rooted below the project, tell the coder that its cwd is
     already that code root. The orchestrator plans from the project root and can otherwise repeat the
@@ -4820,15 +5295,19 @@ def _advance_pipeline(task_id: str, agent: str, next_task_id: Optional[str] = No
     lock so a concurrent vault mutation (a parallel ``initiative_new`` / handover) can't interleave —
     e.g. the active slug being re-pointed mid-advance. Reentrant: the impl's inner reconcile does not
     re-acquire."""
-    _emit_hook("pre_advance", {"task_id": task_id, "agent": (agent or "").upper(),
+    requested_agent = (agent or "").upper()
+    _emit_hook("pre_advance", {"task_id": task_id, "agent": requested_agent,
                                "next_task_id": next_task_id})
     with _vault_lock():
-        result = _advance_pipeline_impl(task_id, agent, next_task_id)
+        result, authoritative_agent = _advance_pipeline_impl(task_id, agent, next_task_id)
     # post_feedback = task completion boundary, published OUTSIDE the vault lock. BOTH completion-writes are
     # re-homed here as bus subscribers — Process-SC (#803) + Lessons (#804) — so the reflection consumers share
     # one consistent wiring path. `result` lets a consumer gate on a FRESH completion ("OK: pipeline advanced …")
     # vs an already-done re-advance / error.
-    _emit_hook("post_feedback", {"task_id": task_id, "agent": (agent or "").upper(), "result": result})
+    # The impl derives the completion authority from the selected feedback filename. Before that selection
+    # (invalid request / missing feedback), the requested agent is the only identity available.
+    _emit_hook("post_feedback", {"task_id": task_id, "agent": authoritative_agent or requested_agent,
+                                  "result": result})
     return result
 
 
@@ -4877,33 +5356,88 @@ def _advance_gate(fb_text: str) -> "Optional[str]":
             f"task stays in_progress (no blind advance).")
 
 
-def _advance_pipeline_impl(task_id: str, agent: str, next_task_id: Optional[str] = None) -> str:
+_ADVANCE_FEEDBACK_BODY_CHARS = 1536
+_ADVANCE_FEEDBACK_EXCERPT_CHARS = 2048   # complete inline fence + bounded coder-authored body
+
+
+def _bounded_advance_feedback(fb_text: str, cap_chars: int) -> str:
+    """Return a deterministic head/tail coder-feedback slice no longer than ``cap_chars``."""
+    if cap_chars <= 0:
+        return ""
+    if len(fb_text) <= cap_chars:
+        return fb_text
+    marker = "\n\n... [Ironclad: chars omitted from coder feedback; excerpt hard-capped.] ...\n\n"
+    if len(marker) >= cap_chars:
+        return marker[:cap_chars]
+    kept = max(0, cap_chars - len(marker))
+    head_n = kept * 2 // 3
+    tail_n = kept - head_n
+    return fb_text[:head_n] + marker + (fb_text[-tail_n:] if tail_n else "")
+
+
+def _advance_feedback_excerpt(fb_text: str) -> str:
+    """Return a hard-bounded, inline-fenced coder excerpt; engine-authored result text stays trusted."""
+    try:
+        if not isinstance(fb_text, str) or not fb_text.strip():
+            return ""
+        from ack import injection as _inj
+        body = _bounded_advance_feedback(fb_text, _ADVANCE_FEEDBACK_BODY_CHARS)
+        signals = _inj.scan(body)
+        fence_overhead = len(_inj.wrap_untrusted("", source="coder_feedback", signals=signals))
+        body = _bounded_advance_feedback(
+            fb_text, min(_ADVANCE_FEEDBACK_BODY_CHARS,
+                         max(0, _ADVANCE_FEEDBACK_EXCERPT_CHARS - fence_overhead)))
+        return _inj.wrap_untrusted(body, source="coder_feedback", signals=signals)
+    except Exception:   # noqa: BLE001 — surfacing validation must never break a completed advance
+        return ""
+
+
+def _advance_pipeline_impl(task_id: str, agent: str,
+                           next_task_id: Optional[str] = None) -> Tuple[str, Optional[str]]:
     """Advances the 'done' pipeline for ONE task deterministically.
     Status transitions go through the TaskStore (directory = truth),
     active.md is projected. Fail-closed: no completion without a feedback
-    file. Touches neither code/ nor the audit chain."""
+    file. Returns the verdict plus the filename-derived authoritative agent
+    once feedback has been selected. Touches neither code/ nor the audit chain."""
     if not task_id or not _TASK_ID_RE.match(task_id):
-        return f"ERROR: invalid task_id: {task_id!r} (expected e.g. KGC-315)"
+        return f"ERROR: invalid task_id: {task_id!r} (expected e.g. KGC-315)", None
     agent = (agent or "").upper()
+    requested_agent = agent
     if not _code_agent_registry().has(agent):   # #449: config-driven membership, fail-closed (no KIMI-norm)
-        return f"ERROR: unknown agent {agent!r} (configured: {', '.join(_agent_names()) or 'none'})"
+        return f"ERROR: unknown agent {agent!r} (configured: {', '.join(_agent_names()) or 'none'})", None
     if next_task_id and not _TASK_ID_RE.match(next_task_id):
-        return f"ERROR: invalid next_task_id: {next_task_id!r}"
+        return f"ERROR: invalid next_task_id: {next_task_id!r}", None
 
     if artifact_root_soft() is None:
-        return f"ERROR: {_msg('init.no_active')}"     # B3: fail-closed — artefacts route to the active initiative
+        return f"ERROR: {_msg('init.no_active')}", None  # B3: fail-closed — artefacts route to the active initiative
     _blk = _internal_target_blocks_normal()           # #979: normal pipeline is off on an internal target
     if _blk:
-        return f"ERROR: {_blk}"
+        return f"ERROR: {_blk}", None
 
     store = _store()
     log: List[str] = []
 
-    # Idempotency gate: task already done → no re-advance needed
+    # Idempotency gate: task already done → no re-advance needed. #1738: a redundant feedback upload is
+    # still a durable trigger after restart, so consume it fail-soft instead of leaving it in the inbox.
     existing = store.get(task_id)
     if existing and existing.get("status") == "done":
-        return (f"OK: task {task_id} is already done — no re-advance needed. "
-                f"feedback is in {(archive_feedback_dir() / f'{task_id}_{agent}-feedback.md').as_posix()}")
+        absorbed: List[str] = []
+        inbox = feedback_dir(soft=True)
+        archive = archive_feedback_dir(soft=True)
+        try:
+            redundant_feedback = (sorted(inbox.glob(f"{task_id}_*-feedback.md"))
+                                  if inbox is not None and archive is not None and inbox.exists() else [])
+        except Exception:   # noqa: BLE001 — discovery is cleanup and must preserve the idempotent OK result
+            redundant_feedback = []
+        if archive is not None:
+            for redundant in redundant_feedback:
+                try:
+                    absorbed.append(_archive_without_clobber(redundant, archive).name)
+                except Exception:   # noqa: BLE001 — cleanup must not change the idempotent OK result
+                    pass
+        absorbed_text = (f" Absorbed redundant feedback: {', '.join(absorbed)}."
+                         if absorbed else " No redundant feedback remained in the inbox.")
+        return (f"OK: task {task_id} is already done — no re-advance needed.{absorbed_text}", None)
 
     # 0. Fail-closed gate: feedback MUST exist. Dev-loop stabilization (Fix 4): key the match on the TASK ID
     #    and derive the TRUE agent from the matched FILENAME (via _FB_RE) — never reconstruct the name from the
@@ -4918,11 +5452,15 @@ def _advance_pipeline_impl(task_id: str, agent: str, next_task_id: Optional[str]
          if _code_agent_registry().has(_fb_agent(p))],
         key=lambda p: p.stat().st_mtime)
     if not _cands:
-        return (f"ERROR: feedback missing: no {task_id}_*-feedback.md in "
-                f"{feedback_dir().as_posix()} nor its archive — the task is NOT complete. Pipeline not advanced.")
+        return ((f"ERROR: feedback missing: no {task_id}_*-feedback.md in "
+                 f"{feedback_dir().as_posix()} nor its archive — the task is NOT complete. Pipeline not advanced."),
+                None)
     _exact = [p for p in _cands if _fb_agent(p) == agent]
     fb = _exact[-1] if _exact else _cands[-1]      # exact caller agent (newest), else newest matching feedback
     agent = _fb_agent(fb)                          # the TRUE runner, from the filename (authoritative for the rest)
+    if requested_agent != agent:
+        log.append(f"WARNING: requested agent {requested_agent} does not match actual feedback agent {agent}; "
+                   f"the engine used filename-derived agent {agent}")
     log.append(f"feedback found: {fb} (agent {agent})")
     try:
         _fbtext = fb.read_text(encoding="utf-8")
@@ -4941,12 +5479,17 @@ def _advance_pipeline_impl(task_id: str, agent: str, next_task_id: Optional[str]
                                kind=_st if _st in ("blocked", "clarification_needed") else "blocked")
         except Exception:   # noqa: BLE001 — a marking hiccup must not change the refusal outcome
             pass
-        return _gate_err
+        return _gate_err, agent
+
+    _feedback_excerpt = _advance_feedback_excerpt(_fbtext)
+    _review_block = _code_review_checkpoint(store, task_id, agent, existing or {}, fb, _fbtext)
+    if _review_block is not None:
+        return _review_block, agent
 
     _egress_err, _egress_log = _egress_advance_check_log()
     log.extend(_egress_log)
     if _egress_err:
-        return _egress_err
+        return _egress_err, agent
 
     try:
         # 1. archive the current active.md handover (before the switch)
@@ -5030,7 +5573,7 @@ def _advance_pipeline_impl(task_id: str, agent: str, next_task_id: Optional[str]
         # 5. activate the next task (store) — active.md follows from the projection
         if next_task_id:
             try:
-                store.transition(next_task_id, "in_progress")
+                _claim_in_progress(store, next_task_id)
                 log.append(f"next task {next_task_id} → in_progress")
             except KeyError:
                 log.append(f"WARN: next task {next_task_id} not found")
@@ -5068,10 +5611,12 @@ def _advance_pipeline_impl(task_id: str, agent: str, next_task_id: Optional[str]
                 log.append(f"regen {_script}: WARN {_e!r}")
 
     except Exception as e:
-        return f"ERROR: pipeline step failed: {e}\nso far:\n" + "\n".join(f"  - {l}" for l in log)
+        return f"ERROR: pipeline step failed: {e}\nso far:\n" + "\n".join(f"  - {l}" for l in log), agent
 
     _reconcile_active_soft()   # C2: keep the active initiative's INDEX.md fresh (fail-soft, index only)
     result = f"OK: pipeline advanced for {task_id} ({agent})\n" + "\n".join(f"  - {l}" for l in log)
+    if _feedback_excerpt:
+        result += "\n\nCoder-reported validation (bounded excerpt):\n" + _feedback_excerpt
     # #1296 (guided mode): with the continuation OFF nothing follows automatically — so the advance
     # RESULT itself names the deterministically selected next unit and the exact step to proceed
     # (the same recommendation the steering state carries). Fail-soft, advisory only.
@@ -5087,7 +5632,7 @@ def _advance_pipeline_impl(task_id: str, agent: str, next_task_id: Optional[str]
                            f"dependencies) — inspect /board.")
         except Exception:  # noqa: BLE001 — the recommendation must never break a completed advance
             pass
-    return result
+    return result, agent
 
 
 # ─── Path guard: detect invented codebase paths in the handover ───
@@ -5162,9 +5707,17 @@ def _enrich_handover(tid: str, handover_md: str, fields: Dict[str, Any], log: Li
     ACE/lesson context (#863/#877/#880). ``fields`` supplies title/type (the creation payload on the
     create path; the STORED task on the re-hand path). The approved-design snapshot is protected and is
     preflighted by both callers; later advisory enrichments remain fail-soft."""
+    # Machine ``task_id`` keys are normalized first; then the deliberately space-only human ``Task ID``
+    # matcher reconciles the body Meta label from that same authoritative id without consuming frontmatter.
     ho_md = _normalize_handover_id(handover_md, tid)
+    ho_md = _normalize_handover_meta_id(ho_md, tid)       # #1622: body Task ID agrees with frontmatter
     ho_md = _normalize_handover_recipient(ho_md, agent)   # #1311: body Recipient agrees with frontmatter `to:`
     ho_md = _inject_code_root_note(ho_md)                 # #1328: coder cwd already IS the configured code root
+    # Re-handover (#1614 code-review round, #1296 next-unit) recycles the already-enriched on-disk
+    # handover — strip any prior advisory Memory/Lessons blocks before recomputing so they never stack
+    # (constraints already self-strip via _inject_approved_design_standard). Idempotent on the create path.
+    ho_md = _strip_marker_block(ho_md, _MEMORY_BRIEF_MARKERS).rstrip()
+    ho_md = _strip_marker_block(ho_md, _LESSONS_MARKERS).rstrip()
     # S2 (#1415): every handover receives the approved design standard when one is present.
     if constraint_snapshot is not None and not approved_design_preinjected:
         ho_md = _inject_approved_design_standard(ho_md, approved_design_standard or [], log)
@@ -5187,7 +5740,8 @@ def _enrich_handover(tid: str, handover_md: str, fields: Dict[str, Any], log: Li
                 count_tokens=_count_tokens,
             )
             if mem_ctx:
-                ho_md = ho_md.rstrip() + "\n\n---\n\n" + mem_ctx
+                _mo, _mc = _MEMORY_BRIEF_MARKERS
+                ho_md = ho_md.rstrip() + "\n\n" + _mo + "\n\n---\n\n" + mem_ctx.rstrip() + "\n\n" + _mc
                 log.append("Memory context injected")
         except Exception:
             pass
@@ -5217,7 +5771,9 @@ def _enrich_handover(tid: str, handover_md: str, fields: Dict[str, Any], log: Li
         else:
             lesson_ctx = _lessons.brief([ns])
         if lesson_ctx:
-            ho_md = ho_md.rstrip() + "\n\n---\n\n## Lessons\n\n" + lesson_ctx
+            _lo, _lc = _LESSONS_MARKERS
+            ho_md = (ho_md.rstrip() + "\n\n" + _lo + "\n\n---\n\n## Lessons\n\n"
+                     + lesson_ctx.rstrip() + "\n\n" + _lc)
             log.append("Lesson context injected")
     except Exception:   # noqa: BLE001 — advisory: a lesson read must never break a turn
         pass
@@ -5427,6 +5983,10 @@ def _stage_handover_impl(task_id: Optional[str], agent: str, handover_md: str,
     store = _store()
     log: List[str] = []
     task_type = ""
+    resolved = (store.get(task_id) if task_id and _TASK_ID_RE.match(task_id) else None)
+    #1738: completion is terminal at the staging seam too; force never authorizes a second paid run.
+    if resolved and resolved.get("status") == "done":
+        return f"ERROR: task {task_id} is done — a done unit is never re-staged or re-executed"
     try:
         if task_json:
             # parse task fields
@@ -5827,7 +6387,8 @@ def _select_next_unit(store: "TaskStore") -> "tuple[Optional[Dict[str, Any]], in
     eligible_count, open_count)`` — ``open_count > 0`` with no winner is a dependency/blocked
     deadlock the caller must surface (never a silent idle)."""
     open_units = [t for t in store.list("pending")
-                  if str(t.get("type", "")).lower() != "epic"
+                  if t.get("status", "pending") == "pending"
+                  and str(t.get("type", "")).lower() != "epic"
                   and _find_handover(t.get("id") or "") is None]
     if not open_units:
         return None, 0, 0
@@ -6195,6 +6756,13 @@ def _store() -> "TaskStore":
     return STORE
 
 
+def _claim_in_progress(store: "TaskStore", task_id: str) -> Dict[str, Any]:
+    """Move a pending task into progress and publish it; callers must not hold the TaskStore lock."""
+    task = store.transition(task_id, "in_progress")
+    _write_board()
+    return task
+
+
 def claim_task(task_id: str, agent: str) -> str:
     """Atomically acquire or renew a client-run task lease without moving a later state backward."""
     agent_u = (agent or "").strip().upper()
@@ -6202,6 +6770,7 @@ def claim_task(task_id: str, agent: str) -> str:
     if not registry.has(agent_u):
         raise ValueError(f"unknown agent {agent_u!r} (configured: {', '.join(registry.names()) or 'none'})")
     store = _store()
+    publish_board = False
     with store._lock:
         task = store.get((task_id or "").strip())
         if task is None:
@@ -6212,10 +6781,12 @@ def claim_task(task_id: str, agent: str) -> str:
         if status == "pending":
             status = str(store.transition(task["id"], "in_progress")["status"])
             store.stamp_claim(task["id"], time.time())
-            return status
-        if status == "in_progress":
+            publish_board = True
+        elif status == "in_progress":
             store.stamp_claim(task["id"], time.time())
-        return status
+    if publish_board:
+        _write_board()  # #1674: publish after the claim lock to avoid TaskStore → vault lock inversion.
+    return status
 
 
 def unclaim_task(task_id: str) -> str:
@@ -6493,9 +7064,12 @@ def _language_guidance(lang: str) -> str:
     default; set ``GX10_LANGUAGE`` (or generation.language) to override."""
     code = (lang or "en").strip().lower()
     name = _LANG_NAMES.get(code, lang)
-    return ("## Response language\n"
+    open_m, close_m = _LANGUAGE_GUIDANCE_MARKERS
+    return (f"{open_m}\n"
+            "## Response language\n"
             f"Always respond to the user in {name}, regardless of the language of the "
-            "input, tools, or context. Keep code identifiers and file paths unchanged.")
+            "input, tools, or context. Keep code identifiers and file paths unchanged.\n"
+            f"{close_m}")
 
 
 def _platform_guidance(platform: str) -> str:
@@ -6503,11 +7077,10 @@ def _platform_guidance(platform: str) -> str:
     if platform == "windows":
         return (
             "## Runtime environment\n"
-            "Operating system: **Windows**. The model `execute_command` shell tool is **unavailable** here: "
-            "command isolation is mandatory and no supported sandbox backend (bwrap/firejail) exists on Windows, "
-            "so every `execute_command` call fails closed with a refusal. Use the `list_directory` tool for "
-            "directory listings, and `read_file`/`write_file`/`edit_file`/`search_files` for file work — those are "
-            "unaffected. A direct, unrestricted shell is operator-only via `/sh` and is not a model tool."
+            "Operating system: **Windows**. The model `execute_command` shell tool is capability-gated: it is "
+            "absent unless an active local client bridge can serve it under the mandatory sandbox policy. Use the "
+            "`list_directory` tool for directory listings, and `read_file`/`write_file`/`edit_file`/`search_files` "
+            "for file work. A direct, unrestricted shell is operator-only via `/sh` and is not a model tool."
         )
     return (
         "## Runtime environment\n"
@@ -6580,8 +7153,8 @@ def _websearch_steer(user_input: str) -> str:
 
 
 def _steering_state_block() -> str:
-    """#1225 (S3): the per-turn AUTHORITATIVE steering state — active project · unit · lifecycle stage ·
-    N pending/M in_progress · watcher/autopilot — read from the SAME globals the plumbing acts on. The caller
+    """#1225 (S3): the per-turn AUTHORITATIVE steering state — active project · unit · artifact root ·
+    lifecycle stage · N pending/M in_progress · watcher/autopilot — read from the SAME globals the plumbing acts on. The caller
     keeps EXACTLY ONE current copy (dropping stale ones), placed after the stable system prefix (KV-cache-safe),
     so the model never has to GUESS its state (the #1225 bug). Returns "" when nothing is bound (no project
     AND no unit) → a plain-chat/unisolated turn stays byte-identical. Compact, secret-free; effectively
@@ -6603,16 +7176,28 @@ def _steering_state_block() -> str:
                 stage = ""
         try:
             store = _store()                               # the same singleton the plumbing uses
-            n_pending = len(store.list("pending"))          # best-effort snapshot ([] when no unit; per-file errors swallowed)
-            n_prog    = len(store.list("in_progress"))
+            pending_tasks = store.list("pending")           # best-effort snapshot ([] when no unit; per-file errors swallowed)
+            in_progress_tasks = store.list("in_progress")
+            n_pending = len(pending_tasks)
+            n_prog    = len(in_progress_tasks)
         except Exception:  # noqa: BLE001
             n_pending = n_prog = 0
+            in_progress_tasks = []
         lines = [
             _STEERING_MARKER,
             f"- active project: {project or '(none)'}"
             + ("  [engine running un-isolated]" if health.get("status") == "unisolated" else ""),
             f"- active unit (initiative): {unit or '(none — no vault/<slug> unit is active)'}",
         ]
+        try:
+            artifact_root = artifact_root_soft()
+            if artifact_root is not None:
+                artifact_rel = artifact_root.relative_to(vault_root()).as_posix()
+                artifact_display = _display_doc_path(artifact_rel).rstrip("/") + "/"
+                lines.append(f"- artifacts: {artifact_display}  "
+                             "(proposals/ decisions/ tasks/ · plumbing under .work/)")
+        except Exception:  # noqa: BLE001 — advisory; omit the artifact root on any hiccup
+            pass
         if stage:
             lines.append(f"- lifecycle stage: {stage}")
         if unit:
@@ -6645,16 +7230,65 @@ def _steering_state_block() -> str:
             else:
                 lines.append("- design gate: design approved — implementation handovers allowed.")
         lines.append(f"- tasks: {n_pending} pending · {n_prog} in_progress")
-        # #1296: the select-unit recommendation — the SAME deterministic policy the continuation
-        # uses, surfaced per turn so guided mode (auto off) can drive the loop by hand.
+        if _AUTOMATION_NOTICE and (_WATCHER_ENABLED or AUTOPILOT_AUTOPLAN):
+            lines.append(f"- automation notice: {_AUTOMATION_NOTICE}")
+        # #1619/#1649: surface completed coder feedback before the next-unit nudge so a paid coder is never
+        # launched twice. The fact is useful in every mode; only watcher-off mode needs the advance imperative.
+        # Match advance's fail-closed filename contract: task-id glob, filename-derived agent, configured registry.
+        try:
+            _ready = []
+            _registry = _code_agent_registry()
+            for _task in in_progress_tasks:
+                _tid = str(_task.get("id") or "").strip()
+                _cands = []
+                for _fb in feedback_dir().glob(f"{_tid}_*-feedback.md"):
+                    _match = _FB_RE.search(_fb.name)
+                    _agent = _match.group(1).upper() if _match else ""
+                    if _registry.has(_agent):
+                        _cands.append((_fb.stat().st_mtime, _agent))
+                if _cands:
+                    _ready.append((_tid, max(_cands)[1]))
+            if _ready:
+                _shown = ", ".join(f"{tid} ({agent})" for tid, agent in _ready[:3])
+                if len(_ready) > 3:
+                    _shown += f" + {len(_ready) - 3} more"
+                _pronoun = "it" if len(_ready) == 1 else "them"
+                if not _WATCHER_ENABLED:
+                    lines.append(f"- feedback ready: {_shown} — coder feedback is waiting in the inbox; call "
+                                 f"advance_pipeline for {_pronoun} (it fail-closes unless the feedback reports done). "
+                                 "Do NOT launch_coder again.")
+                else:
+                    lines.append(f"- feedback ready: {_shown} — coder feedback is waiting in the inbox; the watcher "
+                                 f"is responsible for advancing {_pronoun} (only feedback reporting done can advance). "
+                                 "Do NOT launch_coder again.")
+        except Exception:  # noqa: BLE001 — advisory; never break the turn on a feedback-inbox hiccup
+            pass
+        # #1296/#1649: the selected-unit fact uses the SAME deterministic policy as the continuation;
+        # only continuation-off mode needs the staging imperative so guided mode can drive the loop by hand.
         try:
             _unit, _elig, _n_open = _select_next_unit(store)
             if _unit is not None:
                 _pp = str(_unit.get("parent") or "").strip()
-                lines.append(f"- next open unit: {_unit['id']} ({str(_unit.get('title') or '')!r})"
-                             + (f" under epic {_pp}" if _pp else "")
-                             + " — stage its handover via stage_handover (task_id, no task_json); "
-                               "/auto on drains all open units automatically.")
+                _selected = (f"- next open unit: {_unit['id']} ({str(_unit.get('title') or '')!r})"
+                             + (f" under epic {_pp}" if _pp else ""))
+                if not AUTOPILOT_AUTOPLAN:
+                    lines.append(_selected + " — stage its handover via stage_handover (task_id, no task_json); "
+                                 "/auto on drains all open units automatically.")
+                else:
+                    lines.append(_selected + " — the continuation owns staging its handover; "
+                                 "`/auto off` returns staging to the operator.")
+                    if not _work_in_flight(store):
+                        _uid = str(_unit.get("id") or "")
+                        _recovery_state, _attempts = _continuation_recovery_state(_uid)
+                        if _recovery_state == "queued":
+                            _recovery = "recovery authoring turn is queued/in flight"
+                        elif _recovery_state == "exhausted":
+                            _recovery = ("automatic recovery is exhausted; run `/auto off`, then stage "
+                                         "its handover via `stage_handover`")
+                        else:
+                            _recovery = "the heartbeat will re-fire its authoring turn"
+                        lines.append(f"- continuation stall: {_uid} is eligible with nothing in flight; "
+                                     f"{_recovery}.")
             elif _n_open > 0:
                 lines.append(f"- next open unit: NONE selectable — {_n_open} open unit(s) blocked or "
                              f"dependency-gated (see /board).")
@@ -7280,11 +7914,12 @@ def _emit_agent_frames(results: List[Dict[str, Any]]) -> None:
 def _format_parallel(results: List[Dict[str, Any]]) -> str:
     """Render governed fan-out results back into the turn — numbered, in input order,
     failures isolated so a single bad item never sinks the batch."""
-    ok = sum(1 for r in results if r.get("ok"))
+    ok = sum(1 for r in results if r.get("ok") and (r.get("content") or "").strip())
     lines: List[str] = []
     for i, r in enumerate(results, 1):
         if r.get("ok"):
-            lines.append(f"[{i}] {(r.get('content') or '').strip()}")
+            content = (r.get("content") or "").strip()
+            lines.append(f"[{i}] {content}" if content else f"[{i}] EMPTY: branch returned no content")
         else:
             lines.append(f"[{i}] ERROR: {r.get('error')}")
     return f"[parallel_reason] {ok}/{len(results)} ok\n\n" + "\n\n".join(lines)
@@ -7838,7 +8473,10 @@ def _run_plugin_handler_bounded(name: str, handler, args: Dict[str, Any]):
         except BaseException as exc:  # noqa: BLE001 — surface any handler failure to the caller
             box["error"] = exc
 
-    thread = threading.Thread(target=_worker, daemon=True)
+    # Plugin handlers run off-thread, so carry the request's active ProjectContext into the worker. Without
+    # this, every plugin resolves state_root()/vault_root() against the boot workdir even though /chat bound
+    # the active project on its request thread (contextvars are not inherited by new threads).
+    thread = threading.Thread(target=(_pc.bound_target(_worker) if _pc is not None else _worker), daemon=True)
     thread.start()
     cap = float(TURN_IDLE_TIMEOUT_S) if TURN_IDLE_TIMEOUT_S and TURN_IDLE_TIMEOUT_S > 0 else 0.0
     deadline = time.monotonic() + cap if cap > 0 else None
@@ -7928,9 +8566,9 @@ def _run_tool_dispatch_impl(name: str, args: Dict[str, Any]) -> str:
         if _LOCAL_TOOL_BRIDGE is not None and name in LOCAL_TOOL_NAMES:
             return _LOCAL_TOOL_BRIDGE(name, args)
         if name == "read_file":
-            p = _resolve_exec_path(args["path"])
+            p = _resolve_read_path(args["path"])
             if not p.exists():
-                return f"ERROR: Not found: {args['path']}"
+                return f"ERROR: Not found: {args['path']}{_vault_read_hint(args['path'])}"
             text, size = _read_text_capped(p)
             if text is None:
                 return (f"ERROR: read_file refused: file too large — {size} bytes, "
@@ -8206,34 +8844,10 @@ def _run_tool_dispatch_impl(name: str, args: Dict[str, Any]) -> str:
             mode, material = _assemble_review_material(args.get("paths"))
             if material.startswith("ERROR:"):
                 return material
-            spec = _code_agent_registry().resolve(agent)
-            if spec is None:   # belt-and-suspenders (pick already resolved)
-                return f"ERROR: review agent {agent!r} is not in the code-agent registry."
-            try:
-                from tooling_envelope_runtime import _envelope_authorize_spec
-                refused = _envelope_authorize_spec(spec)
-            except Exception:
-                refused = "tooling envelope refused malformed coder command"
-            if refused:
-                return f"ERROR: review by {agent} failed: {refused}"
-            prompt = _review_prompt(str(args.get("focus") or ""), mode, material)
-            try:
-                from client import default_cli_runner
-            except Exception as e:  # noqa: BLE001
-                return f"ERROR: review runner import failed: {e!r}"
-            effort = getattr(spec, "effort", None) or "high"
-            try:
-                timeout = float(REVIEW_TIMEOUT_S) if REVIEW_TIMEOUT_S is not None else None
-            except (TypeError, ValueError):
-                timeout = 180.0
-            res = default_cli_runner(spec, prompt, effort=str(effort), timeout=timeout)
-            if not res.get("ok"):
-                err = res.get("error") or "reviewer failed"
-                return f"ERROR: review by {agent} failed: {err}"
-            content = (res.get("content") or "").strip()
-            if not content:
-                return f"ERROR: review by {agent} returned empty output."
-            return f"[review by {agent} · {mode}]\n{content}"
+            ok, out = _invoke_reviewer(agent, str(args.get("focus") or ""), mode, material)
+            if not ok:
+                return f"ERROR: review by {agent} failed: {out}"
+            return f"[review by {agent} · {mode}]\n{out}"
 
         elif name == "fetch_url":
             # #1074: verbatim, size-capped http(s) fetch. Trust-gated (sealed) + SSRF-guarded + byte-capped;
@@ -8258,9 +8872,10 @@ def _run_tool_dispatch_impl(name: str, args: Dict[str, Any]) -> str:
             return f"[fetch_url {url}{(' · ' + ctype) if ctype else ''}]\n{text}{tail}"
 
         elif name == "list_directory":
-            p = _resolve_exec_path(args.get("path", "."))
+            p = _resolve_read_path(args.get("path", "."))
             if not p.exists():
-                return f"ERROR: Not found: {args.get('path', '.')}"
+                return (f"ERROR: Not found: {args.get('path', '.')}"
+                        f"{_vault_read_hint(args.get('path', '.'))}")
             # #1488: cap-plus-one detects overflow without materialising a hostile directory. Exact totals
             # remain available for normal directories; an overflow is deliberately reported as "many".
             items = []
@@ -8403,7 +9018,7 @@ def _run_tool_dispatch_impl(name: str, args: Dict[str, Any]) -> str:
             files_scanned = 0
             byte_truncated = False
             budget_truncated = False
-            for fp in _resolve_exec_path(directory).rglob(file_pattern):
+            for fp in _resolve_read_path(directory).rglob(file_pattern):
                 if fp.is_file():
                     if files_scanned >= _SEARCH_MAX_FILES:
                         budget_truncated = True
@@ -8460,6 +9075,12 @@ def _run_tool_dispatch_impl(name: str, args: Dict[str, Any]) -> str:
             _ho_out = args.get("handover_md", "")
             try:
                 _fields = _tj_out if isinstance(_tj_out, dict) else (json.loads(_tj_out) if isinstance(_tj_out, str) and _tj_out.strip() else None)
+                if (args.get("task_json") and isinstance(_fields, dict)
+                        and str(_fields.get("type", "")).lower() in _IMPLEMENTATION_TASK_TYPES):
+                    return ("ERROR: ad-hoc implementation handover refused - implementation work must be "
+                            "decomposed into an epic + units via plan_units, not staged as a standalone task. "
+                            "After the design is approved, call plan_units(epic_json, units_json), then hand off "
+                            "each unit (stage_handover with task_id, no task_json).")
                 # #1296 parity: the re-hand path (task_id, no task_json — the continuation's
                 # [NEXT-UNIT] staging) routes off the STORED task, so a lazily staged unit gets the
                 # same deterministic cost routing as a created one.
@@ -8777,6 +9398,20 @@ class GX10:
             sys_msg["content"] = sys_msg["content"].rstrip() + "\n\n" + note
         else:
             self.messages.insert(0, {"role": "system", "content": note})
+
+    def _replace_language_guidance(self):
+        """Replace the marked reply-language block in the live base prompt (fail-soft)."""
+        try:
+            sys_msg = next((m for m in self.messages if m.get("role") == "system"), None)
+            if not sys_msg or not isinstance(sys_msg.get("content"), str):
+                return
+            note = _language_guidance(LANGUAGE)
+            if note in sys_msg["content"]:
+                return
+            stripped = _strip_marker_block(sys_msg["content"], _LANGUAGE_GUIDANCE_MARKERS).rstrip()
+            sys_msg["content"] = stripped + ("\n\n" if stripped else "") + note
+        except Exception:
+            pass
 
     def _inject_platform_guidance(self):
         self._append_guidance(_platform_guidance(self.platform))
@@ -10142,7 +10777,7 @@ HELP = """
                               (on|off|true|false|num|str; e.g. mpr.enabled on)
     quality reset    clear a latched output-quality staging hold
     tool <name> <args|text>   run a tool DIRECTLY/deterministically (no model election, no RAG);
-                              text → first required arg, or {json}. e.g. tool mpr_research <frage>
+                              text → first required arg, or {json}. e.g. tool mpr_research <question>
     rag on|off       toggle per-turn retrieval (RAG) for this session
     context          show the context-budget report
     fork [unit]      show the MPR architecture-decision proposal at a fork (recommendation only — you decide)
@@ -10764,21 +11399,46 @@ class _CacheActiveRegistry:
         self._reg.set_active(pid)
 
 
-def _switch_apply_config(merged: Dict[str, Any]) -> None:
-    """``apply_config`` seam for a ``/switch``: re-derive the engine globals from *merged* AND publish it as
-    ``_EFFECTIVE_CFG`` so ``/config get`` and the rest of the engine see the active project's config. A failed
-    re-derive restores the complete pre-switch runtime snapshot before the project switch rolls its context back."""
+def _switch_apply_config(merged: Dict[str, Any]) -> List[str]:
+    """Apply base + project overlay + valid session overrides for a ``/switch``.
+
+    Returns the session override keys that could not be reapplied. A failed final apply restores the complete
+    pre-switch runtime snapshot before the project switch rolls its context back.
+    """
     global _EFFECTIVE_CFG
     with _CONFIG_LOCK:
         original = _EFFECTIVE_CFG
         snapshot = _snapshot_config_runtime()
+        skipped: List[str] = []
         try:
-            _apply_config(merged)
+            # Work on a copy so the switch's base+overlay projection remains an immutable restore point.
+            # Each recorded value validated when it was set. With today's empty production overlays the
+            # skip path is therefore unreachable; validating incrementally is forward-correct for a future
+            # project overlay that conflicts with an otherwise-valid session value. Keep skipped intent in
+            # _SESSION_OVERRIDES so a later project can still reapply it.
+            effective = copy.deepcopy(merged)
+            # Dict insertion order preserves each override's first successful commit, reproducing the
+            # operator's live sequence. No current leaf pair needs a different replay order after re-setting
+            # a controlling key; revisit this invariant if such a schema relationship is introduced.
+            for key, value in _SESSION_OVERRIDES.items():
+                candidate = copy.deepcopy(effective)
+                try:
+                    _cfg_set(candidate, key, value)
+                    _normalize_config_for_apply(candidate)
+                    _validate_config_projection(candidate)
+                    _derive_config_state(candidate)
+                except Exception as exc:  # noqa: BLE001 — one stale override must not abort the project switch
+                    logger.debug("Switch skipped runtime override %s: %r", key, exc)
+                    skipped.append(key)
+                    continue
+                effective = candidate
+            _apply_config(effective)
         except Exception:
             _restore_config_runtime(snapshot)
             _EFFECTIVE_CFG = original
             raise
-        _EFFECTIVE_CFG = merged
+        _EFFECTIVE_CFG = effective
+        return skipped
 
 
 def _project_overlay_for(project) -> Dict[str, Any]:
@@ -10842,6 +11502,11 @@ def _switch_command(agent: "GX10", arg_str: str) -> str:
         return f"[switch] {pid!r} is archived — /project unarchive {pid} first"
     if _BASE_CFG is None:
         return "[switch] no live base config (the switch rebuilds the project config from it)"
+    skipped_runtime: List[str] = []
+
+    def _apply_switch_config(merged: Dict[str, Any]) -> None:
+        skipped_runtime[:] = _switch_apply_config(merged)
+
     with _switch_serialize():                 # #979: serialize concurrent switches (at most one active mode)
         try:
             target, dropped = _ps.switch_project(
@@ -10849,7 +11514,7 @@ def _switch_command(agent: "GX10", arg_str: str) -> str:
                 registry=shim,
                 agent=_SwitchAgent(agent),
                 base_cfg=_BASE_CFG,
-                apply_config=_switch_apply_config,
+                apply_config=_apply_switch_config,
                 overlay_for=_project_overlay_for,
                 in_flight=_project_in_flight,
                 ctx_for=_engine_ctx_for,
@@ -10858,6 +11523,11 @@ def _switch_command(agent: "GX10", arg_str: str) -> str:
             return f"[switch] refused — {e}"
         except Exception as e:   # noqa: BLE001 — switch_project rolled the ctx back to the leaving project
             return f"[switch] failed — {e!r}"
+        finally:
+            try:
+                agent._replace_language_guidance()  # keep the final effective config + live conversation aligned
+            except Exception:
+                pass
         _set_active_project(target)           # publish to this process's other threads (only AFTER commit)
     # S11a-2 (#630): reload skills so the NEW project's library is discovered (and the previous project's
     # library items dropped) — build-then-swap, so a reload hiccup never empties the live registries and an
@@ -10869,6 +11539,11 @@ def _switch_command(agent: "GX10", arg_str: str) -> str:
     msg = f"[switch] now on {target.id} → {_engine_ctx_for(target).root}"
     if dropped:
         msg += f"\n  (dropped locked config overrides: {', '.join(dropped)})"
+    if skipped_runtime:
+        count = len(skipped_runtime)
+        noun = "override" if count == 1 else "overrides"
+        msg += (f"\n  ⚠ switch could not re-apply {count} runtime {noun}: "
+                f"{', '.join(sorted(skipped_runtime))}")
     return msg
 
 
@@ -10951,6 +11626,7 @@ def _project_new_mint(agent: "GX10", arg_str: str) -> str:
         return "[project] project registry unavailable"
     if agent is None:                                    # activation goes through the switch → needs a session
         return "[project] /project new requires an interactive session"
+    legacy_type = bool(re.search(r"(?<!\S)--type(?:=|\s|$)", arg_str))
     name, typ, path, err = _parse_project_new(arg_str)
     if err:
         return err if err.startswith("usage") else f"[project] {err}"
@@ -10983,15 +11659,23 @@ def _project_new_mint(agent: "GX10", arg_str: str) -> str:
             pass
         return f"[project] mint of {slug!r} rolled back — {sw}"
     seeded = ""
+    seeded_unit = None
     if typ:
         try:
             # #1276 (facet 2): seed the unit under a CANONICAL `main` slug, NOT the project name — so the vault
             # doc path is `<project>/vault/main/…`, not the redundant `<project>/vault/<project>/…` double name.
             v = initiative_new("main", typ)              # seed the first work unit under the now-active project
             seeded = f" · seeded {typ} unit '{v.slug}'"
+            seeded_unit = v
         except Exception as e:  # noqa: BLE001 — seed is best-effort (incl. FS errors); the project is still valid
             seeded = f" · (unit seed skipped: {e})"
-    return f"[project] created {proj.id} → {proj.root}  (mem_ns {proj.mem_ns[:8]}, active){seeded}\n  {sw}"
+    warning = ""
+    if legacy_type:
+        actual = (f"seeded {seeded_unit.type} unit '{seeded_unit.slug}'"
+                  if seeded_unit is not None else "the unit seed was skipped")
+        warning = f"\n  [WARN] --type is obsolete and was ignored; {actual}."
+    return (f"[project] created {proj.id} → {proj.root}  (mem_ns {proj.mem_ns[:8]}, active){seeded}"
+            f"{warning}\n  {sw}")
 
 
 def _project_scopes(proj: "Any") -> "List[str]":
@@ -11151,7 +11835,7 @@ def _project_archive(args: "List[str]", *, archive: bool) -> str:
 
 
 def _project_command(arg_str: str, agent: "Optional[GX10]" = None) -> str:
-    """`/project list | new <name> [--type] [--path] | active | track …` — the guided project-setup command
+    """`/project list | new <name> [--path] | use <slug> | active | track …` — the guided project-setup command
     (ADR-0011 / S16): manage registered, isolated projects (the SSOT the `/switch` verb selects from) and
     their parallel tracks. ``new`` activates through the quiesced switch and so needs the session *agent*;
     the other verbs are pure bookkeeping. (`/initiative` is a deprecated alias.)"""
@@ -11182,6 +11866,12 @@ def _project_command(arg_str: str, agent: "Optional[GX10]" = None) -> str:
         if sub in ("new", "add"):
             rest = arg_str.split(None, 1)[1] if len(parts) > 1 else ""
             return _project_new_mint(agent, rest)
+        if sub == "use":
+            rest = arg_str.split(None, 1)[1].strip() if len(parts) > 1 else ""
+            if not rest:
+                return "usage: /project use <slug>"
+            v = initiative_use(rest)
+            return _msg("project.cmd_unit_active", slug=v.slug, type=v.type, path=v.path.as_posix())
         if sub == "active":
             cur = _ACTIVE_PROJECT
             return (f"[project] active: {cur.id} → {_engine_ctx_for(cur).root}"
@@ -11504,10 +12194,16 @@ def _dispatch(agent: GX10, user_input: str):
         elif parts[2].strip() in _CONFIG_ALIASES:
             legacy = parts[2].strip()
             key, val = _CONFIG_ALIASES[legacy], _coerce_cfg_value(parts[3])
+            previous_language = LANGUAGE
             refusal = _config_set_atomic(key, val)
             if refusal is not None:
                 _ui_print(col(f"  [config] refused: {refusal}", C.RED))
             else:
+                if LANGUAGE != previous_language:
+                    try:
+                        agent._replace_language_guidance()
+                    except Exception:
+                        pass
                 _ui_print(col(f"  [config] '{legacy}' is deprecated; set {key} = {val!r} "
                               "(alias kept for one release)", C.YELLOW))
         elif _config_tombstone_reason(parts[2].strip()) is not None:
@@ -11526,9 +12222,8 @@ def _dispatch(agent: GX10, user_input: str):
         elif parts[2].strip().split(".")[0] not in _EFFECTIVE_CFG:
             # #932 gap-2: an unknown ROOT section is a typo, not a real key — REFUSE (no silent write, no
             # false-GREEN). Known core sections + existing plugin namespaces (e.g. mpr.*) have a live root,
-            # so they still set; only a mistyped/unknown root is rejected. (A wrong leaf under a known root
-            # cannot be caught without a schema — accepted oracle limit.)
-            _ui_print(col("  " + _msg("config.unknown_key", name=parts[2].strip()), C.RED))
+            # so they still set; mistyped core leaves are rejected against the schema in the branch below.
+            _ui_print(col("  " + _config_unknown_key_message(parts[2].strip()), C.RED))
         else:
             key, val = parts[2].strip(), _coerce_cfg_value(parts[3])
             if key in config_schema.LEAVES:
@@ -11538,12 +12233,18 @@ def _dispatch(agent: GX10, user_input: str):
                     _ui_print(col(f"  [config] refused: {e}", C.RED))
                     return
             elif key.split(".")[0] in {leaf.split(".")[0] for leaf in config_schema.LEAVES}:
-                _ui_print(col("  " + _msg("config.unknown_key", name=key), C.RED))
+                _ui_print(col("  " + _config_unknown_key_message(key), C.RED))
                 return
+            previous_language = LANGUAGE
             refusal = _config_set_atomic(key, val)
             if refusal is not None:
                 _ui_print(col(f"  [config] refused: {refusal}", C.RED))
             else:
+                if LANGUAGE != previous_language:
+                    try:
+                        agent._replace_language_guidance()
+                    except Exception:
+                        pass
                 _ui_print(col(f"  [config] set {key} = {val!r}", C.GREEN))
     elif cmd == "quality reset":
         global _QUALITY_TRIPPED
@@ -11591,7 +12292,7 @@ def _dispatch(agent: GX10, user_input: str):
             cap = (f"max {AUTOPILOT_MAX_TASKS} tasks, stops automatically" if AUTOPILOT_MAX_TASKS > 0
                    else "UNBOUNDED — every unit is a paid coder run; cap it with `auto on N`")
             _ui_print(col(f"[AUTO] FULL automation ON — watcher + autopilot "
-                          f"(max_concurrent={AUTOPILOT_MAX_CONCURRENT}) + continuation ({cap}).", C.GREEN))
+                          f"(engine max_concurrent={AUTOPILOT_MAX_CONCURRENT}) + continuation ({cap}).", C.GREEN))
             _ui_print(col("  The loop now advances finished tasks, stages the next open unit and "
                           "launches its coder until the epic is drained. `auto off` returns to guided mode.",
                           C.GRAY))
@@ -11781,9 +12482,10 @@ def _dispatch(agent: GX10, user_input: str):
         _ui_print(col(_generate_command(user_input[len("generate"):].strip()), C.CYAN))
     elif cmd.startswith("tool "):
         # Deterministic, model-free tool call: `/tool <name> <json|text>`. Runs run_tool() DIRECTLY, so a
-        # tool (e.g. the mpr_research panel) fires WITHOUT depending on the model electing it AND without the
-        # per-turn RAG context (there is no model turn) — fixes the run_mpr trigger/RAG-recycle fork. Plain
-        # text maps to the tool's first required parameter; `{...}` is parsed as explicit JSON args.
+        # tool fires WITHOUT depending on the model electing it AND without per-turn RAG context (there is no
+        # model turn). Plain text maps to the tool's first required parameter; `{...}` is parsed as explicit
+        # JSON args. The bounded plugin worker inherits this request's ProjectContext (see
+        # _run_plugin_handler_bounded), so direct plugin calls keep the same active-project routing.
         parts = user_input.split(None, 2)
         name = parts[1] if len(parts) > 1 else ""
         rest = parts[2].strip() if len(parts) > 2 else ""
@@ -11959,6 +12661,11 @@ def _do_launch(task_id: str, agent: str):
     in_progress. The subprocess runs detached; a monitor thread frees the
     concurrency slot on exit. On error the slot is freed
     immediately. (The reconciler has already reserved the slot.)"""
+    # #1738: feedback in flight is completion authority, never authorization for another paid coder run.
+    if _feedback_present(task_id):
+        _autopilot_release()
+        _ui_print(col(f"  [AUTO] feedback for {task_id} is already waiting — launch discarded", C.YELLOW))
+        return
     if _task_is_escalated(_store().get(task_id)):
         _autopilot_release()
         _ui_print(col(f"  [AUTO] {task_id} is terminally escalated — launch discarded", C.YELLOW))
@@ -12010,6 +12717,7 @@ def _do_launch(task_id: str, agent: str):
             _store().mark_blocked(task_id, reason=err, kind="errored")
         except Exception:  # noqa: BLE001
             pass
+        _write_board()  # Publish once, after the final blocked state is durable.
         _autopilot_release()
         _ui_print(col(f"  ✗ [AUTO] {err}", C.RED))
         return
@@ -12037,6 +12745,7 @@ def _do_launch(task_id: str, agent: str):
               f"advances ONLY on `status: done`), otherwise `status: blocked` or `status: clarification_needed`.")
     _bin = spec.bin or AUTOPILOT_CLAUDE_BIN
     _tmpl = spec.cmd_template or ""
+    mcp_args, mcp_env = _mcp_for_launch(spec)
     # #449 (review B-1): the Claude `--print` autopilot shape keeps its stream plumbing. The permission
     # mode comes from the agent spec; bypass is emitted only for an explicit per-agent capability opt-in.
     _is_claude_print = _bin in (AUTOPILOT_CLAUDE_BIN, "claude") and "--print" in _tmpl
@@ -12067,6 +12776,10 @@ def _do_launch(task_id: str, agent: str):
                 extra.append(dangerous_flag)
         elif dangerous_flag not in extra and "--permission-mode" not in extra:
             extra.extend(["--permission-mode", spec.permission_mode or "default"])
+        if mcp_args:
+            # Keep the Memory MCP at the canonical tooling-envelope slot: after the permission/bypass
+            # flag and before stream/print flags. Empty args add no tokens, preserving the old argv.
+            extra.extend(shlex.split(mcp_args))
         if AUTOPILOT_STREAM:
             # Live streaming: stream-json NEEDS --verbose (otherwise claude aborts).
             # Stdout is piped to the line-oriented log drainer below so tailers see live output without
@@ -12084,7 +12797,8 @@ def _do_launch(task_id: str, agent: str):
         from commands import build_agent_argv
         cap = str(_fb_path) if _fb_path is not None else _fb_name   # #1288: same feedback path stated in the prompt
         argv = build_agent_argv(_tmpl, bin=_bin, model=str(model), effort=str(effort),
-                                permission=spec.permission_mode or "", prompt=prompt, feedback=cap)
+                                permission=spec.permission_mode or "", prompt=prompt, feedback=cap,
+                                mcp=mcp_args)
     try:
         from tooling_envelope_runtime import _envelope_authorize
         refused = _envelope_authorize(_bin, argv if (_is_claude_print or not _tmpl) else _tmpl)
@@ -12105,7 +12819,7 @@ def _do_launch(task_id: str, agent: str):
         lf = open(logfile, "w", encoding="utf-8")
         # PYTHONIOENCODING=utf-8: prevents a cp1252 crash on non-ASCII characters
         # (e.g. → in handover texts) on Windows. Kimi and Claude both inherit it.
-        _launch_env = {**os.environ, "PYTHONIOENCODING": "utf-8"}
+        _launch_env = {**os.environ, "PYTHONIOENCODING": "utf-8", **mcp_env}
         # S9c: the code-agent runs in the active project's root (so its file edits land in that tree); the
         # default project resolves to None → the process workdir, byte-identical to the pre-isolation launch.
         proc = subprocess.Popen(argv, cwd=(_exec_cwd() or "."), stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -12161,7 +12875,7 @@ def _do_launch(task_id: str, agent: str):
     with _AUTOPILOT_LOCK:
         _AUTOPILOT_PROCS[task_id] = proc
     try:
-        _store().transition(task_id, "in_progress")
+        _claim_in_progress(_store(), task_id)
     except KeyError:
         pass
     _ui_print(col(f"  → [AUTO] claude launched: "
@@ -12221,11 +12935,12 @@ def _do_launch(task_id: str, agent: str):
 
 def _auto_owns_launching() -> bool:
     """#1309: True when the automation loop is ACTUALLY driving coder launches — the launcher (autopilot)
-    is on AND the reconciler loop runs (watcher on, or decoupled autopilot). In the mixed states
-    `autopilot on` alone (watcher off + automation.decoupled False) or `autoplan on` alone (continuation
-    without the launcher), the loop never launches, so launching stays a guided/manual action
-    (launch_coder). Both `launch_coder` (defer) and the `plan_units` armed prompt gate on this."""
-    return AUTOPILOT_ENABLED and (_WATCHER_ENABLED or AUTOMATION_DECOUPLED)
+    is on AND the reconciler loop runs (watcher, continuation, or decoupled autopilot keeps it live).
+    `autopilot on` alone in coupled mode and `autoplan on` without the launcher remain guided/manual;
+    both `launch_coder` (defer) and the `plan_units` armed prompt gate on this."""
+    return AUTOPILOT_ENABLED and (
+        _WATCHER_ENABLED or AUTOPILOT_AUTOPLAN or AUTOMATION_DECOUPLED
+    )
 
 
 def _trigger_coder(task_id: "Optional[str]" = None) -> str:
@@ -12337,10 +13052,40 @@ def _task_progress_mtime(store: "TaskStore", tid: str) -> "Optional[float]":
     return max(mtimes) if mtimes else None
 
 
+def _feedback_present(task_id: str) -> bool:
+    """Whether completion feedback for a task is waiting in the active initiative inbox."""
+    d = feedback_dir(soft=True)
+    if d is None or not d.exists():
+        return False
+    try:
+        return next(d.glob(f"{task_id}_*-feedback.md"), None) is not None
+    except OSError:
+        #1738: a probe error must block dispatch/reclaim, not authorize another paid coder run.
+        return True
+
+
 def _reconcile_once(store: "TaskStore", enqueue, seen_mtime: Dict[str, float],
                     enqueued: set, launch_enqueue=None, launched: Optional[set] = None):
     """One reconciler tick. seen_mtime/enqueued/launched are persistent
     across ticks (completeness or dedup gate)."""
+    #1738: stale handovers for terminal tasks must not survive a restart and become dispatch material again.
+    # Archival is housekeeping, so each file fails soft and the rest of the reconcile tick continues.
+    handover_inbox = handovers_dir(soft=True)
+    handover_archive = archive_handovers_dir(soft=True)
+    if handover_inbox is not None and handover_archive is not None and handover_inbox.exists():
+        try:
+            stale_handovers = list(handover_inbox.glob("*.md"))
+        except OSError:
+            stale_handovers = []
+        for handover in stale_handovers:
+            tid = handover.name.rsplit("_", 1)[0]
+            try:
+                task = store.get(tid)
+                if task and task.get("status") == "done":
+                    _archive_without_clobber(handover, handover_archive)
+            except Exception:   # noqa: BLE001 — stale-artifact cleanup must not break reconciliation
+                pass
+
     # ── Launch side (autopilot): pending + handover → start claude ──
     if AUTOPILOT_ENABLED and launch_enqueue is not None and launched is not None:
         for task in sorted(store.list("pending"),
@@ -12348,6 +13093,9 @@ def _reconcile_once(store: "TaskStore", enqueue, seen_mtime: Dict[str, float],
             if _task_is_escalated(task):
                 continue
             tid = task.get("id") or ""
+            # #1738: a reclaimed pending task with feedback in flight must advance, never launch again.
+            if _feedback_present(tid):
+                continue
             ho = _find_handover(tid)
             if not ho:
                 continue                      # no handover → not yet launchable
@@ -12378,7 +13126,10 @@ def _reconcile_once(store: "TaskStore", enqueue, seen_mtime: Dict[str, float],
     # renewing, so reclaim its task for a later /pending poll. Server-launched/autopilot tasks have no
     # claimed_at field and are deliberately excluded. Re-read under the store lock before transitioning so
     # a renewal racing this tick cannot be overwritten from the stale list snapshot.
-    if CLAIM_LEASE_TTL_S > 0:
+    #1738: a lease older than TTL is only meaningful once the server has observed a full TTL window in which
+    # a renewal could have arrived; durable claim age may include downtime before this process started.
+    if (CLAIM_LEASE_TTL_S > 0
+            and time.monotonic() - _PROCESS_STARTED_MONOTONIC >= CLAIM_LEASE_TTL_S):
         now = time.time()
         for listed in store.list("in_progress"):
             tid = listed.get("id") or ""
@@ -12399,6 +13150,10 @@ def _reconcile_once(store: "TaskStore", enqueue, seen_mtime: Dict[str, float],
                         or claimed_at is None or claim_age <= CLAIM_LEASE_TTL_S):
                     enqueued.discard(lease_key)
                     continue
+                #1738: feedback owns completion once present; reclaiming here would make /pending redispatch it.
+                if _feedback_present(tid):
+                    enqueued.discard(lease_key)
+                    continue
                 try:
                     store.transition(tid, "pending")
                 except Exception:   # noqa: BLE001 — a reclaim hiccup must not break the tick
@@ -12412,8 +13167,6 @@ def _reconcile_once(store: "TaskStore", enqueue, seen_mtime: Dict[str, float],
                     C.YELLOW,
                 ))
 
-    # S7 (#1229): when decoupled and only autopilot is on, this is a launch-only tick — the feedback-advance
-    # side belongs to the watcher concern. Byte-identical when coupled (the loop only runs with watcher on).
     # ── S7 (#1229) heartbeat side: flag an in_progress task that had a progress signal (coder log /
     #    feedback mtime) and then went silent for HEARTBEAT_STALL_S seconds. Runs whenever the loop ticks —
     #    INDEPENDENT of the watcher/feedback concern (a wedged autopilot coder must be caught in decoupled,
@@ -12445,9 +13198,9 @@ def _reconcile_once(store: "TaskStore", enqueue, seen_mtime: Dict[str, float],
                         store.clear_blocked(tid)
                 except Exception:   # noqa: BLE001
                     pass
-    # S7 (#1229): when decoupled and only autopilot is on, this is a launch-only tick — the feedback-advance
-    # side belongs to the watcher concern. Byte-identical when coupled (the loop only runs with watcher on).
-    if AUTOMATION_DECOUPLED and not _WATCHER_ENABLED:
+    # S7 (#1229/#1651): feedback advance belongs exclusively to the watcher concern. The reconciler loop
+    # also runs for continuation recovery and decoupled launches, so every mode must enforce this here.
+    if not _WATCHER_ENABLED:
         return
     # ── Feedback side: pending OR in_progress + feedback OF THE ASSIGNED
     #    agent → advance. IMPORTANT: also scan `pending` — a task processed
@@ -12513,7 +13266,38 @@ def _reconcile_once(store: "TaskStore", enqueue, seen_mtime: Dict[str, float],
         enqueue(tid, agent, fb.name)
 
 
-def _reconciler_loop(stop_event: threading.Event, interval: float):
+def _continuation_reconcile_once(store: "TaskStore", enqueue, *, sealed: bool = False) -> bool:
+    """Repair an edge-triggered continuation that went idle while an eligible unit remains.
+
+    This heartbeat deliberately does not call ``_continuation_tick``: no task completed here, so the
+    completed-task counter and its operator cap must not move. Failed/no-op turns release the in-flight
+    latch, but the per-unit recovery ceiling prevents an eligible unit from consuming turns forever.
+    """
+    _continuation_reset_progress(store)
+    if not AUTOPILOT_AUTOPLAN or _work_in_flight(store):
+        return False
+    unit, _elig, n_open = _select_next_unit(store)
+    if unit is None:
+        if n_open > 0:
+            _set_automation_notice(
+                f"continuation deadlock — {n_open} open unit(s) but none selectable; "
+                "inspect /board for blocked units or unsatisfied dependencies"
+            )
+        return False
+    tid = str(unit.get("id") or "")
+    if sealed:
+        _set_automation_notice(
+            f"continuation for {tid} is paused — channel sealed (no live session)"
+        )
+        return False
+    if not _enqueue_next_unit(None, unit, enqueue, recovery=True):
+        return False
+    _ui_print(col(f"\n  ⚠ [CONTINUATION] idle with eligible unit {tid} — recovery authoring turn queued",
+                  C.YELLOW))
+    return True
+
+
+def _reconciler_loop(stop_event: threading.Event, interval: float, is_sealed=None):
     seen_mtime: Dict[str, float] = {}
     enqueued: set = set()
     launched: set = set()
@@ -12527,14 +13311,18 @@ def _reconciler_loop(stop_event: threading.Event, interval: float):
         _INPUT_QUEUE.put(f"{_LAUNCH_CMD}{tid}\x00{agent}")
 
     while not stop_event.wait(interval):
-        # S7 (#1229): OFF → coupled (the loop runs iff watcher on). ON → autopilot is self-sufficient (the loop
-        # runs if EITHER concern is on; the feedback side stays _WATCHER-gated inside _reconcile_once).
-        if not (_WATCHER_ENABLED or (AUTOMATION_DECOUPLED and AUTOPILOT_ENABLED)):
+        # The loop serves three independently gated concerns: watcher feedback, continuation recovery, and
+        # decoupled autopilot launch. Each side enforces its own flag inside the tick.
+        if not (_WATCHER_ENABLED or AUTOPILOT_AUTOPLAN
+                or (AUTOMATION_DECOUPLED and AUTOPILOT_ENABLED)):
             continue
         bind_active()           # S5b: this daemon thread → the active project (re-read each tick; follows a switch)
         try:
-            _reconcile_once(_store(), enqueue, seen_mtime, enqueued,
+            store = _store()
+            _reconcile_once(store, enqueue, seen_mtime, enqueued,
                             launch_enqueue, launched)
+            sealed = bool(is_sealed()) if is_sealed is not None else False
+            _continuation_reconcile_once(store, _INPUT_QUEUE.put, sealed=sealed)
         except Exception as e:
             _ui_print(col(f"[WARN] reconciler tick failed: {e}", C.YELLOW))
 
@@ -12592,7 +13380,7 @@ def _autoplan_prompt(tid: str) -> Optional[str]:
     )
 
 
-def _next_unit_prompt(done_tid: "Optional[str]", unit: "Dict[str, Any]") -> str:
+def _next_unit_prompt(done_tid: "Optional[str]", unit: "Dict[str, Any]", *, recovery: bool = False) -> str:
     """#1296: the [NEXT-UNIT] staging turn — the engine has already SELECTED the unit
     (deterministic policy); the model's only job is to AUTHOR its handover. The unit exists in
     the store, so the call is stage_handover with task_id and WITHOUT task_json. ``done_tid`` is
@@ -12615,6 +13403,10 @@ def _next_unit_prompt(done_tid: "Optional[str]", unit: "Dict[str, Any]") -> str:
                 f"({(fb_dir / (done_tid + '_<agent>-feedback.md')).as_posix()}). Plan-relevant items under "
                 f"## Issues (effort change, new dependency, path correction, architecture insight)? → Then "
                 f"FIRST adjust the plan (add units via plan_units with epic_id, or report), THEN continue. ")
+    elif recovery:
+        head = (f"[NEXT-UNIT] The automation heartbeat recovered an idle continuation. The engine "
+                f"selected the next open unit{progress}: ")
+        duty = ""
     else:
         head = f"[NEXT-UNIT] Automation armed. The engine selected the FIRST open unit{progress}: "
         duty = ""
@@ -12629,6 +13421,125 @@ def _next_unit_prompt(done_tid: "Optional[str]", unit: "Dict[str, Any]") -> str:
           f"completed units EXISTS, extend it. AUTONOMY DUTY: no questions; if this unit is obsolete "
           f"or impossible, say why and stage nothing."
     )
+
+
+def _set_automation_notice(message: str) -> None:
+    """Publish the current background automation fault, or clear it after proven recovery."""
+    global _AUTOMATION_NOTICE
+    _AUTOMATION_NOTICE = str(message or "").strip()
+
+
+def _continuation_authoring_item(item: str) -> "Tuple[Optional[str], str]":
+    """Decode a structured continuation item while leaving its operator-visible prompt unchanged."""
+    raw = str(item or "")
+    if not raw.startswith(_AUTHOR_CMD):
+        return None, raw
+    parts = raw.split("\x00", 3)  # ['', 'author', tid, prompt]
+    if len(parts) != 4 or not parts[2]:
+        return None, raw
+    return parts[2], parts[3]
+
+
+def _continuation_release_authoring(tid: str) -> None:
+    """Release a consumed unit latch without changing its bounded recovery history."""
+    with _CONTINUATION_AUTHORING_LOCK:
+        _CONTINUATION_AUTHORING.discard(str(tid or ""))
+
+
+def _continuation_recovery_state_locked(tid: str) -> "Tuple[str, int]":
+    """Return the authoritative queued/retry/exhausted state while the caller holds the lock."""
+    attempts = _CONTINUATION_RECOVERY_ATTEMPTS.get(tid, 0)
+    if tid in _CONTINUATION_AUTHORING:
+        return "queued", attempts
+    if attempts >= _CONTINUATION_RECOVERY_MAX_ATTEMPTS:
+        return "exhausted", attempts
+    return "retry", attempts
+
+
+def _continuation_recovery_state(tid: str) -> "Tuple[str, int]":
+    """Read a unit's authoritative recovery state under the continuation lock."""
+    with _CONTINUATION_AUTHORING_LOCK:
+        return _continuation_recovery_state_locked(str(tid or ""))
+
+
+def _continuation_unit_progressed(store: "TaskStore", tid: str) -> bool:
+    """Return True once a unit is staged, in flight, or advanced."""
+    for task in store.list():
+        if str(task.get("id") or "") != tid:
+            continue
+        if task.get("status") in {"in_progress", "done"}:
+            return True
+        return _find_handover(tid) is not None
+    return False
+
+
+def _continuation_mark_progress(tid: str) -> None:
+    """Forget recovery failures after real unit progress, allowing a later legitimate retry."""
+    with _CONTINUATION_AUTHORING_LOCK:
+        _CONTINUATION_RECOVERY_ATTEMPTS.pop(str(tid or ""), None)
+
+
+def _continuation_reset_progress(store: "TaskStore") -> None:
+    """Reset attempt state for any previously retried unit that has since progressed."""
+    with _CONTINUATION_AUTHORING_LOCK:
+        attempted = tuple(_CONTINUATION_RECOVERY_ATTEMPTS)
+    for tid in attempted:
+        if _continuation_unit_progressed(store, tid):
+            _continuation_mark_progress(tid)
+
+
+def _continuation_authoring_result(tid: str, *, progressed: bool, error: str = "") -> None:
+    """Publish dispatch outcome and preserve the recovery ceiling across failed/no-op turns."""
+    _continuation_release_authoring(tid)
+    if progressed:
+        _continuation_mark_progress(tid)
+        _set_automation_notice("")
+        return
+    recovery_state, attempts = _continuation_recovery_state(tid)
+    detail = error or "the turn completed without staging or advancing the unit"
+    if recovery_state == "exhausted":
+        _set_automation_notice(
+            f"continuation authoring for {tid} stopped after {attempts} recovery attempts: {detail}; "
+            "automatic recovery is exhausted for this unit"
+        )
+    else:
+        _set_automation_notice(
+            f"continuation authoring for {tid} failed: {detail}; "
+            f"the heartbeat may retry ({attempts}/{_CONTINUATION_RECOVERY_MAX_ATTEMPTS})"
+        )
+
+
+def _enqueue_next_unit(done_tid: "Optional[str]", unit: "Dict[str, Any]", enqueue,
+                       *, recovery: bool = False) -> bool:
+    """Atomically latch and enqueue one canonical next-unit authoring turn."""
+    tid = str(unit.get("id") or "")
+    if not tid.strip():
+        return False
+    prompt = _next_unit_prompt(done_tid, unit, recovery=recovery)
+    with _CONTINUATION_AUTHORING_LOCK:
+        recovery_state, attempts = _continuation_recovery_state_locked(tid)
+        if recovery_state == "queued":
+            return False
+        if recovery and recovery_state == "exhausted":
+            _set_automation_notice(
+                f"continuation authoring for {tid} stopped after {attempts} recovery attempts; "
+                "automatic recovery is exhausted for this unit"
+            )
+            return False
+        _CONTINUATION_AUTHORING.add(tid)
+        if recovery:
+            _CONTINUATION_RECOVERY_ATTEMPTS[tid] = attempts + 1
+        try:
+            enqueue(f"{_AUTHOR_CMD}{tid}\x00{prompt}")
+        except Exception:
+            _CONTINUATION_AUTHORING.discard(tid)
+            if recovery:
+                if attempts:
+                    _CONTINUATION_RECOVERY_ATTEMPTS[tid] = attempts
+                else:
+                    _CONTINUATION_RECOVERY_ATTEMPTS.pop(tid, None)
+            raise
+    return True
 
 
 def _continuation_kick() -> bool:
@@ -12647,7 +13558,8 @@ def _continuation_kick() -> bool:
         unit, _elig, _n_open = _select_next_unit(s)
         if unit is None:
             return False
-        _INPUT_QUEUE.put(_next_unit_prompt(None, unit))
+        if not _enqueue_next_unit(None, unit, _INPUT_QUEUE.put):
+            return False
         _ui_print(col(f"  → [CONTINUATION] bootstrapping: authoring the handover for "
                       f"{unit['id']} ({str(unit.get('title') or '')!r})", C.CYAN))
         return True
@@ -12655,7 +13567,7 @@ def _continuation_kick() -> bool:
         return False
 
 
-def _continuation_tick(tid: str, enqueue) -> None:
+def _continuation_tick(tid: str, enqueue) -> bool:
     """#1296: after a successful advance — count it, enforce the max-tasks limit, and when nothing
     is actively running continue the loop in leg order: (1) next OPEN UNIT of the decomposition →
     enqueue its [NEXT-UNIT] handover-authoring turn; (2) no units left → the capability-backlog
@@ -12665,8 +13577,10 @@ def _continuation_tick(tid: str, enqueue) -> None:
     ``AUTOPILOT_AUTOPLAN`` only — independent of autopilot's *launch* side, so it works in the
     server/client split (server plans, client executes, server advances, server plans again)."""
     global _AUTOPLAN_DONE, AUTOPILOT_AUTOPLAN
+    # Advancement is real progress even when the operator disarmed continuation before this tick.
+    _continuation_mark_progress(tid)
     if not AUTOPILOT_AUTOPLAN:
-        return
+        return False
     _AUTOPLAN_DONE += 1
     _ui_print(col(f"  [CONTINUATION] {_AUTOPLAN_DONE}"
                   + (f"/{AUTOPILOT_MAX_TASKS}" if AUTOPILOT_MAX_TASKS > 0 else "")
@@ -12677,28 +13591,31 @@ def _continuation_tick(tid: str, enqueue) -> None:
             _EFFECTIVE_CFG["autopilot"]["autoplan"] = False
         _ui_print(col(f"\n  ✓ [CONTINUATION] limit reached ({_AUTOPLAN_DONE}/"
                       f"{AUTOPILOT_MAX_TASKS}) — continuation stopped.", C.GREEN))
-        return
+        return False
     s = _store()
     if _work_in_flight(s):
-        return                       # something runs / is staged → the launcher's turn, not ours
+        _continuation_reset_progress(s)
+        return False                 # something runs / is staged → the launcher's turn, not ours
     unit, _elig, n_open = _select_next_unit(s)
     if unit is not None:
-        enqueue(_next_unit_prompt(tid, unit))
-        _ui_print(col(f"\n  → [CONTINUATION] next open unit after {tid}: {unit['id']} "
-                      f"({unit.get('title')!r}) — authoring its handover", C.CYAN))
-        return
+        if _enqueue_next_unit(tid, unit, enqueue):
+            _ui_print(col(f"\n  → [CONTINUATION] next open unit after {tid}: {unit['id']} "
+                          f"({unit.get('title')!r}) — authoring its handover", C.CYAN))
+            return True
+        return False
     if n_open > 0:
         _ui_print(col(f"  ⚠ [CONTINUATION] {n_open} open unit(s) but NONE selectable — blocked or "
                       f"unsatisfied dependencies. Inspect /board; the loop stays armed.", C.YELLOW))
-        return
+        return False
     prompt = _autoplan_prompt(tid)
     if prompt is None:
         _ui_print(col("  [CONTINUATION] pipeline drained — no open units, no capability backlog "
                       "(paths.active_capability_backlog). Idle, armed.", C.CYAN))
-        return
+        return False
     enqueue(prompt)
     _ui_print(col(f"\n  → [AUTOPLAN] queue empty after {tid} — planning the next task "
                   f"from the backlog", C.CYAN))
+    return True
 
 
 def _code_defaults() -> Dict[str, Any]:
@@ -12861,7 +13778,8 @@ _CONFIG_DERIVED_GLOBALS = (
     "LLM_CONNECT_TIMEOUT_S", "LLM_FIRST_TOKEN_TIMEOUT_S", "LLM_MAX_RETRIES", "STATE_ROOT",
     "VAULT_ROOT", "CODE_SUBDIR", "SESSION_FILE", "CODE_ROOT", "PLATFORM_MODE", "PLATFORM",
     "TASKS_DEDUP_THRESHOLD", "TASK_PREFIX", "_TASK_ID_RE", "FORGE_ENABLED", "FORGE_REPO",
-    "FORGE_ADAPTER", "FORGE_TOKEN_ENV", "REVIEW_AGENT", "REVIEW_TIMEOUT_S", "NOTIFY_WEBHOOK",
+    "FORGE_ADAPTER", "FORGE_TOKEN_ENV", "REVIEW_AGENT", "REVIEW_TIMEOUT_S", "CODE_REVIEW_MODE",
+    "CODE_REVIEW_MAX_ROUNDS", "CODE_REVIEW_AGENT", "NOTIFY_WEBHOOK",
     "AUDIT_SCOPE", "SANDBOX", "MULTI_TENANT", "TOOLING_ENVELOPE_POLICY", "ALERT_ENABLED",
     "LODESTAR_ENABLED", "ONBOARDING_MODE", "AUTOPILOT_ENABLED", "AUTOPILOT_CLAUDE_BIN",
     "AUTOPILOT_EXTRA_ARGS", "AUTOPILOT_DEFAULT_EFFORT", "AUTOPILOT_LOGS_DIR",
@@ -12942,6 +13860,12 @@ def _derive_config_state(cfg: Dict[str, Any]) -> _DerivedConfigState:
         REVIEW_TIMEOUT_S  = float(cfg.get("review", {}).get("timeout_s", REVIEW_TIMEOUT_S) or 180.0)  # #1221
     except (TypeError, ValueError):
         REVIEW_TIMEOUT_S  = 180.0
+    CODE_REVIEW_MODE = str(cfg.get("code_review", {}).get("mode", "off") or "off").strip().lower()
+    try:
+        CODE_REVIEW_MAX_ROUNDS = int(cfg.get("code_review", {}).get("max_rounds", 2) or 2)
+    except (TypeError, ValueError):
+        CODE_REVIEW_MAX_ROUNDS = 2
+    CODE_REVIEW_AGENT = str(cfg.get("code_review", {}).get("agent", "") or "").strip().upper()
     NOTIFY_WEBHOOK        = str(cfg.get("notify", {}).get("webhook", NOTIFY_WEBHOOK) or "")   # #1083
     AUDIT_SCOPE           = str(cfg.get("audit", {}).get("scope", AUDIT_SCOPE) or "mutating").lower()   # #1067
     if AUDIT_SCOPE not in {"mutating", "all"}:
@@ -13232,6 +14156,7 @@ def _config_set_atomic(key: str, value: Any) -> Optional[str]:
             return f"runtime apply failed: {exc}"
 
         _EFFECTIVE_CFG = candidate
+        _SESSION_OVERRIDES[key] = value
         for warning in derived.warnings:
             print(col(warning, C.YELLOW))
         return None

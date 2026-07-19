@@ -137,6 +137,55 @@ def test_plan_units_refuses_language_drift_before_creating_anything(monkeypatch)
     assert gx10._store().list() == []
 
 
+def test_stage_handover_refuses_ad_hoc_implementation_even_with_force():
+    task = _u(1)
+    task["description"] = ("Implement the approved file-search command with complete validation and "
+                           "focused regression coverage.")
+    store = gx10._store()
+
+    for force in (False, True):
+        out = gx10._run_tool_dispatch("stage_handover", {
+            "agent": "OPUS",
+            "handover_md": "Implement the approved file-search command exactly as designed.",
+            "task_json": task,
+            "force": force,
+        })
+        assert out.startswith("ERROR: ad-hoc implementation handover refused")
+        assert "plan_units(epic_json, units_json)" in out
+        assert store.list() == []
+
+
+def test_stage_handover_still_creates_ad_hoc_non_implementation_task():
+    task = _u(1, typ="research")
+    task["description"] = ("Research the file-search behavior and document the evidence needed for the "
+                           "approved design.")
+
+    out = gx10._run_tool_dispatch("stage_handover", {
+        "agent": "OPUS",
+        "handover_md": "Research the file-search behavior and record concrete design evidence.",
+        "task_json": task,
+    })
+
+    assert out.startswith("OK:"), out
+    created = gx10._store().list("pending")
+    assert len(created) == 1 and created[0]["type"] == "research"
+
+
+def test_stage_handover_still_accepts_existing_implementation_unit():
+    assert gx10._plan_units(json.dumps(_EPIC), json.dumps([_u(1)])).startswith("OK:")
+    unit = next(task for task in gx10._store().list("pending")
+                if task.get("type") == "implementation")
+
+    out = gx10._run_tool_dispatch("stage_handover", {
+        "task_id": unit["id"],
+        "agent": "OPUS",
+        "handover_md": "Implement the approved file-search unit exactly as designed.",
+    })
+
+    assert out.startswith("OK:"), out
+    assert gx10._find_handover(unit["id"]) is not None
+
+
 # ── epic auto-complete on the last child's advance ───────────────────────────
 
 def _advance(tid: str) -> str:
@@ -184,6 +233,17 @@ def test_rehand_normalizes_id_and_stamps_assigned_to():
     assert store.get(tid).get("assigned_to") == "OPUS"           # canonical identity stamped
 
 
+def test_rehand_refuses_done_task_even_with_force():
+    store = gx10._store()
+    tid = store.create(dict(_u(1)), force=True)["id"]
+    store.transition(tid, "done")
+
+    out = gx10._stage_handover(tid, "OPUS", "body", force=True)
+
+    assert out == f"ERROR: task {tid} is done — a done unit is never re-staged or re-executed"
+    assert not list(gx10.handovers_dir().glob(f"{tid}_*.md"))
+
+
 # ── /auto — the automation meta-switch ───────────────────────────────────────
 
 def test_watcher_defaults_off_and_config_cannot_enable_it_independently(monkeypatch):
@@ -208,10 +268,12 @@ def test_watcher_defaults_off_and_config_cannot_enable_it_independently(monkeypa
          gx10._EFFECTIVE_CFG) = saved
 
 
-def test_auto_on_off_flips_the_three_flags():
+def test_auto_on_off_flips_the_three_flags(monkeypatch):
     saved = (gx10._WATCHER_ENABLED, gx10.AUTOPILOT_ENABLED, gx10.AUTOPILOT_AUTOPLAN,
              gx10.AUTOPILOT_MAX_TASKS, gx10._AUTOPLAN_DONE, gx10._EFFECTIVE_CFG)
     try:
+        surfaced = []
+        monkeypatch.setattr(gx10, "_ui_print", lambda message, *a, **k: surfaced.append(str(message)))
         gx10._EFFECTIVE_CFG = gx10._code_defaults()
         gx10._dispatch(None, "auto on 5")
         assert gx10._WATCHER_ENABLED and gx10.AUTOPILOT_ENABLED and gx10.AUTOPILOT_AUTOPLAN
@@ -219,6 +281,7 @@ def test_auto_on_off_flips_the_three_flags():
         assert gx10._EFFECTIVE_CFG["autopilot"]["enabled"] is True
         assert gx10._EFFECTIVE_CFG["autopilot"]["autoplan"] is True
         assert gx10._EFFECTIVE_CFG["autopilot"]["autoplan_max_tasks"] == 5
+        assert any("autopilot (engine max_concurrent=" in message for message in surfaced)
         gx10._dispatch(None, "auto off")
         assert not (gx10._WATCHER_ENABLED or gx10.AUTOPILOT_ENABLED or gx10.AUTOPILOT_AUTOPLAN)
     finally:
@@ -278,12 +341,13 @@ def test_plan_units_result_bootstraps_when_armed(monkeypatch):
     assert "launch it with launch_coder" in out and "do NOT call launch_coder" not in out
 
 
-def test_plan_units_armed_defers_launch_when_auto_owns_launching(monkeypatch):
-    # #1309: when the loop actually owns launching (autopilot + watcher = the /auto meta-switch), the armed
-    # prompt tells the model NOT to call launch_coder — the loop launches, so no double-drive.
+@pytest.mark.parametrize("watcher", [False, True])
+def test_plan_units_armed_defers_launch_when_auto_owns_launching(monkeypatch, watcher):
+    # #1309/#1651: continuation keeps the loop live, so autopilot owns launching with or without the watcher;
+    # the armed prompt tells the model NOT to call launch_coder and avoids a double-drive.
     monkeypatch.setattr(gx10, "AUTOPILOT_AUTOPLAN", True)
     monkeypatch.setattr(gx10, "AUTOPILOT_ENABLED", True, raising=False)
-    monkeypatch.setattr(gx10, "_WATCHER_ENABLED", True, raising=False)
+    monkeypatch.setattr(gx10, "_WATCHER_ENABLED", watcher, raising=False)
     out = gx10._plan_units(json.dumps(_EPIC), json.dumps([_u(1)]))
     assert "AUTOMATION ARMED" in out and "do NOT call launch_coder" in out
 

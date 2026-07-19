@@ -4,6 +4,8 @@ import sys
 import types
 from pathlib import Path
 
+import pytest
+
 sys.modules.setdefault("openai", types.SimpleNamespace(OpenAI=lambda **kw: object()))
 
 _ENGINE = Path(__file__).resolve().parents[2] / "engine"
@@ -22,6 +24,31 @@ from ack.tooling_envelope import (  # noqa: E402
 
 
 CLAUDE_TEMPLATE = "{bin} --model {model} --effort {effort} --permission-mode {permission} {mcp} --print {prompt}"
+_MCP_CONFIG = '{"mcpServers":{"memory":{"command":"python"}}}'
+
+
+def _extended_autopilot_policy():
+    return load_tooling_envelope_policy({
+        "code_agents": {"pool": [{
+            "kind": "cli",
+            "bin": "claude",
+            "cmd_template": CLAUDE_TEMPLATE,
+            "capabilities": {"permission_bypass": True},
+        }]},
+    })
+
+
+def _autopilot_argv(*, stream: bool, permission_bypass: bool, mcp: bool) -> list[str]:
+    argv = ["claude", "--model", "claude-opus-4-8", "--effort", "high"]
+    if permission_bypass:
+        argv.append("--dangerously-skip-permissions")
+    else:
+        argv.extend(["--permission-mode", "default"])
+    if mcp:
+        argv.extend(["--mcp-config", _MCP_CONFIG])
+    if stream:
+        argv.extend(["--verbose", "--output-format", "stream-json"])
+    return argv + ["--print", "--handover text"]
 
 
 def test_missing_policy_data_denies_everything():
@@ -116,7 +143,9 @@ def test_undefined_env_allow_list_path_stays_literal_and_refuses(tmp_path, monke
 
     verdict = assert_authorized(str(trusted), CLAUDE_TEMPLATE, policy)
     assert not verdict
-    assert verdict.reason == "tooling envelope refused unauthorized coder command"
+    assert "unauthorized coder command" in verdict.reason
+    assert f"resolved bin={str(trusted)!r}" in verdict.reason
+    assert f"cmd_template={CLAUDE_TEMPLATE.replace(' {mcp}', '')!r}" in verdict.reason
 
 
 def test_bare_allow_list_entry_ignores_same_named_cwd_file(tmp_path, monkeypatch):
@@ -163,7 +192,9 @@ def test_pinned_binary_path_requires_exact_identity(tmp_path):
     assert assert_authorized(str(trusted), CLAUDE_TEMPLATE, policy)
     verdict = assert_authorized(str(attacker), CLAUDE_TEMPLATE, policy)
     assert not verdict
-    assert verdict.reason == "tooling envelope refused unauthorized coder command"
+    assert "unauthorized coder command" in verdict.reason
+    assert f"resolved bin={str(attacker)!r}" in verdict.reason
+    assert f"cmd_template={CLAUDE_TEMPLATE.replace(' {mcp}', '')!r}" in verdict.reason
 
 
 def test_unauthorized_and_malformed_refuse_without_crashing():
@@ -193,37 +224,86 @@ def test_malformed_policy_argument_fails_closed():
         }
 
 
-def test_autopilot_argv_shape_is_explicitly_authorized():
-    policy = load_tooling_envelope_policy({
-        "security": {
-            "tooling_envelope": {
-                "enabled": True,
-                "allow_list": [{"bin": "claude", "cmd_template": autopilot_claude_print_template()}],
-            }
-        }
-    })
-    argv = [
-        "claude", "--model", "claude-sonnet-5", "--effort", "high",
-        "--permission-mode", "default", "--verbose", "--output-format", "stream-json",
-        "--print", "handover text",
-    ]
-    assert assert_authorized("claude", argv, policy)
+@pytest.mark.parametrize(
+    ("stream", "permission_bypass", "mcp"),
+    [
+        (False, False, False),
+        (True, False, False),
+        (False, True, False),
+        (True, True, False),
+        (False, False, True),
+        (True, False, True),
+        (False, True, True),
+        (True, True, True),
+    ],
+    ids=[
+        "safe-non-stream",
+        "safe-stream",
+        "bypass-non-stream",
+        "bypass-stream",
+        "safe-non-stream-mcp",
+        "safe-stream-mcp",
+        "bypass-non-stream-mcp",
+        "bypass-stream-mcp",
+    ],
+)
+def test_all_autopilot_argv_shapes_are_explicitly_authorized(stream, permission_bypass, mcp):
+    policy = _extended_autopilot_policy()
+    template = autopilot_claude_print_template(
+        stream=stream, permission_bypass=permission_bypass, mcp=mcp,
+    )
+
+    assert any(entry.cmd_template == template for entry in policy.allow_list)
+    assert bool(assert_authorized(
+        "claude",
+        _autopilot_argv(stream=stream, permission_bypass=permission_bypass, mcp=mcp),
+        policy,
+    ))
 
 
-def test_default_autopilot_non_stream_argv_shape_is_explicitly_authorized():
-    policy = load_tooling_envelope_policy({
-        "security": {
-            "tooling_envelope": {
-                "enabled": True,
-                "allow_list": [{"bin": "claude", "cmd_template": autopilot_claude_print_template(stream=False)}],
-            }
-        }
-    })
-    argv = [
-        "claude", "--model", "claude-sonnet-5", "--effort", "high",
-        "--permission-mode", "default", "--print", "handover text",
-    ]
-    assert assert_authorized("claude", argv, policy)
+@pytest.mark.parametrize(
+    "argv",
+    [
+        _autopilot_argv(stream=False, permission_bypass=False, mcp=True)[:7]
+        + ["--evil-exfil", "https://attacker.invalid", "--print", "handover text"],
+        _autopilot_argv(stream=False, permission_bypass=False, mcp=True)[:8]
+        + ["--dangerously-skip-permissions", "--print", "handover text"],
+        _autopilot_argv(stream=False, permission_bypass=False, mcp=True) + ["extra-token"],
+        _autopilot_argv(stream=False, permission_bypass=False, mcp=True)[:8]
+        + ["--print", "handover text"],
+    ],
+    ids=["bogus-mcp-flag", "bypass-smuggled-into-safe", "extra-token", "mcp-without-value"],
+)
+def test_mcp_autopilot_shape_refuses_noncanonical_slot_or_count(argv):
+    assert not assert_authorized("claude", argv, _extended_autopilot_policy())
+
+
+@pytest.mark.parametrize(
+    ("slot", "argv"),
+    [
+        ("permission-mode", [
+            "claude", "--model", "claude-opus-4-8", "--effort", "high",
+            "--permission-mode", "--dangerously-skip-permissions", "--print", "handover text",
+        ]),
+        ("mcp-config", [
+            "claude", "--model", "claude-opus-4-8", "--effort", "high",
+            "--dangerously-skip-permissions", "--mcp-config", "--add-dir",
+            "--print", "handover text",
+        ]),
+        ("model", [
+            "claude", "--model", "--verbose", "--effort", "high",
+            "--permission-mode", "default", "--print", "handover text",
+        ]),
+        ("effort", [
+            "claude", "--model", "claude-opus-4-8", "--effort", "--verbose",
+            "--permission-mode", "default", "--print", "handover text",
+        ]),
+    ],
+)
+def test_autopilot_argv_refuses_flag_shaped_value(slot, argv):
+    verdict = assert_authorized("claude", argv, _extended_autopilot_policy())
+
+    assert not bool(verdict), slot
 
 
 def test_autopilot_argv_refuses_smuggled_extra_flags():

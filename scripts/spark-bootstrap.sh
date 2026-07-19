@@ -105,8 +105,8 @@ done
 
 # ── 2) orchestrator (optional) ───────────────────────────────────────────────
 if [ "$WITH_ORCH" = 1 ] && [ "$ORCH_DOCKER" = 1 ]; then
-  # Containerisiert: Image bauen + als Service neben vLLM laufen lassen (host-net,
-  # damit localhost:VLLM_PORT erreichbar ist und :ORCH_PORT auf dem Host bindet).
+  # Containerized: build the image and run it as a service next to vLLM (host network,
+  # so localhost:VLLM_PORT is reachable and :ORCH_PORT binds on the host).
   log "building orchestrator image '$ORCH_CONTAINER' from $REPO_ROOT"
   docker build -t "$ORCH_CONTAINER" "$REPO_ROOT" >/dev/null
   docker rm -f "$ORCH_CONTAINER" >/dev/null 2>&1 || true

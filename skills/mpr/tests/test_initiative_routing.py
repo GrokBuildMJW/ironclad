@@ -17,6 +17,7 @@ import pytest
 sys.modules.setdefault("openai", types.SimpleNamespace(OpenAI=lambda **kw: object()))
 
 import gx10  # noqa: E402  (core/engine on sys.path via conftest)
+import mpr.entry as entry  # noqa: E402
 from mpr.entry import _engine_deps, mpr_research_run  # noqa: E402
 
 
@@ -40,12 +41,38 @@ def test_runs_dir_falls_back_to_default_without_initiative(tmp_path):
     assert deps.runs_dir == "runs/mpr"
 
 
-def test_mpr_research_run_failclosed_without_initiative(tmp_path):
+def test_mpr_research_run_failclosed_without_initiative(tmp_path, monkeypatch):
+    seen: list[str] = []
+    real_msg = gx10._msg
+    monkeypatch.setattr(gx10, "_msg", lambda key: seen.append(key) or real_msg(key))
     out = mpr_research_run("Soll X auf Postgres laufen?")
     assert out.startswith("ERROR")
+    assert seen == ["init.no_active"]
     assert "no active initiative" in out
+    assert "the artifacts would have no home." in out
+    assert "/project new" in out
+    assert "/initiative" not in out
+    assert "--type mpr" not in out
+    assert "--type software" not in out
     # nothing was written into the project root
     assert not (tmp_path / "runs").exists()
+
+
+def test_mpr_research_engine_context_failure_still_runs(tmp_path, monkeypatch):
+    calls: list[tuple[str, object]] = []
+
+    def _raise():
+        raise RuntimeError("engine context unavailable")
+
+    def _run(query, **kwargs):
+        calls.append((query, kwargs["deps"]))
+        return "MPR RAN"
+
+    monkeypatch.setattr(gx10, "artifact_root_soft", _raise)
+    monkeypatch.setattr(entry, "run_mpr", _run)
+    out = mpr_research_run("Should X run on Postgres?")
+    assert out == "MPR RAN"
+    assert len(calls) == 1 and calls[0][0] == "Should X run on Postgres?"
 
 
 def test_mpr_research_run_passes_gate_with_initiative(tmp_path):

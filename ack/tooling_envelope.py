@@ -23,12 +23,28 @@ _AUTOPILOT_SAFE_STREAM = (
 _AUTOPILOT_SAFE_NON_STREAM = (
     "{bin} --model {model} --effort {effort} --permission-mode {permission} --print {prompt}"
 )
+_AUTOPILOT_SAFE_STREAM_MCP = (
+    "{bin} --model {model} --effort {effort} --permission-mode {permission} "
+    "--mcp-config {mcp_config} --verbose --output-format stream-json --print {prompt}"
+)
+_AUTOPILOT_SAFE_NON_STREAM_MCP = (
+    "{bin} --model {model} --effort {effort} --permission-mode {permission} "
+    "--mcp-config {mcp_config} --print {prompt}"
+)
 _AUTOPILOT_BYPASS_STREAM = (
     "{bin} --model {model} --effort {effort} --dangerously-skip-permissions "
     "--verbose --output-format stream-json --print {prompt}"
 )
 _AUTOPILOT_BYPASS_NON_STREAM = (
     "{bin} --model {model} --effort {effort} --dangerously-skip-permissions --print {prompt}"
+)
+_AUTOPILOT_BYPASS_STREAM_MCP = (
+    "{bin} --model {model} --effort {effort} --dangerously-skip-permissions "
+    "--mcp-config {mcp_config} --verbose --output-format stream-json --print {prompt}"
+)
+_AUTOPILOT_BYPASS_NON_STREAM_MCP = (
+    "{bin} --model {model} --effort {effort} --dangerously-skip-permissions "
+    "--mcp-config {mcp_config} --print {prompt}"
 )
 
 
@@ -103,11 +119,15 @@ def _derived_entries(config: dict) -> list[dict]:
                     out.extend([
                         {"bin": effective_bin, "cmd_template": _AUTOPILOT_SAFE_STREAM},
                         {"bin": effective_bin, "cmd_template": _AUTOPILOT_SAFE_NON_STREAM},
+                        {"bin": effective_bin, "cmd_template": _AUTOPILOT_SAFE_STREAM_MCP},
+                        {"bin": effective_bin, "cmd_template": _AUTOPILOT_SAFE_NON_STREAM_MCP},
                     ])
                     if permission_bypass:
                         out.extend([
                             {"bin": effective_bin, "cmd_template": _AUTOPILOT_BYPASS_STREAM},
                             {"bin": effective_bin, "cmd_template": _AUTOPILOT_BYPASS_NON_STREAM},
+                            {"bin": effective_bin, "cmd_template": _AUTOPILOT_BYPASS_STREAM_MCP},
+                            {"bin": effective_bin, "cmd_template": _AUTOPILOT_BYPASS_NON_STREAM_MCP},
                         ])
     return out
 
@@ -149,7 +169,18 @@ def assert_authorized(bin: Any, cmd_template: Any, policy: Any) -> Verdict:
         for entry in pol.allow_list:
             if _bin_matches(candidate_bin, entry.bin) and candidate_template == _normalize_template(entry.cmd_template):
                 return Verdict(True)
-        return Verdict(False, "tooling envelope refused unauthorized coder command")
+        try:
+            resolved_bin = repr(bin)
+        except Exception:
+            resolved_bin = "<unprintable>"
+        # /feedback persists this detail as operator-visible durable blocked_reason. An absolute executable
+        # path can expose the local install layout; that is an intentional operations-diagnosis tradeoff.
+        return Verdict(
+            False,
+            "tooling envelope refused unauthorized coder command "
+            f"(resolved bin={resolved_bin}, cmd_template={candidate_template!r}; "
+            "no allow_list entry matched both)",
+        )
     except Exception:
         return Verdict(False, "tooling envelope refused malformed coder command")
 
@@ -198,13 +229,23 @@ def _bin_matches(candidate_identity: str, allowed: str) -> bool:
     if not _is_bare_command(allowed_expanded):
         return candidate_identity == _path_identity(allowed_expanded)
     allowed_identity = _bin_identity(allowed_expanded)
-    candidate_basename = os.path.basename(candidate_identity)
-    allowed_basename = os.path.basename(allowed_identity)
+    candidate_basename = _portable_basename(candidate_identity)
+    allowed_basename = _portable_basename(allowed_identity)
     return (
         candidate_identity == allowed_identity
         or candidate_basename == allowed_basename
         or _windows_executable_stem(candidate_basename).lower() == allowed_basename.lower()
     )
+
+
+def bin_matches(candidate: Any, allowed: Any) -> bool:
+    """Match a resolved CLI binary against an allowed binary across host path styles."""
+    return _bin_matches(_bin_identity(candidate), str(allowed or ""))
+
+
+def _portable_basename(value: str) -> str:
+    """Return a basename for POSIX or Windows separators, independent of the client host."""
+    return re.split(r"[/\\]", value)[-1]
 
 
 def _windows_executable_stem(value: str) -> str:
@@ -281,22 +322,46 @@ def _normalize_argv(argv: Sequence[Any]) -> str:
     return _normalize_template(" ".join(shlex.quote(p) for p in parts))
 
 
+def _is_value_token(token: str) -> bool:
+    """Return whether a model-authored autopilot value slot contains a real value, not a flag.
+
+    The child is spawned without a shell, so a flag-shaped value is inert. Refusing one removes the
+    asymmetry between the denylisted ``--dangerously-skip-permissions`` and any other flag and closes model,
+    effort, permission-mode, and MCP-config slots uniformly.
+    """
+    return bool(token) and not token.startswith("--")
+
+
 def _looks_like_autopilot(parts: Sequence[str]) -> str:
     tokens = list(parts)
     # Extension-insensitive like _bin_matches: a probe-resolved claude.cmd/.exe stem is still `claude`.
     if len(tokens) < 8 or _windows_executable_stem(os.path.basename(tokens[0])).lower() != "claude":
         return ""
-    if tokens[1] != "--model" or not tokens[2] or tokens[3] != "--effort" or not tokens[4]:
+    if (tokens[1] != "--model" or not _is_value_token(tokens[2])
+            or tokens[3] != "--effort" or not _is_value_token(tokens[4])):
         return ""
-    if len(tokens) == 9 and tokens[5] == "--permission-mode" and tokens[6] and tokens[7] == "--print" and tokens[8]:
+    if (len(tokens) == 9 and tokens[5] == "--permission-mode" and _is_value_token(tokens[6])
+            and tokens[7] == "--print" and tokens[8]):
         return _AUTOPILOT_SAFE_NON_STREAM
-    if len(tokens) == 12 and tokens[5] == "--permission-mode" and tokens[6] and tokens[7:11] == [
+    if len(tokens) == 12 and tokens[5] == "--permission-mode" and _is_value_token(tokens[6]) and tokens[7:11] == [
         "--verbose",
         "--output-format",
         "stream-json",
         "--print",
     ] and tokens[11]:
         return _AUTOPILOT_SAFE_STREAM
+    if (len(tokens) == 11 and tokens[5] == "--permission-mode" and _is_value_token(tokens[6])
+            and tokens[7] == "--mcp-config" and _is_value_token(tokens[8])
+            and tokens[9] == "--print" and tokens[10]):
+        return _AUTOPILOT_SAFE_NON_STREAM_MCP
+    if (len(tokens) == 14 and tokens[5] == "--permission-mode" and _is_value_token(tokens[6])
+            and tokens[7] == "--mcp-config" and _is_value_token(tokens[8]) and tokens[9:13] == [
+                "--verbose",
+                "--output-format",
+                "stream-json",
+                "--print",
+            ] and tokens[13]):
+        return _AUTOPILOT_SAFE_STREAM_MCP
     if len(tokens) == 8 and tokens[5:7] == ["--dangerously-skip-permissions", "--print"] and tokens[7]:
         return _AUTOPILOT_BYPASS_NON_STREAM
     if len(tokens) == 11 and tokens[5:10] == [
@@ -307,11 +372,29 @@ def _looks_like_autopilot(parts: Sequence[str]) -> str:
         "--print",
     ] and tokens[10]:
         return _AUTOPILOT_BYPASS_STREAM
+    if (len(tokens) == 10 and tokens[5] == "--dangerously-skip-permissions"
+            and tokens[6] == "--mcp-config" and _is_value_token(tokens[7])
+            and tokens[8] == "--print" and tokens[9]):
+        return _AUTOPILOT_BYPASS_NON_STREAM_MCP
+    if (len(tokens) == 13 and tokens[5] == "--dangerously-skip-permissions"
+            and tokens[6] == "--mcp-config" and _is_value_token(tokens[7]) and tokens[8:12] == [
+                "--verbose",
+                "--output-format",
+                "stream-json",
+                "--print",
+            ] and tokens[12]):
+        return _AUTOPILOT_BYPASS_STREAM_MCP
     return ""
 
 
-def autopilot_claude_print_template(stream: bool = True, *, permission_bypass: bool = False) -> str:
+def autopilot_claude_print_template(
+    stream: bool = True, *, permission_bypass: bool = False, mcp: bool = False,
+) -> str:
     """The explicit non-provider-template Claude autopilot argv shape."""
     if permission_bypass:
+        if mcp:
+            return _AUTOPILOT_BYPASS_STREAM_MCP if stream else _AUTOPILOT_BYPASS_NON_STREAM_MCP
         return _AUTOPILOT_BYPASS_STREAM if stream else _AUTOPILOT_BYPASS_NON_STREAM
+    if mcp:
+        return _AUTOPILOT_SAFE_STREAM_MCP if stream else _AUTOPILOT_SAFE_NON_STREAM_MCP
     return _AUTOPILOT_SAFE_STREAM if stream else _AUTOPILOT_SAFE_NON_STREAM

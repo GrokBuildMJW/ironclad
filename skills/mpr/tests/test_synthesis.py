@@ -8,9 +8,12 @@ from __future__ import annotations
 
 import json
 
+import gx10  # noqa: E402  (core/engine on sys.path via conftest)
+import pytest
 from mpr.synthesis import (
     PerspectiveResult,
     SynthesisInput,
+    _default_degrade_format,
     synthesize,
     write_back,
 )
@@ -113,6 +116,21 @@ def test_input_order_role_binding():
 
 
 # ── §8-D degradation ─────────────────────────────────────────────────────────────────────────────
+@pytest.mark.parametrize("results", [
+    [{"ok": True, "content": " alpha ", "error": None},
+     {"ok": True, "content": "beta", "error": None}],
+    [{"ok": True, "content": "", "error": None}],
+    [{"ok": True, "content": " \t\r\n ", "error": None}],
+    [{"ok": True, "content": "first", "error": None},
+     {"ok": False, "content": None, "error": "boom"},
+     {"ok": True, "content": "", "error": None}],
+    [{"ok": False, "content": None, "error": "one"},
+     {"ok": False, "content": None, "error": "two"}],
+], ids=["all-ok", "ok-but-empty", "whitespace-only", "mixed-ok-error", "all-error"])
+def test_default_degrade_format_matches_engine_byte_for_byte(results):
+    assert _default_degrade_format(results) == gx10._format_parallel(results)
+
+
 def test_degraded_when_half_panel_fails():
     persp = [P("A", "a"), P("B", "b"), P("C", None, ok=False, error="timeout"),
              P("D", None, ok=False, error="empty")]

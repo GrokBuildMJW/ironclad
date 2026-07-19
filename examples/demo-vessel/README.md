@@ -39,5 +39,5 @@ sits under **Blocked** ("waiting on: todo-create") until a done task implements
 `todo-create`. Add a done task with `"capability": "todo-create"` and re-run step 1
 to watch the backlog re-rank deterministically.
 
-> Real vessels (e.g. a product or business case) live in the **private** monorepo
-> under `vessels/`; only this demo ships publicly.
+> This is a self-contained demo vessel. Build your own vessel alongside it using
+> the same structure.

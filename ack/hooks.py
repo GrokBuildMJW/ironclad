@@ -43,8 +43,8 @@ PRE_TURN = "pre_turn"            #: before prompt assembly for a turn (process-h
 POST_GENERATE = "post_generate"  #: a model/agent turn produced an output (the Verifier feed site)
 PRE_HANDOVER = "pre_handover"    #: before a task+handover is staged
 POST_HANDOVER = "post_handover"  #: after a handover is staged (the Quality-breaker score-feed site)
-POST_FEEDBACK = "post_feedback"  #: task completion (the lessons + process-lesson write site)
-PRE_ADVANCE = "pre_advance"      #: before the pipeline advances
+POST_FEEDBACK = "post_feedback"  #: completion; ctx.agent is derived from selected feedback filename (request fallback before selection)
+PRE_ADVANCE = "pre_advance"      #: before advance; ctx.agent is the requested agent
 POST_TOOLRESULT = "post_toolresult"  #: a tool returned (ctx carries the tool name to disambiguate)
 ESCALATION = "escalation"        #: #1083: a HUMAN_ESCALATION fired (budget spent) — the off-duty-notify site
 

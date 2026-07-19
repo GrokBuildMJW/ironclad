@@ -74,8 +74,8 @@ test('InputBox — ruled prompt with buffer + caret', () => {
   unmount();
 });
 
-test('InputBox — empty shows hint', () => {
-  const {frame, unmount} = renderToString(<InputBox buffer="" caret={false} hint="Ask something …" />, 80, 4);
+test('InputBox — empty shows English default hint', () => {
+  const {frame, unmount} = renderToString(<InputBox buffer="" caret={false} />, 80, 4);
   assert.match(frame(), /Ask something …/);
   unmount();
 });

@@ -220,6 +220,7 @@ def test_apply_env_parses_documented_false_before_validation(monkeypatch):
 
 def test_apply_env_consumes_every_schema_binding_including_prompt(monkeypatch):
     empty_string_values = {
+        "code_review.agent": "reviewer",
         "forge.repo": "owner/repo",
         "memory.base_url": "http://memory.invalid",
         "notify.webhook": "https://notify.invalid/hook",

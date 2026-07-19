@@ -91,7 +91,38 @@ def test_local_tool_routes_to_bridge_when_active():
     assert gx10.run_tool("execute_command", {"command": "ls"}) == "BRIDGED:execute_command:None"
 
 
-def test_bridge_frame_ships_exec_cwd_only_for_non_default_project(monkeypatch, tmp_path):
+def test_windows_engine_does_not_offer_execute_command_without_bridge(monkeypatch):
+    monkeypatch.setattr(gx10, "PLATFORM", "windows")
+    gx10._LOCAL_TOOL_BRIDGE = None
+
+    assert "execute_command" not in {t["function"]["name"] for t in gx10._effective_tools()}
+
+
+def test_windows_engine_offers_execute_command_with_bridge(monkeypatch):
+    monkeypatch.setattr(gx10, "PLATFORM", "windows")
+    gx10._LOCAL_TOOL_BRIDGE = lambda _name, _args: "BRIDGED"
+
+    assert "execute_command" in {t["function"]["name"] for t in gx10._effective_tools()}
+
+
+def test_linux_engine_tool_offer_is_unchanged(monkeypatch):
+    monkeypatch.setattr(gx10, "PLATFORM", "linux")
+    monkeypatch.setattr(gx10, "FRAMING_NOTES_ENABLED", False)
+    monkeypatch.setattr(gx10, "ONBOARDING_MODE", False)
+    monkeypatch.setattr(gx10, "_MEMORY", None)
+    monkeypatch.setattr(gx10, "_WORKERS", None)
+    monkeypatch.setattr(gx10, "_web_search_available", lambda: False)
+    monkeypatch.setattr(gx10, "_forge_available", lambda: False)
+    monkeypatch.setattr(gx10, "_review_available", lambda: False)
+    monkeypatch.setattr(gx10, "_web_search_trust_ok", lambda: False)
+    monkeypatch.setattr(gx10, "_PLUGIN_TOOLS", {})
+    monkeypatch.setattr(gx10, "_PLAYBOOKS", {})
+    monkeypatch.setattr(gx10, "_PROMPTS", {})
+
+    assert gx10._effective_tools() == gx10._tools_with_agent_enum(gx10.TOOLS)
+
+
+def test_bridge_frame_ships_project_paths_only_for_non_default_project(monkeypatch, tmp_path):
     # #1317: the TR frame ships the active project's exec cwd ONLY for a genuinely non-default project (so a
     # bridged tool runs THERE); the DEFAULT project OMITS it → the client keeps its own cwd (byte-identical).
     import project_context as _pc
@@ -118,8 +149,12 @@ def test_bridge_frame_ships_exec_cwd_only_for_non_default_project(monkeypatch, t
         t.join(2)
         return payload
 
-    assert "exec_cwd" not in _frame(None)                        # default (no non-default ctx) → omitted
-    assert _frame(str(tmp_path))["exec_cwd"] == str(tmp_path)     # non-default project → its root shipped
+    default = _frame(None)
+    assert "exec_cwd" not in default                              # default (no non-default ctx) → omitted
+    assert "project_root" not in default
+    active = _frame(str(tmp_path))
+    assert active["exec_cwd"] == str(tmp_path)                     # non-default project → its roots shipped
+    assert active["project_root"] == str(tmp_path)
 
 
 def test_python_client_maps_versioned_exec_and_carries_sandbox_policy(monkeypatch):

@@ -50,6 +50,16 @@ test('MEM-16: registry derives LOCAL_COMMANDS + powers completions', () => {
   assert.ok(completions('stat').some((c) => c.name === 'status' && c.scope === 'server'));
   assert.ok(completions('des').some((c) => c.name === 'design' && c.scope === 'server'));
   assert.equal(completions('zzz').length, 0); // no match
+  const tool = COMMANDS.find((c) => c.name === 'tool');
+  assert.equal(tool?.usage, '<name> <args|text>');
+  assert.equal(tool?.desc, 'run a tool directly/deterministic, e.g. tool mpr_research <question>');
+  // #1617: static cold-start guidance mirrors the implemented engine verbs and never teaches removed --type.
+  const initiative = COMMANDS.find((c) => c.name === 'initiative');
+  const project = COMMANDS.find((c) => c.name === 'project');
+  assert.equal(initiative?.usage, 'new <name> | list | use <slug> | active | reconcile');
+  assert.equal(project?.usage, 'list [--all] | new <name> [--path <dir>] | use <slug> | active | track new|use|list | delete <id> [--purge] | archive|unarchive <id>');
+  assert.ok(!initiative?.usage?.includes('--type'));
+  assert.ok(!project?.usage?.includes('--type'));
 });
 
 test('#452: /coders is a local command + offered in completions', () => {

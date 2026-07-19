@@ -37,6 +37,12 @@ client shows a suggestion instead, so a typo never bills a model turn:
 A bare `/<name>` that is **not** close to any command still forwards, so a prompt-library item invoked as
 `/<prompt-name>` continues to work.
 
+Unknown `/config set` keys use the same dependency-free edit-distance primitive against the config schema,
+but first account for the common shorthand of typing only a key's leaf name. A unique exact leaf suggests
+its full dotted key (`language` → `generation.language`); an ambiguous leaf lists at most five sorted
+matches and reports how many remain instead of choosing one. If no leaf matches, only a full dotted key
+within edit distance 2 is suggested. Inputs with no plausible match keep the original refusal unchanged.
+
 ## Unambiguous prefix
 
 A prefix that matches exactly one **non-destructive** command auto-resolves (`/stat` → `/status`). A prefix
@@ -58,7 +64,8 @@ Accepting a suggestion inserts the token into the line (it does not reset it to 
 ## Discovery
 
 - `/config keys` lists every settable dotted config key; boot-only keys (wired once at startup) are
-  flagged. `/config set` **refuses an unknown root key** (a typo) instead of silently writing it.
+  flagged. `/config set` **refuses an unknown key** instead of silently writing it and offers bounded,
+  deterministic near-match guidance when the schema has a plausible candidate.
 - `/skills` shows each tool's parameters; `/prompts` lists the prompt library.
 - `/help` groups the commands by danger tier (read-only / mutating / destructive / costly).
 

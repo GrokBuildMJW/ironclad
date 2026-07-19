@@ -3,7 +3,7 @@
 Covers the dependency-free stdio MCP server (`engine/memory_mcp.py`): the JSON-RPC protocol
 (initialize / tools/list / tools/call / notifications), the read-only tool set (search + deep_query, NO
 write), fail-soft behaviour, the serve() loop framing, and the always-on launch renderer `render_mcp_launch`
-(#994-S10: read-only Memory MCP when memory + per-CLI mcp_template, any profile; secret-free env, forward-slash path).
+(#994-S10: configured memory always supplies its environment; launch arguments require a per-CLI template).
 """
 from __future__ import annotations
 
@@ -105,11 +105,11 @@ def test_serve_loop_skips_garbage_and_replies_per_line():
     assert ids == [1, 2]                                          # blank + malformed frames skipped
 
 
-# ── gated launch renderer ────────────────────────────────────────────────────
+# ── launch renderer ──────────────────────────────────────────────────────────
 _TMPL = '--mcp-config \'{"mcpServers":{"memory":{"command":"{mcp_cmd}","args":["{mcp_script}"]}}}\''
 
 
-def test_render_mcp_launch_is_always_on_when_configured():
+def test_render_mcp_launch_with_template_returns_unchanged_args_and_env():
     # #994-S10: the read-only Memory MCP is ALWAYS ON when memory + a per-CLI template — no longer
     # sealed-gated (the profile no longer matters; a coder can only READ memory, never write).
     for sealed in (False, True):
@@ -117,9 +117,17 @@ def test_render_mcp_launch_is_always_on_when_configured():
                                                  namespace="ironclad", py="python", path="C:/x/memory_mcp.py")
         assert '"command":"python"' in args and '"args":["C:/x/memory_mcp.py"]' in args   # forward-slash → valid JSON
         assert env == {"GX10_MEMORY_URL": "http://mem:8800", "GX10_MCP_MEMORY_NS": "ironclad"}
-    # OFF only when memory is unconfigured OR the agent has no template → byte-identical launch (no args/env)
+
+
+def test_render_mcp_launch_without_template_returns_connection_env_only():
+    # #1683: a CLI with persistent MCP registration needs the connection but no per-launch arguments.
+    assert memory_mcp.render_mcp_launch(None, memory_url="http://mem:8800", namespace="ns") == (
+        "", {"GX10_MEMORY_URL": "http://mem:8800", "GX10_MCP_MEMORY_NS": "ns"},
+    )
+
+
+def test_render_mcp_launch_without_memory_is_unchanged():
     assert memory_mcp.render_mcp_launch(_TMPL, memory_url="", namespace="ns") == ("", {})
-    assert memory_mcp.render_mcp_launch(None, memory_url="http://mem:8800", namespace="ns") == ("", {})
 
 
 def test_render_mcp_launch_normalizes_windows_path():

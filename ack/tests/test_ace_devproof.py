@@ -1,10 +1,10 @@
-"""ACE-DEVPROOF (#855 / #881, M4-4) — the M4 capstone: a boundary-clean END-TO-END proof that BOTH
-dev-processes learn from the ledger-derived trajectory. Drives the full M4 stack (ledger →
+"""ACE-DEVPROOF (#855 / #881, M4-4) — the M4 capstone: a boundary-clean END-TO-END proof that multiple
+dev-process producers learn from the ledger-derived trajectory. Drives the full M4 stack (ledger →
 `ack.ace.devtraj` → the gx10 M4-2 scan → the real `ReflectionWorker` → `PlaybookStore.adapt` → a playbook
-mutation) for the SAME ledger schema both the PUBLIC generic `ack.devprocess` driver and the INTERNAL DEV-3
-(`scripts/devloop`) emit — one adapter serves both (DP-3). Also proves DP-4 (tampered/absent ledger ⇒ no
-crash, no learning), exactly-once (no double-learning vs #863/M4-0), and the used-bullet correlation (M4-3).
-Reads the ledger as plain data — imports NOTHING private (no Spark IP / hostnames / vessel names).
+mutation) for the same shared ledger schema — one adapter serves every conforming producer (DP-3). Also
+proves DP-4 (tampered/absent ledger ⇒ no crash, no learning), exactly-once (no double-learning vs
+#863/M4-0), and the used-bullet correlation (M4-3).
+Reads the ledger as plain data and imports no producer-specific implementation.
 """
 from __future__ import annotations
 

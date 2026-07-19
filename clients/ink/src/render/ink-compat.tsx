@@ -16,7 +16,7 @@ import {Palette} from './palette.js';
 import {paint} from './paint.js';
 import {createConfig, attachYoga, calculate, freeYoga} from './layout.js';
 import {createRoot} from './host.js';
-import {RenderContext, createRenderContext} from './hooks.js';
+import {RenderContext, createRenderContext, type Key} from './hooks.js';
 import {FocusContext, FocusManager} from './focus.js';
 
 export {useInput, useApp, useStdout, useStdin, type Key} from './hooks.js';
@@ -107,7 +107,7 @@ export function renderToString(
   element: ReactNode,
   columns = 80,
   rows = 24,
-): {frame: () => string; unmount: () => void} {
+): {frame: () => string; input: (input: string, key: Key) => void; unmount: () => void} {
   const container = createVNode('ink-root');
   const palette = new Palette();
   const config = createConfig();
@@ -135,6 +135,7 @@ export function renderToString(
 
   return {
     frame: () => frameText,
+    input: (input, key) => bridge.emit(input, key),
     unmount: () => {
       root.unmount();
       freeYoga(container);

@@ -111,13 +111,19 @@ def test_safe_promote_quarantines_a_measured_regression(tmp_path, monkeypatch):
 
 def test_safe_promote_keeps_an_improvement(tmp_path, monkeypatch):
     st = _store(tmp_path, monkeypatch)
+
+    def noisy_adapt_once(traj, pb, **kw):
+        pb.add_bullet("new-strategy", "strategies_and_hard_rules")
+        return {"skipped": False, "added": 1, "quarantined": 1}
+
+    monkeypatch.setattr(ace_mod, "adapt_once", noisy_adapt_once)
     scores = iter([0.5, 0.9])
     st.set_transports(eval_fn=lambda pb: next(scores))
 
     result = st.adapt(object(), scope=SCOPE)
 
     assert result["promoted"] is True
-    assert not result.get("quarantined")
+    assert result["quarantined"] is False
     assert result["scores"] == {"before": 0.5, "after": 0.9}
     assert any("new-strategy" in lesson for lesson in st.get_lessons(SCOPE))
 

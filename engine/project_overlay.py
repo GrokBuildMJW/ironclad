@@ -7,10 +7,11 @@ Two fail-closed guards the quiesced switch (S5) applies when it builds a project
    DROP any overlay key under a LOCKED prefix. The locked set protects the deployment-wide, security- and
    isolation-bearing config a project must never re-point: ``connection`` (where the model/memory live),
    ``security`` (trust profile / sealing), ``setup`` (boot operating mode), ``search`` (web-search gate),
-   ``plugins_dir`` (3rd-party load root), and ``providers.budget`` (the cost ceiling). An optional CLOSED
-   ``allow`` set further restricts overrides to named top-level sections (deny-by-default); the default is
-   open-except-locked, and S5 / a deployment may pass a closed allowlist once the overridable surface is
-   finalized. Returns ``(merged, dropped)`` so the switch can log what a project tried to lock-override.
+   ``generation`` (reply-language / decoding settings), ``plugins_dir`` (3rd-party load root), and
+   ``providers.budget`` (the cost ceiling). An optional CLOSED ``allow`` set further restricts overrides to
+   named top-level sections (deny-by-default); the default is open-except-locked, and S5 / a deployment may
+   pass a closed allowlist once the overridable surface is finalized. Returns ``(merged, dropped)`` so the
+   switch can log what a project tried to lock-override.
 
 2. ``contain(project_root, candidate)`` — canonicalize *candidate* (resolving symlinks + ``..``) and assert
    it stays INSIDE *project_root*, closing the verbatim-absolute / traversal / symlink override of
@@ -30,6 +31,7 @@ LOCKED_PREFIXES: Tuple[str, ...] = (
     "security",            # trust profile / sealing / egress
     "setup",               # boot-fixed operating mode (server|local)
     "search",              # web-search adapter + trust gate
+    "generation",          # reply-language + decoding settings — never per-project
     "plugins_dir",         # 3rd-party plugin load root
     "providers.budget",    # the cost ceiling (a project must not raise its own budget)
 )

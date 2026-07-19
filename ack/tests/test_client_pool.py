@@ -79,7 +79,7 @@ class _FakeServer:
             self.signals.append(("unclaim", task_id))
         return {"ok": True, "status": "pending"}
 
-    def feedback(self, task_id, agent, content, exit_code=None, stderr=""):   # #455: accept the run signal
+    def feedback(self, task_id, agent, content, exit_code=None, stderr="", launch_refusal=""):
         with self._lock:
             self.uploaded.append((task_id, agent, content))
         # Deliberately OMITS "classification" → exercises _process_one's `cls is None` back-compat
@@ -303,7 +303,9 @@ def test_run_handover_uses_server_shipped_tooling_envelope_without_global_config
     assert out is None
     assert calls == []
     assert meta["exit_code"] is None
-    assert meta["stderr_tail"] == "tooling envelope refused unauthorized coder command"
+    assert "unauthorized coder command" in meta["stderr_tail"]
+    assert "resolved bin='claude'" in meta["stderr_tail"]
+    assert f"cmd_template={client.DEFAULT_AGENT_CMD!r}" in meta["stderr_tail"]
 
 
 def test_run_handover_server_shipped_tooling_envelope_authorized_spawns(tmp_path, monkeypatch):
@@ -492,13 +494,13 @@ def test_process_one_renews_claim_during_run_and_stops_after(monkeypatch, tmp_pa
         return "feedback", {}
 
     srv.claim = _claim
-    monkeypatch.setattr(client, "_CLAIM_RENEW_INTERVAL_S", 0.01)
     monkeypatch.setattr(client, "_run_handover", _blocking)
     claimed = {"KGC-1"}
+    item = {**_items("KGC-1")[0], "lease_renew_s": 0.01}
     result: list[bool] = []
     worker = threading.Thread(
         target=lambda: result.append(client._process_one(
-            srv, tmp_path, _items("KGC-1")[0], claimed, lambda *_args: None)),
+            srv, tmp_path, item, claimed, lambda *_args: None)),
     )
     worker.start()
     worker.join(timeout=3)
@@ -511,6 +513,56 @@ def test_process_one_renews_claim_during_run_and_stops_after(monkeypatch, tmp_pa
     threading.Event().wait(0.05)
     with call_lock:
         assert claim_calls == stopped_at
+
+
+def test_renew_claim_warns_once_and_continues_after_failures():
+    srv = _FakeServer([])
+    attempts = 0
+    logs: list[str] = []
+
+    def _failed_claim(_task_id, _agent):
+        nonlocal attempts
+        attempts += 1
+        raise OSError("server unavailable")
+
+    class _StopAfterTwoAttempts:
+        def __init__(self):
+            self.waits = 0
+
+        def wait(self, _interval):
+            self.waits += 1
+            return self.waits > 2
+
+    srv.claim = _failed_claim
+    client._renew_claim(srv, "KGC-1", "OPUS", _StopAfterTwoAttempts(), 0.01, logs.append)
+
+    assert attempts == 2
+    assert logs == ["  ⚠ KGC-1: claim lease renewal failed (continuing): server unavailable"]
+
+
+@pytest.mark.parametrize(("item_patch", "expected"), [
+    ({"lease_renew_s": 12.5}, 12.5),
+    ({"lease_renew_s": "0.25"}, 0.25),
+    ({}, 30.0),
+    ({"lease_renew_s": None}, 30.0),
+    ({"lease_renew_s": 0}, 30.0),
+    ({"lease_renew_s": -1}, 30.0),
+    ({"lease_renew_s": float("nan")}, 30.0),
+    ({"lease_renew_s": float("inf")}, 30.0),
+    ({"lease_renew_s": 86400.1}, 30.0),
+    ({"lease_renew_s": "invalid"}, 30.0),
+])
+def test_process_one_uses_valid_item_lease_renew_cadence_or_default(
+        monkeypatch, tmp_path, item_patch, expected):
+    srv = _FakeServer(_items("KGC-1"))
+    intervals = []
+    monkeypatch.setattr(client, "_renew_claim",
+                        lambda _srv, _tid, _agent, _stop, interval, _log: intervals.append(interval))
+    monkeypatch.setattr(client, "_run_handover",
+                        lambda item, codedir, log=print: ("feedback", {}))
+    item = {**_items("KGC-1")[0], **item_patch}
+    assert client._process_one(srv, tmp_path, item, {"KGC-1"}, lambda *_args: None) is True
+    assert intervals == [expected]
 
 
 def test_already_claimed_not_resubmitted(monkeypatch, tmp_path):
@@ -558,6 +610,73 @@ def test_failure_unclaims_for_retry(monkeypatch, tmp_path):
     assert srv.signals == [("claim", "KGC-1", "OPUS"), ("unclaim", "KGC-1")]
 
 
+def test_refused_launch_is_reported_once_and_not_redispatched_but_sibling_runs(monkeypatch, tmp_path):
+    class _Server(_FakeServer):
+        def feedback(self, task_id, agent, content, exit_code=None, stderr="", launch_refusal=""):
+            self.uploaded.append((task_id, agent, content, launch_refusal))
+            return ({"classification": "launch-refused", "action": "terminal"}
+                    if launch_refusal else {"classification": "ok-feedback", "feedback_file": "fb.md"})
+
+    srv = _Server(_items("REFUSED", "SIBLING"))
+
+    def _run(item, codedir, log=print):
+        if item["id"] == "REFUSED":
+            reason = ("tooling envelope refused unauthorized coder command "
+                      "(resolved bin='kimi', cmd_template='{bin} refused {prompt}'; "
+                      "no allow_list entry matched both)")
+            return None, {"exit_code": None, "stderr_tail": reason, "launch_refusal": reason}
+        return "status: done\nok", {"exit_code": 0, "stderr_tail": ""}
+
+    monkeypatch.setattr(client, "_run_handover", _run)
+    claimed = set()
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = client.dispatch_pending(srv, tmp_path, pool, claimed)
+        wait(first)
+        second = client.dispatch_pending(srv, tmp_path, pool, claimed)
+    assert second == []
+    assert len([x for x in srv.uploaded if x[0] == "REFUSED"]) == 1
+    assert len([x for x in srv.uploaded if x[0] == "SIBLING"]) == 1
+    assert claimed == {"REFUSED", "SIBLING"}
+    assert not [x for x in srv.signals if x[0] == "unclaim"]
+
+
+def test_refused_launch_stays_terminal_when_feedback_transport_fails_then_retries_after_restart(
+        monkeypatch, tmp_path):
+    class _Server(_FakeServer):
+        def __init__(self):
+            super().__init__(_items("REFUSED-NETWORK"))
+            self.reports = 0
+
+        def feedback(self, task_id, agent, content, exit_code=None, stderr="", launch_refusal=""):
+            self.reports += 1
+            raise OSError("network down")
+
+    reason = "tooling envelope refused unauthorized coder command"
+    monkeypatch.setattr(client, "_run_handover", lambda *_args, **_kwargs: (
+        None, {"exit_code": None, "stderr_tail": reason, "launch_refusal": reason}))
+    srv = _Server()
+    claimed = set()
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        wait(client.dispatch_pending(srv, tmp_path, pool, claimed))
+        assert client.dispatch_pending(srv, tmp_path, pool, claimed) == []
+        assert srv.reports == 1
+        assert not [x for x in srv.signals if x[0] == "unclaim"]
+        assert claimed == {"REFUSED-NETWORK"}
+
+        restarted_claims = set()
+        assert len(client.dispatch_pending(srv, tmp_path, pool, restarted_claims)) == 1
+
+
+def test_dispatch_skips_escalated_task(monkeypatch, tmp_path):
+    srv = _FakeServer([{"id": "ESCALATED", "agent": "KIMI", "blocked": True,
+                        "blocked_kind": "escalated"}])
+    monkeypatch.setattr(client, "_run_handover",
+                        lambda *_args, **_kwargs: pytest.fail("escalated task was dispatched"))
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        assert client.dispatch_pending(srv, tmp_path, pool, set()) == []
+    assert srv.signals == []
+
+
 def test_exception_unclaims(monkeypatch, tmp_path):
     srv = _FakeServer(_items("KGC-1"))
 
@@ -573,7 +692,21 @@ def test_exception_unclaims(monkeypatch, tmp_path):
     assert all(f.result() is False for f in results.done)
 
 
-def test_claim_and_unclaim_transport_errors_are_fail_soft(monkeypatch, tmp_path):
+def test_process_one_done_claim_is_not_launchable(monkeypatch, tmp_path):
+    srv = _FakeServer(_items("KGC-1"))
+    srv.claim = lambda *_args: {"ok": True, "status": "done"}
+    logs = []
+    monkeypatch.setattr(client, "_run_handover",
+                        lambda *_args, **_kwargs: pytest.fail("coder was spawned after a done claim"))
+    claimed = {"KGC-1"}
+    assert client._process_one(srv, tmp_path, _items("KGC-1")[0], claimed, logs.append) is False
+    assert claimed == set()
+    assert srv.uploaded == []
+    assert not [signal for signal in srv.signals if signal[0] == "unclaim"]
+    assert logs == ["  ✗ KGC-1: not launchable (claim status 'done') — skipped"]
+
+
+def test_process_one_claim_transport_error_is_not_launchable(monkeypatch, tmp_path):
     srv = _FakeServer(_items("KGC-1"))
     logs = []
 
@@ -582,10 +715,34 @@ def test_claim_and_unclaim_transport_errors_are_fail_soft(monkeypatch, tmp_path)
 
     srv.claim = _offline
     monkeypatch.setattr(client, "_run_handover",
-                        lambda item, codedir, log=print: ("feedback", {}))
-    assert client._process_one(srv, tmp_path, _items("KGC-1")[0], {"KGC-1"}, logs.append) is True
+                        lambda *_args, **_kwargs: pytest.fail("coder was spawned after a failed claim"))
+    claimed = {"KGC-1"}
+    assert client._process_one(srv, tmp_path, _items("KGC-1")[0], claimed, logs.append) is False
+    assert claimed == set()
+    assert srv.uploaded == []
+    assert not [signal for signal in srv.signals if signal[0] == "unclaim"]
+    assert logs == ["  ✗ KGC-1: not launchable (/claim failed: server unavailable) — skipped"]
+
+
+def test_process_one_in_progress_claim_launches(monkeypatch, tmp_path):
+    srv = _FakeServer(_items("KGC-1"))
+    launched = []
+    monkeypatch.setattr(client, "_run_handover", lambda item, codedir, log=print: (
+        launched.append(item["id"]), ("feedback", {}))[1])
+    claimed = {"KGC-1"}
+    assert client._process_one(
+        srv, tmp_path, _items("KGC-1")[0], claimed, lambda *_args: None) is True
+    assert launched == ["KGC-1"]
     assert srv.uploaded == [("KGC-1", "OPUS", "feedback")]
-    assert any("/claim failed (continuing)" in line for line in logs)
+    assert claimed == {"KGC-1"}
+
+
+def test_unclaim_transport_error_is_fail_soft(monkeypatch, tmp_path):
+    srv = _FakeServer(_items("KGC-1"))
+    logs = []
+
+    def _offline(*_args):
+        raise OSError("server unavailable")
 
     srv.unclaim = _offline
     monkeypatch.setattr(client, "_run_handover",

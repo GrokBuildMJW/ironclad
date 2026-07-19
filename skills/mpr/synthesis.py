@@ -5,9 +5,9 @@ EXACTLY ONE governed LLM call + deterministic rendering (templates, Syn-4) + cro
 (conflicts, Syn-3). It **never raises** for model/transport/memory errors — it degrades stepwise (§7).
 
 Ride, don't duplicate: the degradation formatter (`degrade_format`) and the memory reducer
-(`write_back(reducer=…)`) are INJECTED — run() (1f) passes ironclad's `_format_parallel`
-(gx10.py:1709) and `_reduce_worker_results` (gx10.py:1810) through; here they are stubbable and the
-default formatter mirrors `_format_parallel` minimally, without pulling the engine import into this module.
+(`write_back(reducer=…)`) are injected. When MPR is embedded, `entry.py` binds them to the engine's
+`_format_parallel` and `_reduce_worker_results`; the defaults keep standalone and stubbed use working
+without pulling the engine import into this module.
 """
 from __future__ import annotations
 
@@ -84,12 +84,15 @@ def _quorum(ok: List[PerspectiveResult], all_p: List[PerspectiveResult]) -> str:
 
 
 def _default_degrade_format(results: List[dict]) -> str:
-    # minimal mirror of gx10._format_parallel (gx10.py:1709) — run() injects the real one.
-    ok = sum(1 for r in results if r.get("ok"))
+    # Standalone fallback for the engine-injected gx10._format_parallel.
+    ok = sum(1 for r in results if r.get("ok") and (r.get("content") or "").strip())
     lines = []
     for i, r in enumerate(results, 1):
-        lines.append(f"[{i}] {(r.get('content') or '').strip()}" if r.get("ok")
-                     else f"[{i}] ERROR: {r.get('error')}")
+        if r.get("ok"):
+            content = (r.get("content") or "").strip()
+            lines.append(f"[{i}] {content}" if content else f"[{i}] EMPTY: branch returned no content")
+        else:
+            lines.append(f"[{i}] ERROR: {r.get('error')}")
     return f"[parallel_reason] {ok}/{len(results)} ok\n\n" + "\n\n".join(lines)
 
 

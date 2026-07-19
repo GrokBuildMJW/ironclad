@@ -18,12 +18,14 @@ test('stream parser — text + tool frame toggle, split across chunks', async ()
     },
   });
   await feed(enc.encode('hello'));
-  await feed(enc.encode(NUL + 'TR{"id":"a","name":"read_file","args":{"path":"x"}}' + NUL + 'wor'));
+  await feed(enc.encode(NUL + 'TR{"id":"a","name":"read_file","args":{"path":"x"},"exec_cwd":"/project/src","project_root":"/project"}' + NUL + 'wor'));
   await feed(enc.encode('ld'));
   await feed(null);
   assert.deepEqual(texts, ['hello', 'world']);
   assert.equal(frames.length, 1);
-  assert.deepEqual(frames[0], {id: 'a', name: 'read_file', args: {path: 'x'}});
+  assert.deepEqual(frames[0], {
+    id: 'a', name: 'read_file', args: {path: 'x'}, execCwd: '/project/src', projectRoot: '/project',
+  });
 });
 
 test('stream parser — versioned model exec carries the mandatory sandbox policy', async () => {

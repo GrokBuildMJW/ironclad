@@ -1,6 +1,9 @@
 """Hermetic sibling-test runner (S11b-2): gate.run_sibling_test_hermetic and gate.gate_generated execute path."""
 from __future__ import annotations
 
+from types import SimpleNamespace
+from unittest.mock import patch
+
 from ack import gate
 import pytest
 
@@ -22,6 +25,17 @@ def test_hermetic_passing_test(tmp_path):
     py = _mk(tmp_path, 'def test_ok():\n    assert 1 + 1 == 2\n')
     ok, detail = gate.run_sibling_test_hermetic(py)
     assert ok, detail
+
+
+def test_hermetic_child_uses_plain_assertions(tmp_path):
+    py = _mk(tmp_path, 'def test_ok():\n    assert True\n')
+    completed = SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    with patch.object(gate.subprocess, "run", return_value=completed) as run:
+        ok, detail = gate.run_sibling_test_hermetic(py)
+
+    assert ok, detail
+    assert "--assert=plain" in run.call_args.args[0]
 
 
 def test_hermetic_failing_test(tmp_path):

@@ -4,6 +4,7 @@ Pins G-002 (online adaptation), O-001 (label-free), O-002 (cumulative), L-001 (r
 from __future__ import annotations
 
 import json
+import threading
 import time
 
 from ack.ace import (Playbook, Trajectory, AdaptConfig, adapt_once, OnlineAdapter, ReflectionWorker,
@@ -158,3 +159,84 @@ def test_worker_background_thread_processes_then_stops():
     finally:
         w.stop()
     assert seen == ["bg"] and w.processed == 1
+
+
+def test_worker_stop_waits_for_inflight_item_and_clears_thread():
+    started = threading.Event()
+    finish = threading.Event()
+    completed = threading.Event()
+
+    def process(_item):
+        started.set()
+        assert finish.wait(timeout=1.0)
+        completed.set()
+
+    w = ReflectionWorker(process=process)
+    w.submit(Trajectory(query="in-flight"))
+    w.start()
+    release = None
+    try:
+        assert started.wait(timeout=1.0)
+        release = threading.Timer(0.05, finish.set)
+        release.start()
+        w.stop()
+    finally:
+        finish.set()
+        if release is not None:
+            release.join(timeout=1.0)
+        if w._thread is not None:
+            w.stop()
+    assert completed.is_set() and w.processed == 1
+    assert w._thread is None
+    assert not any(t.name == "ace-reflection-worker" and t.is_alive() for t in threading.enumerate())
+
+
+def test_worker_stop_finite_timeout_keeps_live_thread_observable():
+    started = threading.Event()
+    finish = threading.Event()
+
+    def process(_item):
+        started.set()
+        assert finish.wait(timeout=1.0)
+
+    w = ReflectionWorker(process=process)
+    w.submit(Trajectory(query="in-flight"))
+    w.start()
+    try:
+        assert started.wait(timeout=1.0)
+        w.stop(timeout=0.01)
+        assert w._thread is not None and w._thread.is_alive()
+    finally:
+        finish.set()
+        w.stop()
+    assert w._thread is None and w.processed == 1
+
+
+def test_worker_stop_drains_items_not_yet_started():
+    started = threading.Event()
+    finish = threading.Event()
+    seen = []
+
+    def process(item):
+        seen.append(item.query)
+        started.set()
+        assert finish.wait(timeout=1.0)
+
+    w = ReflectionWorker(process=process)
+    for query in ("first", "queued-1", "queued-2"):
+        w.submit(Trajectory(query=query))
+    w.start()
+    release = None
+    try:
+        assert started.wait(timeout=1.0)
+        release = threading.Timer(0.05, finish.set)
+        release.start()
+        w.stop()
+    finally:
+        finish.set()
+        if release is not None:
+            release.join(timeout=1.0)
+        if w._thread is not None:
+            w.stop()
+    assert seen == ["first"] and w.processed == 1
+    assert w.pending() == 0 and w._thread is None

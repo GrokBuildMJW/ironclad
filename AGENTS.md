@@ -29,8 +29,8 @@ a failed check — report the exact error and stop (fail-closed).
    - Check: `python -c "import ack, pydantic; print('ack ok')"`.
 4. **Run the test suite.** `python -m pytest ack/tests -q`.
    - Check: all tests pass. Stop on any failure; report the failing test names.
-5. **Confirm the public boundary stays clean:** `core/` must not import from or hardcode any
-   private path or literal. (A boundary check enforces this in the project's private CI.)
+5. **Confirm the public boundary stays clean:** the repository root is the boundary surface; shipped
+   code must not import from or hardcode any private path or literal. A boundary check enforces this in CI.
 
 Done-A: `import ack` works and `pytest` is green.
 
@@ -69,7 +69,7 @@ Done-A: `import ack` works and `pytest` is green.
    `GX10_SERVER_URL=http://localhost:8100 ironclad`.)
    - Check: a coherent answer + a `✓ DONE` line. Stop if the call errors.
    - A plain question needs nothing more; to drive an artefact-producing **build** task, first
-     `/project new <name> --type software` (fail-closed without one — see
+     `/project new <name>` (fail-closed without one — see
      [`docs/state-and-initiative.md`](docs/state-and-initiative.md)).
 
 Done-B: a real model turn returns through the engine.
@@ -115,7 +115,7 @@ endpoint, never bake it in.
      (the launcher starts it on first `ironclad`). Stop if the model endpoint shows `NOT reachable` —
      fix the endpoint (Track B/C) before declaring done.
 4. **Smoke a turn:** run `ironclad`, ask a short question, confirm a coherent answer. (An artefact-producing
-   build task first needs `/project new <name> --type software`.)
+   build task first needs `/project new <name>`.)
 
 Done-D: the installer completed, `ironclad-doctor` is green, and a turn returns. Never edit the scripts to
 inject a host — pass `--base-url`/`-BaseUrl` or `GX10_BASE_URL`; the repo stays secret-free.

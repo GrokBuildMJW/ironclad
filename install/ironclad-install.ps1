@@ -21,7 +21,13 @@ param(
   [string]$ConnectionFile = $(if ($env:GX10_CONNECTION_FILE) { $env:GX10_CONNECTION_FILE } else { "" })
 )
 $ErrorActionPreference = "Stop"
+$PSNativeCommandUseErrorActionPreference = $false
 function Say($m) { Write-Host "[install] $m" }
+
+function Assert-NativeSuccess {
+  param([string]$Step, [int]$ExitCode)
+  if ($ExitCode -ne 0) { throw "$Step failed (exit code $ExitCode)" }
+}
 
 $ScriptDir = $PSScriptRoot
 $Root = (Resolve-Path "$ScriptDir\..").Path
@@ -52,17 +58,29 @@ Say "root=$Root  project=$Project  model=$Model  base_url=$BaseUrl"
 
 # --- venv + engine ---
 $Venv = "$Root\.venv"
-if (-not (Test-Path "$Venv\Scripts\python.exe")) { Say "creating venv ($Venv) ..."; & python -m venv $Venv }
+if (-not (Test-Path "$Venv\Scripts\python.exe")) {
+  Say "creating venv ($Venv) ..."
+  & python -m venv $Venv
+  Assert-NativeSuccess "venv creation" $LASTEXITCODE
+}
 $VenvPy = "$Venv\Scripts\python.exe"
 Say "installing the engine (pip install -e .[engine,memory]) ..."
 & $VenvPy -m pip install --quiet --upgrade pip
+Assert-NativeSuccess "pip upgrade" $LASTEXITCODE
 # Install the warm-cache client (the `memory` extra -> redis>=5) alongside the engine so the warm tier
 # works whenever GX10_WARM_URL is set (via env or -WarmUrl), matching the Docker image; warm stays OFF
 # at runtime until a URL is configured. ".[extra]" from the pkg dir -- pip rejects "C:\abs\path[extra]".
-Push-Location $PkgRoot
-& $VenvPy -m pip install --quiet -e ".[engine,memory]"
-Pop-Location
-& $VenvPy -c "import ack, pydantic" | Out-Null
+$pkgLocationPushed = $false
+try {
+  Push-Location $PkgRoot
+  $pkgLocationPushed = $true
+  & $VenvPy -m pip install --quiet -e ".[engine,memory]"
+  Assert-NativeSuccess "engine install (pip install -e .[engine,memory])" $LASTEXITCODE
+} finally {
+  if ($pkgLocationPushed) { Pop-Location }
+}
+& $VenvPy -c "import ack, pydantic"
+Assert-NativeSuccess "engine import smoke (import ack, pydantic)" $LASTEXITCODE
 
 # --- optional TypeScript client ---
 $ClientCli = ""
@@ -70,10 +88,26 @@ if ($InkDir -and (Get-Command node -ErrorAction SilentlyContinue)) {
   # The ink client needs Node >= 22 (clients/ink package.json engines); npm does NOT enforce `engines` by
   # default, so gate it here and skip with a clear message on older Node rather than emit a cryptic build error.
   $nodeMajor = 0; try { $nodeMajor = [int]((& node -p "process.versions.node.split('.')[0]") 2>$null) } catch {}
-  if ($nodeMajor -ge 22) {
+  if ($nodeMajor -eq 0) {
+    Say "WARN: Node is present, but its version could not be determined; skipping the ink client and using the legacy Python client."
+  } elseif ($nodeMajor -ge 22) {
     Say "building the ink client ..."
-    Push-Location $InkDir; npm install --silent | Out-Null; npm run build --silent | Out-Null; Pop-Location
-    $ClientCli = "$InkDir\dist\cli.js"
+    $inkLocationPushed = $false
+    try {
+      Push-Location $InkDir
+      $inkLocationPushed = $true
+      # npm ci is lockfile-exact and repairs a half-deleted node_modules tree left by an interrupted install.
+      npm ci --silent
+      Assert-NativeSuccess "npm ci for the ink client" $LASTEXITCODE
+      npm run build --silent
+      Assert-NativeSuccess "npm run build for the ink client" $LASTEXITCODE
+      if (-not (Test-Path "$InkDir\dist\cli.js" -PathType Leaf)) {
+        throw "npm run build for the ink client succeeded but dist\cli.js is missing"
+      }
+      $ClientCli = "$InkDir\dist\cli.js"
+    } finally {
+      if ($inkLocationPushed) { Pop-Location }
+    }
   } else { Say "skipping ink client — Node >= 22 required (have $(node -v)); the legacy Python client still works." }
 } else { Say "skipping ink client (no Node or clients/ink absent) — the legacy Python client still works." }
 

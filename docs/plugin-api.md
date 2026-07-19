@@ -52,6 +52,9 @@ That's the whole contract. The core never changed.
   parameter without a default is *required*. Framework/sentinel parameter names
   (`self`/`cls`/`context`/`identity`/`vessel_id` and a bare `_`) and `*args`/`**kwargs`
   are excluded automatically. Return a string (it goes back to the model as the tool result).
+  The engine runs it in a bounded worker that inherits the invoking request's active-project
+  routing, so project-relative state remains scoped identically for model-elected and direct
+  `/tool` calls.
 - **Registry registration points** (`ack.registry.Registry`): `register_tool`,
   `register_skill`, `register_task_type`, `discover_skills`, `bind_mcp_provider` — the
   programmatic API behind discovery, if you embed the kernel yourself.

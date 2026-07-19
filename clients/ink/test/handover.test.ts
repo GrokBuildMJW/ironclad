@@ -1,11 +1,14 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import React from 'react';
 import {promises as fs} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {setTimeout as delay} from 'node:timers/promises';
-import {shlexSplit, buildAgentArgv, resolveLaunch, runHandover, processOne, Pool, dispatchPending, reapCoders, authorizeLaunch, DEFAULT_AGENT_CMD, MAX_CAPTURE_BYTES, spawnAgent, readCapped, FEEDBACK_MAX_BYTES, type HandoverCfg} from '../src/agent/handover.js';
+import {shlexSplit, buildAgentArgv, resolveLaunch, isClaudeBaseSpec, runHandover, processOne, Pool, dispatchPending, reapCoders, authorizeLaunch, DEFAULT_AGENT_CMD, MAX_CAPTURE_BYTES, spawnAgent, readCapped, FEEDBACK_MAX_BYTES, type HandoverCfg} from '../src/agent/handover.js';
 import {Server, type Json} from '../src/net/server.js';
+import {Box, Text, renderToString} from '../src/render/ink-compat.js';
+import {committedBlock, committedContinuation} from '../src/ui/App.js';
 
 const baseCfg: HandoverCfg = {
   claudeBinOverride: null,
@@ -13,6 +16,7 @@ const baseCfg: HandoverCfg = {
   claudeEffort: 'high',
   claudePermissionMode: 'acceptEdits',
 };
+const launchableClaim = async (): Promise<Json> => ({status: 'in_progress'});
 const envelopeFor = (template: string) => ({
   enabled: true,
   allow_list: [{bin: '*', cmd_template: template}],
@@ -119,7 +123,7 @@ test('reapCoders kills + unclaims an in-flight coder before session close (#1541
     const payload = p === '/pending'
       ? {pending: [{id: 'REAP1', agent: 'OPUS', handover: 'long', bin: process.execPath,
                     cmd_template: template, tooling_envelope: envelopeFor(template)}]}
-      : {ok: true, status: 'pending'};
+      : {ok: true, status: p === '/claim' ? 'in_progress' : 'pending'};
     return new Response(JSON.stringify(payload), {status: 200});
   }) as typeof fetch;
   try {
@@ -198,7 +202,7 @@ test('resolveLaunch — the server per-agent spec drives bin/template/model/effo
 
 test('resolveLaunch — an explicit client override beats the item; defaults fill the rest (INK-HANDOVER-1)', () => {
   const cfg: HandoverCfg = {...baseCfg, claudeBinOverride: '/usr/local/bin/claude', agentCmdOverride: '{bin} --print {prompt}'};
-  const spec = resolveLaunch({agent: 'OPUS', bin: '/srv/ignored', cmd_template: '{bin} ignored'}, cfg);
+  const spec = resolveLaunch({agent: 'OPUS', bin: '/srv/bin/claude', cmd_template: '{bin} ignored'}, cfg);
   assert.equal(spec.bin, '/usr/local/bin/claude'); // explicit override wins over the item spec
   assert.equal(spec.template, '{bin} --print {prompt}');
   assert.equal(spec.model, 'claude-opus-4-8'); // item omits model → OPUS default
@@ -206,6 +210,40 @@ test('resolveLaunch — an explicit client override beats the item; defaults fil
   assert.equal(spec.permission, 'acceptEdits'); // cfg default
   assert.equal(spec.permissionBypass, false);
   assert.deepEqual(spec.mcpEnv, {});
+});
+
+test('Claude base detection — shared Python/Ink vectors keep path, extension, and case semantics aligned (#1675)', () => {
+  // Keep byte-for-byte inputs aligned with test_code_agent_registry.py; the implementations cannot cross the
+  // language boundary, so this vector is the drift guard for the override-scoping decision.
+  const vectors: Array<[unknown, boolean]> = [
+    ['claude', true],
+    ['C:\\Tools\\Claude\\claude.EXE', true],
+    ['CLAUDE', true],
+    ['ClAuDe.cmd', true],
+    ['claude-wrapper.exe', false],
+    ['', true],
+  ];
+  for (const [bin, expected] of vectors) assert.equal(isClaudeBaseSpec(bin), expected, String(bin));
+});
+
+test('runHandover — Claude overrides cannot rewrite a KIMI server bin/template pair (#1675)', async () => {
+  const dir = await fs.mkdtemp(join(tmpdir(), 'ink-ho-kimi-'));
+  const writer = join(dir, 'kimi-writer.cjs');
+  await fs.writeFile(writer, "require('fs').writeFileSync(process.argv[2], 'status: done\\nKIMI OWN BIN');", 'utf8');
+  const kimiTemplate = `{bin} ${writer.replace(/\\/g, '/')} {feedback}`;
+  const cfg: HandoverCfg = {
+    ...baseCfg,
+    claudeBinOverride: 'claude-override-must-not-run',
+    agentCmdOverride: '{bin} claude-override-template-must-not-run {prompt}',
+  };
+
+  const result = await runHandover({
+    id: 'KGC-6', agent: 'KIMI', handover: 'verify', bin: process.execPath,
+    cmd_template: kimiTemplate, tooling_envelope: envelopeFor(kimiTemplate),
+  }, dir, cfg, () => {});
+
+  assert.equal(result.fb, 'status: done\nKIMI OWN BIN');
+  assert.equal(result.meta.exit_code, 0);
 });
 
 test('runHandover — permission bypass without per-agent capability is refused before spawn', async () => {
@@ -315,23 +353,109 @@ test('authorizeLaunch — undefined environment variables stay literal and refus
 });
 
 test('authorizeLaunch — unauthorized template is refused fail-closed', () => {
-  assert.match(authorizeLaunch('python', '{bin} wrapper.py {prompt}', {
+  const refusal = authorizeLaunch('python', '{bin} wrapper.py {prompt}', {
     enabled: true,
     allow_list: [{bin: 'claude', cmd_template: '{bin} --print {prompt}'}],
-  }) ?? '', /unauthorized coder command/);
+  }) ?? '';
+  assert.match(refusal, /unauthorized coder command/);
+  assert.match(refusal, /resolved bin="python"/);
+  assert.match(refusal, /cmd_template="\{bin\} wrapper\.py \{prompt\}"/);
+  assert.match(refusal, /no allow_list entry matched both/);
+});
+
+test('dispatchPending — envelope refusal is reported once, stays claimed, and does not stop a sibling (#1676)', async () => {
+  const dir = await fs.mkdtemp(join(tmpdir(), 'ink-ho-refusal-'));
+  const writer = join(dir, 'ok-writer.cjs');
+  await fs.writeFile(writer, "require('fs').writeFileSync(process.argv[2], 'status: done\\nok');", 'utf8');
+  const okTemplate = `{bin} ${writer.replace(/\\/g, '/')} {feedback}`;
+  const refusedTemplate = '{bin} refused-wrapper {prompt}';
+  const pending = [
+    {id: 'REFUSED', agent: 'KIMI', handover: 'x', bin: 'kimi', cmd_template: refusedTemplate,
+     tooling_envelope: {enabled: true, allow_list: [{bin: 'kimi', cmd_template: '{bin} allowed {prompt}'}]}},
+    {id: 'SIBLING', agent: 'KIMI', handover: 'y', bin: process.execPath, cmd_template: okTemplate,
+     tooling_envelope: envelopeFor(okTemplate)},
+  ];
+  const feedback: Json[] = [];
+  let pendingCalls = 0;
+  const srv = {
+    async pending(): Promise<Json[]> { pendingCalls++; return pending; },
+    claim: launchableClaim,
+    async feedback(body: Json): Promise<Json> {
+      feedback.push(body);
+      return body['launch_refusal']
+        ? {classification: 'launch-refused', action: 'terminal'}
+        : {classification: 'ok-feedback', feedback_file: 'fb.md'};
+    },
+    async unclaim(): Promise<Json> { throw new Error('terminal refusal must not unclaim'); },
+  } as unknown as Server;
+  const claimed = new Set<string>();
+  const logs: string[] = [];
+  const pool = new Pool(2);
+
+  const first = await dispatchPending(srv, dir, baseCfg, pool, claimed, m => logs.push(m));
+  assert.deepEqual((await Promise.all(first)).sort(), [false, true]);
+  const second = await dispatchPending(srv, dir, baseCfg, pool, claimed, m => logs.push(m));
+
+  assert.equal(second.length, 0);
+  assert.equal(pendingCalls, 2);
+  assert.equal(feedback.filter(v => v['task_id'] === 'REFUSED').length, 1);
+  assert.equal(feedback.filter(v => v['task_id'] === 'SIBLING').length, 1);
+  assert.ok(claimed.has('REFUSED'));
+  assert.ok(logs.some(m => m.includes('resolved bin="kimi"') && m.includes(refusedTemplate)));
+});
+
+test('dispatchPending — refusal stays terminal when /feedback transport fails, then retries after restart (#1676)', async () => {
+  const dir = await fs.mkdtemp(join(tmpdir(), 'ink-ho-refusal-network-'));
+  const pending = [{
+    id: 'REFUSED-NETWORK', agent: 'KIMI', handover: 'x', bin: 'kimi', cmd_template: '{bin} refused {prompt}',
+    tooling_envelope: {enabled: true, allow_list: [{bin: 'kimi', cmd_template: '{bin} allowed {prompt}'}]},
+  }];
+  let reports = 0;
+  let unclaims = 0;
+  const srv = {
+    async pending(): Promise<Json[]> { return pending; },
+    claim: launchableClaim,
+    async feedback(): Promise<Json> { reports++; throw new Error('network down'); },
+    async unclaim(): Promise<Json> { unclaims++; return {ok: true}; },
+  } as unknown as Server;
+  const claimed = new Set<string>();
+
+  assert.deepEqual(await Promise.all(await dispatchPending(srv, dir, baseCfg, new Pool(1), claimed, () => {})), [false]);
+  assert.equal((await dispatchPending(srv, dir, baseCfg, new Pool(1), claimed, () => {})).length, 0);
+  assert.equal(reports, 1);
+  assert.equal(unclaims, 0);
+  assert.ok(claimed.has('REFUSED-NETWORK'));
+
+  const restartedClaims = new Set<string>();
+  assert.equal((await dispatchPending(srv, dir, baseCfg, new Pool(1), restartedClaims, () => {})).length, 1);
+});
+
+test('dispatchPending — an escalated task is terminal and never submitted (#1676)', async () => {
+  let claimed = false;
+  const srv = {
+    async pending(): Promise<Json[]> {
+      return [{id: 'ESCALATED', agent: 'KIMI', blocked: true, blocked_kind: 'escalated'}];
+    },
+    async claim(): Promise<Json> { claimed = true; return {}; },
+  } as unknown as Server;
+
+  const jobs = await dispatchPending(srv, '.', baseCfg, new Pool(1), new Set(), () => {});
+  assert.equal(jobs.length, 0);
+  assert.equal(claimed, false);
 });
 
 test('processOne — ALWAYS reports the run signal even when the binary is missing (INK-HANDOVER-2)', async () => {
   const dir = await fs.mkdtemp(join(tmpdir(), 'ink-ho-'));
   const calls: Json[] = [];
   const srv = {
+    claim: launchableClaim,
     async feedback(body: Json): Promise<Json> {
       calls.push(body);
       return {classification: 'agent-unavailable'};
     },
   } as unknown as Server;
-  const cfg: HandoverCfg = {...baseCfg, agentCmdOverride: '{bin} {prompt}'};
-  const item = {id: 'T1', agent: 'OPUS', handover: 'do x', bin: 'definitely-no-such-binary-xyz123', tooling_envelope: envelopeFor(cfg.agentCmdOverride ?? DEFAULT_AGENT_CMD)};
+  const cfg: HandoverCfg = {...baseCfg, claudeBinOverride: 'definitely-no-such-binary-xyz123', agentCmdOverride: '{bin} {prompt}'};
+  const item = {id: 'T1', agent: 'OPUS', handover: 'do x', bin: 'claude', tooling_envelope: envelopeFor(cfg.agentCmdOverride ?? DEFAULT_AGENT_CMD)};
   const claimed = new Set(['T1']);
   const logs: string[] = [];
   const ok = await processOne(srv, item, dir, cfg, claimed, m => logs.push(m));
@@ -341,9 +465,44 @@ test('processOne — ALWAYS reports the run signal even when the binary is missi
   assert.equal(calls[0]?.['exit_code'], null);
   assert.equal(calls[0]?.['stderr'], 'binary-not-found');
   assert.equal(claimed.has('T1'), false); // un-claimed for retry/failover
-  // An older server object has neither method: both signal failures are logged and remain fail-soft.
-  assert.ok(logs.some(m => m.includes('/claim failed (continuing)')));
+  // An older server object has no /unclaim method: failed-run release remains fail-soft.
   assert.ok(logs.some(m => m.includes('/unclaim failed (continuing)')));
+});
+
+test('processOne — claim status done is never launched (#1738)', async () => {
+  let feedbackCalls = 0;
+  const srv = {
+    async claim(): Promise<Json> { return {status: 'done'}; },
+    async feedback(): Promise<Json> { feedbackCalls++; return {}; },
+  } as unknown as Server;
+  const claimed = new Set(['DONE1']);
+  const logs: string[] = [];
+
+  const ok = await processOne(srv, {id: 'DONE1', agent: 'OPUS', handover: 'must not run'}, '.', baseCfg,
+    claimed, m => logs.push(m));
+
+  assert.equal(ok, false);
+  assert.equal(feedbackCalls, 0);
+  assert.equal(claimed.has('DONE1'), false);
+  assert.ok(logs.some(m => m.includes("not launchable (claim status 'done') — skipped")));
+});
+
+test('processOne — claim transport error is never launched (#1738)', async () => {
+  let feedbackCalls = 0;
+  const srv = {
+    async claim(): Promise<Json> { throw new Error('offline'); },
+    async feedback(): Promise<Json> { feedbackCalls++; return {}; },
+  } as unknown as Server;
+  const claimed = new Set(['CLAIMERR']);
+  const logs: string[] = [];
+
+  const ok = await processOne(srv, {id: 'CLAIMERR', agent: 'OPUS', handover: 'must not run'}, '.', baseCfg,
+    claimed, m => logs.push(m));
+
+  assert.equal(ok, false);
+  assert.equal(feedbackCalls, 0);
+  assert.equal(claimed.has('CLAIMERR'), false);
+  assert.ok(logs.some(m => m.includes('not launchable (/claim failed: offline) — skipped')));
 });
 
 test('processOne — POSTs /claim before spawn', async () => {
@@ -384,6 +543,98 @@ test('processOne — POSTs /claim before spawn', async () => {
   }
 });
 
+test('processOne — renews through a slow feedback upload and stops after settle (#1738)', async (t) => {
+  t.mock.timers.enable({apis: ['setInterval']});
+  const dir = await fs.mkdtemp(join(tmpdir(), 'ink-ho-renew-'));
+  const writer = join(dir, 'writer.cjs');
+  await fs.writeFile(writer, "require('fs').writeFileSync(process.argv[2], 'status: done\\n');", 'utf8');
+  const template = `{bin} ${writer.replace(/\\/g, '/')} {feedback}`;
+  let claims = 0;
+  let feedbackStartedResolve!: () => void;
+  const feedbackStarted = new Promise<void>((resolve) => { feedbackStartedResolve = resolve; });
+  let finishFeedback!: (value: Json) => void;
+  const feedbackResult = new Promise<Json>((resolve) => { finishFeedback = resolve; });
+  const srv = {
+    async claim(): Promise<Json> { claims++; return {status: 'in_progress'}; },
+    async feedback(): Promise<Json> {
+      feedbackStartedResolve();
+      return feedbackResult;
+    },
+  } as unknown as Server;
+
+  const job = processOne(srv, {
+    id: 'RENEW1', agent: 'OPUS', handover: 'long run', lease_renew_s: 0.01,
+    bin: process.execPath, cmd_template: template, tooling_envelope: envelopeFor(template),
+  }, dir, baseCfg, new Set(['RENEW1']), () => {});
+  await feedbackStarted;
+  const claimsBeforeUploadTick = claims;
+  t.mock.timers.tick(10);
+  await Promise.resolve();
+  await Promise.resolve();
+  assert.ok(claims > claimsBeforeUploadTick, 'renewal must continue while /feedback is in flight');
+
+  finishFeedback({classification: 'ok-feedback', feedback_file: 'fb.md'});
+  assert.equal(await job, true);
+  const settledClaims = claims;
+  t.mock.timers.tick(1000);
+  await Promise.resolve();
+  assert.equal(claims, settledClaims);
+});
+
+test('processOne — awaits an in-flight renewal before /unclaim (#1738)', async (t) => {
+  t.mock.timers.enable({apis: ['setInterval']});
+  const dir = await fs.mkdtemp(join(tmpdir(), 'ink-ho-renew-release-'));
+  const cfg: HandoverCfg = {
+    ...baseCfg,
+    claudeBinOverride: 'definitely-no-such-binary-renew-release',
+    agentCmdOverride: '{bin} {prompt}',
+  };
+  const events: string[] = [];
+  let claims = 0;
+  let renewalStartedResolve!: () => void;
+  const renewalStarted = new Promise<void>((resolve) => { renewalStartedResolve = resolve; });
+  let finishRenewal!: (value: Json) => void;
+  const renewalResult = new Promise<Json>((resolve) => { finishRenewal = resolve; });
+  let feedbackStartedResolve!: () => void;
+  const feedbackStarted = new Promise<void>((resolve) => { feedbackStartedResolve = resolve; });
+  let finishFeedback!: (value: Json) => void;
+  const feedbackResult = new Promise<Json>((resolve) => { finishFeedback = resolve; });
+  const srv = {
+    async claim(): Promise<Json> {
+      claims++;
+      if (claims === 1) return {status: 'in_progress'};
+      renewalStartedResolve();
+      return renewalResult;
+    },
+    async feedback(): Promise<Json> {
+      feedbackStartedResolve();
+      return feedbackResult;
+    },
+    async unclaim(): Promise<Json> {
+      events.push('unclaim');
+      return {status: 'pending'};
+    },
+  } as unknown as Server;
+
+  const job = processOne(srv, {
+    id: 'RENEW2', agent: 'OPUS', handover: 'fail', lease_renew_s: 0.01, bin: 'claude',
+    tooling_envelope: envelopeFor(cfg.agentCmdOverride ?? DEFAULT_AGENT_CMD),
+  }, dir, cfg, new Set(['RENEW2']), () => {});
+  await feedbackStarted;
+  t.mock.timers.tick(10);
+  await renewalStarted;
+  events.push('feedback-resolved');
+  finishFeedback({classification: 'task-failed'});
+  await Promise.resolve();
+  await Promise.resolve();
+  assert.equal(events.includes('unclaim'), false);
+
+  events.push('renewal-resolved');
+  finishRenewal({status: 'in_progress'});
+  assert.equal(await job, false);
+  assert.deepEqual(events, ['feedback-resolved', 'renewal-resolved', 'unclaim']);
+});
+
 test('processOne — POSTs /unclaim after coder failure', async () => {
   const dir = await fs.mkdtemp(join(tmpdir(), 'ink-ho-'));
   const calls: Array<{path: string; body: Json}> = [];
@@ -399,10 +650,10 @@ test('processOne — POSTs /unclaim after coder failure', async () => {
   }) as typeof fetch;
   try {
     const srv = new Server('http://engine.test');
-    const cfg: HandoverCfg = {...baseCfg, agentCmdOverride: '{bin} {prompt}'};
+    const cfg: HandoverCfg = {...baseCfg, claudeBinOverride: 'definitely-no-such-binary-1455', agentCmdOverride: '{bin} {prompt}'};
     const claimed = new Set(['T1456']);
     const ok = await processOne(srv, {
-      id: 'T1456', agent: 'OPUS', handover: 'fail', bin: 'definitely-no-such-binary-1455',
+      id: 'T1456', agent: 'OPUS', handover: 'fail', bin: 'claude',
       tooling_envelope: envelopeFor(cfg.agentCmdOverride ?? DEFAULT_AGENT_CMD),
     }, dir, cfg, claimed, () => {});
     assert.equal(ok, false);
@@ -420,6 +671,7 @@ test('processOne — a nonzero exit with stderr and no feedback still reports th
   await fs.writeFile(failer, "process.stderr.write('boom: quota exceeded'); process.exit(7);", 'utf8');
   const calls: Json[] = [];
   const srv = {
+    claim: launchableClaim,
     async feedback(body: Json): Promise<Json> {
       calls.push(body);
       return {classification: 'agent-unavailable'};
@@ -442,6 +694,7 @@ test('processOne — uploads the captured final message via the {feedback} fallb
   await fs.writeFile(writer, "require('fs').writeFileSync(process.argv[2], 'CAPTURED');", 'utf8');
   const calls: Json[] = [];
   const srv = {
+    claim: launchableClaim,
     async feedback(body: Json): Promise<Json> {
       calls.push(body);
       return {classification: 'ok-feedback', feedback_file: 'fb.md'};
@@ -469,11 +722,12 @@ test('processOne — a coder that emits its result ONLY to stdout is CAPTURED (n
   await fs.writeFile(writer, "process.stdout.write('STDOUT_ONLY_RESULT'); process.exit(0);", 'utf8');
   const calls: Json[] = [];
   const srv = {
+    claim: launchableClaim,
     async feedback(body: Json): Promise<Json> {
       calls.push(body);
       return {classification: 'ok-feedback', feedback_file: 'fb.md'};
     },
-  } as Server;
+  } as unknown as Server;
   const cfg: HandoverCfg = {...baseCfg, claudeBinOverride: process.execPath, agentCmdOverride: `{bin} ${writer.replace(/\\/g, '/')}`};
   const claimed = new Set(['T1406']);
   const stdoutWrites: string[] = [];
@@ -507,13 +761,17 @@ test('processOne — coder stdout and stderr are written to a per-task log; clie
     'utf8',
   );
   const srv = {
+    claim: launchableClaim,
     async feedback(): Promise<Json> {
       return {classification: 'task-failed'};
     },
   } as unknown as Server;
-  const logs: string[] = [];
+  const renderedLogs: React.ReactElement[] = [];
   const cfg: HandoverCfg = {...baseCfg, claudeBinOverride: process.execPath, agentCmdOverride: `{bin} ${writer.replace(/\\/g, '/')}`};
-  const ok = await processOne(srv, {id: 'T1406LOG', agent: 'OPUS', handover: 'do noisy', tooling_envelope: envelopeFor(cfg.agentCmdOverride ?? DEFAULT_AGENT_CMD)}, dir, cfg, new Set(['T1406LOG']), (m) => logs.push(m));
+  const ok = await processOne(srv, {id: 'T1406LOG', agent: 'OPUS', handover: 'do noisy', tooling_envelope: envelopeFor(cfg.agentCmdOverride ?? DEFAULT_AGENT_CMD)}, dir, cfg, new Set(['T1406LOG']), (message, options) => {
+    const line = React.createElement(Text, null, message);
+    renderedLogs.push(options?.tight ? committedContinuation(line) : committedBlock(line));
+  });
   assert.equal(ok, false);
 
   const coderLog = join(dir, '.ironclad', 'agent', 'logs', 'T1406LOG_OPUS.log');
@@ -522,11 +780,21 @@ test('processOne — coder stdout and stderr are written to a per-task log; clie
   assert.match(logText, /## stdout\nCODER_STDOUT_FULL/);
   assert.match(logText, /## stderr\nfirst raw stderr line that must not be dumped\nsecond diagnostic line\nfinal diagnostic tail/);
 
-  assert.ok(logs.some((m) => m.includes('OPUS stderr (')));
-  assert.ok(logs.some((m) => m.includes(coderLog)));
-  assert.ok(logs.some((m) => m.includes('second diagnostic line | final diagnostic tail')));
-  assert.equal(logs.some((m) => m.includes('first raw stderr line that must not be dumped')), false);
-  assert.equal(logs.some((m) => m.includes('CODER_STDOUT_FULL')), false);
+  const rendered = renderToString(
+    React.createElement(Box, {flexDirection: 'column'}, React.createElement(Text, null, 'previous'), ...renderedLogs),
+    240,
+    20,
+  );
+  const frame = rendered.frame();
+  const lines = frame.split('\n');
+  const stderrHeader = lines.findIndex((line) => line.includes('OPUS stderr ('));
+  assert.ok(stderrHeader > 0, 'the stderr event is rendered');
+  assert.equal(lines[stderrHeader - 1], '', 'the stderr event starts a separated poller block');
+  assert.match(lines[stderrHeader + 1] ?? '', /second diagnostic line \| final diagnostic tail/, 'the synchronous stderr tail is tight under its header');
+  assert.match(frame, new RegExp(coderLog.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+  assert.doesNotMatch(frame, /first raw stderr line that must not be dumped/);
+  assert.doesNotMatch(frame, /CODER_STDOUT_FULL/);
+  rendered.unmount();
 });
 
 test('processOne — a FAILED run keeps its scratch for diagnosis + retry (#1300)', async () => {
@@ -534,6 +802,7 @@ test('processOne — a FAILED run keeps its scratch for diagnosis + retry (#1300
   const failer = join(dir, 'fail.cjs');
   await fs.writeFile(failer, "process.exit(1);", 'utf8');
   const srv = {
+    claim: launchableClaim,
     async feedback(): Promise<Json> {
       return {classification: 'task-failed'};
     },
@@ -553,6 +822,7 @@ test('runHandover — the coder is launched in the server-shipped project cwd, n
   await fs.writeFile(writer, 'require("fs").writeFileSync(process.argv[2], process.cwd());', 'utf8');
   const calls: Json[] = [];
   const srv = {
+    claim: launchableClaim,
     async feedback(body: Json): Promise<Json> {
       calls.push(body);
       return {classification: 'ok-feedback', feedback_file: 'fb.md'};
@@ -576,6 +846,7 @@ test('runHandover — falls back to the client codedir when the server ships no 
   await fs.writeFile(writer, 'require("fs").writeFileSync(process.argv[2], process.cwd());', 'utf8');
   const calls: Json[] = [];
   const srv = {
+    claim: launchableClaim,
     async feedback(body: Json): Promise<Json> {
       calls.push(body);
       return {classification: 'ok-feedback', feedback_file: 'fb.md'};
@@ -594,6 +865,7 @@ test('runHandover — falls back to codedir when the shipped cwd does not exist 
   await fs.writeFile(writer, 'require("fs").writeFileSync(process.argv[2], process.cwd());', 'utf8');
   const calls: Json[] = [];
   const srv = {
+    claim: launchableClaim,
     async feedback(body: Json): Promise<Json> {
       calls.push(body);
       return {classification: 'ok-feedback', feedback_file: 'fb.md'};
@@ -612,15 +884,28 @@ test('Pool — caps concurrency at max', async () => {
   const pool = new Pool(2);
   let active = 0;
   let peak = 0;
+  let markFull!: () => void;
+  let release!: () => void;
+  const full = new Promise<void>((resolve) => {
+    markFull = resolve;
+  });
+  const pending = new Promise<void>((resolve) => {
+    release = resolve;
+  });
   const job = (): Promise<boolean> =>
     pool.run(async () => {
       active++;
       peak = Math.max(peak, active);
-      await new Promise((r) => setTimeout(r, 20));
+      if (active === 2) markFull();
+      await pending;
       active--;
       return true;
     });
-  await Promise.all([job(), job(), job(), job(), job()]);
+  const jobs = Promise.all([job(), job(), job(), job(), job()]);
+  await full;
+  assert.equal(active, 2, 'the first two jobs remain pending at the pool limit');
+  release();
+  await jobs;
   assert.ok(peak <= 2, `peak concurrency ${peak} must be ≤ 2`);
 });
 

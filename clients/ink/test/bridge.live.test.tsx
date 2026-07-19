@@ -25,7 +25,7 @@ test('bridge roundtrip — a model write_file lands on the local fs', {skip: !LI
   const {stdin, unmount, lastFrame} = render(<App srv={srv} codedir={dir} maxAgents={3} />);
   try {
     await sleep(400);
-    stdin.write('Nutze dein write_file-Werkzeug und erstelle die Datei bridge_ok.txt mit exakt dem Inhalt READY. Keine Rückfrage.');
+    stdin.write('Use your write_file tool to create bridge_ok.txt with exactly the content READY. Do not ask a follow-up question.');
     await sleep(150); // let React commit setBuffer before Enter
     stdin.write('\r');
     const target = path.join(dir, 'bridge_ok.txt');

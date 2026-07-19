@@ -53,8 +53,11 @@ def test_board_command_writes_and_displays(monkeypatch, tmp_path):
     _mk("a task")
     out = gx10._board_command(None)
     assert "## pending (1)" in out and "a task" in out
+    assert "ironclad:board:auto" not in out
     board = gx10.vault_root() / gx10.active_slug() / gx10.BOARD_FILENAME
-    assert board.is_file() and gx10._BOARD_AUTO_START in board.read_text(encoding="utf-8")
+    persisted = board.read_text(encoding="utf-8")
+    assert board.is_file()
+    assert gx10._BOARD_AUTO_START in persisted and gx10._BOARD_AUTO_END in persisted
 
 
 def test_board_idempotent(monkeypatch, tmp_path):
@@ -66,6 +69,38 @@ def test_board_idempotent(monkeypatch, tmp_path):
     first = f.read_text(encoding="utf-8")
     gx10._write_board()
     assert f.read_text(encoding="utf-8") == first          # a second write changes nothing
+
+
+def test_claim_republishes_board_with_running_unit(monkeypatch, tmp_path):
+    _setup(monkeypatch, tmp_path)
+    epic_id = _mk("delivery epic", type="epic")
+    running_id = _mk("claimed unit", parent=epic_id)
+    _mk("waiting unit", parent=epic_id)
+    gx10._write_board()                                    # establish the pre-claim pending projection
+
+    assert gx10.claim_task(running_id, "OPUS") == "in_progress"
+
+    board_path = gx10.vault_root() / gx10.active_slug() / gx10.BOARD_FILENAME
+    board = board_path.read_text(encoding="utf-8")
+    pending = board[board.index("## pending"):board.index("## in_progress")]
+    in_progress = board[board.index("## in_progress"):board.index("## done")]
+    assert "## in_progress (1)" in board
+    assert f"`{running_id}`" in in_progress
+    assert f"`{running_id}`" not in pending
+
+
+def test_claim_in_progress_helper_republishes_running_unit(monkeypatch, tmp_path):
+    _setup(monkeypatch, tmp_path)
+    running_id = _mk("launched unit")
+    gx10._write_board()                                    # establish the pre-launch pending projection
+
+    task = gx10._claim_in_progress(gx10._store(), running_id)
+
+    board_path = gx10.vault_root() / gx10.active_slug() / gx10.BOARD_FILENAME
+    board = board_path.read_text(encoding="utf-8")
+    assert task["status"] == "in_progress"
+    assert "## in_progress (1)" in board
+    assert f"`{running_id}`" in board[board.index("## in_progress"):board.index("## done")]
 
 
 def test_board_no_active_unit_is_friendly(monkeypatch, tmp_path):

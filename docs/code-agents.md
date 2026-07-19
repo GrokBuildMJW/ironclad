@@ -8,16 +8,17 @@ change**.
 
 ## How it works
 
-One env var, `GX10_AGENT_CMD`, is the command template. Placeholders:
+For the legacy single-agent Claude-base setup, `GX10_AGENT_CMD` overrides the command template. Placeholders:
 
 | placeholder | becomes |
 |-------------|---------|
-| `{bin}` | the binary (also settable via `GX10_CLAUDE_BIN`) |
+| `{bin}` | the binary (overridable for a Claude base via `GX10_CLAUDE_BIN`) |
 | `{model}` | the model the orchestrator picked for the task |
 | `{effort}` | the effort level (`GX10_CLAUDE_EFFORT`, default `high`) |
 | `{permission}` | the permission mode (`GX10_CLAUDE_PERMISSION_MODE`, safe default `default`) |
 | `{prompt}` | the instruction (stays a **single argument**, even with spaces) |
 | `{feedback}` | a result-capture path — a CLI that writes its final message to a file (e.g. Codex `-o {feedback}`) gets a deterministic fallback if it skips the feedback file (point 4); optional |
+| `{mcp}` | the CLI-specific read-only Memory MCP arguments rendered from `mcp_template`; empty when memory or the template is unavailable |
 
 Use **only the placeholders your CLI needs** — drop the rest. The default template is
 Claude Code's shape, so nothing changes unless you override it.
@@ -40,7 +41,7 @@ four points, it works.
 
 ## The agent registry — many agents, config-driven
 
-`GX10_AGENT_CMD` configures **one** agent for every handover. To run **several** agents and let
+`GX10_AGENT_CMD` configures the Claude-base agent in a **single-agent** setup. To run **several** agents and let
 the orchestrator pick one per task (e.g. Opus for security/architecture, Sonnet for docs, Codex for
 implementation), declare them in the **code-agent registry** — a config block, no code change:
 
@@ -50,20 +51,30 @@ implementation), declare them in the **code-agent registry** — a config block,
   "timeout_s": 1800,
   "pool": [
     { "provider_id": "claude-opus",  "kind": "cli", "agent_id": "OPUS",
-      "model": "claude-opus-4-8",  "bin": "claude", "display": "Claude Opus 4.8",
-      "cmd_template": "{bin} --model {model} --effort {effort} --permission-mode {permission} --print {prompt}",
-      "effort": "xhigh", "permission_mode": "default" },
-    { "provider_id": "codex", "kind": "cli", "agent_id": "CODEX", "model": "gpt-5.5", "bin": "codex",
-      "cmd_template": "{bin} exec -m {model} -s workspace-write -c 'approval_policy=\"never\"' --skip-git-repo-check -o {feedback} {prompt}" }
+      "model": "YOUR_CLAUDE_MODEL", "bin": "claude", "display": "Claude CLI",
+      "cmd_template": "{bin} --model {model} --effort {effort} --permission-mode {permission} {mcp} --print {prompt}",
+      "effort": "xhigh", "permission_mode": "default",
+      "mcp_template": "--mcp-config '{\"mcpServers\":{\"memory\":{\"command\":\"{mcp_cmd}\",\"args\":[\"{mcp_script}\"]}}}'" },
+    { "provider_id": "codex", "kind": "cli", "agent_id": "CODEX",
+      "model": "YOUR_CODEX_MODEL", "bin": "codex", "bin_glob": "YOUR_CODEX_LAUNCHER_GLOB",
+      "cmd_template": "{bin} exec -m {model} -s workspace-write -c 'approval_policy=\"never\"' --skip-git-repo-check {mcp} -o {feedback} {prompt}",
+      "mcp_template": "-c 'mcp_servers.memory.command=\"{mcp_cmd}\"' -c 'mcp_servers.memory.args=[\"{mcp_script}\"]'" }
   ]
 }
 ```
 
+Replace `YOUR_CLAUDE_MODEL` and `YOUR_CODEX_MODEL` with models supported by the respective installed
+CLIs, and `YOUR_CODEX_LAUNCHER_GLOB` with the fallback glob for your installation. All three are
+deployment-owned values, so this example deliberately does not pin a release or embed a platform-specific
+install path.
+
 - **`agent_id`** is the agent's stable identity AND the handover/feedback filename token
   (`<ID>_<AGENT>.md`) — so it must be **letters only** (e.g. `OPUS`, `SONNET`, `CODEX`; not
   `CLAUDE_OPUS`). It's what `stage_handover`/`advance_pipeline` accept in their `agent` field.
-- Ironclad ships **OPUS** and **SONNET** as **overridable** defaults — override their model/template,
-  drop them, or add your own freely; nothing is hard-coded.
+- Ironclad ships **OPUS** and **SONNET** as ready-to-run defaults with concrete model IDs.
+  Declaring `code_agents.pool` replaces that default list: every entry, including each model, is then
+  deployment-owned. Override the shipped entries, drop them, or add your own freely; they are starting
+  entries, not privileged bindings.
 - The **server resolves the full spec** (`bin`/`cmd_template`/`model`/`effort`/`permission` and the
   permission-bypass capability) from the
   registry and ships it to the client, which just renders it — so each agent runs with its own command
@@ -98,12 +109,14 @@ implementation), declare them in the **code-agent registry** — a config block,
   the server classifies the run as `agent-unavailable` (a layered check of a JSON error event → a stderr
   regex → an exit code, with patterns in your `conf/`), trips a process-lifetime circuit-breaker for that
   agent, and the next handover **fails over to the cheapest non-tripped peer that is *capable of the
-  task's class*** — so an exhausted agent never silently retries forever, and a **security** or
-  **architecture** task never falls to a cheaper-but-weaker agent. The task class is derived
-  deterministically from the task's `type` (`security`/`security-audit` → `security`, `architecture`,
-  `verification` → `analysis`, everything else → `coding`; the model's own claims are not trusted), and a
-  `code_agents.classes` map names which agents may serve each class (default `security: [OPUS]`,
-  `architecture: [OPUS]`, `coding: [OPUS, SONNET]`, `analysis: [SONNET]`). The staged
+  task's class*** — so an exhausted agent never silently retries forever, and a **complex** task (the class
+  for `security`, `security-audit`, `architecture`, and `optimization` types) never falls to a
+  cheaper-but-weaker agent. The task class is derived deterministically from the task's `type`:
+  `security`/`security-audit`/`architecture`/`optimization` → `complex`;
+  `documentation`/`concept`/`cleanup`/`smoke-test` → `routine`; `verification`/`research` → `analysis`;
+  every other or unmapped type → `standard` (the model's own claims are not trusted). A
+  `code_agents.classes` map names which agents may serve each class (default `complex: [OPUS]`,
+  `standard: [SONNET, OPUS]`, `routine: [SONNET]`, `analysis: [SONNET]`). The staged
   (orchestrator-chosen) agent stays authoritative and a pin still wins — the class only **scopes the
   failover peers**. An unmapped/unknown class imposes no restriction (fail-open); if every capable agent
   is tripped the chosen one is kept (fail-closed — never an out-of-class agent). The classifier is
@@ -116,7 +129,7 @@ implementation), declare them in the **code-agent registry** — a config block,
   shim named like your `bin` just works), else the optional **`bin_glob`** — a glob whose **newest** match
   (by mtime) is used, for a CLI installed under a **rotating/hashed launcher path**. Env vars (`%VAR%` /
   `$VAR`) and `~` in `bin_glob` are expanded. Keep the concrete install path in your own `conf/` (it is a
-  deployment detail, not part of the core mechanism); see the verified Codex example below for the shape.
+  deployment detail, not part of the core mechanism); the Codex example above shows the field's placement.
 - **Model validation (advisory, opt-in).** A code-agent may declare `models_probe` (arguments appended to
   the resolved CLI binary to list advertised models) and optional `models_pattern` (regex for extracting
   model ids for display). At boot the server runs the probe best-effort, warns when the configured `model`
@@ -130,16 +143,21 @@ implementation), declare them in the **code-agent registry** — a config block,
 - **Read-only Memory MCP (`mcp_template`).** An MCP-capable CLI can LIVE-query the project memory
   during a handover. Put a `{mcp}` placeholder in the agent's `cmd_template` and an `mcp_template` (the
   per-CLI MCP config — Claude `--mcp-config <json>`, Codex `-c mcp_servers.*`; the `{mcp_cmd}`/`{mcp_script}`
-  tokens render to the python invocation of `memory_mcp.py`). The MCP is injected whenever a memory service
-  is configured and the agent ships an `mcp_template`, regardless of trust profile — otherwise `{mcp}` is
-  empty and the launch is unchanged. The connection is passed via the spawned process's env (secret-free,
-  never on the MCP wire), and the read is **read-only**, scoped to the project memory namespace.
+  tokens render to the python invocation of `memory_mcp.py`). Both launch paths resolve that MCP: the
+  thin-client `/pending` path ships the rendered arguments and environment to the client, while the
+  engine-native autopilot injects them directly (at Claude's strict tooling-envelope MCP slot or through
+  the shared template renderer for another CLI). Whenever a memory service is configured, both launch paths
+  provide the connection environment, independent of `mcp_template`; per-launch `{mcp}` arguments are rendered
+  only when the agent ships that template. This lets a CLI with persistent MCP registration connect while its
+  argv stays unchanged. With no configured memory, both argv and environment remain unchanged. The connection
+  stays secret-free on the MCP wire, and the read is **read-only**, scoped to the project memory namespace.
 
-**Precedence.** Per field the client resolves: an **explicit client-side `GX10_AGENT_CMD` /
-`GX10_CLAUDE_BIN`** (the single-agent BYO override below) **wins**, else the **server-resolved registry
-spec**, else the built-in Claude default. So setting `GX10_AGENT_CMD` on the client always takes effect —
-even against a default server that ships OPUS/SONNET — while a deployment that configures the registry and
-sets no client override gets each agent's own command shape.
+**Precedence.** The client first resolves the server's base binary, using Claude when the server omits it.
+If that base binary is Claude, an explicit client-side `GX10_AGENT_CMD` / `GX10_CLAUDE_BIN` (the legacy
+single-agent BYO override below) wins per field, then the server-resolved registry spec, then the built-in
+Claude default. If the server resolves a **non-Claude registry agent**, both client overrides are deliberately
+ignored and that agent keeps its server-resolved bin/template pair. Applying a Claude binary override to
+another agent's template would synthesize a command pair that the mandatory tooling envelope cannot authorize.
 
 ## Tooling envelope (mandatory launch allow-list)
 
@@ -168,6 +186,10 @@ ignored; they cannot disable authorization. A mismatch is refused fail-closed an
 The generated [`config-runtime.md`](config-runtime.md) inventory therefore lists the retired key only as
 tombstone metadata; there is no live enable row for tooling authorization.
 
+**OPS:** A deployment that pins an explicit `security.tooling_envelope.allow_list` must also include all four
+`_AUTOPILOT_*_MCP` templates, or an in-engine Claude launch with memory configured is refused fail-closed.
+The safe default is to omit `allow_list` and let boot derive it.
+
 The allow-list is intentionally small and non-secret:
 
 - `bin` names the authorized executable identity. A bare command name may match by basename after normal
@@ -176,7 +198,9 @@ The allow-list is intentionally small and non-secret:
   realpath identity. `$VAR`/`${VAR}` and a leading bare `~` are expanded; undefined env references remain
   literal. Only `*` and `?` globs are portable.
 - `cmd_template` is the authorized template shape, not the rendered prompt. The guard normalizes variable
-  fields like model/effort/prompt, but extra flags or a different template refuse.
+  fields like model/effort/prompt, but extra flags or a different template refuse. In canonical Claude
+  autopilot shapes, the model, effort, permission-mode, and MCP-config value slots must be non-empty and
+  must not start with `--`; the final prompt remains free text and may start with `--`.
 - `allow_list` is boot-only; `/config set` cannot alter launch authority in a running process.
 - The policy applies only to coder invocation surfaces: provider CLI runner, Python/Ink handover clients,
   autopilot launch/reconciler launches, the `review` tool, and `/coders use`. It does not enforce a network

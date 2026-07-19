@@ -14,7 +14,8 @@ memory write path, a full audit trail per run.
 ## Gates — loaded vs. active (IMPORTANT)
 
 MPR is a **core built-in** (ADR-0002) — **always loaded**, no load gate. A single **runtime**
-switch controls whether it runs; the tool is always registered, but it can be paused live.
+switch controls whether it runs; the tool is registered for both the embedded dev-process
+architecture-fork route and deterministic direct `/tool mpr_research <question>` invocation.
 
 | Gate | Source | Default | Effect when OFF | Toggle |
 |------|--------|---------|-----------------|--------|

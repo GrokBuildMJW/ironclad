@@ -368,10 +368,13 @@ def _stream_turn(srv: Server, payload: str) -> None:
             ln, buf["s"] = buf["s"].split("\n", 1)
             route(ln)
 
+    def on_retry(reason: str, _delay: float, next_attempt: int, max_attempts: int) -> None:
+        _commit(Text(f"  ↻ {reason} — retrying ({next_attempt}/{max_attempts})", style=DIM))
+
     try:
         # X-Local-Tools:1 is set by client.Server → passed-through code-tools run
         # LOCALLY here via the tool-bridge, against this machine's working copy.
-        res = srv.chat_stream(payload, on_text)
+        res = srv.chat_stream(payload, on_text, on_retry=on_retry)
         if res and res.get("needs_confirm"):   # #935: destructive → not executed; re-run with --yes
             ci = res["needs_confirm"]   # #956: reason is the full localized line → single-language
             _commit(Text(f"  ⚠ {ci.get('command', '?')}: {ci.get('reason', 'destructive command')}", style=WARNING))
@@ -506,7 +509,8 @@ def _handle_auto(srv: Server, codedir: Path, pool: ThreadPoolExecutor, claimed: 
             auto["stop"] = stop
             threading.Thread(target=_auto_loop, args=(stop,), daemon=True).start()
             _commit(Text(
-                f"  [AUTO] poller ON — pulls handovers every 5s, ≤{max_agents} parallel",
+                f"  [AUTO] client poller ON — pulls handovers every 5s, "
+                f"≤{max_agents} local coders parallel",
                 style=ACCENT))
         else:
             _commit(Text("  [AUTO] already running", style=DIM))

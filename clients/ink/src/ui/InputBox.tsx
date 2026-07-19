@@ -11,7 +11,7 @@ import {displayBuffer} from './pasteStore.js';
 export function InputBox({
   buffer,
   caret = true,
-  hint = 'Frag etwas …',
+  hint = 'Ask something …',
 }: {
   buffer: string;
   caret?: boolean;

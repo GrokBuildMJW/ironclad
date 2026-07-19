@@ -13,6 +13,7 @@ _ENGINE = Path(__file__).resolve().parents[2] / "engine"
 if str(_ENGINE) not in sys.path:
     sys.path.insert(0, str(_ENGINE))
 
+import playbook_store as store_mod
 from playbook_store import (PlaybookStore, migrate_lessons, _render_bullets, record_unit_bullets,
                             read_unit_bullets, record_fork_proposal, read_fork_proposal, list_fork_proposals)
 from ack.ace import Trajectory, HELPFUL
@@ -162,6 +163,44 @@ def test_adapt_fail_soft_on_raising_chat(tmp_path):
     s.set_transports(chat=boom)
     out = s.adapt(Trajectory(query="q", outcome="success"), scope=_SCOPE)   # never raises
     assert s.get_lessons(_SCOPE) == []                       # empty reflection → no-op
+
+
+def test_adapt_snapshot_failure_keeps_result_contract(tmp_path, monkeypatch):
+    s = _store(tmp_path, chat=lambda prompt: "unused")
+    monkeypatch.setattr(s, "_save_history", lambda scope, hist: False)
+
+    out = s.adapt(Trajectory(query="q", outcome="success"), scope=_SCOPE)
+
+    assert out["skipped"] is True and out["snapshot_failed"] is True
+    assert out["quarantined"] is False and out["promoted"] is False
+
+
+def test_atomic_writers_retry_one_transient_replace_lock(tmp_path, monkeypatch):
+    s = _store(tmp_path)
+    real_replace = store_mod.os.replace
+    attempts = {}
+
+    def fail_each_destination_once(source, target):
+        target = Path(target)
+        attempts[target] = attempts.get(target, 0) + 1
+        if attempts[target] == 1:
+            raise PermissionError(13, "transient host lock", str(target))
+        real_replace(source, target)
+
+    # This patches process-global os.replace for the test duration; monkeypatch teardown restores it.
+    monkeypatch.setattr(store_mod.os, "replace", fail_each_destination_once)
+    s.report_lesson(_SCOPE, "durable lesson")
+    active = s._load(_SCOPE)
+    history = s._load_history(_SCOPE)
+    source_version = history.snapshot(active)
+    assert s._save_history(_SCOPE, history) is True
+    assert s._quarantine(_SCOPE, active, source_version, state="test", reason="retry proof") is True
+
+    expected = {s._path(_SCOPE), s._history_path(_SCOPE), s._quarantine_path(_SCOPE)}
+    assert set(attempts) == expected and all(attempts[path] == 2 for path in expected)
+    assert s.get_lessons(_SCOPE) == ["durable lesson"]
+    assert s.versions(_SCOPE) == [source_version]
+    assert s.quarantined(_SCOPE)[0]["reason"] == "retry proof"
 
 
 # ─── one-time migration of the legacy #602 EngineLessonStore tree ────────────────────────────────────

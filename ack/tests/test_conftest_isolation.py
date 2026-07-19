@@ -3,9 +3,12 @@
 import ast
 import importlib.util as _ilu
 import sys
+import threading
 import types
 from types import SimpleNamespace
 from pathlib import Path
+
+import pytest
 
 _ackconf_spec = _ilu.spec_from_file_location(
     "ack_tests_conftest", Path(__file__).with_name("conftest.py")
@@ -14,6 +17,7 @@ _ackconf = _ilu.module_from_spec(_ackconf_spec)
 _ackconf_spec.loader.exec_module(_ackconf)
 _GX10_STATE_ATTRS = _ackconf._GX10_STATE_ATTRS
 _ace_isolation = _ackconf._ace_isolation
+_join_ace_worker_threads = _ackconf._join_ace_worker_threads
 
 sys.modules.setdefault("openai", types.SimpleNamespace(OpenAI=lambda **kw: object()))
 
@@ -107,7 +111,7 @@ def test_derive_config_state_globals_are_all_declared():
     )
 
 
-def test_ace_isolation_stops_live_worker_started_by_apply_config(tmp_path, monkeypatch):
+def test_ace_isolation_joins_retained_worker_and_fails_if_stuck(tmp_path, monkeypatch):
     import gx10
 
     fixture = _ace_isolation.__wrapped__(
@@ -121,10 +125,42 @@ def test_ace_isolation_stops_live_worker_started_by_apply_config(tmp_path, monke
     assert worker is not None
     assert worker._thread is not None and worker._thread.is_alive()
 
+    entered = threading.Event()
+    release = threading.Event()
+
+    def block_in_flight(_item):
+        entered.set()
+        release.wait(timeout=5.0)
+
+    worker._process = block_in_flight
+    assert worker.submit(object()) is True
+    assert entered.wait(timeout=1.0)
+    thread = worker._thread
+    monkeypatch.setattr(worker, "stop", lambda: worker.__class__.stop(worker, timeout=0.0))
+
+    delayed_release = threading.Timer(0.2, release.set)
+    delayed_release.start()
     try:
-        next(fixture)
-    except StopIteration:
-        pass
+        try:
+            next(fixture)
+        except StopIteration:
+            pass
+        leaked = thread.is_alive()
+    finally:
+        release.set()
+        delayed_release.join(timeout=1.0)
+        thread.join(timeout=1.0)
 
     assert gx10._ACE_WORKER is None
     assert worker._thread is None
+    assert leaked is False
+
+    stuck_release = threading.Event()
+    stuck = threading.Thread(target=stuck_release.wait, name="ace-reflection-worker", daemon=True)
+    stuck.start()
+    try:
+        with pytest.raises(RuntimeError, match="survived test teardown after 0.0s"):
+            _join_ace_worker_threads(timeout=0.01)
+    finally:
+        stuck_release.set()
+        stuck.join(timeout=1.0)

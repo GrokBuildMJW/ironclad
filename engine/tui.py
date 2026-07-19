@@ -175,8 +175,12 @@ def _worker(srv: Server, codedir: Path, q: "Queue[str]", app: "Application",
                 line, partial["buf"] = partial["buf"].split("\n", 1)
                 _emit_line(line)
 
+        def _on_retry(reason: str, _delay: float, next_attempt: int, max_attempts: int) -> None:
+            gx10._ui_print(gx10.col(
+                f"  ↻ {reason} — retrying ({next_attempt}/{max_attempts})", gx10.C.GRAY))
+
         try:
-            srv.chat_stream(payload, _on_text)
+            srv.chat_stream(payload, _on_text, on_retry=_on_retry)
         except Exception as e:  # noqa: BLE001
             gx10._ui_print(gx10.col(f"  ✗ /chat/stream failed: {e!r}", gx10.C.RED))
         finally:
@@ -263,7 +267,8 @@ def _worker(srv: Server, codedir: Path, q: "Queue[str]", app: "Application",
                         while not stop.wait(5.0):
                             client.dispatch_pending(srv, codedir, pool, claimed, log=log)
                     threading.Thread(target=_loop, daemon=True).start()
-                    log(gx10.col("  [AUTO] poller ON — pulls handovers continuously, in parallel", gx10.C.GREEN))
+                    log(gx10.col("  [AUTO] client poller ON — pulls handovers continuously, "
+                                 "local coders in parallel", gx10.C.GREEN))
                 elif arg == "off" and auto.get("stop") is not None:
                     auto["stop"].set(); auto["stop"] = None
                     log(gx10.col("  [AUTO] poller OFF", gx10.C.YELLOW))

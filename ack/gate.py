@@ -95,6 +95,8 @@ def run_sibling_test_hermetic(py_path: str | Path, *, timeout: int = HERMETIC_TE
       absolute path / ``__file__``;
     - the *timeout* bounds the direct ``pytest`` child (it is killed on expiry); a test that spawns its
       own detached children may leave orphans.
+    The child runs with plain asserts (``--assert=plain``) — no pytest assertion rewriting — so the #1665
+    Python-3.14 rewrite flake cannot recur in the nested process; a failure still reports the line + ``AssertionError``.
     ``gate_generated`` does NOT run this unless ``execute=True``."""
     p = Path(py_path).resolve()                      # absolute, so the test path resolves under cwd=tmp
     test_file = p.parent.parent / "tests" / f"test_{p.stem}.py"
@@ -103,7 +105,13 @@ def run_sibling_test_hermetic(py_path: str | Path, *, timeout: int = HERMETIC_TE
     try:
         with tempfile.TemporaryDirectory(prefix="ack-hermetic-") as tmp:
             cp = subprocess.run(
-                [sys.executable, "-m", "pytest", str(test_file), "-q", "-p", "no:cacheprovider"],
+                [
+                    sys.executable, "-m", "pytest", str(test_file), "-q", "-p", "no:cacheprovider",
+                    # Avoid #1665's nested assertion-rewrite exposure. Plain mode loses pytest's rich
+                    # assertion introspection, but still reports the failing line and AssertionError,
+                    # which is sufficient for this pass/fail gate and its already-bounded detail tail.
+                    "--assert=plain",
+                ],
                 cwd=tmp, env=_hermetic_env(), capture_output=True, text=True,
                 encoding="utf-8", errors="replace", timeout=timeout,
             )

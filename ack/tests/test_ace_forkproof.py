@@ -1,12 +1,12 @@
 """ACE-FORKPROOF (#855 / #886, M5-5) — the M5 capstone: a boundary-clean END-TO-END proof of the whole
-MPR-for-architecture propose-loop through the ONE core seam, for BOTH dev-processes, inert when gated off.
+MPR-for-architecture propose-loop through one shared seam for multiple ledger producers, inert when gated off.
 
 Drives M5-1..M5-4 with stubs (deterministic, no network): a `ForkSignal` on the ledger → M5-2 fires the
 gated, off-path, pre-informed MPR panel → M5-3 records + renders the decision-matrix as a recommendation →
 the operator resolves (a `ForkResolution`) → M5-4 records a fork-decision bullet → a SECOND comparable
-`ForkSignal`'s MPR query is pre-informed by that bullet. Also: dual-process parity (public generic +
-internal DEV-3 via the same seam / ledger schema), the gate-off no-op, and the fail-soft matrix.
-Reads the ledger as plain data — imports nothing private (no Spark IP / hostnames / vessel names).
+`ForkSignal`'s MPR query is pre-informed by that bullet. Also: producer parity through the same seam and
+ledger schema, the gate-off no-op, and the fail-soft matrix. Reads the ledger as plain data and imports no
+producer-specific implementation.
 """
 from __future__ import annotations
 

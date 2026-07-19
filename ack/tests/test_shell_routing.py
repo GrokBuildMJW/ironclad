@@ -28,9 +28,11 @@ def test_detect_shell_powershell_vs_bash():
     assert gx10._detect_shell("git status") == "bash"  # shell-agnostic defaults to bash
 
 
-def test_windows_guidance_declares_model_shell_unavailable():
+def test_windows_guidance_describes_bridge_safe_offer_gate():
     g = gx10._platform_guidance("windows")
-    assert "unavailable" in g.lower()
+    assert "capability-gated" in g
+    assert "active local client bridge" in g
+    assert "every `execute_command` call fails closed" not in g
     assert "list_directory" in g
     assert "/sh" in g
     assert "execute_command" in g

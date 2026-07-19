@@ -466,6 +466,49 @@ def test_bare_approve_with_single_proposal_promotes(monkeypatch, tmp_path):
     assert _decision_frontmatter()["approved"] == "true"
 
 
+def test_approve_stamps_promotion_provenance_and_resolved_graph_edge(monkeypatch, tmp_path):
+    _setup(monkeypatch, tmp_path)
+    gx10.record_design("Only", "the one approach")
+
+    out = gx10._approve_command("design")
+
+    assert out.startswith("OK")
+    assert _decision_frontmatter()["supersedes"] == "[proposals/design-1.md]"
+    proposal_fm = _proposal_frontmatter(1)
+    assert proposal_fm["promoted"] == "true"
+    assert proposal_fm["promoted_to"] == "decisions/design.md"
+    graph = json.loads(
+        (gx10.vault_root() / gx10.active_slug() / "GRAPH.json").read_text(encoding="utf-8")
+    )
+    assert graph["edges"]
+    assert {
+        "from": "decisions/design.md",
+        "type": "supersedes",
+        "to": "proposals/design-1.md",
+        "resolved": True,
+    } in graph["edges"]
+
+
+def test_explicit_reapprove_same_variant_is_byte_idempotent(monkeypatch, tmp_path):
+    _setup(monkeypatch, tmp_path)
+    gx10.record_design("Only", "the one approach")
+    assert gx10._approve_design(design_id="1").startswith("OK")
+    before_decision = _decision_doc().read_bytes()
+    before_proposal = _proposal_doc(1).read_bytes()
+
+    out = gx10._approve_design(design_id="design-1")
+
+    assert out.startswith("OK")
+    assert _decision_doc().read_bytes() == before_decision
+    assert _proposal_doc(1).read_bytes() == before_proposal
+    decision_text = before_decision.decode("utf-8")
+    proposal_text = before_proposal.decode("utf-8")
+    assert decision_text.count("\nsupersedes:") == 1
+    assert proposal_text.count("\npromoted:") == 1
+    assert proposal_text.count("\npromoted_to:") == 1
+    assert decision_text.split("---", 2)[2] == proposal_text.split("---", 2)[2]
+
+
 def test_approve_unknown_proposal_id(monkeypatch, tmp_path):
     _setup(monkeypatch, tmp_path)
     gx10.record_design("A", "x")

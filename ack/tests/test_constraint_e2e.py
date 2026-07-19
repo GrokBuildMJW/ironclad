@@ -44,16 +44,18 @@ def test_run_tool_flow_records_framing_and_enforces_approved_design(monkeypatch,
     assert design.startswith("OK: design proposal recorded at ")
     assert gx10._approve_design().startswith("OK")
 
-    drift = gx10.run_tool(
-        "stage_handover",
-        {"agent": "OPUS", "handover_md": "body", "task_json": _impl_json("rust", language="rust")},
+    # #1613: an ad-hoc implementation task_json is now refused at the model tool-dispatch (run_tool). The
+    # core-API `_stage_handover` still enforces the approved design's typed language for such a create, so the
+    # design-standard behaviour is exercised directly here (the dispatch-level ad-hoc refusal + steer-to-
+    # plan_units is covered in test_plan_units).
+    drift = gx10._stage_handover(
+        None, "OPUS", "body", task_json=_impl_json("rust", language="rust"),
     )
     assert drift.startswith("ERROR")
     assert "approved design requires language='python'" in drift
 
-    ok = gx10.run_tool(
-        "stage_handover",
-        {"agent": "OPUS", "handover_md": "body", "task_json": _impl_json("python", language="python")},
+    ok = gx10._stage_handover(
+        None, "OPUS", "body", task_json=_impl_json("python", language="python"),
     )
     assert ok.startswith("OK")
     tid = gx10._store().list("pending")[0]["id"]
@@ -70,18 +72,18 @@ def test_framing_off_still_requires_and_injects_approved_design(monkeypatch, tmp
     assert gx10.run_tool("record_constraints", {"title": "Context", "body": "x"}) == (
         "ERROR: framing notes disabled"
     )
-    refused = gx10.run_tool(
-        "stage_handover",
-        {"agent": "OPUS", "handover_md": "body", "task_json": _impl_json("before design")},
+    # #1613: the core-API `_stage_handover` enforces the blind-coding design gate for an ad-hoc create; the
+    # model tool-dispatch refuses ad-hoc implementation outright (see test_plan_units).
+    refused = gx10._stage_handover(
+        None, "OPUS", "body", task_json=_impl_json("before design"),
     )
     assert "blind-coding refused" in refused
     assert gx10._store().list("pending") == []
 
     gx10.record_design("Approach", "Use Python.", language="python")
     assert gx10._approve_design().startswith("OK")
-    out = gx10.run_tool(
-        "stage_handover",
-        {"agent": "OPUS", "handover_md": "body", "task_json": _impl_json(language="python")},
+    out = gx10._stage_handover(
+        None, "OPUS", "body", task_json=_impl_json(language="python"),
     )
 
     assert out.startswith("OK")

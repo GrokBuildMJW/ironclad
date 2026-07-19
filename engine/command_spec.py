@@ -152,7 +152,7 @@ COMMAND_SPECS: Tuple[CommandSpec, ...] = (
     CommandSpec("project", DESTRUCTIVE, "Project/workspace management (delete --purge is destructive).",
                 subcommands=("new", "list", "use", "active", "track", "delete", "archive", "unarchive"),
                 flags=(FlagSpec("--path",), FlagSpec("--purge", "delete: irreversibly remove files")),
-                usage="list [--all] | new <name> [--path <dir>] | active | "
+                usage="list [--all] | new <name> [--path <dir>] | use <slug> | active | "
                       "track new|use|list | delete <id> [--purge] | archive|unarchive <id>"),
     CommandSpec("generate", COSTLY, "Scaffold a new case/prompt (writes files).",
                 flags=(FlagSpec("--domain", required=True), FlagSpec("--case", required=True),

@@ -177,8 +177,26 @@ class ReflectionWorker:
         self._thread = threading.Thread(target=_loop, name="ace-reflection-worker", daemon=True)
         self._thread.start()
 
-    def stop(self, timeout: float = 2.0) -> None:
+    def _drain_pending(self) -> None:
+        """Discard queued items not yet started, narrowing stop()'s in-flight window to a single item."""
+        while True:
+            try:
+                self._q.get_nowait()
+            except queue.Empty:
+                break
+
+    def stop(self, timeout: "Optional[float]" = None) -> None:
+        """Stop the daemon and wait for it to exit.
+
+        Queued reflections that have not started are discarded, so at most the single in-flight item can
+        finish. The default join waits to completion. If a finite timeout expires, the live thread remains
+        observable and :meth:`start` cannot spawn an overlapping worker.
+        """
         self._stop.set()
-        if self._thread:
-            self._thread.join(timeout=timeout)
+        t = self._thread
+        if t is None:
+            return
+        self._drain_pending()
+        t.join(timeout=timeout)
+        if not t.is_alive():
             self._thread = None

@@ -183,10 +183,20 @@ def test_mint_duplicate_failclosed(mint_env):
 
 
 def test_mint_ignores_legacy_type(mint_env):
-    # #984: a legacy/bogus --type is tolerated + ignored — the project is created as software.
-    out = gx10._project_command("new eps --type bogus", FakeGx())
-    assert "created" in out and "seeded software" in out
+    # #1617: a legacy MPR type is tolerated + ignored, but the operator is told what was really seeded.
+    out = gx10._project_command("new eps --type mpr", FakeGx())
+    assert "created" in out and "seeded software unit 'main'" in out
+    assert "[WARN]" in out and "--type is obsolete and was ignored" in out
     assert any(p.id == "eps" for p in gx10._REGISTRY.list())
+
+
+def test_mint_without_legacy_type_keeps_existing_output_byte_exact(mint_env):
+    out = gx10._project_command("new plain", FakeGx())
+    proj = gx10._REGISTRY.get("plain")
+    assert proj is not None
+    assert out == (f"[project] created plain → {proj.root}  (mem_ns {proj.mem_ns[:8]}, active)"
+                   " · seeded software unit 'main'\n"
+                   f"  [switch] now on plain → {proj.root}")
 
 
 def test_mint_bad_name_rejected(mint_env):
@@ -209,3 +219,34 @@ def test_mint_requires_agent(mint_env):
     out = gx10._project_command("new noagent")
     assert "requires an interactive session" in out
     assert not any(p.id == "noagent" for p in gx10._REGISTRY.list())
+
+
+def test_project_use_activates_existing_unit(mint_env):
+    gx10._project_command("new alpha", FakeGx())
+    gx10.initiative_new("Second Unit")
+    gx10.initiative_use("main")
+
+    out = gx10._project_command("use second-unit")
+
+    assert gx10.active_slug() == "second-unit"
+    assert "[project] active unit: second-unit" in out
+    assert gx10.initiative_active() is not None
+    assert gx10.initiative_active().path.as_posix() in out
+
+
+def test_project_use_unknown_slug_fails_closed(mint_env):
+    gx10._project_command("new alpha", FakeGx())
+    before = gx10.active_slug()
+
+    out = gx10._project_command("use ghost")
+
+    assert "no initiative 'ghost'" in out
+    assert gx10.active_slug() == before
+
+
+def test_project_use_without_slug_returns_usage(mint_env):
+    gx10._project_command("new alpha", FakeGx())
+    before = gx10.active_slug()
+
+    assert gx10._project_command("use") == "usage: /project use <slug>"
+    assert gx10.active_slug() == before

@@ -329,7 +329,7 @@ function rangedRead(text: string, args: Args): string | null {
 
 // ── dispatch ─────────────────────────────────────────────────────────────────
 export async function runTool(
-  name: string, args: Args, baseCwd?: string, sandboxPolicy = 'auto', signal?: AbortSignal,
+  name: string, args: Args, baseCwd?: string, projectRoot?: string, sandboxPolicy = 'auto', signal?: AbortSignal,
 ): Promise<string> {
   // #1317: run the bridged tool in the server-shipped active-project cwd (`baseCwd`) when it exists on THIS
   // host (code_locality=mount); otherwise the client's own process.cwd() (remote/sealed / an older engine
@@ -352,11 +352,34 @@ export async function runTool(
   // the raw model-supplied path echoed in ERROR/OK strings — stays byte-identical. Callers keep the RAW
   // arg for display and use R(arg) only for the actual fs operation target.
   const R = (v: string): string => (override && !path.isAbsolute(v) ? path.resolve(base, v) : v);
+  // #1615: reads keep code-root precedence but may fall back to a server-shipped project root. The root
+  // and candidate must both exist on this host, and the candidate must remain contained under that root.
+  // Any stat/path error preserves the primary target so read failures retain their existing behaviour.
+  const RR = async (v: string): Promise<string> => {
+    const primary = R(v);
+    if (path.isAbsolute(v) || !override || !projectRoot) return primary;
+    try {
+      await fs.stat(primary);
+      return primary;
+    } catch {
+      /* primary missing or unreadable → test the contained project-root fallback */
+    }
+    try {
+      if (!(await fs.stat(projectRoot)).isDirectory()) return primary;
+      const candidate = path.resolve(projectRoot, v);
+      const relative = path.relative(projectRoot, candidate);
+      if (relative.startsWith('..') || path.isAbsolute(relative)) return primary;
+      await fs.stat(candidate);
+      return candidate;
+    } catch {
+      return primary;
+    }
+  };
   try {
     const toolName = name === SANDBOXED_EXEC_WIRE_TOOL ? 'execute_command' : name;
     switch (toolName) {
       case 'read_file': {
-        const p = R(reqStr(args, 'path'));
+        const p = await RR(reqStr(args, 'path'));
         let bounded: {buf: Buffer; size: number; over: boolean};
         try {
           bounded = await readBoundedFile(p, MAX_FILE_BYTES);
@@ -401,7 +424,7 @@ export async function runTool(
 
       case 'list_directory': {
         const rawArg = args['path'] === undefined ? '.' : String(args['path']);
-        const raw = R(rawArg);                                   // resolved target for readdir/classify/stat
+        const raw = await RR(rawArg);                            // resolved target for readdir/classify/stat
         const entries: Dirent[] = [];
         let overflow = false;
         try {
@@ -604,7 +627,7 @@ export async function runTool(
 
       case 'search_files': {
         const raw = reqStr(args, 'pattern');
-        const directory = R(args['directory'] === undefined ? '.' : String(args['directory']));
+        const directory = await RR(args['directory'] === undefined ? '.' : String(args['directory']));
         const filePattern = args['file_pattern'] === undefined ? '*.md' : String(args['file_pattern']);
         let hit: (line: string) => boolean;
         try {

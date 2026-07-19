@@ -21,6 +21,10 @@ export {MAX_CAPTURE_BYTES};
 
 type Item = Record<string, unknown>;
 const str = (v: unknown, d = ''): string => (v === undefined || v === null ? d : String(v));
+export interface HandoverLogOptions {
+  tight?: boolean;
+}
+export type HandoverLog = (message: string, options?: HandoverLogOptions) => void;
 
 /** The Claude-default launch template — used only when neither an explicit client override nor the
  *  server's per-agent spec supplies one (≙ client.py DEFAULT_AGENT_CMD). */
@@ -31,6 +35,7 @@ const WINDOWS_EXECUTABLE_EXTENSIONS = new Set(['.exe', '.cmd', '.bat', '.com', '
 /** #455: how much of a code-agent's stderr to upload for the server-side exhausted classifier. */
 const STDERR_TAIL_CHARS = 4000;
 const CODER_TIMEOUT_DEFAULT_S = 1800;
+const CLAIM_LEASE_RENEW_DEFAULT_S = 40;
 // A coder-controlled feedback / capture file is a short summary; read at most this many bytes so a coder
 // that writes a multi-GB file can never OOM the client (#1543). The status: line is first, so a tail cut is safe.
 export const FEEDBACK_MAX_BYTES = 1024 * 1024;
@@ -46,9 +51,9 @@ export async function readCapped(filePath: string, cap: number = FEEDBACK_MAX_BY
   }
 }
 export interface HandoverCfg {
-  // #449/INK-HANDOVER-1 (#503): an EXPLICIT client-side override (GX10_CLAUDE_BIN / GX10_AGENT_CMD or
-  // the config file) — the documented single-agent BYO path — beats the server's per-agent spec; null
-  // (unset) ⇒ the server spec wins, then the built-in default. Mirrors client.py's *_OVERRIDE precedence.
+  // #449/INK-HANDOVER-1 (#503): legacy single-agent BYO overrides. They apply only when the server's
+  // resolved base binary is Claude (or absent and therefore Claude by default); registry agents keep their
+  // server-resolved bin/template pair. Mirrors client.py's *_OVERRIDE scoping.
   claudeBinOverride: string | null;
   agentCmdOverride: string | null;
   claudeEffort: string; // default effort when the item omits it
@@ -63,8 +68,9 @@ function firstNonEmpty(...vals: Array<string | null | undefined>): string {
 
 /** The fully-resolved per-agent launch spec (INK-HANDOVER-1, #503). PURE + testable: the server ships
  *  the full spec per `/pending` item (bin/cmd_template/model/effort/permission + mcp/mcp_env); the client
- *  is a thin renderer. Precedence per field mirrors client.py `_run_handover`: an explicit client override
- *  > the server's item spec > the built-in default; `mcp`/`mcp_env` come straight from the item. */
+ *  is a thin renderer. For a server-resolved Claude binary (or an absent bin, which defaults to Claude),
+ *  an explicit client override wins, then the server item, then the built-in default. A non-Claude registry
+ *  agent always keeps its server-resolved bin/template pair. `mcp`/`mcp_env` come straight from the item. */
 export interface LaunchSpec {
   bin: string;
   model: string;
@@ -125,10 +131,14 @@ function binMatches(candidate: string, allowed: string): boolean {
   if (/[?*]/.test(a)) return globMatch(candidate, a);
   if (!isBareCommand(a)) return candidate === binIdentity(a);
   const aid = binIdentity(a);
-  const candidateBasename = path.basename(candidate);
-  const allowedBasename = path.basename(aid);
+  const candidateBasename = portableBasename(candidate);
+  const allowedBasename = portableBasename(aid);
   return candidate === aid || candidateBasename === allowedBasename ||
     windowsExecutableStem(candidateBasename).toLowerCase() === allowedBasename.toLowerCase();
+}
+
+function portableBasename(v: string): string {
+  return v.split(/[\\/]/).at(-1) ?? '';
 }
 
 function windowsExecutableStem(v: string): string {
@@ -137,16 +147,19 @@ function windowsExecutableStem(v: string): string {
 }
 
 export function authorizeLaunch(bin: string, template: string, policy: ToolingEnvelopePolicy | null | undefined): string | null {
-  if (policy === undefined || policy === null) return 'tooling envelope refused malformed policy';
-  if (policy.enabled !== true) return 'tooling envelope refused malformed policy';
-  if (!Array.isArray(policy.allow_list)) return 'tooling envelope refused malformed policy';
+  // The command detail is persisted by /feedback as operator-visible durable blocked_reason. Absolute
+  // executable paths may therefore reveal the local install layout; that tradeoff is deliberate for diagnosis.
+  const command = `resolved bin=${JSON.stringify(bin)}, cmd_template=${JSON.stringify(normalizeTemplate(template))}`;
+  if (policy === undefined || policy === null) return `tooling envelope refused malformed policy (${command})`;
+  if (policy.enabled !== true) return `tooling envelope refused malformed policy (${command})`;
+  if (!Array.isArray(policy.allow_list)) return `tooling envelope refused malformed policy (${command})`;
   const candidateBin = binIdentity(bin);
   const candidateTemplate = normalizeTemplate(template);
-  if (!candidateBin || !candidateTemplate) return 'tooling envelope refused malformed coder command';
+  if (!candidateBin || !candidateTemplate) return `tooling envelope refused malformed coder command (${command})`;
   for (const e of policy.allow_list) {
     if (binMatches(candidateBin, str(e.bin)) && candidateTemplate === normalizeTemplate(e.cmd_template)) return null;
   }
-  return 'tooling envelope refused unauthorized coder command';
+  return `tooling envelope refused unauthorized coder command (${command}; no allow_list entry matched both)`;
 }
 
 export function resolveLaunch(item: Item, cfg: HandoverCfg): LaunchSpec {
@@ -155,18 +168,27 @@ export function resolveLaunch(item: Item, cfg: HandoverCfg): LaunchSpec {
   if (me && typeof me === 'object' && !Array.isArray(me)) {
     for (const [k, v] of Object.entries(me as Record<string, unknown>)) mcpEnv[String(k)] = String(v);
   }
+  const serverBin = firstNonEmpty(str(item['bin']), DEFAULT_BIN);
+  const isClaudeSpec = isClaudeBaseSpec(serverBin);
   return {
-    bin: firstNonEmpty(cfg.claudeBinOverride, str(item['bin']), DEFAULT_BIN),
+    bin: isClaudeSpec ? firstNonEmpty(cfg.claudeBinOverride, serverBin) : serverBin,
     // model fallback matches client.py exactly (`item['model'] or 'claude-opus-4-8'`) — the server ships
     // the per-agent model, so no client-side agent→model table (a thin renderer keeps no such table).
     model: firstNonEmpty(str(item['model']), 'claude-opus-4-8'),
     effort: firstNonEmpty(str(item['effort']), cfg.claudeEffort),
     permission: firstNonEmpty(str(item['permission']), cfg.claudePermissionMode),
     permissionBypass: item['permission_bypass'] === true,
-    template: firstNonEmpty(cfg.agentCmdOverride, str(item['cmd_template']), DEFAULT_AGENT_CMD),
+    template: isClaudeSpec
+      ? firstNonEmpty(cfg.agentCmdOverride, str(item['cmd_template']), DEFAULT_AGENT_CMD)
+      : firstNonEmpty(str(item['cmd_template']), DEFAULT_AGENT_CMD),
     mcp: str(item['mcp']),
     mcpEnv,
   };
+}
+
+export function isClaudeBaseSpec(serverBin: unknown): boolean {
+  const resolved = firstNonEmpty(str(serverBin), DEFAULT_BIN);
+  return binMatches(binIdentity(resolved), DEFAULT_BIN);
 }
 
 /** POSIX shlex.split — whitespace splits tokens; single/double quotes and backslash group. */
@@ -365,7 +387,7 @@ export function spawnAgent(
 /** The handover run result: the feedback text (null if none) + the run signal meta (#455). */
 export interface RunResult {
   fb: string | null;
-  meta: {exit_code: number | null; stderr: string};
+  meta: {exit_code: number | null; stderr: string; launch_refusal?: string};
 }
 
 /** ≙ _run_handover: materialise the handover, run the per-agent code-agent locally, read the feedback,
@@ -375,7 +397,7 @@ export async function runHandover(
   item: Item,
   codedir: string,
   cfg: HandoverCfg,
-  log: (m: string) => void,
+  log: HandoverLog,
 ): Promise<RunResult> {
   const tid = str(item['id']);
   const agent = str(item['agent'], 'OPUS').toUpperCase();
@@ -446,7 +468,7 @@ export async function runHandover(
   const refusal = authorizeLaunch(spec.bin, spec.template, item['tooling_envelope'] as ToolingEnvelopePolicy | undefined);
   if (refusal) {
     log(`  ✗ ${refusal} — handover ${tid} skipped`);
-    return {fb: null, meta: {exit_code: null, stderr: refusal}};
+    return {fb: null, meta: {exit_code: null, stderr: refusal, launch_refusal: refusal}};
   }
 
   log(`  → code-agent (local): ${tid} (${agent}, ${spec.model}, effort=${spec.effort})  cwd=${launchCwd}`);
@@ -480,7 +502,7 @@ export async function runHandover(
   if (res.stderr.trim()) {
     log(`  ⓘ ${agent} stderr (${res.stderr.length} chars) -> ${logPath}`);
     const tail = res.stderr.trim().split(/\r?\n/).slice(-2).join(' | ').slice(-200);
-    if (tail) log(`     ${tail}`);
+    if (tail) log(`     ${tail}`, {tight: true});
   }
   if (res.timedOut) {
     // A hung coder held its pool claim forever (#1491). The tree was killed; report a plain failure so the
@@ -538,40 +560,92 @@ async function cleanupAgentScratch(codedir: string, item: Item): Promise<void> {
   }
 }
 
-/** ≙ _process_one: run the handover, upload feedback; un-claim on any failure for retry. */
+/** ≙ _process_one: run and report; retry transient failures, retain deterministic launch refusals. */
 export async function processOne(
   srv: Server,
   item: Item,
   codedir: string,
   cfg: HandoverCfg,
   claimed: Set<string>,
-  log: (m: string) => void,
+  log: HandoverLog,
 ): Promise<boolean> {
   const tid = str(item['id']);
   const agent = str(item['agent'], 'OPUS').toUpperCase();
+  let claimStatus = '';
   try {
-    await srv.claim(tid, agent);
+    const claim = await srv.claim(tid, agent);
+    claimStatus = typeof claim['status'] === 'string' ? claim['status'] : '';
   } catch (e) {
-    log(`  ⚠ ${tid}: /claim failed (continuing): ${e instanceof Error ? e.message : String(e)}`);
+    log(`  ✗ ${tid}: not launchable (/claim failed: ${e instanceof Error ? e.message : String(e)}) — skipped`);
+    claimed.delete(tid);
+    return false;
   }
+  // #1738: only the server's persisted in_progress state authorizes a paid coder launch.
+  if (claimStatus !== 'in_progress') {
+    log(`  ✗ ${tid}: not launchable (claim status '${claimStatus || 'missing'}') — skipped`);
+    claimed.delete(tid);
+    return false;
+  }
+  let launchRefused = false;
+  const rawRenewS = Number(item['lease_renew_s']);
+  const renewS = Number.isFinite(rawRenewS) && rawRenewS > 0 && rawRenewS <= 86400
+    ? rawRenewS : CLAIM_LEASE_RENEW_DEFAULT_S;
+  let renewalWarned = false;
+  let renewalStopped = false;
+  let inflightRenewal: Promise<unknown> | null = null;
+  const renewalTimer = setInterval(() => {
+    // #1738: serialize renewals and retain the active promise so release can await it before /unclaim.
+    if (renewalStopped || inflightRenewal !== null) return;
+    let tracked: Promise<unknown>;
+    tracked = Promise.resolve().then(() => srv.claim(tid, agent)).then((renewed) => {
+      const status = typeof renewed['status'] === 'string' ? renewed['status'] : '';
+      if (status !== 'in_progress' && !renewalWarned) {
+        renewalWarned = true;
+        log(`  ⚠ ${tid}: claim lease renewal returned status '${status || 'missing'}' (continuing)`);
+      }
+    }).catch((e: unknown) => {
+      if (!renewalWarned) {
+        renewalWarned = true;
+        log(`  ⚠ ${tid}: claim lease renewal failed (continuing): ${e instanceof Error ? e.message : String(e)}`);
+      }
+    }).finally(() => {
+      if (inflightRenewal === tracked) inflightRenewal = null;
+    });
+    inflightRenewal = tracked;
+  }, Math.max(1, Math.round(renewS * 1000)));
+  const stopRenewal = async (): Promise<void> => {
+    // #1738: close the tick gate first, then await the current fail-soft renewal before release/cleanup.
+    renewalStopped = true;
+    clearInterval(renewalTimer);
+    const renewal = inflightRenewal;
+    if (renewal !== null) await renewal;
+  };
   try {
     const {fb, meta} = await runHandover(item, codedir, cfg, log);
+    launchRefused = !!meta.launch_refusal;
     // INK-HANDOVER-2 (#503): ALWAYS report the run signal (even with no feedback) so the server can
     // classify a budget-exhausted run → trip the #455 breaker + fail over on the next poll, instead of
-    // retrying the same out-of-budget agent forever. Mirrors client.py _process_one.
+    // retrying the same out-of-budget agent forever. Mirrors client.py _process_one. #1738: renewal stays
+    // active through this upload so a slow POST cannot open a reclaim/re-dispatch window.
     const res = await srv.feedback({
       task_id: tid,
       agent,
       content: fb ?? '',
       exit_code: meta.exit_code,
       stderr: meta.stderr,
+      ...(meta.launch_refusal ? {launch_refusal: meta.launch_refusal} : {}),
     });
+    await stopRenewal();
     const clsRaw = (res as Json)['classification'];
     const cls = typeof clsRaw === 'string' ? clsRaw : null;
     if (cls === 'ok-feedback' || (cls === null && fb)) {
       log(`  ✓ feedback uploaded: ${tid} → ${str((res as Json)['feedback_file'])}`);
       await cleanupAgentScratch(codedir, item); // #1300: the scratch is done its job
       return true;
+    }
+    if (cls === 'launch-refused' || meta.launch_refusal) {
+      log(`  ✗ ${tid}: launch permanently refused and reported; task left blocked`);
+      return false;
     }
     if (cls === 'agent-unavailable') {
       log(`  ⚠ ${tid}: ${agent} unavailable (budget/quota) → failing over to a peer on the next poll`);
@@ -580,6 +654,15 @@ export async function processOne(
     }
   } catch (e) {
     log(`  ✗ ${tid}: upload/code-agent failed: ${e instanceof Error ? e.message : String(e)}`);
+  } finally {
+    // #1738: upload failures take the same stop-and-await path before any /unclaim below.
+    await stopRenewal();
+  }
+  if (launchRefused) {
+    // The refusal is deterministic even when /feedback failed. Keep it in this process-lifetime `claimed`
+    // set so later polls cannot re-dispatch it; a client restart creates a fresh set and retries after config repair.
+    log(`  ✗ ${tid}: launch permanently refused locally; task retained until client restart`);
+    return false;
   }
   try {
     await srv.unclaim(tid);
@@ -597,7 +680,7 @@ export async function dispatchPending(
   cfg: HandoverCfg,
   pool: Pool,
   claimed: Set<string>,
-  log: (m: string) => void,
+  log: HandoverLog,
 ): Promise<Array<Promise<boolean>>> {
   let pending: Json[];
   try {
@@ -609,7 +692,7 @@ export async function dispatchPending(
   const jobs: Array<Promise<boolean>> = [];
   for (const item of pending) {
     const tid = str(item['id']);
-    if (!tid || claimed.has(tid)) continue;
+    if (!tid || claimed.has(tid) || str(item['blocked_kind']) === 'escalated') continue;
     claimed.add(tid); // claim immediately → no double-launch on an overlapping poll
     // #1541: track the job so the CLI can await its /feedback + /unclaim cleanup on exit (before it closes
     // the session). Deregister on settle so the set only ever holds genuinely in-flight work.

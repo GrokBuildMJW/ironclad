@@ -9,6 +9,8 @@ Modelled on ``test_code_agent_registry.py`` (the ``_do_launch`` Popen-fake patte
 """
 from __future__ import annotations
 
+import os
+import shlex
 import sys
 import threading
 import types
@@ -122,6 +124,113 @@ def test_launch_coder_default_non_stream_uses_safe_permission_mode(monkeypatch, 
     ]
     assert "--dangerously-skip-permissions" not in popen[0]
     assert gx10._store().get(tid)["status"] == "in_progress"
+
+
+@pytest.mark.parametrize("memory_configured", [False, True], ids=["memory-off", "memory-on"])
+def test_launch_coder_claude_memory_mcp_shape_and_env(monkeypatch, tmp_path, memory_configured):
+    from ack.tooling_envelope import assert_authorized
+
+    cfg = gx10._code_defaults()
+    if memory_configured:
+        cfg["code_agents"]["pool"][0]["mcp_template"] = (
+            "--mcp-config '{\"mcpServers\":{\"memory\":{\"command\":\"{mcp_cmd}\","
+            "\"args\":[\"{mcp_script}\"]}}}'"
+        )
+    tid, popen = _setup(monkeypatch, tmp_path, cfg=cfg)
+    monkeypatch.setattr(gx10, "AUTOPILOT_STREAM", False, raising=False)
+    monkeypatch.setattr(
+        gx10,
+        "_MEMORY_CONFIG",
+        {"base_url": "http://memory:8800", "agent_id": "ironclad"} if memory_configured else {},
+        raising=False,
+    )
+    resolved = []
+    real_mcp_for_launch = gx10._mcp_for_launch
+
+    def _tracked_mcp_for_launch(spec):
+        result = real_mcp_for_launch(spec)
+        resolved.append(result)
+        return result
+
+    launch_env = {}
+
+    def _fake_popen(argv, *args, **kwargs):
+        popen.append(list(argv))
+        launch_env.update(kwargs["env"])
+        return _FakeProc()
+
+    monkeypatch.setattr(gx10, "_mcp_for_launch", _tracked_mcp_for_launch)
+    monkeypatch.setattr(gx10.subprocess, "Popen", _fake_popen)
+
+    assert _launch(task_id=tid).startswith("OK:")
+    assert len(resolved) == 1
+    mcp_args, mcp_env = resolved[0]
+    mcp_tokens = shlex.split(mcp_args)
+    assert popen[0] == [
+        "claude", "--model", "claude-opus-4-8", "--effort", "high",
+        "--permission-mode", "default", *mcp_tokens, "--print", popen[0][-1],
+    ]
+    assert bool(mcp_tokens) is memory_configured
+    assert assert_authorized("claude", popen[0], gx10.TOOLING_ENVELOPE_POLICY)
+    assert launch_env == {**os.environ, "PYTHONIOENCODING": "utf-8", **mcp_env}
+    if not memory_configured:
+        assert (mcp_args, mcp_env) == ("", {})
+
+
+def test_launch_coder_config_agent_renders_memory_mcp_and_merges_env(monkeypatch, tmp_path):
+    import commands
+
+    cfg = gx10._code_defaults()
+    cfg["code_agents"]["pool"][0].update({
+        "provider_id": "codex",
+        "agent_id": "CODEX",
+        "display": "Codex",
+        "model": "deployment-model",
+        "bin": "codex",
+        "cmd_template": "{bin} exec --model {model} {mcp} -o {feedback} {prompt}",
+        "mcp_template": "-c 'mcp_servers.memory.command=\"{mcp_cmd}\"'",
+    })
+    tid, popen = _setup(monkeypatch, tmp_path, agent="CODEX", cfg=cfg)
+    monkeypatch.setattr(
+        gx10,
+        "_MEMORY_CONFIG",
+        {"base_url": "http://memory:8800", "agent_id": "ironclad"},
+        raising=False,
+    )
+    resolved = []
+    real_mcp_for_launch = gx10._mcp_for_launch
+
+    def _tracked_mcp_for_launch(spec):
+        result = real_mcp_for_launch(spec)
+        resolved.append(result)
+        return result
+
+    rendered = []
+    real_build_agent_argv = commands.build_agent_argv
+
+    def _tracked_build_agent_argv(template, **kwargs):
+        rendered.append((template, dict(kwargs)))
+        return real_build_agent_argv(template, **kwargs)
+
+    launch_env = {}
+
+    def _fake_popen(argv, *args, **kwargs):
+        popen.append(list(argv))
+        launch_env.update(kwargs["env"])
+        return _FakeProc()
+
+    monkeypatch.setattr(gx10, "_mcp_for_launch", _tracked_mcp_for_launch)
+    monkeypatch.setattr(commands, "build_agent_argv", _tracked_build_agent_argv)
+    monkeypatch.setattr(gx10.subprocess, "Popen", _fake_popen)
+
+    assert _launch(task_id=tid).startswith("OK:")
+    assert len(resolved) == 1
+    mcp_args, mcp_env = resolved[0]
+    assert len(rendered) == 1 and rendered[0][1]["mcp"] == mcp_args
+    assert shlex.split(mcp_args) == popen[0][4:6]
+    assert launch_env == {**os.environ, "PYTHONIOENCODING": "utf-8", **mcp_env}
+    assert launch_env["GX10_MEMORY_URL"] == "http://memory:8800"
+    assert launch_env["GX10_MCP_MEMORY_NS"] == "ironclad"
 
 
 def test_launch_coder_explicit_agent_capability_restores_permission_bypass(monkeypatch, tmp_path):
@@ -289,6 +398,14 @@ def test_launch_coder_error_when_spawn_fails(monkeypatch, tmp_path):
 
 def test_launch_coder_cached_model_mismatch_marks_blocked_without_spawn(monkeypatch, tmp_path):
     tid, popen = _setup(monkeypatch, tmp_path)
+    board_writes = []
+    write_board = gx10._write_board
+
+    def _record_board_write():
+        board_writes.append(None)
+        write_board()
+
+    monkeypatch.setattr(gx10, "_write_board", _record_board_write)
     gx10._MODEL_CHECK_CACHE["OPUS"] = providers.ModelCheck(
         agent_id="OPUS",
         configured="claude-opus-4-8",
@@ -303,6 +420,10 @@ def test_launch_coder_cached_model_mismatch_marks_blocked_without_spawn(monkeypa
     assert t["status"] == "in_progress"
     assert t["blocked_kind"] == "errored"
     assert "not offered" in t["blocked_reason"]
+    assert len(board_writes) == 1
+    board = (gx10.vault_root() / gx10.active_slug() / gx10.BOARD_FILENAME).read_text(encoding="utf-8")
+    assert f"`{tid}`" in board
+    assert "⚠ ERRORED: agent OPUS: model" in board
 
 
 def test_launch_coder_empty_model_cache_keeps_launch_path(monkeypatch, tmp_path):

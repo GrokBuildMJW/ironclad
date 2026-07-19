@@ -204,6 +204,9 @@ def test_run_handover_refuses_unauthorized_without_spawn(monkeypatch, tmp_path):
     fb, meta = client._run_handover(item, tmp_path, log=lambda *_: None)
     assert fb is None
     assert "unauthorized coder command" in meta["stderr_tail"]
+    assert "resolved bin='python'" in meta["stderr_tail"]
+    assert "cmd_template='{bin} wrapper.py {prompt}'" in meta["stderr_tail"]
+    assert meta["launch_refusal"] == meta["stderr_tail"]
     assert called is False
 
 

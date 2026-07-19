@@ -43,6 +43,14 @@ def test_benign_keyish_names_are_not_flagged():
         assert not agent_env._is_sensitive(benign)
 
 
+def test_memory_mcp_connection_env_survives_secret_scrub():
+    env = {"GX10_MEMORY_URL": "http://mem:8800", "GX10_MCP_MEMORY_NS": "project-ns",
+           "GH_TOKEN": "secret", "GX10_API_KEY": "secret"}  # gitleaks:allow — dummy test values
+    assert agent_env.scrub_agent_env(env) == {
+        "GX10_MEMORY_URL": "http://mem:8800", "GX10_MCP_MEMORY_NS": "project-ns",
+    }
+
+
 def test_harden_redirects_credentials_keeps_home_no_claude_config_dir(tmp_path):
     env = {"PATH": "/usr/bin", "HOME": "/real/home",
            "GH_TOKEN": "t", "GX10_SERVER_TOKEN": "s"}          # gitleaks:allow — NAMES only

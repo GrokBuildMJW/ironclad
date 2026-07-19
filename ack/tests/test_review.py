@@ -280,6 +280,9 @@ def test_review_config_defaults_present():
     assert "review" in d
     assert "agent" in d["review"] and "timeout_s" in d["review"]
     assert d["review"]["timeout_s"] == gx10.REVIEW_TIMEOUT_S
+    assert d["code_review"]["mode"] == "off"
+    assert d["code_review"]["max_rounds"] == 2
+    assert d["code_review"]["agent"] == ""
 
 
 def test_apply_config_sets_review_globals(monkeypatch):

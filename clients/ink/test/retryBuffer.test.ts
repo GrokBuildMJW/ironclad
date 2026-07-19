@@ -120,13 +120,22 @@ test('flush stops at the first still-transient item (keeps the rest in order)', 
 });
 
 test('#1490 concurrent flushes never drop an unsent result (re-entrancy guard)', async () => {
-  // #1490 flushes on EVERY connected poll, so a slow flush can overlap the next poll's flush. Without the
-  // guard, both read q[0] then both shift() — the 2nd shift removes an item that was never sent. A SLOW
-  // server makes the two flushes genuinely interleave; both queued results must still be delivered exactly once.
+  // #1490 flushes on EVERY connected poll, so a pending flush can overlap the next poll's flush. Without the
+  // guard, both read q[0] then both shift() — the 2nd shift removes an item that was never sent. The deferred
+  // request forces that overlap without depending on a wall-clock delay.
+  let markStarted!: () => void;
+  let release!: () => void;
+  const started = new Promise<void>((resolve) => {
+    markStarted = resolve;
+  });
+  const pending = new Promise<void>((resolve) => {
+    release = resolve;
+  });
   class SlowSrv {
     calls: Array<{id: string; result: string}> = [];
     async req(_m: string, _p: string, body?: Record<string, unknown>): Promise<Record<string, unknown>> {
-      await new Promise((r) => setTimeout(r, 10));
+      markStarted();
+      await pending;
       this.calls.push({id: String(body?.['id']), result: String(body?.['result'])});
       return {};
     }
@@ -140,7 +149,11 @@ test('#1490 concurrent flushes never drop an unsent result (re-entrancy guard)',
 
   const slow = new SlowSrv();
   const srv = slow as unknown as Server;
-  await Promise.all([b.flush(srv), b.flush(srv)]); // two overlapping flushes
+  const first = b.flush(srv);
+  await started;
+  const second = b.flush(srv);
+  release();
+  await Promise.all([first, second]);
 
   assert.equal(b.size, 0, 'both results delivered, none dropped');
   assert.deepEqual(slow.calls, [{id: '1', result: 'a'}, {id: '2', result: 'b'}],

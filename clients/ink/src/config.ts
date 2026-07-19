@@ -23,8 +23,8 @@ export interface Config {
   claudePermissionMode: string;
   agentCmd: string;
   // INK-HANDOVER-1 (#503): the EXPLICIT client-side bin/template (env or config file), null if unset.
-  // Distinct from the resolved claudeBin/agentCmd above: an explicit override beats the server's
-  // per-agent spec, whereas an unset value lets the server spec win (then the built-in default).
+  // Distinct from the resolved claudeBin/agentCmd above: an explicit override beats a Claude base
+  // spec only; a non-Claude registry agent retains the server-resolved bin/template pair.
   claudeBinExplicit: string | null;
   agentCmdExplicit: string | null;
   maxAgents: number;

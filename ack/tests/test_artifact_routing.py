@@ -81,6 +81,23 @@ def test_stage_handover_normalizes_body_recipient_to_the_agent(tmp_path):
     assert "**Recipient:** SONNET" in ho and "Recipient:** OPUS" not in ho
 
 
+def test_stage_handover_normalizes_body_meta_id_without_consuming_frontmatter(tmp_path):
+    gx10.initiative_new("Meta ID", "software")
+    approve_active_design(gx10)
+    tid = gx10._store().create(dict(_TASK), force=True)["id"]
+    body = ("---\ntask_id: KGC-999\nto: OPUS\n---\n## Meta\n- **Task ID:** main\n\n"
+            "## Steps\ndo it")
+
+    out = gx10._stage_handover(tid, "OPUS", body)
+
+    assert "ERROR" not in out
+    ho = (tmp_path / "vault" / "meta-id" / ".work" / "handovers" / f"{tid}_OPUS.md").read_text(
+        encoding="utf-8")
+    assert f"task_id: {tid}" in ho
+    assert f"**Task ID:** {tid}" in ho
+    assert "Task ID:** main" not in ho
+
+
 def test_normalize_handover_recipient_forms_and_noop():
     # #1311: rewrite a body Recipient naming a (different) configured AGENT to the resolved agent — plain,
     # bulleted, and bold with the colon inside (`**Recipient:**`) or outside (`**Recipient**:`) the bold —
@@ -101,6 +118,19 @@ def test_normalize_handover_recipient_forms_and_noop():
     assert gx10._normalize_handover_recipient(two, "SONNET") == two
     assert gx10._normalize_handover_recipient("Recipient: OPUS\n", "") == "Recipient: OPUS\n"   # no agent → no-op
     assert gx10._normalize_handover_recipient("no meta here\n", "SONNET") == "no meta here\n"    # no line → no-op
+
+
+def test_normalize_handover_meta_id_scopes_and_payload_guard():
+    md = ("---\ntask_id: KGC-1\n---\n## Meta\n**Task ID**: main\n\n"
+          "```\nTask ID: main\n```\n\n## Task payload\nTask ID: main\n")
+    fixed = gx10._normalize_handover_meta_id(md, "KGC-1")
+    assert fixed.startswith("---\ntask_id: KGC-1\n---")                 # YAML was not the consumed match
+    assert "**Task ID**: KGC-1" in fixed
+    assert "```\nTask ID: main\n```" in fixed                         # fenced example untouched
+    assert "## Task payload\nTask ID: main" in fixed                  # later payload untouched
+
+    legitimate = "## Task payload\nTask ID: JIRA-431\n"
+    assert gx10._normalize_handover_meta_id(legitimate, "KGC-1") == legitimate
 
 
 def test_inject_code_root_note_enabled_and_disabled(monkeypatch):

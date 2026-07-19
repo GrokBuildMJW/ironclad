@@ -45,7 +45,7 @@ export GX10_BASE_URL=http://localhost:8000/v1 GX10_MODEL=your-model   # your mod
 
 python engine/server.py &              # 1) the orchestrator (the agent + state)
 python engine/client.py --codedir .    # 2) the client — drives it; type what you want
-#   /project new demo --type software      ← create a workspace first (artefacts live under vault/<slug>/)
+#   /project new demo                      ← create a workspace first (artefacts live under vault/<slug>/)
 #   Read README.md and summarise it.   /   Build add(a,b) in calc.py with a pytest test, and run it.
 ```
 
@@ -121,7 +121,7 @@ APIs/layout/config may change. Tagged releases ship on **PyPI** (`ironclad-ai`) 
 development snapshot. The internal DEV → Prod → Public **promote pipeline** that hardens our
 releases is in development (today a manual gated path).
 
-Verified by **3585 Python tests** (3576 offline + 9 live) plus **481 TypeScript client
+Verified by **3766 Python tests** (3757 offline + 9 live) plus **504 TypeScript client
 tests**, and a **full end-to-end run with a real code-agent**. Read these before relying on
 anything:
 
@@ -237,7 +237,7 @@ export GX10_API_KEY=...                           # only if your endpoint needs 
 python engine/server.py &
 ( cd clients/ink && npm install && npm install -g . )    # global `ironclad`, like claude / kimi
 ironclad --server http://localhost:8100                  # runs in the current folder (codedir = cwd)
-# then, before the first build/task:  /project new myproject --type software
+# then, before the first build/task:  /project new myproject
 # zero-Node alternative: python engine/client.py --codedir .   (legacy TUI: engine/tui.py)
 ```
 

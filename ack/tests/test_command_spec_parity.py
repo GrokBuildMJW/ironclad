@@ -11,6 +11,10 @@ from pathlib import Path
 
 import pytest
 
+_ENGINE = Path(__file__).resolve().parents[2] / "engine"
+if str(_ENGINE) not in sys.path:
+    sys.path.insert(0, str(_ENGINE))
+
 _REPO = Path(__file__).resolve().parents[3]
 _GUARD = _REPO / "scripts" / "ci" / "check_command_spec_parity.py"
 

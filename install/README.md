@@ -7,7 +7,9 @@ deployment is baked into the repo.
 
 **Prerequisites:** **Python ≥ 3.10** (required). The optional TypeScript client additionally needs
 **Node ≥ 22** — on older Node the installer skips the client build with a message and you fall back to the
-zero-dependency Python client.
+zero-dependency Python client. On Windows, venv creation, pip setup, engine installation, and the engine import
+smoke all fail loudly with their native diagnostics; an attempted Node ≥ 22 ink build likewise aborts on dependency,
+build, or missing-artifact failure. A present but broken Node emits a warning before the Python client fallback.
 
 ## Install (run once, from the project folder you want to drive)
 

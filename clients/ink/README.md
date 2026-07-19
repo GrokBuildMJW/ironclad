@@ -86,12 +86,17 @@ Secret-free: no private host/IP lives in the package — the config file sits on
 | `serverUrl` / `GX10_SERVER_URL`       | orchestrator base URL (the `:8100` port)           | `http://localhost:8100`  |
 | `serverToken` / `GX10_SERVER_TOKEN`   | deployment secret (only `token`/`sealed` profile)  | _(none)_                 |
 | `maxAgents` / `GX10_MAX_AGENTS`       | max parallel local code-agents                     | `3`                      |
-| `agentCmd` / `GX10_AGENT_CMD`         | local code-agent command template (bring your own) | Claude Code template     |
-| `claudeBin` / `GX10_CLAUDE_BIN`       | code-agent binary                                  | `claude`                 |
+| `agentCmd` / `GX10_AGENT_CMD`         | Claude-base single-agent command template override | Claude Code template     |
+| `claudeBin` / `GX10_CLAUDE_BIN`       | Claude-base single-agent binary override            | `claude`                 |
 | `tunnelCmd` / `GX10_TUNNEL_CMD`       | client-managed tunnel for the `sealed` profile     | _(none)_                 |
 | `srcDir` / `GX10_SRC`                  | repo root for `/update` (rebuild from source)      | _(none)_                 |
 | `claudeEffort` / `GX10_CLAUDE_EFFORT` | code-agent reasoning effort                        | `high`                   |
 | `claudePermissionMode` / `GX10_CLAUDE_PERMISSION_MODE` | code-agent permission mode (default lets the coder run its own tests) | `bypassPermissions`      |
+
+The two single-agent overrides apply only when the server resolves the base binary as Claude, or omits it
+and therefore gets the Claude default. A non-Claude registry agent deliberately ignores them and keeps its
+server-resolved bin/template pair; mixing a Claude binary override into another agent's template would fail
+the mandatory tooling-envelope authorization.
 
 Env-only: `GX10_STATE` overrides the per-project session-state file path; `GX10_RESUME` /
 `GX10_NO_RESUME` opt into / force off session resume (`NO_RESUME` wins).

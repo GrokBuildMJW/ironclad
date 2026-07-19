@@ -84,8 +84,31 @@ def test_handover_and_advance_publish_boundary_events(tmp_path, monkeypatch):
     assert by_event["pre_handover"]["agent"] == "OPUS"
     assert by_event["post_handover"]["result"].startswith("OK")
     assert by_event["pre_advance"]["task_id"] == tid
+    assert by_event["pre_advance"]["agent"] == "OPUS"       # request identity
     assert by_event["post_feedback"]["task_id"] == tid
+    assert by_event["post_feedback"]["agent"] == "OPUS"     # authoritative feedback identity
     assert by_event["post_feedback"]["result"].startswith("OK")
+
+
+def test_missing_feedback_post_event_falls_back_to_requested_agent(tmp_path, monkeypatch):
+    gx10._apply_config(gx10._code_defaults())
+    gx10.STORE = None
+    monkeypatch.chdir(tmp_path)
+    gx10.initiative_new("Order Service", "software")
+    tid = gx10._store().create(
+        {"type": "feature", "priority": "high", "title": "Build X", "description": "Build X"},
+        force=True,
+    )["id"]
+    gx10._store().transition(tid, "in_progress")
+    seen = []
+    hooks.register_hook("post_feedback", lambda ctx: seen.append(dict(ctx)))
+
+    out = gx10._advance_pipeline(tid, "OPUS")
+
+    assert out.startswith("ERROR: feedback missing")
+    assert len(seen) == 1
+    assert seen[0]["task_id"] == tid and seen[0]["agent"] == "OPUS"
+    assert seen[0]["result"] == out
 
 
 def test_lifecycle_byte_identical_with_no_hooks(tmp_path, monkeypatch):

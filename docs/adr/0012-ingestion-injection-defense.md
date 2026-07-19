@@ -27,6 +27,10 @@ context:
    signals. Structured/already-budgeted results are fenced without the head/tail cap.
 4. Import or wrapper failure returns a safe tool error. Raw untrusted bytes are withheld.
 
+Mixed-trust results are fenced at their source boundary instead of wrapping authoritative engine speech.
+In particular, `advance_pipeline` hard-bounds and fences only its coder-authored validation excerpt; its
+`OK:` / `ERROR:` verdict, mechanical log, and routing warnings remain outside both result classifications.
+
 `security.injection_defense` and `GX10_INJECTION_DEFENSE` are deprecated tombstones. Their values warn and
 are ignored; `/config set` refuses the retired key. There is no disable path, and the generated
 [`config-runtime.md`](../config-runtime.md) reference lists it only in tombstone metadata.

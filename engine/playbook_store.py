@@ -68,6 +68,10 @@ _CATEGORY_SECTION = {
 _VALID_SECTIONS = set(DEFAULT_SECTIONS)
 _HISTORY_MAX = 20                       # #1082: bound the per-scope rollback history (newest kept)
 _WORD_RE = re.compile(r"[a-z0-9]+")
+_REPLACE_RETRIES = 3                    # brief Windows AV/indexer locks: 2 + 4 + 8 ms, then fail-soft
+_REPLACE_BACKOFF_S = 0.002
+_TRANSIENT_REPLACE_WINERRORS = {5, 32}  # ERROR_ACCESS_DENIED / ERROR_SHARING_VIOLATION
+_TRANSIENT_REPLACE_ERRNOS = {13}        # EACCES (a separate numbering space)
 
 
 def _scoped(scope: Any) -> bool:
@@ -99,6 +103,26 @@ def _category_value(category: Any) -> str:
 
 def _section_for(category_value: str) -> str:
     return _CATEGORY_SECTION.get(category_value, _DEFAULT_SECTION)
+
+
+def _replace_with_retry(source: Path, target: Path) -> None:
+    """Replace *target* atomically, retrying only brief Windows access/sharing locks.
+
+    Three retries keep the worst-case delay bounded at 14 ms while covering the short lock blips produced by
+    antivirus/indexer handles. Persistent locks and unrelated I/O errors still reach the caller's fail-soft
+    path instead of being hidden by an unbounded retry loop.
+    """
+    for attempt in range(_REPLACE_RETRIES + 1):
+        try:
+            os.replace(source, target)
+            return
+        except OSError as ex:
+            transient = (isinstance(ex, PermissionError)
+                         or getattr(ex, "winerror", None) in _TRANSIENT_REPLACE_WINERRORS
+                         or ex.errno in _TRANSIENT_REPLACE_ERRNOS)
+            if not transient or attempt == _REPLACE_RETRIES:
+                raise
+            time.sleep(_REPLACE_BACKOFF_S * (2 ** attempt))
 
 
 class PlaybookStore:
@@ -180,7 +204,7 @@ class PlaybookStore:
             self._base.mkdir(parents=True, exist_ok=True)
             tmp = path.parent / f"{path.name}.{os.getpid()}.tmp"
             tmp.write_text(pb.to_json(), encoding="utf-8")
-            os.replace(tmp, path)
+            _replace_with_retry(tmp, path)
             return True
         except Exception:   # noqa: BLE001 — I/O / serialization / inert store → no-op, never raises
             if tmp is not None:
@@ -213,7 +237,7 @@ class PlaybookStore:
             log = hist.to_log()[-_HISTORY_MAX:]          # keep only the newest snapshots
             tmp = path.parent / f"{path.name}.{os.getpid()}.tmp"
             tmp.write_text(json.dumps(log), encoding="utf-8")
-            os.replace(tmp, path)
+            _replace_with_retry(tmp, path)
             return True
         except Exception:   # noqa: BLE001 — advisory, never raises
             if tmp is not None:
@@ -250,7 +274,7 @@ class PlaybookStore:
             })
             tmp = path.parent / f"{path.name}.{os.getpid()}.tmp"
             tmp.write_text(json.dumps(log[-_HISTORY_MAX:]), encoding="utf-8")
-            os.replace(tmp, path)
+            _replace_with_retry(tmp, path)
             return True
         except Exception:   # noqa: BLE001 — quarantine is advisory; active state remains untouched
             if tmp is not None:
@@ -456,7 +480,8 @@ class PlaybookStore:
         (no charge, no mutation) when no ``chat`` transport is injected or nothing is learned. Fail-soft —
         never raises; returns a summary."""
         from ack.ace import adapt_once   # local import keeps the per-method surface tidy
-        base = {"skipped": True, "added": 0, "rated": 0, "merged": 0, "pruned": 0}
+        base = {"skipped": True, "added": 0, "rated": 0, "merged": 0, "pruned": 0,
+                "quarantined": False, "promoted": False}
         if self._chat is None or not _scoped(scope):
             return base
         try:
@@ -471,8 +496,11 @@ class PlaybookStore:
                     return {**base, "snapshot_failed": True}
 
                 candidate = Playbook.from_json(active.to_json())
-                summary = adapt_once(trajectory, candidate, chat=self._chat, embed=self._embed,
-                                     budget=self._budget, config=self._config)
+                summary = {**base, **adapt_once(trajectory, candidate, chat=self._chat, embed=self._embed,
+                                                budget=self._budget, config=self._config)}
+                # adapt_once reports its noisy-bullet drop COUNT under this key; PlaybookStore exposes only
+                # the transaction-level quarantine boolean, which the explicit quarantine paths below set.
+                summary["quarantined"] = False
                 if summary.get("skipped"):
                     return summary
 

@@ -112,16 +112,60 @@ def test_reconcile_decoupled_autopilot_only_skips_feedback(monkeypatch, tmp_path
     assert calls == []                                  # decoupled + watcher off → no feedback-advance
 
 
-def test_reconcile_coupled_runs_feedback_byte_identical(monkeypatch, tmp_path):
+def test_reconcile_autopilot_skips_pending_handover_with_feedback(monkeypatch, tmp_path):
     _setup(monkeypatch, tmp_path)
-    monkeypatch.setattr(gx10, "AUTOMATION_DECOUPLED", False)   # default → guard is a no-op
-    monkeypatch.setattr(gx10, "_WATCHER_ENABLED", False)
+    monkeypatch.setattr(gx10, "AUTOPILOT_ENABLED", True)
+    monkeypatch.setattr(gx10, "AUTOPILOT_MAX_CONCURRENT", 1)
+    tid = gx10._store().create(
+        {"type": "feature", "priority": "high", "title": "feedback ready", "description": "y"},
+        force=True,
+    )["id"]
+    (gx10.handovers_dir() / f"{tid}_OPUS.md").write_text("body", encoding="utf-8")
+    _feedback(tid)
+    launches: list[tuple[str, str]] = []
+
+    gx10._reconcile_once(
+        gx10._store(), lambda *a: None, {}, set(),
+        launch_enqueue=lambda task_id, agent: launches.append((task_id, agent)), launched=set(),
+    )
+
+    assert launches == []
+    assert gx10._autopilot_active() == 0
+    assert gx10._store().get(tid)["status"] == "pending"
+
+
+def test_do_launch_skips_pending_handover_with_feedback(monkeypatch, tmp_path):
+    _setup(monkeypatch, tmp_path)
+    tid = gx10._store().create(
+        {"type": "feature", "priority": "high", "title": "feedback ready", "description": "y"},
+        force=True,
+    )["id"]
+    (gx10.handovers_dir() / f"{tid}_OPUS.md").write_text("body", encoding="utf-8")
+    _feedback(tid)
+    monkeypatch.setattr(
+        gx10.subprocess, "Popen", lambda *a, **k: pytest.fail("feedback in flight must block spawn"),
+    )
+
+    gx10._autopilot_reserve()
+    gx10._do_launch(tid, "OPUS")
+
+    assert gx10._autopilot_active() == 0
+    assert gx10._store().get(tid)["status"] == "pending"
+
+
+@pytest.mark.parametrize("watcher,expected_calls", [(False, 0), (True, 1)])
+def test_reconcile_coupled_feedback_requires_watcher_with_continuation_armed(
+        monkeypatch, tmp_path, watcher, expected_calls):
+    _setup(monkeypatch, tmp_path)
+    monkeypatch.setattr(gx10, "AUTOMATION_DECOUPLED", False)
+    monkeypatch.setattr(gx10, "AUTOPILOT_AUTOPLAN", True)     # widens the loop gate for heartbeat recovery
+    monkeypatch.setattr(gx10, "_WATCHER_ENABLED", watcher)
     tid = _mk_inprogress()
     _feedback(tid, status="done")
     seen, enq, calls = {}, set(), []
     gx10._reconcile_once(gx10._store(), lambda *a: calls.append(a), seen, enq)
     gx10._reconcile_once(gx10._store(), lambda *a: calls.append(a), seen, enq)
-    assert len(calls) == 1                              # coupled: feedback side runs (the caller gates the loop)
+    assert len(calls) == expected_calls
 
 
 def test_autopilot_double_message_only_when_coupled(monkeypatch, tmp_path):
@@ -175,6 +219,7 @@ def test_heartbeat_honors_positive_finite_tuning():
 def test_claim_lease_reclaims_expired_client_task(monkeypatch, tmp_path):
     _setup(monkeypatch, tmp_path)
     monkeypatch.setattr(gx10, "CLAIM_LEASE_TTL_S", 10.0)
+    monkeypatch.setattr(gx10, "_PROCESS_STARTED_MONOTONIC", gx10.time.monotonic() - 11.0)
     tid = gx10._store().create(
         {"type": "feature", "priority": "high", "title": "expired", "description": "y"},
         force=True,
@@ -200,6 +245,84 @@ def test_claim_lease_reclaims_expired_client_task(monkeypatch, tmp_path):
     gx10._reconcile_once(gx10._store(), lambda *a: None, {}, enqueued)
     assert gx10._store().get(tid)["status"] == "pending"
     assert sum("claim lease expired" in line for line in lines) == 2
+
+
+def test_claim_lease_waits_for_boot_grace_then_reclaims(monkeypatch, tmp_path):
+    _setup(monkeypatch, tmp_path)
+    monkeypatch.setattr(gx10, "CLAIM_LEASE_TTL_S", 10.0)
+    tid = gx10._store().create(
+        {"type": "feature", "priority": "high", "title": "restart grace", "description": "y"},
+        force=True,
+    )["id"]
+    gx10.claim_task(tid, "OPUS")
+    gx10._store().stamp_claim(tid, gx10.time.time() - 20.0)
+    monotonic_now = gx10.time.monotonic()
+    monkeypatch.setattr(gx10, "_PROCESS_STARTED_MONOTONIC", monotonic_now)
+
+    gx10._reconcile_once(gx10._store(), lambda *a: None, {}, set())
+    assert gx10._store().get(tid)["status"] == "in_progress"
+
+    monkeypatch.setattr(gx10, "_PROCESS_STARTED_MONOTONIC", monotonic_now - 11.0)
+    gx10._reconcile_once(gx10._store(), lambda *a: None, {}, set())
+    assert gx10._store().get(tid)["status"] == "pending"
+
+
+def test_claim_lease_does_not_reclaim_task_with_feedback(monkeypatch, tmp_path):
+    _setup(monkeypatch, tmp_path)
+    monkeypatch.setattr(gx10, "CLAIM_LEASE_TTL_S", 10.0)
+    tid = gx10._store().create(
+        {"type": "feature", "priority": "high", "title": "feedback ready", "description": "y"},
+        force=True,
+    )["id"]
+    gx10.claim_task(tid, "OPUS")
+    gx10._store().stamp_claim(tid, gx10.time.time() - 20.0)
+    _feedback(tid)
+
+    gx10._reconcile_once(gx10._store(), lambda *a: None, {}, set())
+
+    assert gx10._store().get(tid)["status"] == "in_progress"
+
+
+def test_claim_lease_does_not_reclaim_when_feedback_probe_raises(monkeypatch, tmp_path):
+    _setup(monkeypatch, tmp_path)
+    monkeypatch.setattr(gx10, "CLAIM_LEASE_TTL_S", 10.0)
+    monkeypatch.setattr(gx10, "HEARTBEAT_STALL_S", 0.0)
+    monkeypatch.setattr(gx10, "_PROCESS_STARTED_MONOTONIC", gx10.time.monotonic() - 11.0)
+    tid = gx10._store().create(
+        {"type": "feature", "priority": "high", "title": "probe failure", "description": "y"},
+        force=True,
+    )["id"]
+    gx10.claim_task(tid, "OPUS")
+    gx10._store().stamp_claim(tid, gx10.time.time() - 20.0)
+
+    class _UnreadableFeedbackDir:
+        def exists(self):
+            return True
+
+        def glob(self, _pattern):
+            raise OSError("feedback inbox unavailable")
+
+    monkeypatch.setattr(gx10, "feedback_dir", lambda soft=False: _UnreadableFeedbackDir())
+
+    gx10._reconcile_once(gx10._store(), lambda *a: None, {}, set())
+
+    assert gx10._store().get(tid)["status"] == "in_progress"
+
+
+def test_reconcile_archives_stale_handover_for_done_task(monkeypatch, tmp_path):
+    _setup(monkeypatch, tmp_path)
+    tid = gx10._store().create(
+        {"type": "feature", "priority": "high", "title": "already complete", "description": "y"},
+        force=True,
+    )["id"]
+    handover = gx10.handovers_dir() / f"{tid}_OPUS.md"
+    handover.write_text("stale handover\n", encoding="utf-8")
+    gx10._store().transition(tid, "done")
+
+    gx10._reconcile_once(gx10._store(), lambda *a: None, {}, set())
+
+    assert not handover.exists()
+    assert (gx10.archive_handovers_dir() / handover.name).read_text(encoding="utf-8") == "stale handover\n"
 
 
 def test_claim_lease_keeps_fresh_client_task(monkeypatch, tmp_path):

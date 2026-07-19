@@ -38,7 +38,7 @@ def _fake_repo(root: Path, ver: str = "0.0.22"):
     (root / "core" / "pyproject.toml").write_text(
         f'[project]\nname = "ironclad-ai"\nversion = "{ver}"\n', encoding="utf-8")
     (root / ".github" / "DEV_LOOP.md").write_text(
-        f"# Dev loop\n- **Stand:** Releases via PyPI (`ironclad-ai`, aktuell v{ver}).\n", encoding="utf-8")
+        f"# Dev loop\n- **Current:** Releases via PyPI (`ironclad-ai`, current v{ver}).\n", encoding="utf-8")
     (root / "core" / "docs" / "status.md").write_text(
         f"# Status\n> published as GitHub Releases (latest `v{ver}`); the running state is here.\n",
         encoding="utf-8")
@@ -54,6 +54,8 @@ def test_prepare_release_bumps_all_files_and_satisfies_invariants(tmp_path):
     doctor = _load("_doctor", _DOCTOR)
     rpf = _load("_rpf2", _RPF)
     _fake_repo(tmp_path)
+    stale_dev = (tmp_path / ".github" / "DEV_LOOP.md").read_text(encoding="utf-8")
+    assert doctor.devloop_dangling_refs(stale_dev, set(), "0.0.23")
     changed = rp.prepare_release(tmp_path, "0.0.23")
     assert set(changed) == {"core/pyproject.toml", ".github/DEV_LOOP.md", "docs/status.md",
                             "core/README.md", "core/CHANGELOG.md"}
@@ -93,7 +95,7 @@ def test_bad_version_refused(tmp_path):
 def test_fail_closed_on_absent_pattern(tmp_path):
     rp = _load("_rprep4", _RPREP)
     _fake_repo(tmp_path)
-    # drift: DEV_LOOP loses its 'aktuell v<X>' marker → the bump must refuse, not silently skip
+    # drift: DEV_LOOP loses its 'current v<X>' marker → the bump must refuse, not silently skip
     (tmp_path / ".github" / "DEV_LOOP.md").write_text("# Dev loop\nno version here\n", encoding="utf-8")
     with pytest.raises(ValueError, match="DEV_LOOP"):
         rp.prepare_release(tmp_path, "0.0.23")
@@ -101,6 +103,6 @@ def test_fail_closed_on_absent_pattern(tmp_path):
 
 def test_pure_bump_helpers():
     rp = _load("_rprep5", _RPREP)
-    assert rp.bump_devloop("aktuell v0.0.22 today", "0.0.23") == "aktuell v0.0.23 today"
+    assert rp.bump_devloop("current v0.0.22 today", "0.0.23") == "current v0.0.23 today"
     assert rp.bump_status("latest `v0.0.22`", "0.0.23") == "latest `v0.0.23`"
     assert rp.bump_readme("currently `v0.0.22`", "0.0.23") == "currently `v0.0.23`"

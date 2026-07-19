@@ -3,8 +3,8 @@
 A minimal, dependency-free **stdio MCP server** (JSON-RPC 2.0, newline-delimited) that exposes the
 project memory to an external coding CLI (Codex/Claude) as **read-only** tools, so the agent can query the
 same knowledge the orchestrator has during a handover. Spawned as a subprocess by the MCP-capable CLI; the
-code-agent registry injects the per-CLI MCP config (and this script's memory connection) at launch whenever
-a memory service is configured and the agent ships an ``mcp_template``, regardless of trust profile.
+code-agent registry injects this script's memory connection at launch whenever a memory service is configured;
+for CLIs with an ``mcp_template`` it additionally injects the per-launch MCP config.
 
 Design:
 - **secret-free wire**: the memory connection (base_url + the PROJECT namespace agent_id) is read from the
@@ -79,17 +79,22 @@ def server_path() -> str:
 def render_mcp_launch(mcp_template: Optional[str], *, memory_url: str, namespace: str,
                       sealed: bool = False, py: str = "", path: str = "") -> Tuple[str, Dict[str, str]]:
     """#480 / #994-S10: the Memory-MCP launch args + env for one code agent. The read-only Memory MCP is
-    ALWAYS ON (operator 2026-07-03) whenever a memory service is configured (``memory_url``) AND the agent
-    ships a per-CLI ``mcp_template`` — regardless of the trust profile. Safe un-gate: the MCP exposes ONLY
-    read tools (``memory_search`` + ``memory_deep_query``, no write), so a coder can only READ project
-    memory, never write/corrupt it. (The ``sealed`` requirement of the original #480 wiring was dropped so
-    the self-learning loop's coders always have live memory; ``sealed`` is kept as an ignored kwarg for
-    backward compatibility.) Returns ``(mcp_args, mcp_env)`` — ``("", {})`` when memory is unconfigured or the
-    agent has no template (so the agent launches byte-identically). The ``{mcp_server}`` token renders to the
-    python invocation of this script; the memory connection travels in ``mcp_env`` (inherited by the spawned
-    MCP), NEVER on the MCP wire (secret-free). Pure → unit-tested."""
-    if not (memory_url and mcp_template):
+    ALWAYS ON (operator 2026-07-03) whenever a memory service is configured (``memory_url``), regardless of
+    the trust profile. Safe un-gate: the MCP exposes ONLY read tools (``memory_search`` +
+    ``memory_deep_query``, no write), so a coder can only READ project memory, never write/corrupt it. (The
+    ``sealed`` requirement of the original #480 wiring was dropped so the self-learning loop's coders always
+    have live memory; ``sealed`` is kept as an ignored kwarg for backward compatibility.) Returns
+    ``(mcp_args, mcp_env)``: unconfigured memory returns ``("", {})``; configured memory always returns the
+    connection env, while the args are rendered only for an agent with a per-CLI ``mcp_template``. Thus the
+    template+memory and no-memory cases remain byte-identical, while a CLI with persistent MCP registration
+    receives ``("", mcp_env)``. The ``{mcp_server}`` token renders to the python invocation of this script;
+    the memory connection travels in ``mcp_env`` (inherited by the spawned MCP), NEVER on the MCP wire
+    (secret-free). Pure → unit-tested."""
+    if not memory_url:
         return "", {}
+    env = {"GX10_MEMORY_URL": memory_url, "GX10_MCP_MEMORY_NS": namespace or "ironclad"}
+    if not mcp_template:
+        return "", env
     cmd = (py or sys.executable).replace("\\", "/")
     script = (path or server_path()).replace("\\", "/")   # forward slashes: valid inside a JSON/TOML
                                                           # mcp_template AND runnable by Windows Python
@@ -101,7 +106,6 @@ def render_mcp_launch(mcp_template: Optional[str], *, memory_url: str, namespace
                 .replace("{mcp_script}", script)
                 # combined convenience token for simple shells
                 .replace("{mcp_server}", f"{shlex.quote(cmd)} {shlex.quote(script)}"))
-    env = {"GX10_MEMORY_URL": memory_url, "GX10_MCP_MEMORY_NS": namespace or "ironclad"}
     return mcp_args, env
 
 

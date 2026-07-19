@@ -193,3 +193,81 @@ def test_coder_spawn_argument_under_non_default_ctx(monkeypatch, tmp_path) -> No
 def test_coder_spawn_argument_without_context() -> None:
     assert pc.current() is None
     assert (gx10._exec_cwd() or ".") == "."
+
+
+def test_read_file_resolves_vault_sibling_from_code_root(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(gx10, "_BOOT_WORKDIR", tmp_path / "boot")
+    monkeypatch.setattr(gx10, "CODE_SUBDIR", "src")
+    handover = tmp_path / "vault" / "main" / ".work" / "handovers" / "KGC-1_SONNET.md"
+    handover.parent.mkdir(parents=True)
+    handover.write_text("handover content", encoding="utf-8")
+
+    with pc.use(ProjectContext("p", str(tmp_path), "")):
+        assert gx10._exec_cwd() == str(tmp_path / "src")
+        result = gx10.run_tool("read_file", {"path": "vault/main/.work/handovers/KGC-1_SONNET.md"})
+        assert result == "handover content"
+
+
+def test_list_directory_resolves_vault_sibling_from_code_root(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(gx10, "_BOOT_WORKDIR", tmp_path / "boot")
+    monkeypatch.setattr(gx10, "CODE_SUBDIR", "src")
+    handovers = tmp_path / "vault" / "main" / ".work" / "handovers"
+    handovers.mkdir(parents=True)
+    (handovers / "KGC-1_SONNET.md").write_text("handover", encoding="utf-8")
+
+    with pc.use(ProjectContext("p", str(tmp_path), "")):
+        listing = gx10.run_tool("list_directory", {"path": "vault/main/.work/handovers"})
+        assert "KGC-1_SONNET.md" in listing
+
+
+def test_write_file_stays_anchored_at_code_root(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(gx10, "_BOOT_WORKDIR", tmp_path / "boot")
+    monkeypatch.setattr(gx10, "CODE_SUBDIR", "src")
+
+    with pc.use(ProjectContext("p", str(tmp_path), "")):
+        result = gx10.run_tool("write_file", {"path": "vault/x.md", "content": "code copy"})
+
+    assert "OK" in result
+    assert (tmp_path / "src" / "vault" / "x.md").read_text(encoding="utf-8") == "code copy"
+    assert not (tmp_path / "vault" / "x.md").exists()
+
+
+def test_read_file_prefers_code_root_on_collision(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(gx10, "_BOOT_WORKDIR", tmp_path / "boot")
+    monkeypatch.setattr(gx10, "CODE_SUBDIR", "src")
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "same.txt").write_text("code-root copy", encoding="utf-8")
+    (tmp_path / "same.txt").write_text("project-root copy", encoding="utf-8")
+
+    with pc.use(ProjectContext("p", str(tmp_path), "")):
+        assert gx10.run_tool("read_file", {"path": "same.txt"}) == "code-root copy"
+
+
+def test_read_file_does_not_follow_project_root_traversal(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(gx10, "_BOOT_WORKDIR", tmp_path / "boot")
+    monkeypatch.setattr(gx10, "CODE_SUBDIR", "src")
+    (tmp_path / "vault").mkdir()
+    secret = tmp_path.parent / "secret.txt"
+    secret.write_text("outside secret", encoding="utf-8")
+
+    with pc.use(ProjectContext("p", str(tmp_path), "")):
+        result = gx10.run_tool("read_file", {"path": "vault/../../secret.txt"})
+
+    assert "ERROR: Not found" in result
+    assert "outside secret" not in result
+
+
+def test_missing_vault_read_includes_guidance(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(gx10, "_BOOT_WORKDIR", tmp_path / "boot")
+    monkeypatch.setattr(gx10, "CODE_SUBDIR", "src")
+
+    with pc.use(ProjectContext("p", str(tmp_path), "")):
+        result = gx10.run_tool("read_file", {"path": "vault/main/.work/handovers/missing.md"})
+
+    assert "ERROR: Not found" in result
+    assert "dev-loop artifacts live under" in result
+
+
+def test_resolve_read_path_without_project_is_unchanged() -> None:
+    assert pc.current() is None
+    assert gx10._resolve_read_path("sub/f.txt") == Path("sub/f.txt")

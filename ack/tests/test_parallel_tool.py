@@ -85,6 +85,50 @@ def test_error_isolation_in_render():
     assert "[2] ERROR: boom:bad-one" in out
 
 
+def test_format_parallel_all_empty_ok_branches():
+    out = gx10._format_parallel([
+        {"ok": True, "content": "", "error": None},
+        {"ok": True, "content": None, "error": None},
+    ])
+    assert out == (
+        "[parallel_reason] 0/2 ok\n\n"
+        "[1] EMPTY: branch returned no content\n\n"
+        "[2] EMPTY: branch returned no content"
+    )
+
+
+def test_format_parallel_mixed_results_preserve_order():
+    out = gx10._format_parallel([
+        {"ok": True, "content": " first ", "error": None},
+        {"ok": True, "content": "", "error": None},
+        {"ok": False, "content": None, "error": "boom"},
+        {"ok": True, "content": "last", "error": None},
+    ])
+    assert out == (
+        "[parallel_reason] 2/4 ok\n\n"
+        "[1] first\n\n"
+        "[2] EMPTY: branch returned no content\n\n"
+        "[3] ERROR: boom\n\n"
+        "[4] last"
+    )
+
+
+def test_format_parallel_whitespace_only_content_is_empty():
+    out = gx10._format_parallel([{"ok": True, "content": " \t\r\n ", "error": None}])
+    assert out == (
+        "[parallel_reason] 0/1 ok\n\n"
+        "[1] EMPTY: branch returned no content"
+    )
+
+
+def test_format_parallel_all_content_is_byte_identical():
+    out = gx10._format_parallel([
+        {"ok": True, "content": " alpha ", "error": None},
+        {"ok": True, "content": "beta", "error": None},
+    ])
+    assert out == "[parallel_reason] 2/2 ok\n\n[1] alpha\n\n[2] beta"
+
+
 def test_validation_rejects_bad_items():
     gx10._WORKERS = _StubWorkers()
     assert "non-empty list" in gx10.run_tool("parallel_reason", {"items": []})

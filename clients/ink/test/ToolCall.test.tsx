@@ -1,6 +1,6 @@
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
-import React from 'react';
+import React, {useState} from 'react';
 import {renderToString} from '../src/render/ink-compat.js';
 import {ToolCall, isErrorResult} from '../src/ui/ToolCall.js';
 
@@ -48,5 +48,23 @@ test('#1167 expanded shows the exact Kind(arg) header + the full result under a 
   assert.match(f, /● Read\(x\.ts\)/);
   assert.match(f, /⎿ line a/);
   assert.match(f, /line b/);
+  unmount();
+});
+
+test('#1621 an expanded in-flight tool collapses as soon as its result completes', async () => {
+  let complete = (): void => assert.fail('completion setter was not mounted');
+  function CompletingCall(): React.ReactElement {
+    const [result, setResult] = useState<string[]>([]);
+    complete = () => setResult(['large detail that must fold', 'second detail line']);
+    return <ToolCall label="parallel_reason(2 branches)" result={result} defaultOpen />;
+  }
+
+  const {frame, unmount} = renderToString(<CompletingCall />, 80, 8);
+  assert.match(frame(), /● parallel_reason\(2 branches\)/, 'the running call is open in the live area');
+  complete();
+  await new Promise((resolve) => setImmediate(resolve));
+  const f = frame();
+  assert.match(f, /● parallel_reason\(2 branches\)/, 'the completed collapsed header remains visible');
+  assert.doesNotMatch(f, /large detail that must fold/);
   unmount();
 });

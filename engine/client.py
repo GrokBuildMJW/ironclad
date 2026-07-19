@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import shlex
 import socket
@@ -47,7 +48,7 @@ import urllib.parse
 import urllib.request
 from concurrent.futures import Future, ThreadPoolExecutor, wait
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import config_schema
 import proc_tree
@@ -80,16 +81,17 @@ CLAUDE_PERMISSION_MODE = os.environ.get("GX10_CLAUDE_PERMISSION_MODE", _SAFE_PER
 DEFAULT_AGENT_CMD = ("{bin} --model {model} --effort {effort} "
                      "--permission-mode {permission} --print {prompt}")
 _CODER_TIMEOUT_DEFAULT = 1800.0
+_CHAT_STREAM_ATTEMPTS = 3
+_CHAT_STREAM_RETRY_BASE_S = 0.1
 _TOOL_RESULT_POST_BACKOFF_S = 0.5
 _TOOL_RESULT_POST_DEADLINE_S = float(os.environ.get("GX10_TOOL_RESULT_DEADLINE_S") or 150.0)
 _TOOL_RESULT_POST_MAX_BACKOFF_S = 5.0
 #: Cap on the coder-controlled feedback / capture result file. Feedback is a short summary; the file is
 #: read cap+1 bytes at a time so a coder that writes a multi-GB file can never OOM the client. Env: GX10_FEEDBACK_MAX_BYTES.
 _FEEDBACK_MAX_BYTES = int(os.environ.get("GX10_FEEDBACK_MAX_BYTES") or 1024 * 1024)
-#: #449 (review B round 4): the RAW client-side overrides (None when unset) — an EXPLICIT
-#: ``GX10_AGENT_CMD``/``GX10_CLAUDE_BIN`` is the documented single-agent BYO path and must WIN over the
-#: server-resolved registry spec (otherwise the default server's OPUS/SONNET template would make the
-#: documented client-side override unreachable). When unset, the server spec is authoritative.
+#: #449/#1675: legacy single-agent BYO overrides. They apply only when the server-resolved base binary is
+#: Claude (or omitted and therefore Claude by default); other registry agents keep their authoritative
+#: bin/template pair.
 AGENT_CMD_OVERRIDE = os.environ.get("GX10_AGENT_CMD") or None
 CLAUDE_BIN_OVERRIDE = os.environ.get("GX10_CLAUDE_BIN") or None
 AGENT_CMD = AGENT_CMD_OVERRIDE or DEFAULT_AGENT_CMD
@@ -348,11 +350,16 @@ class Server:
     def chat(self, message: str) -> Dict[str, Any]:
         return self._req("POST", "/chat", {"message": message})
 
-    def chat_stream(self, message: str, on_text, confirm: bool = False):
+    def chat_stream(self, message: str, on_text, confirm: bool = False,
+                    on_retry: Optional[Callable[[str, float, int, int], None]] = None):
         """Stream a turn from /chat/stream, calling ``on_text(chunk)`` as text arrives.
         Code-tools the orchestrator passes through (``\\x00TR{json}\\x00`` frames) are run
         LOCALLY here and their result posted back to /tool-result, so the remote agent
         operates on YOUR filesystem. Decodes UTF-8 incrementally; blocks until done.
+
+        A pre-stream 5xx is retried before any response body is read. ``on_retry`` receives
+        the server reason, delay, next attempt, and maximum attempts. Once the connection
+        opens, stream reads are never retried because replaying a partial turn is unsafe.
 
         #935: for a destructive command the server replies with a JSON ``{needs_confirm}`` (Content-Type
         application/json) INSTEAD of a stream — this returns that dict (nothing streamed) so the caller can
@@ -373,7 +380,18 @@ class Server:
         dec = codecs.getincrementaldecoder("utf-8")("replace")
         buf = ""
         expecting_frame = False                       # toggles on every \x00 (text↔frame)
-        with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+        for attempt in range(1, _CHAT_STREAM_ATTEMPTS + 1):
+            try:
+                resp = urllib.request.urlopen(req, timeout=self.timeout)
+                break
+            except urllib.error.HTTPError as e:
+                if e.code < 500 or attempt >= _CHAT_STREAM_ATTEMPTS:
+                    raise
+                delay = _CHAT_STREAM_RETRY_BASE_S * 2 ** (attempt - 1)
+                if on_retry is not None:
+                    on_retry(http_error_msg(e), delay, attempt + 1, _CHAT_STREAM_ATTEMPTS)
+                time.sleep(delay)
+        with resp:
             # #935: a destructive command → JSON needs_confirm (not a stream); return it to the caller.
             if (resp.headers.get_content_type() == "application/json"):
                 try:
@@ -479,12 +497,14 @@ class Server:
         return self._req("POST", "/coders", {"agent": agent})
 
     def feedback(self, task_id: str, agent: str, content: str,
-                 exit_code: Optional[int] = None, stderr: str = "") -> Dict[str, Any]:
+                 exit_code: Optional[int] = None, stderr: str = "",
+                 launch_refusal: str = "") -> Dict[str, Any]:
         # #455: also report the raw run signal (exit code + a stderr tail) so the server can classify
         # a budget-exhausted run and fail over. Back-compatible: omitted ⇒ today's feedback-only post.
         return self._req("POST", "/feedback",
-                         {"task_id": task_id, "agent": agent, "content": content,
-                          "exit_code": exit_code, "stderr": stderr})
+                          {"task_id": task_id, "agent": agent, "content": content,
+                           "exit_code": exit_code, "stderr": stderr,
+                           **({"launch_refusal": launch_refusal} if launch_refusal else {})})
 
 
 # --------------------------------------------------------------------------- #
@@ -631,13 +651,15 @@ def _run_handover(item: Dict[str, Any], codedir: Path, log=print) -> Tuple[Optio
 
     # #449 (C0R-9): the SERVER resolves the agent's full spec from the config-driven registry and
     # ships it in the item — the client is a THIN RENDERER (no client-side registry, no agent→model
-    # table). Precedence per field: an EXPLICIT client-side override (GX10_AGENT_CMD / GX10_CLAUDE_BIN —
-    # the documented single-agent BYO path, review B round 4) > the server spec > the Claude default.
-    # So a default server's OPUS/SONNET template never makes a deliberate client override unreachable.
+    # table). The legacy single-agent BYO overrides apply as a pair only to a Claude base spec. A registry
+    # agent such as Kimi keeps the server's bin/template pair, which the tooling envelope authorizes together.
     model = item.get("model") or "claude-opus-4-8"
     effort = item.get("effort") or DEFAULT_EFFORT
-    bin_ = CLAUDE_BIN_OVERRIDE or item.get("bin") or CLAUDE_BIN
-    template = AGENT_CMD_OVERRIDE or item.get("cmd_template") or DEFAULT_AGENT_CMD
+    server_bin = item.get("bin") or "claude"
+    is_claude_spec = _is_claude_spec(server_bin)
+    bin_ = (CLAUDE_BIN_OVERRIDE or server_bin) if is_claude_spec else server_bin
+    template = ((AGENT_CMD_OVERRIDE or item.get("cmd_template") or DEFAULT_AGENT_CMD)
+                if is_claude_spec else (item.get("cmd_template") or DEFAULT_AGENT_CMD))
     permission = item.get("permission") or CLAUDE_PERMISSION_MODE
     bypass_requested = (permission == "bypassPermissions"
                         or "--dangerously-skip-permissions" in template)
@@ -670,9 +692,9 @@ def _run_handover(item: Dict[str, Any], codedir: Path, log=print) -> Tuple[Optio
               f"short result summary to {fb_path}. The FIRST line of that file must be `status: done` when "
               f"complete (the pipeline advances ONLY on `status: done`), otherwise `status: blocked` or "
               f"`status: clarification_needed`.")
-    # #480/#994-S10: the server resolves the read-only Memory MCP whenever a memory service is
-    # configured and the agent ships an mcp_template. Empty when memory is unconfigured or the agent
-    # has no mcp_template; the client only renders what the server sent.
+    # #480/#994-S10/#1683: the server resolves the read-only Memory MCP connection whenever memory is
+    # configured; per-launch arguments additionally require an mcp_template. The client only renders what
+    # the server sent, so a persistently registered CLI gets an empty {mcp} plus the connection environment.
     # #1307: the {feedback} capture path is ABSOLUTE so it is independent of the coder's cwd.
     argv = build_agent_argv(template, bin=bin_, model=str(model),
                             effort=str(effort), permission=permission,
@@ -685,8 +707,13 @@ def _run_handover(item: Dict[str, Any], codedir: Path, log=print) -> Tuple[Optio
         from tooling_envelope_runtime import _envelope_authorize
         refused = _envelope_authorize(bin_, template)
     if refused:
+        if "resolved bin=" not in refused:
+            refused = (f"{refused} (resolved bin={bin_!r}, cmd_template={template!r}; "
+                       "no allow_list entry matched both)")
+        # This diagnostic is sent as the durable, operator-visible blocked_reason. It may expose the local
+        # executable's absolute install path, which is intentional for operations diagnosis.
         log(f"  ✗ {refused} — handover {tid} skipped")
-        return None, {"exit_code": None, "stderr_tail": refused}
+        return None, {"exit_code": None, "stderr_tail": refused, "launch_refusal": refused}
     log(f"  → code-agent (local): {tid} ({agent}, {model}, effort={effort})  cwd={launch_cwd}")
     # #480: the spawned MCP (a sub-subprocess of the agent CLI) inherits the memory connection from the
     # agent's env — the connection travels here, NEVER on the MCP JSON-RPC wire (secret-free).
@@ -765,43 +792,75 @@ def _run_handover(item: Dict[str, Any], codedir: Path, log=print) -> Tuple[Optio
     return None, meta
 
 
-def _renew_claim(srv: Server, tid: str, agent: str, stop: threading.Event) -> None:
+def _renew_claim(srv: Server, tid: str, agent: str, stop: threading.Event,
+                 renew_interval_s: float, log=print) -> None:
     """Best-effort lease renewal while a local coder owns the task."""
-    while not stop.wait(_CLAIM_RENEW_INTERVAL_S):
+    warned = False
+    while not stop.wait(renew_interval_s):
         try:
             srv.claim(tid, agent)
-        except Exception:   # noqa: BLE001 — lease loss must never interrupt the coder
-            pass
+        except Exception as e:   # noqa: BLE001 — lease loss must never interrupt the coder
+            if not warned:
+                warned = True
+                log(f"  ⚠ {tid}: claim lease renewal failed (continuing): {e}")
+
+
+def _is_claude_spec(server_bin: Any) -> bool:
+    """Mirror Ink's ``binMatches(binIdentity(bin or 'claude'), 'claude')`` decision."""
+    from ack.tooling_envelope import bin_matches
+    return bin_matches(server_bin or "claude", "claude")
 
 
 def _process_one(srv: Server, codedir: Path, item: Dict[str, Any], claimed: set,
                  log=print) -> bool:
-    """One pool job: run the handover locally, upload its feedback. On any failure
-    the task is UNclaimed so the next poll retries it. Returns True on a clean upload."""
+    """Run one handover and upload feedback; retry transient failures, retain launch refusals."""
     tid = item.get("id") or ""
     agent = (item.get("agent") or "OPUS").upper()
     renew_stop: Optional[threading.Event] = None
     renew_thr: Optional[threading.Thread] = None
+    claim_status = ""
     try:
-        srv.claim(tid, agent)
-    except Exception as e:  # noqa: BLE001 — an older/unreachable server must not block a working coder
-        log(f"  ⚠ {tid}: /claim failed (continuing): {e}")
-    else:
-        renew_stop = threading.Event()
-        renew_thr = threading.Thread(target=_renew_claim, args=(srv, tid, agent, renew_stop), daemon=True)
-        renew_thr.start()
+        claim = srv.claim(tid, agent)
+        if isinstance(claim, dict) and isinstance(claim.get("status"), str):
+            claim_status = claim["status"]
+    except Exception as e:  # noqa: BLE001 — #1738: an unconfirmed claim cannot authorize a launch
+        log(f"  ✗ {tid}: not launchable (/claim failed: {e}) — skipped")
+        claimed.discard(tid)
+        return False
+    # #1738: only the server's persisted in_progress state authorizes a paid coder launch.
+    if claim_status != "in_progress":
+        log(f"  ✗ {tid}: not launchable (claim status '{claim_status or 'missing'}') — skipped")
+        claimed.discard(tid)
+        return False
+    raw_renew_s = item.get("lease_renew_s")
+    try:
+        renew_interval_s = float(raw_renew_s)
+    except (TypeError, ValueError, OverflowError):
+        renew_interval_s = _CLAIM_RENEW_INTERVAL_S
+    if not math.isfinite(renew_interval_s) or not 0 < renew_interval_s <= 86400:
+        renew_interval_s = _CLAIM_RENEW_INTERVAL_S
+    renew_stop = threading.Event()
+    renew_thr = threading.Thread(
+        target=_renew_claim, args=(srv, tid, agent, renew_stop, renew_interval_s, log), daemon=True)
+    renew_thr.start()
+    launch_refused = False
     try:
         fb, meta = _run_handover(item, codedir, log=log)
+        launch_refused = bool(meta.get("launch_refusal"))
         # #455: ALWAYS report the run signal (even with no feedback) so the server can classify a
         # budget-exhausted run → trip the breaker + fail over on the next poll, instead of retrying
         # the same out-of-budget agent forever. The lease is renewed THROUGH the feedback upload so a
         # slow post can't let it lapse into a double-run (#1525).
-        res = srv.feedback(tid, agent, fb or "",
-                           exit_code=meta.get("exit_code"), stderr=meta.get("stderr_tail", ""))
+        res = srv.feedback(tid, agent, fb or "", exit_code=meta.get("exit_code"),
+                           stderr=meta.get("stderr_tail", ""),
+                           launch_refusal=meta.get("launch_refusal", ""))
         cls = res.get("classification")
         if cls == "ok-feedback" or (cls is None and fb):
             log(f"  ✓ feedback uploaded: {tid} → {res.get('feedback_file')}")
             return True
+        if cls == "launch-refused" or meta.get("launch_refusal"):
+            log(f"  ✗ {tid}: launch permanently refused and reported; task left blocked")
+            return False
         if cls == "agent-unavailable":
             log(f"  ⚠ {tid}: {agent} unavailable (budget/quota) → failing over to a peer on the next poll")
         else:
@@ -818,6 +877,12 @@ def _process_one(srv: Server, codedir: Path, item: Dict[str, Any], claimed: set,
             renew_stop.set()
         if renew_thr is not None:
             renew_thr.join(timeout=5.0)
+    if launch_refused:
+        # The refusal is deterministic even when /feedback failed. Keep it in this process-lifetime
+        # `claimed` set so later polls cannot re-dispatch it; a client restart starts with a fresh set and
+        # retries after the operator has had an opportunity to fix the configuration.
+        log(f"  ✗ {tid}: launch permanently refused locally; task retained until client restart")
+        return False
     try:
         srv.unclaim(tid)
     except Exception as e:  # noqa: BLE001 — reconciler/stall watchdog remain the backstop
@@ -842,7 +907,7 @@ def dispatch_pending(srv: Server, codedir: Path, pool: ThreadPoolExecutor,
         # CLI-3 (#503): atomic check-then-claim under a lock — an overlapping /auto poll + /work (or two
         # poll ticks) could otherwise both pass `tid in claimed` and double-launch the same handover.
         with _CLAIM_LOCK:
-            if not tid or tid in claimed:
+            if not tid or tid in claimed or item.get("blocked_kind") == "escalated":
                 continue
             claimed.add(tid)  # claim immediately → no double-launch on the next poll
         futures.append(pool.submit(_process_one, srv, codedir, item, claimed, log))
@@ -1032,7 +1097,8 @@ def repl(srv: Server, codedir: Path, max_agents: int = DEFAULT_MAX_AGENTS) -> No
                     if auto_stop is None:
                         auto_stop = threading.Event()
                         threading.Thread(target=_auto_loop, args=(auto_stop,), daemon=True).start()
-                        print(f"  [AUTO] poller ON — pulls handovers every 5s, ≤{max_agents} parallel")
+                        print(f"  [AUTO] client poller ON — pulls handovers every 5s, "
+                              f"≤{max_agents} local coders parallel")
                     else:
                         print("  [AUTO] already running")
                 elif arg == "off":
@@ -1057,7 +1123,11 @@ def repl(srv: Server, codedir: Path, max_agents: int = DEFAULT_MAX_AGENTS) -> No
                 while "\n" in buf["s"]:
                     out, buf["s"] = buf["s"].split("\n", 1)
                     print(_style_stream_line(out), flush=True)
-            res = srv.chat_stream(payload, _emit)
+
+            def _retry(reason: str, _delay: float, next_attempt: int, max_attempts: int) -> None:
+                print(_c(f"  ↻ {reason} — retrying ({next_attempt}/{max_attempts})", "gray"), flush=True)
+
+            res = srv.chat_stream(payload, _emit, on_retry=_retry)
             if res and res.get("needs_confirm"):   # #935: destructive → not executed; re-run with --yes
                 ci = res["needs_confirm"]
                 # #956: the reason is the full localized line (reason + how-to-confirm) → print it single-language

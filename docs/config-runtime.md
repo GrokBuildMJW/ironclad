@@ -59,6 +59,18 @@ Example:
 5. With no live config yet (`_EFFECTIVE_CFG is None`, before startup has published its merged config), `set`
    is refused without changing state.
 
+A successful write is also recorded as a process-local **session override**. Every `/switch` rebuilds the
+effective tree in this order:
+
+```
+deployment base  <  project overlay  <  session override
+```
+
+This applies to a same-project re-assert as well as a switch to another project, so a successful `/config set`
+remains global for the engine session. The record is in memory only and is empty after a process restart. If a
+future project overlay makes one recorded value invalid, that value is skipped for that switch (the remaining
+overrides still apply) and `/switch` reports the affected dotted key; the normal path adds no switch message.
+
 Startup keeps a direct apply path because it begins from fresh process state. Config discovery first merges
 all sorted top-level files, includes, and nested domain trees into one projection; that final merged tree is
 validated before any runtime state or `_EFFECTIVE_CFG` is published.
@@ -235,6 +247,9 @@ schema; retired protections appear only as tombstone metadata and never as live 
 | `code_agents.pinned` | `str or null` | `null` | — | `runtime` | `switch` | — | — |
 | `code_agents.pool` | `list` | `[{"agent_id": "OPUS", "bin": "claude", "cmd_template": "{bin} --model {model} --effort {effort} --permission-mode {permission} --print {prompt}", "cost_per_1k_in": 0.015, "cost_per_1k_out": 0.075, "display": "Claude Opus 4.8", "effort": "xhigh", "kind": "cli", "model": "claude-opus-4-8", "permission_mode": "default", "provider_id": "claude-opus"}, {"agent_id": "SONNET", "bin": "claude", "cmd_template": "{bin} --model {model} --effort {effort} --permission-mode {permission} --print {prompt}", "cost_per_1k_in": 0.003, "cost_per_1k_out": 0.015, "display": "Claude Sonnet 5", "effort": "high", "kind": "cli", "model": "claude-sonnet-5", "permission_mode": "default", "provider_id": "claude-sonnet"}]` | — | `boot_only` | `tuning` | — | — |
 | `code_agents.timeout_s` | `int or float` | `1800.0` | `GX10_CODE_AGENTS_TIMEOUT_S` | `runtime` | `tuning` | > 0; <= 7200 | — |
+| `code_review.agent` | `str` | `""` | `GX10_CODE_REVIEW_AGENT` | `runtime` | `tuning` | — | — |
+| `code_review.max_rounds` | `int` | `2` | `GX10_CODE_REVIEW_MAX_ROUNDS` | `runtime` | `tuning` | >= 1; <= 10 | — |
+| `code_review.mode` | `str` | `"off"` | `GX10_CODE_REVIEW_MODE` | `runtime` | `switch` | enum: "off", "simple", "review_of_review" | — |
 | `connection.api_key_env` | `str` | `"GX10_API_KEY"` | — | `runtime` | `tuning` | — | — |
 | `connection.base_url` | `str` | `"http://localhost:8000/v1"` | `GX10_BASE_URL` | `runtime` | `tuning` | — | — |
 | `connection.connect_timeout_s` | `int or float` | `10.0` | `GX10_LLM_CONNECT_TIMEOUT_S` | `runtime` | `tuning` | > 0; <= 120; relationship: timeout_relationship | — |
@@ -430,6 +445,7 @@ creating a protection bypass.
 - `autopilot.stream`
 - `autopilot.terminate_on_advance`
 - `code_agents.pinned`
+- `code_review.mode`
 - `context.emergency_summarize`
 - `context.proactive_roll`
 - `context.rag_enabled`

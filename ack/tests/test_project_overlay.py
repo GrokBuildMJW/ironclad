@@ -52,6 +52,33 @@ def test_nested_locked_providers_budget():
     assert "providers.budget" in dropped
 
 
+def test_generation_language_is_dropped():
+    base = {"generation": {"language": "en"}}
+    overlay = {"generation": {"language": "de"}}
+    merged, dropped = po.apply_project_overlay(base, overlay)
+
+    assert merged["generation"]["language"] == "en"
+    assert dropped == ["generation"]
+
+
+def test_generation_max_tokens_is_dropped():
+    base = {"generation": {"max_tokens": 4096}}
+    overlay = {"generation": {"max_tokens": 8192}}
+    merged, dropped = po.apply_project_overlay(base, overlay)
+
+    assert merged["generation"]["max_tokens"] == 4096
+    assert dropped == ["generation"]
+
+
+def test_generation_drop_preserves_non_locked_overlay_key():
+    base = {"generation": {"language": "en"}, "dev_process": {"tier": 1}}
+    overlay = {"generation": {"language": "de"}, "dev_process": {"tier": 2}}
+    merged, dropped = po.apply_project_overlay(base, overlay)
+
+    assert merged == {"generation": {"language": "en"}, "dev_process": {"tier": 2}}
+    assert dropped == ["generation"]
+
+
 def test_base_is_not_mutated():
     base = {"dev_process": {"tier": 1, "push": "off"}}
     overlay = {"dev_process": {"tier": 2}}

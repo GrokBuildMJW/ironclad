@@ -68,12 +68,13 @@ def _wrap(body: str) -> str:
 
 @dataclass
 class Deps:
-    """Injected handles. run()/standalone binds the real engine globals; tests pass stubs."""
+    """Injected handles. _engine_deps() binds the real engine globals; standalone and tests pass stubs."""
     llm: Any = None                              # ClassifierLLM for the router (complete_json)
     registry: Any = None                         # PanelRegistry
     dispatcher: Any = None                       # P0 ProviderDispatcher (real routing/offload); None → in-engine fanout
     fanout: Optional[Callable] = None            # (prompts, *, system, max_tokens) -> list[worker dict]
     synth_llm: Optional[Callable] = None         # (prompt, *, system, max_tokens) -> str
+    degrade_format: Optional[Callable] = None    # _format_parallel
     reducer: Optional[Callable] = None           # _reduce_worker_results
     store: Any = None                            # TaskStore
     writer: Optional[Callable] = None            # _atomic_write(path, text)
@@ -206,6 +207,7 @@ def _engine_deps(*, artifact_slug: Optional[str] = None) -> Deps:
         d.routing = cfg.providers.routing.model_dump()
         d.default_offload = cfg.providers.default_offload
         d.sovereignty = cfg.sovereignty.model_dump()
+        d.degrade_format = getattr(gx10, "_format_parallel", None)
         d.reducer = getattr(gx10, "_reduce_worker_results", None)
         d.writer = getattr(gx10, "_atomic_write", None)
         d.registry = get_registry(_MPR_ROOT)
@@ -236,6 +238,20 @@ def _engine_deps(*, artifact_slug: Optional[str] = None) -> Deps:
     return d
 
 
+def _no_active_error(engine: Any = None) -> str:
+    """Render the engine's canonical localized no-active guidance, with a correct English fallback."""
+    guidance = "no active initiative — run `/project new <name>` (or `/project use <slug>`) first"
+    accessor = getattr(engine, "_msg", None)
+    if callable(accessor):
+        try:
+            rendered = accessor("init.no_active")
+            if isinstance(rendered, str) and rendered.strip():
+                guidance = rendered.strip()
+        except Exception:  # noqa: BLE001 — standalone/minimal engine → correct English fallback
+            pass
+    return f"ERROR: mpr_research: the artifacts would have no home. {guidance}"
+
+
 def mpr_research_run(query: str, *, route_hint: str = "", domain_hint: str = "", mode_hint: str = "",
                      files: Optional[List[str]] = None, audit_level: str = "",
                      artifact_slug: Optional[str] = None) -> str:
@@ -264,8 +280,7 @@ def mpr_research_run(query: str, *, route_hint: str = "", domain_hint: str = "",
                         "refuse (must be an existing unit of the active project).")
             _target_slug = _want
         elif _gx.artifact_root_soft() is None:
-            return ("ERROR: mpr_research: no active initiative — the artifacts would have no home. "
-                    "Run `/initiative new <name> --type mpr` (or `--type software`) first.")
+            return _no_active_error(_gx)
     except Exception:  # noqa: BLE001 — no engine context (standalone) → normal run
         _gx = None
         _target_slug = (artifact_slug or "").strip() or None
@@ -437,7 +452,8 @@ def run_mpr(query: str, *, route_hint: str = "", domain_hint: str = "", mode_hin
             evidence_source=(decision.evidence_source.value if decision.evidence_source else "mixed"),
             perspectives=presults,
         )
-        out = synthesize(synth_inp, llm_call=deps.synth_llm, lang=deps.language) if deps.synth_llm else None
+        out = synthesize(synth_inp, llm_call=deps.synth_llm,
+                         degrade_format=deps.degrade_format, lang=deps.language) if deps.synth_llm else None
     except Exception as exc:  # noqa: BLE001
         return f"ERROR: mpr_research: synthesis: {exc!r}"
     if out is None:

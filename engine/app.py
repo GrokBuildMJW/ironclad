@@ -302,8 +302,12 @@ class IroncladApp(App):
                 ln, partial["buf"] = partial["buf"].split("\n", 1)
                 emit_line(ln)
 
+        def on_retry(reason: str, _delay: float, next_attempt: int, max_attempts: int) -> None:
+            self._safe_call(self._log, Text(
+                f"  ↻ {reason} — retrying ({next_attempt}/{max_attempts})", style="dim"))
+
         try:
-            res = self.srv.chat_stream(payload, on_text)
+            res = self.srv.chat_stream(payload, on_text, on_retry=on_retry)
             if res and res.get("needs_confirm"):   # #935: destructive → not executed; re-run with --yes
                 ci = res["needs_confirm"]   # #956: reason is the full localized line → single-language
                 self._safe_call(self._log, Text(

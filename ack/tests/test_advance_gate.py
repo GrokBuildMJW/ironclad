@@ -47,16 +47,69 @@ def test_advance_allows_only_explicit_done(monkeypatch, tmp_path):
 
     assert out.startswith("OK: pipeline advanced")
     assert gx10._store().get(tid)["status"] == "done"
+    assert "WARNING: requested agent" not in out
+
+
+def test_done_idempotency_gate_archives_redundant_feedback_without_clobbering(monkeypatch, tmp_path):
+    _setup(monkeypatch, tmp_path)
+    tid = _staged()
+    assert gx10._advance_pipeline(tid, "OPUS").startswith("OK: pipeline advanced")
+    archive = gx10.archive_feedback_dir()
+    archived = archive / f"{tid}_OPUS-feedback.md"
+    original = archived.read_text(encoding="utf-8")
+    fresh = gx10.feedback_dir() / archived.name
+    fresh.write_text("status: done\nredundant upload\n", encoding="utf-8")
+
+    out = gx10._advance_pipeline(tid, "OPUS")
+
+    assert out.startswith(f"OK: task {tid} is already done")
+    assert "Absorbed redundant feedback" in out
+    assert not fresh.exists()
+    assert archived.read_text(encoding="utf-8") == original
+    redundant = list(archive.glob(f"{tid}_OPUS-feedback.redundant-*.md"))
+    assert len(redundant) == 1
+    assert "redundant upload" in redundant[0].read_text(encoding="utf-8")
 
 
 def test_advance_finds_done_feedback_regardless_of_caller_agent(monkeypatch, tmp_path):
     _setup(monkeypatch, tmp_path)
+    monkeypatch.setattr(gx10, "_code_agent_registry", lambda: types.SimpleNamespace(
+        has=lambda agent: agent in {"OPUS", "SONNET", "CODEX"}))
     tid = _staged(agent="SONNET")
+
+    out = gx10._advance_pipeline(tid, "CODEX")
+
+    assert out.startswith("OK: pipeline advanced")
+    assert gx10._store().get(tid)["status"] == "done"
+    assert "WARNING: requested agent CODEX" in out
+    assert "actual feedback agent SONNET" in out
+    assert "used filename-derived agent SONNET" in out
+    assert out.index("WARNING: requested agent CODEX") < out.index("UNTRUSTED CONTENT")
+
+
+def test_advance_surfaces_bounded_coder_validation_excerpt(monkeypatch, tmp_path):
+    _setup(monkeypatch, tmp_path)
+    content = "status: done\n11 passed in 0.42s\nHEAD\n" + "X" * 50_000 + "\nTAIL validation complete"
+    tid = _staged(content)
 
     out = gx10._advance_pipeline(tid, "OPUS")
 
     assert out.startswith("OK: pipeline advanced")
-    assert gx10._store().get(tid)["status"] == "done"
+    assert "Coder-reported validation (bounded excerpt):" in out
+    assert "11 passed in 0.42s" in out and "TAIL validation complete" in out
+    assert "chars omitted" in out
+    assert "source=coder_feedback" in out and "END UNTRUSTED CONTENT" in out
+    fence_at = out.index("[UNTRUSTED CONTENT")
+    assert out[:fence_at].startswith("OK: pipeline advanced")
+    assert "feedback found:" in out[:fence_at]
+    assert gx10._fence_untrusted_result("advance_pipeline", out) == out
+    excerpt = gx10._advance_feedback_excerpt(content)
+    assert len(excerpt) <= gx10._ADVANCE_FEEDBACK_EXCERPT_CHARS
+    assert "advance_pipeline" not in gx10._INGESTION_TOOLS
+    assert "advance_pipeline" not in gx10._UNTRUSTED_RESULT_TOOLS
+    monkeypatch.setattr(gx10, "_bounded_advance_feedback",
+                        lambda *a: (_ for _ in ()).throw(ValueError("odd")))
+    assert gx10._advance_feedback_excerpt("status: done\nodd feedback") == ""   # surfacing stays fail-soft
 
 
 @pytest.mark.parametrize(
@@ -119,6 +172,7 @@ def test_advance_refuses_unreadable_feedback(monkeypatch, tmp_path):
 
     _assert_refused(tid, out)
     assert "feedback is unreadable" in out and "permission denied" in out
+    assert "Coder-reported validation" not in out
 
 
 @pytest.mark.parametrize(

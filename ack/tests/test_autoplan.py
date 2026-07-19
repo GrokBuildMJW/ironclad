@@ -58,6 +58,11 @@ def _enqueue_capture():
     return box, (lambda p: box.append(p))
 
 
+def _queued_prompt(item):
+    _tid, prompt = gx10._continuation_authoring_item(item)
+    return prompt
+
+
 # ── leg 1: open units ─────────────────────────────────────────────────────────
 
 def test_open_unit_enqueues_next_unit_turn(monkeypatch):
@@ -65,8 +70,9 @@ def test_open_unit_enqueues_next_unit_turn(monkeypatch):
     box, enq = _enqueue_capture()
     gx10._continuation_tick("KGC-1", enq)
     assert len(box) == 1
-    assert box[0].startswith("[NEXT-UNIT]")
-    assert "task_id='KGC-2'" in box[0] and "NO task_json" in box[0].replace("no task_json", "NO task_json")
+    prompt = _queued_prompt(box[0])
+    assert prompt.startswith("[NEXT-UNIT]")
+    assert "task_id='KGC-2'" in prompt and "NO task_json" in prompt.replace("no task_json", "NO task_json")
     assert gx10._AUTOPLAN_DONE == 1
 
 
@@ -198,12 +204,22 @@ def test_selection_excludes_epics_and_staged(monkeypatch):
     assert win["id"] == "KGC-3" and n_open == 1
 
 
+def test_selection_never_returns_done_unit_from_stale_pending_snapshot(monkeypatch):
+    stale_done = _unit("KGC-2", prio="critical", status="done")
+    pending = _unit("KGC-3", prio="low", status="pending")
+    monkeypatch.setattr(gx10, "_find_handover", lambda tid: None)
+
+    win, elig, n_open = gx10._select_next_unit(_FakeStore(pending=[stale_done, pending]))
+
+    assert win["id"] == "KGC-3" and elig == 1 and n_open == 1
+
+
 # ── the bootstrap kick (#1296 — arming must stage the FIRST unit) ────────────
 
 def test_kick_enqueues_bootstrap_turn(monkeypatch):
     monkeypatch.setattr(gx10, "_store", lambda: _FakeStore(pending=[_unit("KGC-2")]))
     gx10._continuation_kick()
-    prompt = gx10._INPUT_QUEUE.get_nowait()
+    prompt = _queued_prompt(gx10._INPUT_QUEUE.get_nowait())
     assert prompt.startswith("[NEXT-UNIT] Automation armed")
     assert "task_id='KGC-2'" in prompt
     assert "PLAN-CHANGE" not in prompt          # no predecessor feedback on the bootstrap
@@ -220,3 +236,145 @@ def test_kick_is_noop_when_disarmed_busy_or_empty(monkeypatch):
     monkeypatch.setattr(gx10, "_store", lambda: _FakeStore())
     assert gx10._continuation_kick() is False    # nothing to select
     assert gx10._INPUT_QUEUE.empty()
+
+
+# ── reconciler heartbeat recovery (#1651) ───────────────────────────────────
+
+def _reproduced_idle_store():
+    epic = _unit("KGC-1", typ="epic", created="2026-07-08T08:00:00Z")
+    done = _unit("KGC-2", created="2026-07-08T09:00:00Z")
+    done["status"] = "done"
+    return _FakeStore(
+        pending=[
+            epic,
+            _unit("KGC-4", created="2026-07-08T11:00:00Z", dependencies=["KGC-2"]),
+            _unit("KGC-3", created="2026-07-08T10:00:00Z", dependencies=["KGC-2"]),
+        ],
+        done=[done],
+    )
+
+
+def test_reconciler_refires_reproduced_idle_continuation_without_spending_budget(monkeypatch):
+    store = _reproduced_idle_store()
+    box, enq = _enqueue_capture()
+
+    assert gx10._continuation_reconcile_once(store, enq) is True
+
+    assert len(box) == 1
+    prompt = _queued_prompt(box[0])
+    assert prompt.startswith("[NEXT-UNIT] The automation heartbeat recovered")
+    assert "task_id='KGC-3'" in prompt          # selector winner, not merely the first list item
+    assert gx10._AUTOPLAN_DONE == 0             # recovery is not a completed task
+    assert gx10.AUTOPILOT_AUTOPLAN is True      # max_tasks budget remains armed
+
+
+def test_reconciler_enqueue_retains_notice_until_unit_really_progresses(monkeypatch):
+    store = _reproduced_idle_store()
+    monkeypatch.setattr(gx10, "_store", lambda: store)
+    monkeypatch.setattr(gx10, "registry_health",
+                        lambda: {"status": "ok", "active_project": "demo", "home": None})
+    monkeypatch.setattr(gx10, "active_slug", lambda: None)
+    gx10._set_automation_notice(
+        "continuation authoring for KGC-3 failed: model unavailable; the heartbeat will retry"
+    )
+    box, enq = _enqueue_capture()
+
+    assert gx10._continuation_reconcile_once(store, enq) is True
+
+    assert "model unavailable" in gx10._AUTOMATION_NOTICE
+    gx10._continuation_authoring_result("KGC-3", progressed=True)
+    assert gx10._AUTOMATION_NOTICE == ""
+    assert "automation notice:" not in gx10._steering_state_block()
+
+
+def test_reconciler_bounds_repeated_failed_authoring_and_surfaces_ceiling(monkeypatch):
+    store = _reproduced_idle_store()
+    box, enq = _enqueue_capture()
+
+    for attempt in range(gx10._CONTINUATION_RECOVERY_MAX_ATTEMPTS):
+        assert gx10._continuation_reconcile_once(store, enq) is True
+        gx10._continuation_authoring_result(
+            "KGC-3", progressed=False, error="RuntimeError('model unavailable')"
+        )
+        assert len(box) == attempt + 1
+
+    assert gx10._continuation_reconcile_once(store, enq) is False
+    assert len(box) == gx10._CONTINUATION_RECOVERY_MAX_ATTEMPTS
+    assert "stopped after 3 recovery attempts" in gx10._AUTOMATION_NOTICE
+    assert "automatic recovery is exhausted" in gx10._AUTOMATION_NOTICE
+
+
+def test_tick_and_heartbeat_share_one_atomic_authoring_latch(monkeypatch):
+    store = _reproduced_idle_store()
+    monkeypatch.setattr(gx10, "_store", lambda: store)
+    box, enq = _enqueue_capture()
+
+    assert gx10._continuation_tick("KGC-2", enq) is True
+    assert gx10._continuation_reconcile_once(store, enq) is False
+
+    assert len(box) == 1
+    assert gx10._continuation_authoring_item(box[0])[0] == "KGC-3"
+
+
+@pytest.mark.parametrize("tid", ["", "   "])
+def test_enqueue_next_unit_refuses_blank_id_without_latching_or_enqueueing(tid):
+    box, enq = _enqueue_capture()
+
+    assert gx10._enqueue_next_unit(None, _unit(tid), enq, recovery=True) is False
+
+    assert gx10._CONTINUATION_AUTHORING == set()
+    assert gx10._CONTINUATION_RECOVERY_ATTEMPTS == {}
+    assert box == []
+
+
+@pytest.mark.parametrize("progress", ["staged", "in_progress", "done"])
+def test_recovery_attempts_reset_after_unit_progress(monkeypatch, progress):
+    idle_store = _reproduced_idle_store()
+    progressed = _unit("KGC-3")
+    progressed["status"] = progress if progress != "staged" else "pending"
+    store = (_FakeStore(in_progress=[progressed]) if progress == "in_progress"
+             else _FakeStore(done=[progressed]) if progress == "done"
+             else idle_store)
+    monkeypatch.setattr(
+        gx10, "_find_handover",
+        lambda tid: Path("handover.md") if progress == "staged" else None,
+    )
+    gx10._CONTINUATION_RECOVERY_ATTEMPTS["KGC-3"] = gx10._CONTINUATION_RECOVERY_MAX_ATTEMPTS
+
+    gx10._continuation_reset_progress(store)
+    assert "KGC-3" not in gx10._CONTINUATION_RECOVERY_ATTEMPTS
+
+    monkeypatch.setattr(gx10, "_find_handover", lambda _tid: None)
+    box, enq = _enqueue_capture()
+    assert gx10._continuation_reconcile_once(idle_store, enq) is True
+    assert len(box) == 1
+
+
+def test_reconciler_surfaces_open_unit_deadlock(monkeypatch):
+    store = _FakeStore(pending=[_unit("KGC-3", blocked=True)])
+
+    assert gx10._continuation_reconcile_once(store, lambda _item: None) is False
+
+    assert "continuation deadlock" in gx10._AUTOMATION_NOTICE
+    assert "none selectable" in gx10._AUTOMATION_NOTICE
+
+
+@pytest.mark.parametrize("armed,busy", [(True, True), (False, False)])
+def test_reconciler_refire_respects_work_and_guided_gates(monkeypatch, armed, busy):
+    gx10.AUTOPILOT_AUTOPLAN = armed
+    store = (_FakeStore(in_progress=[_unit("KGC-9")], pending=[_unit("KGC-3")])
+             if busy else _reproduced_idle_store())
+    box, enq = _enqueue_capture()
+
+    assert gx10._continuation_reconcile_once(store, enq) is False
+    assert box == []
+    assert gx10._AUTOPLAN_DONE == 0
+
+
+def test_reconciler_refire_pauses_for_sealed_channel(monkeypatch):
+    box, enq = _enqueue_capture()
+
+    assert gx10._continuation_reconcile_once(_reproduced_idle_store(), enq, sealed=True) is False
+
+    assert box == []
+    assert "channel sealed" in gx10._AUTOMATION_NOTICE

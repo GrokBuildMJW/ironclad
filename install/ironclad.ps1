@@ -20,6 +20,10 @@ if (-not (Test-Path $cfgPath)) {
   }
 }
 $cfg = Get-Content $cfgPath -Raw | ConvertFrom-Json
+if ($cfg.root -and (Test-Path (Join-Path $cfg.root ".install-incomplete"))) {
+  Say "the installed runtime is incomplete (a previous install did not finish) — re-run the Ironclad installer to repair it."
+  exit 2
+}
 $type = if ($cfg.type) { "$($cfg.type)".Trim().ToLower() } else { "desktop" }
 
 # spark: thin client → a remote orchestrator (no local engine/venv). 'desktop' (default) runs the engine locally.

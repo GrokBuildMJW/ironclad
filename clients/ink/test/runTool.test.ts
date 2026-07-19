@@ -110,6 +110,36 @@ test('runTool resolves relative paths + runs execute_command in the shipped base
   await fs.rm(base, {recursive: true, force: true});
 });
 
+test('read-only tools fall back to a contained project root while writes stay at the code root (#1615)', async () => {
+  const root = await tmp();
+  const base = path.join(root, 'src');
+  const vault = path.join(root, 'vault', 'demo');
+  await fs.mkdir(base, {recursive: true});
+  await fs.mkdir(vault, {recursive: true});
+  await fs.writeFile(path.join(vault, 'handover.md'), 'vault sibling', 'utf-8');
+  const relativeVault = path.join('vault', 'demo');
+
+  assert.equal(
+    await runTool('read_file', {path: path.join(relativeVault, 'handover.md')}, base, root),
+    'vault sibling',
+  );
+  assert.match(await runTool('list_directory', {path: relativeVault}, base, root), /\[F\] handover\.md/);
+
+  await runTool('write_file', {path: path.join('vault', 'written.md'), content: 'code-root write'}, base, root);
+  assert.equal(await fs.readFile(path.join(base, 'vault', 'written.md'), 'utf-8'), 'code-root write');
+  assert.equal(await exists(path.join(root, 'vault', 'written.md')), false);
+
+  const outside = path.join(root, '..', `ironclad-outside-${path.basename(root)}.txt`);
+  await fs.writeFile(outside, 'outside secret', 'utf-8');
+  const traversal = path.join('vault', '..', '..', path.basename(outside));
+  const refused = await runTool('read_file', {path: traversal}, base, root);
+  assert.match(refused, /^ERROR: Not found:/);
+  assert.doesNotMatch(refused, /outside secret/);
+
+  await fs.rm(outside, {force: true});
+  await fs.rm(root, {recursive: true, force: true});
+});
+
 test('runTool falls back to process.cwd() when baseCwd is missing on this host; absolute paths unaffected (#1317)', async () => {
   const d = await tmp();
   const ghost = path.join(d, 'does-not-exist');
@@ -331,7 +361,9 @@ test('#1489 execute_command abort kills a spawned descendant tree', {
   try {
     const {command, ready, sentinel} = await processTreeCommand(d);
     const ac = new AbortController();
-    const running = withSandboxShim(() => runTool('execute_command', {command, timeout: 10}, undefined, 'auto', ac.signal));
+    const running = withSandboxShim(() => runTool(
+      'execute_command', {command, timeout: 10}, undefined, undefined, 'auto', ac.signal,
+    ));
     const deadline = Date.now() + 5000;
     while (!(await exists(ready)) && Date.now() < deadline) await delay(10);
     ac.abort();

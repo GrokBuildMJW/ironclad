@@ -58,6 +58,20 @@ class _ForeignProvider:
     def brief(self, scopes, limit=10): return ""
 
 
+class _RecordingWorker:
+    """A deterministic worker stand-in that exposes the submitted Trajectory."""
+
+    def __init__(self):
+        self.items = []
+
+    def submit(self, item):
+        self.items.append(item)
+        return True
+
+    def stop(self):
+        pass
+
+
 def _hard_reset():
     """ACE keeps process-global state (the registered store + the background worker) — quiesce + clear it so
     each test starts clean and no daemon bleeds across tests."""
@@ -83,21 +97,26 @@ def _reset(tmp_path, monkeypatch):
     gx10._EFFECTIVE_CFG = saved
 
 
-def _drive_full(tmp_path, monkeypatch, *, feedback="status: done\n\ndone feedback"):
+def _drive_full(tmp_path, monkeypatch, *, feedback="status: done\n\ndone feedback", cfg=None,
+                feedback_agent="OPUS", requested_agent="OPUS", worker=None):
     """stage → feedback → advance through the real wrapper inside a bound scope ("ns"). Quiesces the worker
     daemon first so a submitted Trajectory stays queued for a deterministic synchronous drain. Returns
     (advance_out, tid)."""
-    gx10._apply_config(gx10._code_defaults())
+    cfg = cfg or gx10._code_defaults()
+    gx10._EFFECTIVE_CFG = cfg
+    gx10._apply_config(cfg)
     if gx10._ACE_WORKER is not None:
         gx10._ACE_WORKER.stop()                 # halt the daemon; submissions stay queued (deterministic)
+    if worker is not None:
+        gx10._ACE_WORKER = worker
     gx10.STORE = None
     monkeypatch.chdir(tmp_path)
     gx10._dispatch(_FakeAgent(), "initiative new Order Service --type software")
     approve_active_design(gx10)
     gx10._stage_handover(None, "OPUS", "## Handover\nbuild it", task_json=_TASK, force=True)
     tid = gx10._store().list("pending")[0]["id"]
-    (gx10.feedback_dir() / f"{tid}_OPUS-feedback.md").write_text(feedback, encoding="utf-8")
-    out = gx10._advance_pipeline(tid, "OPUS")
+    (gx10.feedback_dir() / f"{tid}_{feedback_agent}-feedback.md").write_text(feedback, encoding="utf-8")
+    out = gx10._advance_pipeline(tid, requested_agent)
     return out, tid
 
 
@@ -114,6 +133,61 @@ def test_completion_submits_trajectory_off_the_hot_path(tmp_path, monkeypatch):
         out, _tid = _drive_full(tmp_path, monkeypatch)
     assert out.startswith("OK: pipeline advanced")
     assert gx10._ACE_WORKER.pending() == 1                          # submitted, NOT run inline on the turn
+
+
+def test_mismatched_request_publishes_feedback_agent_and_nonempty_trajectory(tmp_path, monkeypatch):
+    cfg = gx10._code_defaults()
+    cfg["code_agents"]["pool"].append({
+        "provider_id": "cli-codex", "kind": "cli", "agent_id": "CODEX",
+        "model": "gpt-codex", "bin": "codex", "cmd_template": "{bin} {prompt}",
+        "effort": "high", "permission_mode": "default",
+    })
+    worker = _RecordingWorker()
+    seen = []
+    hooks.register_hook("pre_advance", lambda ctx: seen.append(("pre", dict(ctx))))
+    hooks.register_hook("post_feedback", lambda ctx: seen.append(("post", dict(ctx))))
+    feedback = "status: done\n\nSonnet completed the parser and validation checks."
+
+    with pc.use(ProjectContext("p", str(tmp_path), "ns")):
+        out, tid = _drive_full(tmp_path, monkeypatch, feedback=feedback, cfg=cfg,
+                               feedback_agent="SONNET", requested_agent="CODEX", worker=worker)
+
+    assert "WARNING: requested agent CODEX does not match actual feedback agent SONNET" in out
+    assert [(event, ctx["agent"]) for event, ctx in seen] == [("pre", "CODEX"), ("post", "SONNET")]
+    assert (gx10.archive_feedback_dir() / f"{tid}_SONNET-feedback.md").exists()
+    assert len(worker.items) == 1
+    trajectory = worker.items[0]["trajectory"]
+    assert trajectory.outcome == "success"
+    assert trajectory.steps == [feedback.strip()]
+
+
+def test_missing_feedback_does_not_submit_or_consume_injected_bullets(tmp_path, monkeypatch):
+    cfg = gx10._code_defaults()
+    gx10._EFFECTIVE_CFG = cfg
+    gx10._apply_config(cfg)
+    gx10._ACE_WORKER.stop()
+    worker = gx10._ACE_WORKER = _RecordingWorker()
+    gx10.STORE = None
+    monkeypatch.chdir(tmp_path)
+
+    with pc.use(ProjectContext("p", str(tmp_path), "ns")):
+        gx10._dispatch(_FakeAgent(), "initiative new Order Service --type software")
+        approve_active_design(gx10)
+        gx10._stage_handover(None, "OPUS", "## Handover\nbuild it", task_json=_TASK, force=True)
+        tid = gx10._store().list("pending")[0]["id"]
+        gx10._ace_record_injected(tid, ["b-0", "b-2"])
+
+        missing = gx10._advance_pipeline(tid, "OPUS")
+        assert missing.startswith("ERROR: feedback missing")
+        assert worker.items == []
+
+        (gx10.feedback_dir() / f"{tid}_OPUS-feedback.md").write_text(
+            "status: done\n\nCompleted after feedback arrived.", encoding="utf-8")
+        retry = gx10._advance_pipeline(tid, "OPUS")
+
+    assert retry.startswith("OK: pipeline advanced")
+    assert len(worker.items) == 1
+    assert worker.items[0]["trajectory"].used_bullet_ids == ["b-0", "b-2"]
 
 
 def test_drain_learns_feedback_into_the_playbook(tmp_path, monkeypatch):

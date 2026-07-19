@@ -18,6 +18,11 @@ import gx10  # noqa: E402
 import pytest  # noqa: E402
 
 
+@pytest.fixture(autouse=True)
+def _empty_session_overrides(monkeypatch):
+    monkeypatch.setattr(gx10, "_SESSION_OVERRIDES", {})
+
+
 @pytest.fixture
 def captured(monkeypatch):
     """Route _ui_print to a buffer (headless sink), restored after the test."""
@@ -42,6 +47,7 @@ def _runtime_globals():
 def _assert_atomic_refusal(captured, original, tree_before, globals_before):
     assert gx10._EFFECTIVE_CFG is original
     assert gx10._EFFECTIVE_CFG == tree_before
+    assert gx10._SESSION_OVERRIDES == {}
     assert all(getattr(gx10, name) is value for name, value in globals_before.items())
     refusals = [line for line in captured if "[config] refused:" in line]
     assert len(refusals) == 1
@@ -332,6 +338,7 @@ def test_valid_runtime_sets_publish_candidate_and_globals_once(monkeypatch, capt
     assert gx10._EFFECTIVE_CFG is not original
     assert original["quality"]["threshold"] == 0.5
     assert gx10._EFFECTIVE_CFG["quality"]["threshold"] == 0.7
+    assert gx10._SESSION_OVERRIDES["quality.threshold"] == 0.7
     assert gx10._QUALITY_BREAKER.snapshot().threshold == 0.7
     assert sum("[config] set quality.threshold = 0.7" in line for line in captured) == 1
     assert not any("refused" in line for line in captured)
@@ -342,6 +349,7 @@ def test_valid_runtime_sets_publish_candidate_and_globals_once(monkeypatch, capt
     assert gx10._EFFECTIVE_CFG is not previous
     assert previous["verify"]["grounding_threshold"] == 0.5
     assert gx10._EFFECTIVE_CFG["verify"]["grounding_threshold"] == 0.6
+    assert gx10._SESSION_OVERRIDES["verify.grounding_threshold"] == 0.6
     assert gx10._VERIFY_GROUNDING_THRESHOLD == 0.6
     assert sum("[config] set verify.grounding_threshold = 0.6" in line for line in captured) == 1
     assert not any("refused" in line for line in captured)
@@ -412,6 +420,45 @@ def test_dispatch_config_set_rejects_unknown_root(monkeypatch, captured):
     assert "contextt" not in gx10._EFFECTIVE_CFG                    # nothing written
     assert any("unknown key" in s for s in captured)               # explicit refusal, not GREEN 'set'
     assert not any("set contextt" in s for s in captured)
+
+
+def test_config_set_exact_leaf_suggests_unique_dotted_key(monkeypatch, captured):
+    monkeypatch.setattr(gx10, "_EFFECTIVE_CFG", {})
+    gx10._dispatch(types.SimpleNamespace(), "config set language de")
+    assert any("Did you mean 'generation.language'?" in line for line in captured)
+
+
+def test_config_set_ambiguous_leaf_lists_bounded_sorted_candidates(monkeypatch, captured):
+    monkeypatch.setattr(gx10, "_EFFECTIVE_CFG", {})
+    gx10._dispatch(types.SimpleNamespace(), "config set enabled on")
+    line = captured[-1]
+    matches = sorted(key for key in gx10.config_schema.LEAVES if key.endswith(".enabled"))
+    assert all(key in line for key in matches[:5])
+    assert all(key not in line for key in matches[5:])
+    assert "(+5 more)" in line
+    assert "Did you mean" not in line
+
+
+@pytest.mark.parametrize("key", ["generatoin.language", "generation.languag"])
+def test_config_set_close_full_key_typo_suggests_schema_key(monkeypatch, captured, key):
+    monkeypatch.setattr(gx10, "_EFFECTIVE_CFG", {"generation": {"language": "en"}})
+    gx10._dispatch(types.SimpleNamespace(), f"config set {key} de")
+    assert any("Did you mean 'generation.language'?" in line for line in captured)
+
+
+def test_config_set_unrelated_key_keeps_original_refusal_byte_identical(monkeypatch, captured):
+    monkeypatch.setattr(gx10, "LANGUAGE", "en", raising=False)
+    monkeypatch.setattr(gx10, "_EFFECTIVE_CFG", {})
+    gx10._dispatch(types.SimpleNamespace(), "config set zzzzz on")
+    expected = gx10.col("  " + gx10._msg("config.unknown_key", name="zzzzz"), gx10.C.RED)
+    assert captured == [expected + "\n"]
+
+
+def test_config_set_suggestion_uses_german_overlay(monkeypatch, captured):
+    monkeypatch.setattr(gx10, "LANGUAGE", "de", raising=False)
+    monkeypatch.setattr(gx10, "_EFFECTIVE_CFG", {})
+    gx10._dispatch(types.SimpleNamespace(), "config set language de")
+    assert any("Meinten Sie 'generation.language'?" in line for line in captured)
 
 
 def test_render_command_tiers_groups_by_danger():
@@ -499,5 +546,6 @@ def test_engine_i18n_keys_present_in_both_langs():
     import importlib
     m = importlib.import_module("messages")
     for k in ("keys.header", "keys.boot_only", "tiers.header", "tiers.read_only", "tiers.mutating",
-              "tiers.costly", "tiers.destructive", "config.unknown_key", "skills.params"):
+              "tiers.costly", "tiers.destructive", "config.unknown_key", "config.unknown_key_suggestion",
+              "config.unknown_key_candidates", "config.unknown_key_more", "skills.params"):
         assert k in m._MESSAGES["en"] and k in m._MESSAGES["de"], f"missing {k}"

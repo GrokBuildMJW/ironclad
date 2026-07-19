@@ -33,6 +33,7 @@ project list                 list registered projects (* marks the active one)
 project new <name> [--path <dir>]
                              mint a fresh isolated project (root = --path or <cwd>/<slug>, minted mem_ns,
                              made active; seeds the first software vault unit) — the guided setup command
+project use <slug>           select an existing vault unit inside the active project
 project active               show the active project
 project track new <t>        create a parallel track AND switch to it (like git checkout -b)
 project track use <t>        switch to an existing track (vault + memory follow)
@@ -100,11 +101,13 @@ effect on the next turn.
    active context. Absolute tool paths are honoured verbatim; the `default` project resolves to the boot
    workdir, byte-identical to before.
 4. **Rebuild** the effective config for the project from the deployment base (a project overlay may adjust
-   non-locked keys; **locked** keys — `connection`, `security`, `setup`, `search`, `plugins_dir`,
-   `providers.budget` — can never be re-pointed by a project).
+   non-locked keys; **locked** keys — `connection`, `security`, `setup`, `search`, `generation`,
+   `plugins_dir`, `providers.budget` — can never be re-pointed by a project).
 5. **Swap** the conversation: load the entering project's saved session, or start fresh — the live
    conversation is **replaced**, never appended, so nothing bleeds between projects. The system prompt is
-   project-independent (the engine's operating instructions) and is preserved.
+   project-independent (the engine's operating instructions) and is preserved. After every switch attempt,
+   rebuild the live reply-language directive so it agrees with the final effective config — whether the attempt
+   succeeds, re-asserts the same project, is refused, or rolls back.
 6. **Reload** the skill/prompt registries (after the active pointer is committed) so the entering project's
    library is discovered and the leaving project's is dropped — **build-then-swap**: discovery runs into
    fresh dicts, then the live registries are swapped in, so a failed or slow reload never empties them. The

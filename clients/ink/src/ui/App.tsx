@@ -13,7 +13,7 @@ import React, {useEffect, useMemo, useRef, useState, type ReactNode} from 'react
 import {Box, Spacer, Static, Text, useApp, useInput, useStdout} from '../render/ink-compat.js';
 import type {Server} from '../net/server.js';
 import {classify, completions, argCompletions, catalogueToCommands, HELP_TEXT, type Command} from '../commands.js';
-import {chatStream} from '../net/stream.js';
+import {chatStream, type NeedsGuide} from '../net/stream.js';
 import {answerBody, createRouter} from '../stream/route.js';
 import {renderMarkdown} from '../markdown.js';
 import {useStatusPoller} from './useStatusPoller.js';
@@ -32,7 +32,7 @@ import {runPassthroughTool} from '../tools/bridge.js';
 import {runOperatorShell} from '../tools/runTool.js';
 import {setDiagnosticSink} from '../tools/diagnostics.js';
 import {runUpdate} from '../tools/update.js';
-import {Pool, dispatchPending, type HandoverCfg} from '../agent/handover.js';
+import {Pool, dispatchPending, type HandoverCfg, type HandoverLog} from '../agent/handover.js';
 import {loadConfig, VERSION} from '../config.js';
 import {load as loadSession, save as saveSession, clear as clearSession, transcriptStats, statePath} from '../state/persist.js';
 import {ACCENT, DIM, ERROR, TEXT, VERBS} from './theme.js';
@@ -42,10 +42,14 @@ interface Item {
   node: ReactNode;
 }
 
+interface CommitOptions {
+  tight?: boolean;
+}
+
 /** Render a committed turn body — markdown segments + foldable tool calls. Shared by the live commit AND the
  *  session restore (#1187), so restored history looks identical to fresh output (colours + folds), not the
  *  old dim plain text. */
-function renderTurnBody(body: string, wrap: number): React.ReactElement {
+export function renderTurnBody(body: string, wrap: number): React.ReactElement {
   const nodes: ReactNode[] = [];
   for (const s of splitToolBlocks(body)) {
     if (s.type === 'tool') {
@@ -56,7 +60,7 @@ function renderTurnBody(body: string, wrap: number): React.ReactElement {
     }
   }
   return (
-    <Box flexDirection="column" paddingLeft={2} marginTop={1}>
+    <Box flexDirection="column" paddingLeft={2}>
       {nodes.map((n, i) => (
         <Box key={i} marginTop={i === 0 ? 0 : 1}>
           {n}
@@ -66,16 +70,61 @@ function renderTurnBody(body: string, wrap: number): React.ReactElement {
   );
 }
 
+/** One vertical-spacing rule for every block promoted into terminal scrollback (#1621). */
+export function committedBlock(node: ReactNode): React.ReactElement {
+  return <Box marginTop={1}>{node}</Box>;
+}
+
+/** A live continuation belongs to the preceding block and therefore adds no block-start margin (#1645). */
+export function committedContinuation(node: ReactNode): React.ReactElement {
+  return <Box>{node}</Box>;
+}
+
+export function renderStartupBanner(codedir: string, maxAgents: number): React.ReactElement {
+  return (
+    <Box flexDirection="column">
+      <Text bold color={ACCENT}>
+        █▀▄▀█ Ironclad <Text color={DIM}>· Orchestrator Client</Text>
+      </Text>
+      <Text color={DIM}>{`  Ironclad CLI ${VERSION} · code ${codedir} · ≤${maxAgents} agents`}</Text>
+      <Text color={DIM}> /help · exit</Text>
+    </Box>
+  );
+}
+
+export function renderGuidedInput(g: NeedsGuide): React.ReactElement {
+  return (
+    <Box flexDirection="column">
+      <Text color={DIM}>{`  guided input for /${g.command}:`}</Text>
+      <Text color={DIM}>{`    usage: ${g.usage}`}</Text>
+      {g.subcommands?.length ? <Text color={DIM}>{`    subcommands: ${g.subcommands.join(' | ')}`}</Text> : null}
+      {(g.fields ?? []).map((f) => {
+        const bits = [f.required ? 'required' : 'optional'];
+        if (f.choices?.length) bits.push(`choices: ${f.choices.join('|')}`);
+        if (f.default) bits.push(`default: ${f.default}`);
+        return <Text key={f.name} color={DIM}>{`    ${f.name}  (${bits.join(', ')})`}</Text>;
+      })}
+    </Box>
+  );
+}
+
+/** #454: HttpError carries the server's JSON error detail in its message — show that, not 'Error: …'. */
+function operatorErrorMessage(e: unknown): string {
+  return e instanceof Error ? e.message : String(e);
+}
+
 export function App({
   srv,
   codedir,
   maxAgents,
   resume = false,
+  operatorShell = runOperatorShell,
 }: {
   srv: Server;
   codedir: string;
   maxAgents: number;
   resume?: boolean; // MEM-14: opt into resuming the persisted session (default = fresh)
+  operatorShell?: typeof runOperatorShell;
 }): React.ReactElement {
   const {exit} = useApp();
   const {stdout} = useStdout();
@@ -108,7 +157,7 @@ export function App({
     const c = loadConfig();
     return {
       // INK-HANDOVER-1 (#503): pass the EXPLICIT client overrides (null if unset) so the server's
-      // per-agent spec drives bin/template by default and a deliberate BYO override still wins.
+      // per-agent spec drives bin/template by default and a deliberate BYO override wins for Claude specs.
       claudeBinOverride: c.claudeBinExplicit,
       agentCmdOverride: c.agentCmdExplicit,
       claudeEffort: c.claudeEffort,
@@ -116,9 +165,9 @@ export function App({
     };
   }, []);
 
-  const commit = (node: ReactNode): void => {
+  const commit = (node: ReactNode, options: CommitOptions = {}): void => {
     const id = idRef.current++;
-    setItems((xs) => [...xs, {id, node}]);
+    setItems((xs) => [...xs, {id, node: options.tight ? committedContinuation(node) : committedBlock(node)}]);
   };
 
   // §3b(a): persist the (text) transcript + non-secret session handle so a Spark restart / vLLM
@@ -156,13 +205,7 @@ export function App({
     if (didInit.current) return;
     didInit.current = true;
     setDiagnosticSink((m) => commit(<Text color={DIM}>{`  ${m}`}</Text>));
-    commit(
-      <Text bold color={ACCENT}>
-        █▀▄▀█ Ironclad <Text color={DIM}>· Orchestrator Client</Text>
-      </Text>,
-    );
-    commit(<Text color={DIM}>{`  Ironclad CLI ${VERSION} · code ${codedir} · ≤${maxAgents} agents`}</Text>);
-    commit(<Text color={DIM}> /help · exit</Text>);
+    commit(renderStartupBanner(codedir, maxAgents));
     // MEM-14/MEM-18: resume is OPT-IN (default = fresh). With --resume we restore now; otherwise we
     // start clean and stay quiet — the saved session is kept on disk (persist keeps running) and the
     // goodbye on exit (cli.tsx) tells the user it can be brought back with /resume. No startup hint.
@@ -194,11 +237,7 @@ export function App({
     // #1278: echo what the operator TYPED — a slash-command keeps its leading `/` so it is visibly distinct
     // from a chat message (the wire `payload` is slash-stripped; only the echo shows the original input).
     const shown = echo ?? payload;
-    commit(
-      <Box marginTop={1}>
-        <Text color={DIM}>{`> ${shown}`}</Text>
-      </Box>,
-    );
+    commit(<Text color={DIM}>{`> ${shown}`}</Text>);
     // MEM-11: only real conversational turns are kept (persisted + summarised). Slash commands
     // (/status, /clear, /config, /ls, …) are repeatable — show them, but don't record them.
     if (conversational) transcriptRef.current.push(`> ${shown}`);
@@ -234,6 +273,8 @@ export function App({
             }
           },
           onTool: (f) => runPassthroughTool(srv, f, ac.signal),
+          onRetry: (reason, _delayMs, nextAttempt, maxAttempts) =>
+            commit(<Text color={DIM}>{`  ↻ ${reason} — retrying (${nextAttempt}/${maxAttempts})`}</Text>),
         },
         ac.signal,
       );
@@ -247,15 +288,7 @@ export function App({
       }
       if (res?.needs_guide) {   // #955: structured guided input — show the fields; nothing executed
         const g = res.needs_guide;
-        commit(<Text color={DIM}>{`  guided input for /${g.command}:`}</Text>);
-        commit(<Text color={DIM}>{`    usage: ${g.usage}`}</Text>);
-        if (g.subcommands?.length) commit(<Text color={DIM}>{`    subcommands: ${g.subcommands.join(' | ')}`}</Text>);
-        for (const f of g.fields ?? []) {
-          const bits = [f.required ? 'required' : 'optional'];
-          if (f.choices?.length) bits.push(`choices: ${f.choices.join('|')}`);
-          if (f.default) bits.push(`default: ${f.default}`);
-          commit(<Text color={DIM}>{`    ${f.name}  (${bits.join(', ')})`}</Text>);
-        }
+        commit(renderGuidedInput(g));
         abortRef.current = null;
         setThinking(false); // #1304: same leak as the needs_confirm branch
         return;
@@ -263,7 +296,10 @@ export function App({
     } catch (e) {
       // a user-initiated abort (Esc / Ctrl+C) is expected — note it quietly, don't show a ✗ error
       if (ac.signal.aborted) commit(<Text color={DIM}> cancelled</Text>);
-      else commit(<Text color={ERROR}>{`  ✗ ${String(e)}`}</Text>);
+      else {
+        const msg = operatorErrorMessage(e);
+        commit(<Text color={ERROR}>{`  ✗ ${msg}`}</Text>);
+      }
     } finally {
       abortRef.current = null;
     }
@@ -291,7 +327,7 @@ export function App({
   }
 
   async function handleLocal(name: string, payload: string): Promise<void> {
-    const hlog = (m: string): void => commit(<Text color={DIM}>{m}</Text>);
+    const hlog: HandoverLog = (m, options): void => commit(<Text color={DIM}>{m}</Text>, options);
     try {
       if (name === 'help') commit(<Text color={TEXT}>{HELP_TEXT}</Text>);
       else if (name === 'sh') {
@@ -299,9 +335,10 @@ export function App({
         // turn, not persisted. Output to the transcript. (-NonInteractive: interactive cmds time out.)
         if (!payload) commit(<Text color={DIM}> (empty command)</Text>);
         else {
-          commit(<Box marginTop={1}><Text color={DIM}>{`! ${payload}`}</Text></Box>);
-          const out = await runOperatorShell(payload);
-          commit(<Box paddingLeft={2}><Text>{out}</Text></Box>);
+          commit(<Text color={DIM}>{`! ${payload}`}</Text>);
+          const mark = idRef.current;
+          const out = await operatorShell(payload);
+          commit(<Box paddingLeft={2}><Text>{out}</Text></Box>, idRef.current === mark ? {tight: true} : undefined);
         }
       } else if (name === 'reset') {
         // MEM-12: one button for "answers got weird → start clean". Clears all HOT+WARM layers —
@@ -328,29 +365,40 @@ export function App({
         } else {
           const pull = (payload.split(/\s+/)[1] ?? '').toLowerCase() === 'pull';
           commit(<Text color={DIM}>{`  /update — building + installing from ${srcDir}${pull ? ' (with git pull)' : ''} …`}</Text>);
+          let mark = idRef.current;
           const {ok, log} = await runUpdate(srcDir, pull);
-          log.forEach((l) => commit(<Text color={ok ? DIM : ERROR}>{`  ${l}`}</Text>));
+          log.forEach((l) => {
+            commit(<Text color={ok ? DIM : ERROR}>{`  ${l}`}</Text>, idRef.current === mark ? {tight: true} : undefined);
+            mark = idRef.current;
+          });
         }
       } else if (name === 'health') commit(<Text color={DIM}>{`  ${JSON.stringify(await srv.health())}`}</Text>);
       else if (name === 'doctor') commit(<Text color={DIM}>{`  ${JSON.stringify(await srv.doctor())}`}</Text>); // DOCTOR (#503): local GET /doctor, not a billed turn
       else if (name === 'tasks') {
         const ts = await srv.tasks();
         if (!ts.length) commit(<Text color={DIM}> (no tasks)</Text>);
-        ts.forEach((t) =>
-          commit(<Text>{`  ${String(t['status'] ?? '?')}  ${String(t['id'] ?? '?')}  ${String(t['title'] ?? '')}`}</Text>),
+        else commit(
+          <Box flexDirection="column">
+            {ts.map((t) => <Text key={String(t['id'] ?? '?')}>{`  ${String(t['status'] ?? '?')}  ${String(t['id'] ?? '?')}  ${String(t['title'] ?? '')}`}</Text>)}
+          </Box>,
         );
       } else if (name === 'pending') {
         const ps = await srv.pending();
         if (!ps.length) commit(<Text color={DIM}> (no open handovers)</Text>);
-        ps.forEach((p) => commit(<Text>{`  ${String(p['id'] ?? '?')}  ${String(p['title'] ?? '')}`}</Text>));
+        else commit(
+          <Box flexDirection="column">
+            {ps.map((p) => <Text key={String(p['id'] ?? '?')}>{`  ${String(p['id'] ?? '?')}  ${String(p['title'] ?? '')}`}</Text>)}
+          </Box>,
+        );
       } else if (name === 'coders') {
         // #452: which coding agents are bound (● green) vs not found (○ red), then the fan-out lane.
         // #454: `/coders use <id>|auto` pins/clears the runtime coding agent.
         const parts = payload.split(/\s+/);
+        const coderLines: ReactNode[] = [];
         if (parts.length >= 2 && parts[1]?.toLowerCase() === 'use') {
           const res = await srv.setCoderPin(parts[2] ?? 'auto');
           const pin = res['pinned'];
-          commit(
+          coderLines.push(
             <Text color="cyan">
               {pin ? `  → pinned coder: ${String(pin)}` : '  → coder pin cleared (auto: the staged agent per task)'}
             </Text>,
@@ -359,12 +407,12 @@ export function App({
         const d = await srv.coders();
         const coding = (d['coding_agents'] as Array<Record<string, unknown>>) ?? [];
         const pinned = d['pinned'] ? String(d['pinned']) : '';
-        commit(
+        coderLines.push(
           <Text color={DIM}>
             {pinned ? `  pinned: ${pinned}  (/coders use auto to clear)` : '  routing: auto (orchestrator staged agent)'}
           </Text>,
         );
-        if (!coding.length) commit(<Text color={DIM}> (no coding agents configured)</Text>);
+        if (!coding.length) coderLines.push(<Text color={DIM}> (no coding agents configured)</Text>);
         coding.forEach((a) => {
           // #460: an onboarded-but-disabled agent (enabled:false, e.g. KIMI pending calibration) is inert
           // but shown as registered. `enabled` is absent on older servers → default true (back-compat).
@@ -376,7 +424,7 @@ export function App({
           if (!enabled) suffix = <Text color={DIM}>{'  (onboarded · disabled)'}</Text>;
           else if (isPin) suffix = <Text color="cyan">{'  ← pinned'}</Text>;
           else if (!bound) suffix = <Text color={DIM}>{'  (binary not found)'}</Text>;
-          commit(
+          coderLines.push(
             <Text>
               {'  '}
               {dot}
@@ -390,13 +438,13 @@ export function App({
         if (pool.length) {
           const b = (prov['budget'] as Record<string, unknown>) ?? {};
           const spent = Number(b['spent_usd'] ?? 0).toFixed(4);
-          commit(
+          coderLines.push(
             <Text color={DIM}>{`  providers (fan-out): ${prov['active'] ? 'active' : 'inactive'} · spent $${spent}`}</Text>,
           );
           pool.forEach((p) => {
             const reach = Boolean(p['reachable']);
             const reason = p['last_route_reason'] ? `  ← ${String(p['last_route_reason'])}` : '';
-            commit(
+            coderLines.push(
               <Text>
                 {'    '}
                 <Text color={reach ? 'green' : 'red'}>{reach ? '●' : '○'}</Text>
@@ -405,14 +453,43 @@ export function App({
             );
           });
         }
+        commit(
+          <Box flexDirection="column">
+            {coderLines.map((line, i) => <React.Fragment key={i}>{line}</React.Fragment>)}
+          </Box>,
+        );
       } else if (name === 'work') {
         const pool = (poolRef.current ??= new Pool(maxAgents));
-        const jobs = await dispatchPending(srv, codedir, hcfg, pool, claimedRef.current, hlog);
-        if (!jobs.length) commit(<Text color={DIM}> (no new handovers)</Text>);
+        const earlyLogs: string[] = [];
+        let headerCommitted = false;
+        let mark = idRef.current;
+        const workLog: HandoverLog = (m): void => {
+          if (headerCommitted) {
+            commit(<Text color={DIM}>{m}</Text>, idRef.current === mark ? {tight: true} : undefined);
+            mark = idRef.current;
+          }
+          else earlyLogs.push(m);
+        };
+        const jobs = await dispatchPending(srv, codedir, hcfg, pool, claimedRef.current, workLog);
+        if (!jobs.length) {
+          const [first, ...rest] = earlyLogs;
+          if (first !== undefined) commit(<Text color={DIM}>{first}</Text>);
+          rest.forEach((line) => commit(<Text color={DIM}>{line}</Text>, {tight: true}));
+          commit(<Text color={DIM}> (no new handovers)</Text>, first === undefined ? undefined : {tight: true});
+        }
         else {
           commit(<Text color={DIM}>{`  → ${jobs.length} handover(s) started (≤${maxAgents} parallel), waiting …`}</Text>);
+          headerCommitted = true;
+          mark = idRef.current;
+          earlyLogs.forEach((line) => {
+            commit(<Text color={DIM}>{line}</Text>, idRef.current === mark ? {tight: true} : undefined);
+            mark = idRef.current;
+          });
           const ok = (await Promise.all(jobs)).filter(Boolean).length;
-          commit(<Text color={DIM}>{`  done: ${ok}/${jobs.length} cleanly uploaded`}</Text>);
+          commit(
+            <Text color={DIM}>{`  done: ${ok}/${jobs.length} cleanly uploaded`}</Text>,
+            idRef.current === mark ? {tight: true} : undefined,
+          );
         }
       } else if (name === 'auto') {
         // #1296: /auto is the CONSOLIDATED automation switch. The client half is the dispatch
@@ -426,7 +503,7 @@ export function App({
             autoRef.current = setInterval(() => {
               void dispatchPending(srv, codedir, hcfg, pool, claimedRef.current, hlog);
             }, 5000);
-            commit(<Text color={DIM}>{`  [AUTO] poller ON — pulls handovers every 5s, ≤${maxAgents} parallel`}</Text>);
+            commit(<Text color={DIM}>{`  [AUTO] client poller ON — pulls handovers every 5s, ≤${maxAgents} local coders parallel`}</Text>);
           }
         } else if (arg === 'off') {
           if (autoRef.current) {
@@ -440,8 +517,7 @@ export function App({
         await streamTurn(payload, false, `/${payload}`);
       }
     } catch (e) {
-      // #454: HttpError carries the server's JSON error detail in its message — show that, not 'Error: …'.
-      const msg = e instanceof Error ? e.message : String(e);
+      const msg = operatorErrorMessage(e);
       commit(<Text color={ERROR}>{`  ✗ ${msg}`}</Text>);
     }
   }
@@ -564,7 +640,7 @@ export function App({
         <Static items={items}>{(item) => <Box key={item.id}>{item.node}</Box>}</Static>
         {/* #1277: fold tool calls in the LIVE preview via the SAME path as the commit, so a tool call is
             collapsed WHILE it streams instead of showing expanded and folding only at the end of the turn. */}
-        {liveAnswer ? renderTurnBody(liveAnswer, Math.max(20, width - 4)) : null}
+        {liveAnswer ? <Box marginTop={1}>{renderTurnBody(liveAnswer, Math.max(20, width - 4))}</Box> : null}
       </Box>
       {/* #1148: the FIXED chrome — the working/thinking line + input + menu + footer + brand. mount stamps
           this at the viewport bottom (paintFixed) so it stays pinned while the transcript above scrolls

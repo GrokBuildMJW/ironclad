@@ -665,6 +665,54 @@ def test_run_handover_precedence_override_vs_server_spec(tmp_path, monkeypatch):
     assert "--model" not in captured["argv"]           # the server's Claude template did NOT win
 
 
+def test_run_handover_claude_overrides_do_not_rewrite_kimi_spec(tmp_path, monkeypatch):
+    import client
+    item = {"id": "KGC-6", "agent": "KIMI", "model": "kimi-k2.5", "bin": "kimi",
+            "cmd_template": "{bin} -p {prompt} --print -w . -y --output-format stream-json",
+            "permission": "acceptEdits", "tooling_envelope": {"enabled": True, "allow_list": [{
+                "bin": "kimi",
+                "cmd_template": "{bin} -p {prompt} --print -w . -y --output-format stream-json",
+            }]}}
+    captured = {}
+
+    class _P:
+        returncode = 0
+        stderr = __import__("io").BytesIO(b"")
+
+        def __init__(self, argv, **_kwargs):
+            captured["argv"] = argv
+
+        def wait(self, timeout=None):
+            return self.returncode
+
+    monkeypatch.setattr(client.subprocess, "Popen", _P)
+    monkeypatch.setattr(client, "CLAUDE_BIN_OVERRIDE", "claude", raising=False)
+    monkeypatch.setattr(client, "AGENT_CMD_OVERRIDE", "{bin} --claude-only {prompt}", raising=False)
+
+    client._run_handover(item, tmp_path, log=lambda *_args, **_kwargs: None)
+
+    assert captured["argv"][0] == "kimi"
+    assert captured["argv"][1] == "-p"
+    assert "--output-format" in captured["argv"]
+    assert "--claude-only" not in captured["argv"]
+
+
+def test_claude_base_detection_matches_shared_python_ink_vectors():
+    import client
+    # Keep byte-for-byte inputs aligned with handover.test.ts; the implementations cannot cross the
+    # language boundary, so this vector is the drift guard for the override-scoping decision.
+    vectors = [
+        ("claude", True),
+        (r"C:\Tools\Claude\claude.EXE", True),
+        ("CLAUDE", True),
+        ("ClAuDe.cmd", True),
+        ("claude-wrapper.exe", False),
+        ("", True),
+    ]
+    for bin_, expected in vectors:
+        assert client._is_claude_spec(bin_) is expected, bin_
+
+
 # ── #455: budget-exhausted result classifier (layered, conservative) ─────────────────────────────
 _EXH = {"stderr_patterns": [r"(?i)\b(quota|rate limit)\b"], "exit_codes": [42],
         "json_event_types": ["budget_exhausted"]}

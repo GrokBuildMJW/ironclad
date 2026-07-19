@@ -9,26 +9,71 @@
  * The tool execution itself is injected (onTool): Phase 1 stubs it; Phase 2 wires the real
  * local tool-bridge (run the tool on the local fs, POST the result to /tool-result).
  */
-import {HttpError, type Server} from './server.js';
+import {HttpError, httpError, type Server} from './server.js';
 
 const NUL = String.fromCharCode(0); // the \x00 frame delimiter (no raw null byte in source)
+const CHAT_ATTEMPTS = 3;
+const CHAT_RETRY_BASE_MS = 100;
 
 export interface ToolFrame {
   id: string;
   name: string;
   args: Record<string, unknown>;
   execCwd?: string; // #1317: server-shipped active-project exec cwd (mount) — where the bridged tool runs
+  projectRoot?: string; // #1615: project root for contained read-only fallback outside a split code root
   sandbox?: string; // F3b: mandatory server-validated backend preference for the versioned exec wire tool
 }
 
 export interface StreamHandlers {
   onText: (chunk: string) => void;
   onTool?: (frame: ToolFrame) => void | Promise<void>;
+  onRetry?: (reason: string, delayMs: number, nextAttempt: number, maxAttempts: number) => void;
+}
+
+function abortableDelay(ms: number, signal: AbortSignal): Promise<void> {
+  if (signal.aborted) return Promise.reject(signal.reason);
+  return new Promise((resolve, reject) => {
+    const onAbort = (): void => {
+      clearTimeout(timer);
+      reject(signal.reason);
+    };
+    const timer = setTimeout(() => {
+      signal.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    signal.addEventListener('abort', onAbort, {once: true});
+  });
+}
+
+async function fetchChatStream(
+  srv: Server,
+  headers: Record<string, string>,
+  body: string,
+  h: StreamHandlers,
+  signal: AbortSignal,
+): Promise<Response> {
+  for (let attempt = 1; ; attempt++) {
+    const res = await fetch(srv.base + '/chat/stream', {
+      method: 'POST',
+      headers,
+      body,
+      signal,
+    });
+    if (res.ok) return res;
+    const error = httpError('POST', '/chat/stream', res.status, await res.text());
+    if (res.status < 500 || attempt >= CHAT_ATTEMPTS) throw error;
+    const delayMs = CHAT_RETRY_BASE_MS * 2 ** (attempt - 1);
+    h.onRetry?.(error.message, delayMs, attempt + 1, CHAT_ATTEMPTS);
+    await abortableDelay(delayMs, signal);
+  }
 }
 
 async function dispatchFrame(seg: string, onTool?: StreamHandlers['onTool']): Promise<void> {
   const json = seg.startsWith('TR') ? seg.slice(2) : seg;
-  let payload: {id?: string; name?: string; args?: Record<string, unknown>; exec_cwd?: string; sandbox?: string};
+  let payload: {
+    id?: string; name?: string; args?: Record<string, unknown>; exec_cwd?: string;
+    project_root?: string; sandbox?: string;
+  };
   try {
     payload = JSON.parse(json) as typeof payload;
   } catch {
@@ -40,6 +85,7 @@ async function dispatchFrame(seg: string, onTool?: StreamHandlers['onTool']): Pr
     // without it stays byte-identical to {id, name, args} (parity with the pre-#1317 stream).
     const toolFrame: ToolFrame = {id: payload.id, name: payload.name, args: payload.args ?? {}};
     if (payload.exec_cwd) toolFrame.execCwd = payload.exec_cwd;
+    if (payload.project_root) toolFrame.projectRoot = payload.project_root;
     if (payload.sandbox) toolFrame.sandbox = payload.sandbox;
     await onTool(toolFrame);
   }
@@ -104,13 +150,7 @@ export async function chatStream(
   // tears down the fetch + reader IMMEDIATELY instead of waiting on the server to stop generating.
   const timeout = AbortSignal.timeout(srv.timeoutMs);
   const sig = signal ? AbortSignal.any([signal, timeout]) : timeout;
-  const res = await fetch(srv.base + '/chat/stream', {
-    method: 'POST',
-    headers,
-    body: JSON.stringify({message: msg, confirm}),
-    signal: sig,
-  });
-  if (!res.ok) throw new HttpError(res.status, `POST /chat/stream → HTTP ${res.status}`);
+  const res = await fetchChatStream(srv, headers, JSON.stringify({message: msg, confirm}), h, sig);
   // #935/#954: a destructive command → JSON {needs_confirm}; an explicit ?/--guide → JSON {needs_guide};
   // either way the server replies with JSON instead of a stream.
   if (res.headers.get('content-type')?.includes('application/json')) {

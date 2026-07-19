@@ -64,9 +64,9 @@ Staying independent means running on more of *your* models and *your* data.
 - **More local open models.** Verified connection recipes for additional
   locally-served open models (beyond the reference Qwen / Falcon / Jais / K2
   set), so you can pick the model that fits your hardware and licensing.
-- **RAG over local datasets.** Retrieval over your own document and data
-  collections through the memory hook — your private corpus becomes queryable
-  context, kept on-prem.
+- **Turnkey ingestion of local documents.** Automatically chunk and embed a local
+  folder of raw documents into a queryable corpus. This complements the working
+  bring-your-own Mem0 service and corpus path with an end-to-end ingestion workflow.
 - **Richer cold-tier retrieval.** Continued growth of the long-term vector(+graph)
   store as the substrate both connectors and local datasets feed into.
 

@@ -283,7 +283,8 @@ class ToolBridge:
         # the DEFAULT project OMITS it, so the client keeps its own process.cwd() (byte-identical: a client
         # and server on the same fs launched from DIFFERENT directories must not be yanked to the server's
         # cwd). bind_active already ran on this request thread, so _exec_cwd() resolves the active project.
-        # Additive/optional: an older client ignores the field.
+        # #1615: also ship the active project root when present so read-only bridged tools can fall back
+        # from a split code root to contained control-plane paths. Additive/optional: older clients ignore it.
         # F3b: use a versioned wire-only name for model command execution. An older client does not know
         # this name and returns an error instead of running `execute_command` through its legacy direct shell.
         wire_name = _SANDBOXED_EXEC_WIRE_TOOL if name == "execute_command" else name
@@ -293,6 +294,9 @@ class ToolBridge:
         _ecwd = gx10._exec_cwd()
         if _ecwd:
             frame["exec_cwd"] = _ecwd
+        _project_root = str(gx10._project_root() or "")
+        if _project_root:
+            frame["project_root"] = _project_root
         self._emit(_TR_PREFIX + json.dumps(frame) + _TR_SUFFIX)
         # #1553: wait for the /tool-result but ALSO observe cancellation. A bare ev.wait(180) never wakes on
         # /cancel or a client that dies mid-tool (no /tool-result posted), so the turn thread would hold
@@ -397,7 +401,10 @@ def _queue_consumer(agent: gx10.GX10, stop: threading.Event,
         if not item:
             continue
         if item.startswith(gx10._LAUNCH_CMD):
-            # Launching is the client's job — the server starts no code-agents.
+            # Launching is the client's job — the server starts no code-agents. The reconciler reserved
+            # one engine-autopilot slot before enqueueing this command, so discarding it must release that
+            # reservation; client-run concurrency is owned separately by the polling client's pool (#1733).
+            gx10._autopilot_release()
             continue
         if item.startswith(gx10._ADVANCE_CMD):
             parts = item.split("\x00")  # ['', 'advance', tid, agent]
@@ -417,17 +424,52 @@ def _queue_consumer(agent: gx10.GX10, stop: threading.Event,
                 # AND the channel is not sealed (no client present to execute).
                 sealed = sessions.is_sealed() if sessions is not None else False
                 if res and res.startswith("OK") and not sealed:
-                    gx10._continuation_tick(tid, lambda p: gx10._INPUT_QUEUE.put(p))
+                    try:
+                        continued = gx10._continuation_tick(tid, lambda p: gx10._INPUT_QUEUE.put(p))
+                    except Exception as e:  # noqa: BLE001 — keep the queue consumer alive; heartbeat retries
+                        msg = f"continuation after {tid} failed: {e!r}; the heartbeat will retry eligible work"
+                        gx10._set_automation_notice(msg)
+                        print(f"[CONTINUATION] {msg}", flush=True)
+                    else:
+                        # Early returns (busy, drained, or deadlocked) do not prove that the reported
+                        # continuation failure recovered, so retain its operator-visible notice.
+                        if (continued and gx10._AUTOMATION_NOTICE.startswith(
+                                f"continuation after {tid} ")):
+                            gx10._set_automation_notice("")
                 elif sealed:
-                    print("[CONTINUATION] paused — channel sealed (no live session)", flush=True)
+                    msg = "paused — channel sealed (no live session)"
+                    gx10._set_automation_notice(f"continuation after {tid} {msg}")
+                    print(f"[CONTINUATION] {msg}", flush=True)
+                else:
+                    head = res.splitlines()[0] if res else "empty advance result"
+                    msg = f"continuation after {tid} not started — advance did not succeed: {head}"
+                    gx10._set_automation_notice(msg)
+                    print(f"[CONTINUATION] {msg}", flush=True)
             continue
-        # Plain prompt (e.g. autoplan) → normal turn.
+        # Structured continuation items carry their unit id outside the unchanged prompt; ordinary
+        # prompts (e.g. autoplan) pass through untouched.
+        authoring_tid, prompt = gx10._continuation_authoring_item(item)
         with _AGENT_LOCK:
             gx10.bind_active()                  # S5b: this daemon thread → the active project's ctx
             try:
-                gx10._dispatch(agent, item)
+                gx10._dispatch(agent, prompt)
             except Exception as e:  # noqa: BLE001
                 print(f"[QUEUE] dispatch failed: {e!r}", flush=True)
+                if authoring_tid:
+                    gx10._continuation_authoring_result(
+                        authoring_tid, progressed=False, error=repr(e)
+                    )
+            else:
+                if authoring_tid:
+                    try:
+                        progressed = gx10._continuation_unit_progressed(gx10._store(), authoring_tid)
+                    except Exception as e:  # noqa: BLE001 — unknown progress must not clear the fault
+                        gx10._continuation_authoring_result(
+                            authoring_tid, progressed=False,
+                            error=f"could not verify unit progress: {e!r}",
+                        )
+                    else:
+                        gx10._continuation_authoring_result(authoring_tid, progressed=progressed)
 
 
 # --------------------------------------------------------------------------- #
@@ -446,11 +488,16 @@ def _pending_handovers() -> list[Dict[str, Any]]:
     # another project's tree — a project-isolation escape. `None` (the default project, no code_subdir)
     # → the process workdir, byte-identical to before.
     exec_cwd = str(gx10._exec_cwd() or os.getcwd())   # str(): the /pending item is JSON — never a Path
+    # #1615: sibling to cwd, omitted without an active project root for wire compatibility.
+    project_root = str(gx10._project_root() or "")
     out: list[Dict[str, Any]] = []
     for task in store.list("pending"):
         if gx10._task_is_escalated(task):
             continue
         tid = task.get("id") or ""
+        #1738: completion is already in flight; only the feedback reconciler may advance it from here.
+        if gx10._feedback_present(tid):
+            continue
         ho = gx10._find_handover(tid)
         if not ho:
             continue
@@ -480,7 +527,7 @@ def _pending_handovers() -> list[Dict[str, Any]]:
             content = ho.read_text(encoding="utf-8")
         except OSError:
             content = ""
-        out.append({
+        item = {
             "id": tid,
             "agent": agent,
             "title": task.get("title"),
@@ -503,15 +550,20 @@ def _pending_handovers() -> list[Dict[str, Any]]:
             "cmd_template": spec.cmd_template,
             "permission": spec.permission_mode,
             "permission_bypass": bool(spec.capabilities.permission_bypass),
-            # #480/#994-S10: the read-only Memory MCP is always on when a memory service is configured
-            # and the agent ships an mcp_template. The client fills the {mcp} placeholder with `mcp`
-            # and sets `mcp_env` on the agent subprocess (the spawned MCP inherits the memory connection).
-            # ("",{}) when memory is unconfigured or the agent has no mcp_template.
+            # #480/#994-S10/#1683: configured memory always supplies mcp_env; mcp args additionally require
+            # an mcp_template. Thus a persistently registered CLI inherits its connection with no argv change.
+            # Unconfigured memory remains ("", {}), byte-identical for both launch paths.
             **dict(zip(("mcp", "mcp_env"), gx10._mcp_for_launch(spec))),
             # ADR-0007 D1d: local clients spawn on their own host, so ship only the non-secret effective
             # allow-list metadata they need to fail closed before spawn.
             "tooling_envelope": __import__("tooling_envelope_runtime").envelope_policy_public(),
-        })
+        }
+        if project_root:
+            item["project_root"] = project_root
+        if gx10.CLAIM_LEASE_TTL_S > 0:
+            # #1738: keep short test/operational leases renewable before expiry; one second is the wire floor.
+            item["lease_renew_s"] = max(1.0, gx10.CLAIM_LEASE_TTL_S / 3.0)
+        out.append(item)
     return out
 
 
@@ -973,6 +1025,19 @@ class _Handler(BaseHTTPRequestHandler):
                                      "error": f"unknown agent {agent!r} (configured: "
                                               f"{', '.join(gx10._code_agent_registry().names()) or 'none'})"})
                     return
+                # #1676: a tooling-envelope refusal happens before spawn and is deterministic for this
+                # resolved command/policy. Surface it through /feedback, but keep it distinct from a failed
+                # paid run so it neither spends Strategy budget nor enters no-feedback retry/failover.
+                launch_refusal = data.get("launch_refusal")
+                if isinstance(launch_refusal, str) and launch_refusal.strip():
+                    reason = launch_refusal.strip()[:1000]
+                    try:
+                        gx10._store().mark_blocked(tid, reason=reason, kind="errored")
+                    except Exception:  # noqa: BLE001 — the terminal response still stops this client
+                        pass
+                    self._send(200, {"ok": True, "classification": "launch-refused",
+                                     "action": "terminal", "reason": reason})
+                    return
                 # #455: classify the raw run signal (layered JSON→stderr→exit; conf patterns) →
                 # budget-exhausted ⇒ trip the breaker (the next /pending fails over to a peer); a
                 # plain failure ⇒ no feedback written (retry); a real result ⇒ advance.
@@ -1106,7 +1171,7 @@ def serve(host: Optional[str] = None, port: int = 8100,
     # Feedback reconciler (server-side; launch side is a no-op because autopilot is off).
     rt = threading.Thread(
         target=gx10._reconciler_loop,
-        args=(stop, gx10.RECONCILER_INTERVAL),
+        args=(stop, gx10.RECONCILER_INTERVAL, sessions.is_sealed),
         daemon=True,
     )
     rt.start()

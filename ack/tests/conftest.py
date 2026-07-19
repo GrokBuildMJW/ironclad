@@ -9,8 +9,10 @@ import copy
 import base64
 import shutil
 import subprocess
+import threading
 from collections import deque
 from pathlib import Path
+from time import monotonic as _monotonic
 
 import pytest
 
@@ -52,6 +54,9 @@ _GX10_STATE_ATTRS = (
     "FORGE_TOKEN_ENV",
     "REVIEW_AGENT",       # #1221: default reviewer agent_id
     "REVIEW_TIMEOUT_S",  # #1221: review CLI timeout
+    "CODE_REVIEW_MODE",       # #1614: automatic code-review stage mode
+    "CODE_REVIEW_MAX_ROUNDS",  # #1614: blocking review attempts before operator escalation
+    "CODE_REVIEW_AGENT",      # #1614: explicit reviewer pin (empty ⇒ distinct-peer pick)
     "NOTIFY_WEBHOOK",
     "AUDIT_SCOPE",
     "_AUDIT_DEGRADED",
@@ -75,6 +80,9 @@ _GX10_STATE_ATTRS = (
     "AUTOPILOT_AUTOPLAN",
     "AUTOPILOT_MAX_TASKS",
     "_AUTOPLAN_DONE",
+    "_CONTINUATION_AUTHORING",
+    "_CONTINUATION_RECOVERY_ATTEMPTS",
+    "_AUTOMATION_NOTICE",
     "AUTOPILOT_LOG_TERMINAL",
     "TEMPERATURE",
     "MAX_TOKENS",
@@ -187,6 +195,32 @@ def _restore_gx10_state(gx10, snapshot):
         setattr(gx10, attr, _snapshot_value(value))
 
 
+_ACE_WORKER_THREAD_NAME = "ace-reflection-worker"
+_ACE_WORKER_JOIN_TIMEOUT_S = 10.0
+
+
+def _join_ace_worker_threads(timeout: float = _ACE_WORKER_JOIN_TIMEOUT_S) -> None:
+    """Leave no ACE daemon alive to observe the next test's module-global monkeypatches."""
+    deadline = _monotonic() + timeout
+    while True:
+        workers = [thread for thread in threading.enumerate()
+                   if thread.name == _ACE_WORKER_THREAD_NAME and thread.is_alive()]
+        if not workers:
+            return
+        for thread in workers:
+            remaining = deadline - _monotonic()
+            if remaining <= 0:
+                break
+            thread.join(timeout=remaining)
+        survivors = [thread for thread in threading.enumerate()
+                     if thread.name == _ACE_WORKER_THREAD_NAME and thread.is_alive()]
+        if survivors and _monotonic() >= deadline:
+            details = ", ".join(f"{thread.name} (ident={thread.ident})" for thread in survivors)
+            raise RuntimeError(
+                f"ACE worker thread(s) survived test teardown after {timeout:.1f}s: {details}"
+            )
+
+
 @pytest.fixture(autouse=True)
 def _ace_isolation(request, tmp_path, monkeypatch):
     """Isolate gx10's process-global engine state around every ACK test.
@@ -243,13 +277,24 @@ def _ace_isolation(request, tmp_path, monkeypatch):
         return
     if gx10_state is not None:
         _restore_gx10_state(gx10, gx10_state)
+    workers = []
     for wattr in ("_ACE_WORKER", "_ACE_FORK_WORKER"):     # M5-2: also stop the fork MPR worker
         worker = getattr(gx10, wattr, None)
         if worker is not None:
+            workers.append(worker)
             try:
                 worker.stop()
             except Exception:
                 pass
+    # ReflectionWorker.stop() joins to completion by default, but lifecycle tests may deliberately replace it
+    # with a finite-timeout call that retains a live thread reference. Join every named daemon before pytest
+    # restores module-global monkeypatches or starts the next test. A genuinely stuck worker is a hard failure.
+    _join_ace_worker_threads()
+    for worker in workers:
+        try:
+            worker.stop()                               # clear any reference retained by a timed-out test stop
+        except Exception:
+            pass
     for attr, val in (("_ACE_WORKER", None), ("_ACE_STORE", None), ("_ACE_MIGRATED", False),
                       ("_ACE_FORK_WORKER", None), ("_ACE_FORK_MPR", False),
                       # F5a: the quality breaker is ALWAYS-ON now (fed on every handover) and is a rebind-only

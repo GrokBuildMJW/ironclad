@@ -82,6 +82,133 @@ def test_capture_does_not_leak_across_threads():
     assert "BACKGROUND_NOISE" not in cap.text
 
 
+def _run_queue_item(monkeypatch, item, *, dispatch=None, advance=None, wait_until=None):
+    monkeypatch.setattr(gx10, "_INPUT_QUEUE", gx10._q.Queue())
+    monkeypatch.setattr(gx10, "bind_active", lambda: None)
+    if dispatch is not None:
+        monkeypatch.setattr(gx10, "_dispatch", dispatch)
+    if advance is not None:
+        monkeypatch.setattr(gx10, "_advance_pipeline", advance)
+    stop = threading.Event()
+    thread = threading.Thread(target=server._queue_consumer, args=(object(), stop), daemon=True)
+    thread.start()
+    gx10._INPUT_QUEUE.put(item)
+    deadline = time.monotonic() + 2.0
+    ready = wait_until or (lambda: bool(gx10._AUTOMATION_NOTICE))
+    while not ready() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    stop.set()
+    thread.join(timeout=2.0)
+
+
+def test_queue_consumer_releases_reconciler_reserved_autopilot_slot(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    gx10.initiative_new("Client launch", "software")
+    store = gx10._store()
+    tid = _task(store, "client-run handover")
+    ho_dir = gx10.handovers_dir()
+    ho_dir.mkdir(parents=True, exist_ok=True)
+    (ho_dir / f"{tid}_OPUS.md").write_text("body", encoding="utf-8")
+    monkeypatch.setattr(gx10, "_EFFECTIVE_CFG", gx10._code_defaults(), raising=False)
+    monkeypatch.setattr(gx10, "AUTOPILOT_ENABLED", True, raising=False)
+    monkeypatch.setattr(gx10, "AUTOPILOT_MAX_CONCURRENT", 1, raising=False)
+    monkeypatch.setattr(gx10, "_INPUT_QUEUE", gx10._q.Queue())
+    monkeypatch.setattr(gx10, "bind_active", lambda: None)
+    monkeypatch.setattr(
+        gx10,
+        "_do_launch",
+        lambda *_args, **_kwargs: pytest.fail("the server must defer launches to the client"),
+    )
+
+    launched = set()
+    gx10._reconcile_once(
+        store,
+        lambda *_args: None,
+        {},
+        set(),
+        launch_enqueue=lambda task_id, agent: gx10._INPUT_QUEUE.put(
+            f"{gx10._LAUNCH_CMD}{task_id}\x00{agent}"
+        ),
+        launched=launched,
+    )
+    assert gx10._autopilot_active() == 1
+
+    stop = threading.Event()
+    thread = threading.Thread(target=server._queue_consumer, args=(object(), stop), daemon=True)
+    thread.start()
+    deadline = time.monotonic() + 2.0
+    while gx10._autopilot_active() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    stop.set()
+    thread.join(timeout=2.0)
+
+    assert gx10._autopilot_active() == 0
+    assert store.get(tid)["status"] == "pending"
+
+
+def test_queue_consumer_surfaces_non_ok_advance(monkeypatch):
+    gx10._AUTOMATION_NOTICE = ""
+    _run_queue_item(
+        monkeypatch,
+        f"{gx10._ADVANCE_CMD}KGC-2\x00OPUS",
+        advance=lambda tid, agent: "ERROR: completion gate refused feedback",
+    )
+
+    assert "continuation after KGC-2 not started" in gx10._AUTOMATION_NOTICE
+    assert "completion gate refused feedback" in gx10._AUTOMATION_NOTICE
+
+
+def test_queue_consumer_does_not_clear_notice_on_continuation_tick_early_return(monkeypatch):
+    notice = "continuation after KGC-2 failed: prior queue error"
+    gx10._AUTOMATION_NOTICE = notice
+    calls = []
+    monkeypatch.setattr(gx10, "_continuation_tick", lambda tid, enqueue: calls.append(tid) and False)
+
+    _run_queue_item(
+        monkeypatch,
+        f"{gx10._ADVANCE_CMD}KGC-2\x00OPUS",
+        advance=lambda _tid, _agent: "OK: advanced",
+        wait_until=lambda: bool(calls),
+    )
+
+    assert calls == ["KGC-2"]
+    assert gx10._AUTOMATION_NOTICE == notice
+
+
+def test_queue_consumer_surfaces_authoring_dispatch_failure_and_releases_retry_latch(monkeypatch):
+    gx10._AUTOMATION_NOTICE = ""
+    unit = {"id": "KGC-3", "type": "implementation", "priority": "high",
+            "title": "unit KGC-3", "description": "d"}
+    prompt = gx10._next_unit_prompt(None, unit, recovery=True)
+    gx10._CONTINUATION_AUTHORING.add("KGC-3")
+
+    def _fail(agent, item):
+        raise RuntimeError("model unavailable")
+
+    _run_queue_item(monkeypatch, f"{gx10._AUTHOR_CMD}KGC-3\x00{prompt}", dispatch=_fail)
+
+    assert "continuation authoring for KGC-3 failed" in gx10._AUTOMATION_NOTICE
+    assert "model unavailable" in gx10._AUTOMATION_NOTICE
+    assert "KGC-3" not in gx10._CONTINUATION_AUTHORING
+
+
+def test_queue_consumer_releases_latch_from_structured_id_not_prompt_prose(monkeypatch):
+    gx10._AUTOMATION_NOTICE = ""
+    gx10._CONTINUATION_AUTHORING.add("KGC-3")
+    changed_prompt = "[NEXT-UNIT] wording changed and contains no embedded task identifier"
+    dispatched = []
+
+    _run_queue_item(
+        monkeypatch,
+        f"{gx10._AUTHOR_CMD}KGC-3\x00{changed_prompt}",
+        dispatch=lambda _agent, prompt: dispatched.append(prompt),
+    )
+
+    assert dispatched == [changed_prompt]
+    assert "KGC-3" not in gx10._CONTINUATION_AUTHORING
+    assert "completed without staging" in gx10._AUTOMATION_NOTICE
+
+
 def test_capture_sink_strips_nul_from_display_text():
     # #1524 (security): displayed tool text must never carry the client's \x00 frame delimiter — an
     # attacker-controlled tool result (e.g. a read file with an embedded NUL) would otherwise forge a
@@ -196,6 +323,45 @@ def test_pending_handovers_surfaces_staged_task(tmp_path, monkeypatch):
     assert item["model"] == "claude-opus-4-8"
     assert item["effort"] == "high"
     assert item["timeout_s"] == 1800.0
+    assert item["lease_renew_s"] == 40.0
+
+
+def test_pending_handovers_skips_task_with_feedback_in_flight(tmp_path, monkeypatch):
+    tid = _stage_opus(tmp_path, monkeypatch)
+    (gx10.feedback_dir() / f"{tid}_OPUS-feedback.md").write_text("status: done\n", encoding="utf-8")
+
+    assert server._pending_handovers() == []
+
+
+def test_pending_handovers_skips_task_when_feedback_probe_raises(tmp_path, monkeypatch):
+    _stage_opus(tmp_path, monkeypatch)
+
+    class _UnreadableFeedbackDir:
+        def exists(self):
+            return True
+
+        def glob(self, _pattern):
+            raise OSError("feedback inbox unavailable")
+
+    monkeypatch.setattr(gx10, "feedback_dir", lambda soft=False: _UnreadableFeedbackDir())
+
+    assert server._pending_handovers() == []
+
+
+@pytest.mark.parametrize(("ttl_s", "renew_s"), [(2.0, 1.0), (120.0, 40.0)])
+def test_pending_handover_lease_cadence_tracks_short_and_default_ttls(
+        tmp_path, monkeypatch, ttl_s, renew_s):
+    _stage_opus(tmp_path, monkeypatch)
+    monkeypatch.setattr(gx10, "CLAIM_LEASE_TTL_S", ttl_s)
+
+    assert server._pending_handovers()[0]["lease_renew_s"] == renew_s
+
+
+def test_pending_handover_omits_lease_hint_when_disabled(tmp_path, monkeypatch):
+    _stage_opus(tmp_path, monkeypatch)
+    monkeypatch.setattr(gx10, "CLAIM_LEASE_TTL_S", 0.0)
+
+    assert "lease_renew_s" not in server._pending_handovers()[0]
 
 
 def test_pending_handover_ships_live_coder_timeout(tmp_path, monkeypatch):
@@ -312,6 +478,7 @@ def _stage_opus(tmp_path, monkeypatch):
     ho_dir = gx10.handovers_dir()
     ho_dir.mkdir(parents=True, exist_ok=True)
     (ho_dir / f"{tid}_OPUS.md").write_text("---\nto: OPUS\n---\nbody", encoding="utf-8")
+    return tid
 
 
 def test_pending_handover_ships_the_resolved_bin_path(tmp_path, monkeypatch):
@@ -343,6 +510,7 @@ def test_pending_handover_ships_the_exec_cwd(tmp_path, monkeypatch):
     assert item["cwd"]                                        # a concrete cwd is shipped
     assert isinstance(item["cwd"], str)                       # wire contract: JSON string, never a Path
     assert Path(item["cwd"]).resolve() == Path.cwd().resolve()  # == the active project's exec cwd
+    assert "project_root" not in item                         # no active non-default project → omitted
 
 
 def test_pending_handover_cwd_honours_code_subdir(tmp_path, monkeypatch):
@@ -350,9 +518,11 @@ def test_pending_handover_cwd_honours_code_subdir(tmp_path, monkeypatch):
     # demand), so the client builds the product tree isolated from the control-plane (vault/, .ironclad/).
     _stage_opus(tmp_path, monkeypatch)
     monkeypatch.setattr(gx10, "CODE_SUBDIR", "src")
+    monkeypatch.setattr(gx10, "_project_root", lambda: tmp_path)
     item = server._pending_handovers()[0]
     assert Path(item["cwd"]).name == "src"
     assert Path(item["cwd"]).is_dir()                         # created on demand by _exec_cwd
+    assert item["project_root"] == str(tmp_path)
 
 
 # --------------------------------------------------------------------------- #
@@ -451,6 +621,56 @@ def test_http_health_and_chat_capture(tmp_path, monkeypatch):
         assert fo["ok"]
         assert [r["content"] for r in fo["results"]] == ["r:x", "r:y"]
         assert fo["results"][0]["think"] is False
+    finally:
+        httpd.shutdown()
+
+
+def test_http_tool_plugin_keeps_active_project_context(tmp_path, monkeypatch):
+    """#1617: Ink's /chat → /tool path must carry the active project into the bounded plugin thread."""
+    from http.server import ThreadingHTTPServer
+
+    boot = tmp_path / "iron_test"
+    boot.mkdir()
+    monkeypatch.chdir(boot)
+    gx10.init_registry(boot)
+    project = gx10._REGISTRY.register("demo", boot / "demo", make_active=True)
+    gx10._set_active_project(project)
+    gx10.bind_active()
+    gx10.initiative_new("main", "software")
+
+    def _probe(query: str) -> str:
+        ctx = gx10._pc.current()
+        return (f"query={query}; project={ctx.project_id if ctx else None}; state={gx10.state_root()}; "
+                f"active={gx10.active_slug()}; artifact={gx10.artifact_root_soft()}")
+
+    gx10._PLUGIN_TOOLS["mpr_research"] = {
+        "handler": _probe,
+        "schema": {
+            "type": "function",
+            "function": {
+                "name": "mpr_research",
+                "description": "probe MPR routing",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"query": {"type": "string"}},
+                    "required": ["query"],
+                },
+            },
+        },
+    }
+    server._Handler.agent = _StubAgent()
+    server._Handler.cfg = {"connection": {"base_url": "http://localhost:8000/v1"}}
+    server._Handler.workers = _StubWorkers()
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), server._Handler)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    try:
+        response = _post(httpd.server_address[1], "/chat", {"message": "tool mpr_research decide this"})
+        output = response["output"]
+        assert "query=decide this" in output and "project=demo" in output
+        assert f"state={boot / 'demo' / '.ironclad'}" in output
+        assert "active=main" in output
+        assert f"artifact={boot / 'demo' / 'vault' / 'main'}" in output
+        assert f"artifact={boot / 'vault' / 'main'}" not in output
     finally:
         httpd.shutdown()
 
@@ -831,6 +1051,7 @@ def test_reconciler_matches_pinned_agent_feedback(tmp_path, monkeypatch):
     # #454: with a pin, the executing (effective) agent writes {tid}_{pin}-feedback.md — the reconciler
     # must match it to the staged task (look for the EFFECTIVE agent's feedback, not only the staged one).
     monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(gx10, "_WATCHER_ENABLED", True)
     gx10.initiative_new("PinRec", "software")
     store = gx10._store()
     store.create({"type": "feature", "priority": "high", "title": "t", "description": "d",
@@ -853,6 +1074,7 @@ def test_reconciler_pin_change_falls_back_to_staged_feedback(tmp_path, monkeypat
     # #454 (review A): the pin changed mid-handover (effective=SONNET) but the work completed under the
     # STAGED agent (OPUS) — the reconciler falls back to {tid}_OPUS-feedback.md so the task still advances.
     monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(gx10, "_WATCHER_ENABLED", True)
     gx10.initiative_new("PinFb", "software")
     store = gx10._store()
     store.create({"type": "feature", "priority": "high", "title": "t", "description": "d",
@@ -876,6 +1098,7 @@ def test_reconciler_advances_after_pin_cleared_post_run(tmp_path, monkeypatch):
     # feedback.md) then was CLEARED before reconcile — the reconciler must still DISCOVER + advance the
     # SONNET feedback (not only look at the now-effective staged OPUS), or the task strands.
     monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(gx10, "_WATCHER_ENABLED", True)
     gx10.initiative_new("PinClr", "software")
     store = gx10._store()
     store.create({"type": "feature", "priority": "high", "title": "t", "description": "d",
@@ -1019,6 +1242,33 @@ def test_http_feedback_failed_no_feedback_marks_task_blocked(tmp_path, monkeypat
         t = gx10._store().get(tid)
         assert t["blocked_kind"] == "errored"
         assert "unknown model" in t["blocked_reason"]
+    finally:
+        httpd.shutdown()
+
+
+def test_http_feedback_launch_refusal_is_terminal_without_spending_strategy_budget(
+        tmp_path, monkeypatch, _clean_breaker):
+    httpd, port = _start_server(monkeypatch, tmp_path)
+    try:
+        gx10._store().create({"type": "bugfix", "priority": "high", "title": "t", "description": "d"},
+                             force=True)
+        tid = gx10._store().list("pending")[0]["id"]
+        gx10._store().transition(tid, "in_progress")
+        refusal = ("tooling envelope refused unauthorized coder command "
+                   "(resolved bin='kimi', cmd_template='{bin} refused {prompt}'; "
+                   "no allow_list entry matched both)")
+
+        r = _post(port, "/feedback", {"task_id": tid, "agent": "OPUS", "content": "",
+                                      "exit_code": None, "stderr": refusal,
+                                      "launch_refusal": refusal})
+
+        assert r == {"ok": True, "classification": "launch-refused", "action": "terminal",
+                     "reason": refusal}
+        task = gx10._store().get(tid)
+        assert task["status"] == "in_progress"
+        assert task["blocked_kind"] == "errored"
+        assert task["blocked_reason"] == refusal
+        assert gx10._FAILURE_ATTEMPTS.get(tid, 0) == 0
     finally:
         httpd.shutdown()
 

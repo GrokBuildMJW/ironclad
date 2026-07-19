@@ -12,7 +12,7 @@ name: clean-room
 #
 # Rollback runbook (manual, if POST-publish fails): yank the bad version on PyPI
 # (`pip`-side) and mark the GitHub Release as a draft/pre-release; the previous version
-# stays installable. See PROJECT_SETUP.md → release model.
+# stays installable. See the release model in docs/status.md.
 
 on:
   pull_request:

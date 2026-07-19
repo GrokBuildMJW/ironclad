@@ -16,6 +16,18 @@ export class HttpError extends Error {
 
 export type Json = Record<string, unknown>;
 
+/** #454: prefer the server's JSON error detail, with the HTTP status as a fail-soft fallback. */
+export function httpError(method: string, path: string, status: number, raw: string): HttpError {
+  let detail = `${method} ${path} → HTTP ${status}`;
+  try {
+    const j = JSON.parse(raw) as Json;
+    if (typeof j['error'] === 'string') detail = j['error'] as string;
+  } catch {
+    /* non-JSON body → keep the generic detail */
+  }
+  return new HttpError(status, detail);
+}
+
 export class Server {
   readonly base: string;
   readonly timeoutMs: number;
@@ -52,14 +64,7 @@ export class Server {
     if (!res.ok) {
       // #454: surface the server's JSON {error: …} detail (e.g. 'unknown agent …' from POST /coders)
       // so all four clients show the same friendly message; fall back to the generic status line.
-      let detail = `${method} ${path} → HTTP ${res.status}`;
-      try {
-        const j = JSON.parse(raw) as Json;
-        if (typeof j['error'] === 'string') detail = j['error'] as string;
-      } catch {
-        /* non-JSON body → keep the generic detail */
-      }
-      throw new HttpError(res.status, detail);
+      throw httpError(method, path, res.status, raw);
     }
     return raw ? (JSON.parse(raw) as Json) : {};
   }
