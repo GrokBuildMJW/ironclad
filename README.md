@@ -1,14 +1,21 @@
 # Ironclad AI
 
-**An armored, autonomous software‑engineering orchestrator.**
+**An armored, autonomous process orchestrator.**
 
-Ironclad AI takes a plain‑English request and carries it all the way from idea
-to a running, tested, deployed change — planning the work, writing the code,
-verifying it against real evidence, and learning from what happened so the
-next run is better than the last. It runs headless on your own infrastructure,
-speaks a versioned API from day one, and is reachable from a terminal client,
-a rich TypeScript client, or a read‑only browser console — whichever fits the
-moment.
+At its core, Ironclad AI is a configurable engine for running multi‑step
+processes autonomously, end to end: **Plan → Build → Run.** A process isn't
+hardcoded into the engine; it's defined, the same way a build pipeline or an
+infrastructure playbook is defined, and Ironclad carries it out — planning
+the work, executing it, verifying the result against real evidence, and
+learning from what happened so the next run is better than the last. It
+runs headless on your own infrastructure, speaks a versioned API from day
+one, and is reachable from a terminal client, a rich TypeScript client, or a
+read‑only browser console — whichever fits the moment.
+
+The first process it ships with is software engineering, end to end — from
+a plain‑English request to a deployed, tested change. That's the flagship
+example throughout this documentation, but it's an instance of what the
+engine does, not the whole of what it is.
 
 > **Status:** in active development. This repository is a preview of the
 > product documentation — no code is published here.
@@ -17,9 +24,16 @@ moment.
 
 ## What it does
 
-- **Runs full software delivery cycles autonomously.** Init → scope → design →
-  build → go‑live → operate. Every phase produces real, checkable evidence —
-  not a summary of what an agent claims it did.
+- **Runs any defined multi‑step process autonomously.** A process is
+  declared, not hardcoded into the engine — the same machine that runs
+  software engineering end to end (Plan → Build → Run) can run any other
+  multi‑step process defined the same way. Every phase produces real,
+  checkable evidence — not a summary of what an agent claims it did.
+- **Codes discipline once, as skills.** How to plan a change, test it, review
+  it, hand it off cleanly — each is a small, versioned skill definition, not
+  something re‑explained every session. A recurring failure pattern can
+  become a new skill on its own, so the fix applies everywhere going
+  forward, not just to the run that found it.
 - **Learns from its own work.** Every run is reflected on, distilled into
   lessons, and — only after passing a gate — folded into a growing base of
   project and organization‑wide knowledge. Nothing gets promoted to long‑term
@@ -46,19 +60,20 @@ moment.
 
 ```mermaid
 flowchart LR
-    subgraph Clients
-        TUI["Terminal client"]
-        INK["Rich terminal client"]
-        WEB["Browser console (read-only)"]
+    subgraph Clients["🖥️ Clients"]
+        TUI(["Terminal client"])
+        INK(["Rich terminal client"])
+        WEB(["Browser console\n(read-only)"])
     end
 
-    subgraph Engine["Ironclad AI Engine"]
-        API["Versioned API"]
-        LOOP["Agent loop"]
-        PROC["Process engine\n(init → scope → design → build → go-live → operate)"]
-        LEARN["Self-learning layer\n(reflect → curate → gate)"]
-        MEM["Tiered memory\n(promotion-gated)"]
-        AUDIT["Audit ledger\n(hash-chained)"]
+    subgraph Engine["⚙️ Ironclad AI Engine"]
+        API(["Versioned API"])
+        LOOP(["Agent loop & tools"])
+        PROC(["Process engine\nPlan → Build → Run"])
+        SKILL(["Skills\n(discipline, coded once)"])
+        LEARN(["Learning\nreflect → curate → gate"])
+        MEM[("Tiered memory")]
+        AUDIT[("Audit ledger")]
     end
 
     TUI --> API
@@ -66,16 +81,29 @@ flowchart LR
     WEB --> API
     API --> LOOP
     LOOP --> PROC
+    PROC --> SKILL
     PROC --> LEARN
     LEARN --> MEM
-    MEM --> LOOP
+    MEM -.-> LOOP
     PROC --> AUDIT
     LOOP --> AUDIT
+
+    classDef client fill:#2b3a55,stroke:#7ea6ff,stroke-width:2px,color:#eaf0ff
+    classDef core fill:#4a3768,stroke:#c79bff,stroke-width:2px,color:#f3ecff
+    classDef mind fill:#1f4d3d,stroke:#5fd6a8,stroke-width:2px,color:#e6fff5
+    classDef trust fill:#5a2e2e,stroke:#ff9d9d,stroke-width:2px,color:#ffecec
+    class TUI,INK,WEB,API client
+    class LOOP,PROC,SKILL core
+    class LEARN,MEM mind
+    class AUDIT trust
 ```
 
-Every run is driven by the same process engine, observed through the same
-API, and leaves the same kind of trail behind: an append‑only, tamper‑evident
-record of what was decided, what was approved, and what actually happened.
+Every run is driven by the same process engine, guided by the same coded
+discipline, observed through the same API, and leaves the same kind of
+trail behind: an append‑only, tamper‑evident record of what was decided,
+what was approved, and what actually happened. See
+**[Architecture](docs/architecture.md)** for how skills, learning, and
+memory actually connect to each other.
 
 ---
 

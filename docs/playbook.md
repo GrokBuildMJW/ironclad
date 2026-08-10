@@ -1,7 +1,10 @@
 # Playbook: a feature request, start to finish
 
 This walks through a single, realistic example — adding rate limiting to an
-API endpoint — from the first message to a deployed, verified change.
+API endpoint — through software engineering's own Plan → Build → Run cycle,
+from the first message to a deployed, verified change. See
+**[Architecture](architecture.md)** for how the process engine, skills,
+learning, and memory pieces mentioned along the way actually fit together.
 
 ## 1. The ask
 
@@ -32,13 +35,15 @@ guessing.
 
 ## 4. Build
 
-Implementation happens step by step. Each step's own tests are written
-alongside it — not appended afterward — and a new fail‑closed path (what
-happens when the limit is hit) ships with a real counterfactual proof: the
-limiter is deliberately broken, the test that should catch it is confirmed
-to actually go red, then the fix is restored and confirmed green again. A
-green suite by itself is never treated as proof; the failure has to be seen
-to happen.
+Implementation happens step by step, guided by the same test‑first,
+verify‑before‑claiming discipline every build step follows — coded once as
+a skill, not re‑explained for this particular endpoint. Each step's own
+tests are written alongside it — not appended afterward — and a new
+fail‑closed path (what happens when the limit is hit) ships with a real
+counterfactual proof: the limiter is deliberately broken, the test that
+should catch it is confirmed to actually go red, then the fix is restored
+and confirmed green again. A green suite by itself is never treated as
+proof; the failure has to be seen to happen.
 
 ## 5. Go‑live
 
