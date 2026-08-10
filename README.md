@@ -75,7 +75,7 @@ flowchart LR
     subgraph Clients["🖥️ Clients"]
         TUI(["Terminal client"])
         INK(["Rich terminal client"])
-        WEB(["Browser console\n(read-only today,\nfull interaction ahead)"])
+        WEB(["Browser console"])
     end
 
     subgraph Engine["⚙️ Ironclad AI Engine"]
