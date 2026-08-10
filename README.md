@@ -9,8 +9,8 @@ infrastructure playbook is defined, and Ironclad carries it out — planning
 the work, executing it, verifying the result against real evidence, and
 learning from what happened so the next run is better than the last. It
 runs headless on your own infrastructure, speaks a versioned API from day
-one, and is reachable from a terminal client, a rich TypeScript client, or a
-read‑only browser console — whichever fits the moment.
+one, and is reachable from a terminal client on Windows, Linux, or macOS, a
+rich TypeScript client, or a browser console — whichever fits the moment.
 
 The first process it ships with is software engineering, end to end — from
 a plain‑English request to a deployed, tested change. That's the flagship
@@ -53,11 +53,13 @@ engine does, not the whole of what it is.
   drift out of sync with what the API actually promises.
 - **Meets you where you work.** A terminal client for fast, keyboard‑first
   operation; a richer TypeScript client for deeper interaction; a browser
-  console for watching a run unfold in real time. All three speak that same
-  API — nothing is a special case.
-- **Runs anywhere your team does.** A single headless engine, deployable as a
-  Docker image or a native installer, with native clients across Windows,
-  Linux, and macOS.
+  console for watching a run unfold in real time — currently read‑only, on
+  its way to full interaction. All three speak that same API — nothing is
+  a special case.
+- **Runs anywhere your team does.** A single headless engine, deployable as
+  a Docker image or a native installer. The CLI runs natively on all three
+  major platforms — Windows, Linux, and macOS — no matter which one your
+  team develops on.
 - **Proves itself end to end.** A complete Plan → Build → Run cycle — start
   a project, take it through every phase, watch it go live — runs entirely
   through that one API, start to finish, deterministically and against
@@ -73,7 +75,7 @@ flowchart LR
     subgraph Clients["🖥️ Clients"]
         TUI(["Terminal client"])
         INK(["Rich terminal client"])
-        WEB(["Browser console\n(read-only)"])
+        WEB(["Browser console\n(read-only today,\nfull interaction ahead)"])
     end
 
     subgraph Engine["⚙️ Ironclad AI Engine"]
