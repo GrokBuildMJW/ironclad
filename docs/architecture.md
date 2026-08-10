@@ -1,9 +1,15 @@
 # Architecture
 
-Ironclad AI is a single headless engine with a versioned, API‑first surface.
-Every client — terminal, rich terminal, or browser — talks to the same API
-the engine talks to itself, so there is no special internal shortcut and no
-client‑specific behavior to keep in sync.
+Ironclad AI is a single headless engine with one versioned, API‑first
+surface — and that's not a description of the outer edge, it's true all
+the way through. Every client — terminal, rich terminal, or browser — calls
+the same API the engine's own internal machinery calls to drive itself.
+There is no private shortcut for "internal" callers and no client‑specific
+behavior that can quietly drift out of sync with what the API actually
+promises. A complete Plan → Build → Run cycle — starting a project, taking
+it through every phase, watching it go live — runs entirely over that one
+API, end to end, deterministically and against real evidence at every
+step. That's not a demo path; it's the same route every real run takes.
 
 ## A process engine, not a fixed pipeline
 

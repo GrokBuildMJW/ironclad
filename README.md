@@ -1,4 +1,4 @@
-# Ironclad AI
+# Ironclad AI — Community Edition
 
 **An armored, autonomous process orchestrator.**
 
@@ -46,13 +46,23 @@ engine does, not the whole of what it is.
   file, approving a promotion, executing a tool — passes through an
   explicit, auditable gate. Unknown input or an unreachable dependency
   produces a structured refusal, never a silent guess.
+- **Is API‑first, all the way through.** There is exactly one versioned API
+  surface, and every caller uses it the same way — the terminal client, the
+  browser console, and the engine's own internal machinery all go through
+  the identical handlers. Nothing has a private shortcut, so nothing can
+  drift out of sync with what the API actually promises.
 - **Meets you where you work.** A terminal client for fast, keyboard‑first
   operation; a richer TypeScript client for deeper interaction; a browser
-  console for watching a run unfold in real time. All three speak the same
-  versioned API — nothing is a special case.
+  console for watching a run unfold in real time. All three speak that same
+  API — nothing is a special case.
 - **Runs anywhere your team does.** A single headless engine, deployable as a
   Docker image or a native installer, with native clients across Windows,
   Linux, and macOS.
+- **Proves itself end to end.** A complete Plan → Build → Run cycle — start
+  a project, take it through every phase, watch it go live — runs entirely
+  through that one API, start to finish, deterministically and against
+  real, checkable evidence at every step. Not a demo path; the same route
+  every real run takes.
 
 ---
 
@@ -123,4 +133,4 @@ feature request from a one‑line ask through to a deployed, tested change.
 
 ---
 
-*Ironclad AI is built and maintained by MJW Consulting.*
+*Ironclad AI is built and maintained by MJWC‑AI-LAB. Developed in the UAE.*
