@@ -121,9 +121,7 @@ memory actually connect to each other.
 
 ## See it in action
 
-Curious what using it actually looks like? **[Take a look at the
-clients](docs/screens.md)** — the terminal, the rich terminal, and the
-browser console, all watching the same run. Or read the
+Curious what using it actually looks like? Read the
 **[playbook](docs/playbook.md)** — a worked example that follows a single
 feature request from a one‑line ask through to a deployed, tested change.
 
@@ -131,8 +129,6 @@ feature request from a one‑line ask through to a deployed, tested change.
 
 ## Learn more
 
-- **[The clients](docs/screens.md)** — what the terminal, rich terminal,
-  and browser console actually look like
 - **[Playbook](docs/playbook.md)** — a worked example, start to finish
 - **[Architecture](docs/architecture.md)** — how the pieces fit together in
   more depth
