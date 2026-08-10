@@ -3,19 +3,20 @@
 **An armored, autonomous process orchestrator.**
 
 At its core, Ironclad AI is a configurable engine for running multi‑step
-processes autonomously, end to end: **Plan → Build → Run.** A process isn't
-hardcoded into the engine; it's defined, the same way a build pipeline or an
-infrastructure playbook is defined, and Ironclad carries it out — planning
-the work, executing it, verifying the result against real evidence, and
-learning from what happened so the next run is better than the last. It
-runs headless on your own infrastructure, speaks a versioned API from day
-one, and is reachable from a terminal client on Windows, Linux, or macOS, a
+processes autonomously, end to end. A process isn't hardcoded into the
+engine; it's defined, the same way a build pipeline or an infrastructure
+playbook is defined, and Ironclad carries it out — planning the work,
+executing it, verifying the result against real evidence, and learning
+from what happened so the next run is better than the last. It runs
+headless on your own infrastructure, speaks a versioned API from day one,
+and is reachable from a terminal client on Windows, Linux, or macOS, a
 rich TypeScript client, or a browser console — whichever fits the moment.
 
 The first process it ships with is software engineering, end to end — from
-a plain‑English request to a deployed, tested change. That's the flagship
-example throughout this documentation, but it's an instance of what the
-engine does, not the whole of what it is.
+a plain‑English request to a deployed, tested change, through its own
+**Plan → Build → Run** lifecycle. That's the flagship example throughout
+this documentation, but it's an instance of what the engine does, not the
+whole of what it is.
 
 > **Status:** in active development. This repository is a preview of the
 > product documentation — no code is published here.
@@ -60,11 +61,12 @@ engine does, not the whole of what it is.
   a Docker image or a native installer. The CLI runs natively on all three
   major platforms — Windows, Linux, and macOS — no matter which one your
   team develops on.
-- **Proves itself end to end.** A complete Plan → Build → Run cycle — start
-  a project, take it through every phase, watch it go live — runs entirely
-  through that one API, start to finish, deterministically and against
-  real, checkable evidence at every step. Not a demo path; the same route
-  every real run takes.
+- **Proves itself end to end.** A complete run through software
+  engineering's Plan → Build → Run lifecycle — start a project, take it
+  through every phase, watch it go live — runs entirely through that one
+  API, start to finish, deterministically and against real, checkable
+  evidence at every step. Not a demo path; the same route every real run
+  takes.
 
 ---
 
@@ -81,7 +83,7 @@ flowchart LR
     subgraph Engine["⚙️ Ironclad AI Engine"]
         API(["Versioned API"])
         LOOP(["Agent loop & tools"])
-        PROC(["Process engine\nPlan → Build → Run"])
+        PROC(["Process engine"])
         SKILL(["Skills\n(discipline, coded once)"])
         LEARN(["Learning\nreflect → curate → gate"])
         MEM[("Tiered memory")]

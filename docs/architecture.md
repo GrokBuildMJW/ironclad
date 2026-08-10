@@ -6,10 +6,11 @@ the way through. Every client — terminal, rich terminal, or browser — calls
 the same API the engine's own internal machinery calls to drive itself.
 There is no private shortcut for "internal" callers and no client‑specific
 behavior that can quietly drift out of sync with what the API actually
-promises. A complete Plan → Build → Run cycle — starting a project, taking
-it through every phase, watching it go live — runs entirely over that one
-API, end to end, deterministically and against real evidence at every
-step. That's not a demo path; it's the same route every real run takes.
+promises. A complete run through software engineering's Plan → Build → Run
+lifecycle — starting a project, taking it through every phase, watching it
+go live — runs entirely over that one API, end to end, deterministically
+and against real evidence at every step. That's not a demo path; it's the
+same route every real run takes.
 
 ## A process engine, not a fixed pipeline
 
@@ -18,10 +19,15 @@ one. A process is declared — its steps, their order, how they gate on each
 other, what happens on failure — the same way a build pipeline or an
 infrastructure playbook is declared. The engine carries out whatever process
 it's given. Adding a new kind of process to run means writing a new process
-definition; it never means changing the engine itself.
+definition; it never means changing the engine itself. What every process
+shares isn't a fixed set of phases but the same underlying discipline:
+skills applied consistently, evidence over claims, and learning fed back
+into the next run.
 
-The product's standing ambition for any process it runs is the same
-three‑part promise:
+### Software engineering: the first process definition
+
+Software engineering is the first process Ironclad ships with, and it's
+shaped around its own three‑part lifecycle:
 
 ```mermaid
 flowchart LR
@@ -41,10 +47,7 @@ flowchart LR
   and keeps watching it — feeding incidents and outcomes back into the next
   cycle.
 
-### Software engineering: the first process definition
-
-Software engineering is the first process Ironclad ships with — a full
-Plan → Build → Run cycle for shipping a real change:
+A full Plan → Build → Run cycle for shipping a real change looks like this:
 
 ```mermaid
 flowchart LR
@@ -196,7 +199,7 @@ flowchart TB
     end
 
     subgraph CORE["Core loop"]
-        PROC["Process engine\n(Plan → Build → Run)"]
+        PROC["Process engine"]
         SKILL["Skills\n(discipline, coded once)"]
         AGENT["Agent loop & tools"]
     end
