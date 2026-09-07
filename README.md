@@ -64,7 +64,7 @@ want a trail.**
   <img src="images/catalog-library.png" alt="ironclad-ai process catalog library" width="100%">
 </p>
 
-<p align="center"><em>The process catalog. Software development, takeover, extraction, calibration — versioned, grouped by use case.</em></p>
+<p align="center"><em>The process catalog. Pick a version in the library and the materialized flow opens beside it — here <code>sw_dev_default</code>, fourteen steps with gates and reroutes.</em></p>
 
 ```mermaid
 flowchart LR
