@@ -1,79 +1,108 @@
 # Playbook: a feature request, start to finish
 
-This walks through a single, realistic example — adding rate limiting to an
-API endpoint — through software engineering's own Plan → Build → Run cycle,
-from the first message to a deployed, verified change. See
-**[Architecture](architecture.md)** for how the process engine, skills,
-learning, and memory pieces mentioned along the way actually fit together.
+This follows a realistic ask through the shipped software-development
+rulebook — the fourteen-step `sw_dev_default` process, not a slide titled
+Plan → Build → Run. Those three words are still a good way to *talk* about
+it. This page is what ironclad-ai actually does.
+
+See [Architecture](architecture.md) for skills, learning, and memory.
+See [Processes](processes.md) for the other shipped definitions.
 
 ## 1. The ask
 
-> "Add rate limiting to `/api/v1/uploads`. 10 requests per minute per
-> account, return a proper 429 when it's exceeded."
+> Add rate limiting to `/api/v1/uploads`. 10 requests per minute per
+> account. Return a proper 429 when it is exceeded.
 
-That's the whole input. No ticket template, no acceptance‑criteria checklist
-to fill out by hand.
+That is the whole input. No ticket template. You type it in Ink.
 
-## 2. Scope
+## 2. Intake and spine
 
-Ironclad turns the request into a concrete plan: where the limiting logic
-belongs, what "per account" resolves to in this codebase, what the 429
-response body should contain, and what already exists that a new rate
-limiter needs to compose with — auth middleware, existing error envelopes,
-existing tests for the endpoint. The plan is written down before anything is
-built, so it can be checked against the actual request, not reconstructed
-after the fact from the diff.
+The engine records the request as Intake. A weak-prompt review is advisory:
+a vague ask does not deadlock the run, but it is on the record.
 
-## 3. Design
+Then the **spine** — language and approach — is written down *before* scope.
+On the default rulebook this is an operator gate. Ink waits. You approve a
+spine, or you send the run back. The browser console will show the wait. It
+will not let you click it away.
 
-For anything with a real decision behind it — an in‑memory limiter versus a
-shared store, a sliding window versus a fixed one — Ironclad works out the
-tradeoff explicitly rather than picking silently. If the codebase already
-has an established pattern for this kind of decision, it follows it; if
-there's a genuine fork with no established answer, it says so rather than
-guessing.
+## 3. Scope
 
-## 4. Build
+Scope turns the ask into something checkable: where the limiter belongs,
+what "per account" means in *this* codebase, what the 429 body looks like,
+what already exists that the new code has to compose with.
 
-Implementation happens step by step, guided by the same test‑first,
-verify‑before‑claiming discipline every build step follows — coded once as
-a skill, not re‑explained for this particular endpoint. Each step's own
-tests are written alongside it — not appended afterward — and a new
-fail‑closed path (what happens when the limit is hit) ships with a real
-counterfactual proof: the limiter is deliberately broken, the test that
-should catch it is confirmed to actually go red, then the fix is restored
-and confirmed green again. A green suite by itself is never treated as
-proof; the failure has to be seen to happen.
+On `sw_dev_default`, scope is dispatched and operator-gated. You read it.
+You approve it. A replacement scope cannot ride an old approval.
 
-## 5. Go‑live
+## 4. Scope review
 
-Before anything is considered done, the full test suite runs, the specific
-new behavior is exercised against a real request (not just a unit‑level
-mock), and the evidence — what ran, what passed, what the actual response
-looked like under load — is attached to the change itself. Nothing ships on
-the strength of a summary claiming it works.
+An independent review job runs against the persisted scope. Unanimous
+approval continues. Findings reroute back to scope authoring, up to three
+times, with review-of-review on. Exhaustion waits rather than pretending
+the findings were optional.
 
-## 6. Operate
+## 5. Ops contract
 
-Once live, the endpoint is watched: request volume, 429 rates, anything that
-looks like the limiter is either too aggressive or not catching what it
-should. If something goes wrong, it becomes an incident with its own record,
-not a mystery someone has to reconstruct from scratch later.
+Before design, the run authors an operations contract: deploy, health,
+rollback, smoke, verification entrypoints. The default gate is **required**.
+A missing smoke command or an invalid verification section aborts. This is
+the opposite of "we'll add a Dockerfile later."
 
-## 7. What Ironclad remembers
+## 6. Design
 
-If this run turned up something worth keeping — a subtlety in how this
-codebase handles per‑account identity, a gotcha in how the existing error
-envelope needed to be extended — that observation is reflected on, checked
-against what's already known, and, if it survives that check, proposed as a
-new piece of knowledge. It doesn't become part of the system's working
-memory until an explicit approval says so. The next time a similar request
-comes in — for this project, or for the parts of the lesson that generalize
-— that knowledge is there, ranked by how relevant and how recent it is, not
-just dumped into context because it happens to exist.
+For a real fork — in-memory limiter versus a shared store, sliding window
+versus fixed — ironclad-ai works the tradeoff explicitly. The design step
+fans the question out across several lenses and synthesizes one design.
+
+Design review is the same shape as scope review: independent jobs, bounded
+reroute to design, review-of-review. On the default rulebook, design
+approval is an operator gate. `sw_dev_base` can auto-accept after review;
+the default does not.
+
+## 7. Units
+
+The approved design is sliced into delivery units. Decomposition review
+checks that the slice is the work you actually approved, then reroutes to
+planning if it is not.
+
+## 8. Execution
+
+Implementation applies the change, runs the declared build, then the
+declared tests, in that order. A new fail-closed path is expected to ship
+with a counterfactual: the limiter is broken on purpose, the test that
+should catch it goes red, the fix is restored, the suite goes green. A
+green suite by itself is not treated as proof that the failure was seen.
+
+Refusals retry up to the step budget, then follow the pinned refusal route.
+
+## 9. Code review
+
+Review jobs fan out over the actual diff and the verification evidence.
+Findings reroute to execution. Review-of-review can overturn a verdict.
+A remaining rejection can mint a learning proposal. An unchallenged approve
+does not.
+
+You still do not approve code review from the browser. Ink is the control
+surface.
+
+## 10. Go-live
+
+The local go-live gate checks the contract you already approved. A failed
+go-live can take an audited waiver. It cannot take a shrug.
+
+## 11. What ironclad-ai remembers
+
+If this run turned up something worth keeping — how this codebase identifies
+an account, how the error envelope had to grow — that observation is
+reflected, curated against what is already known, and proposed. It does not
+become working memory until an approval says so.
+
+The next similar ask retrieves by relevance and recency, not by dumping
+everything that happens to exist.
 
 ---
 
-That's the shape of every run: a real plan, a real decision trail, evidence
-instead of summaries, and a system that gets a little better at this exact
-kind of work every time it does it again.
+That is the shape of a default software run: a written spine, a written
+scope, independent review, an ops contract that can abort, a design you
+can point at, tests that had to go red, and a ledger of who allowed the
+run to move.

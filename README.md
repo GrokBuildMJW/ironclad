@@ -1,98 +1,94 @@
-# Ironclad AI — Community Edition
+# ironclad-ai
 
 **An armored, autonomous process orchestrator.**
 
-At its core, Ironclad AI is a configurable engine for running multi‑step
-processes autonomously, end to end. A process isn't hardcoded into the
-engine; it's defined, the same way a build pipeline or an infrastructure
-playbook is defined, and Ironclad carries it out — planning the work,
-executing it, verifying the result against real evidence, and learning
-from what happened so the next run is better than the last. It runs
-headless on your own infrastructure, speaks a versioned API from day one,
-and is reachable from a terminal client on Windows, Linux, or macOS, a
-rich TypeScript client, or a browser console — whichever fits the moment.
+Most coding agents are a chat window with tools. That is fine for a spike.
+It is a poor way to ship a change you have to live with.
 
-The first process it ships with is software engineering, end to end — from
-a plain‑English request to a deployed, tested change, through its own
-**Plan → Build → Run** lifecycle. That's the flagship example throughout
-this documentation, but it's an instance of what the engine does, not the
-whole of what it is.
+ironclad-ai runs a **defined process** on your own infrastructure. You write
+the request in plain language. The engine turns it into scoped work, reviews
+it against evidence, and stops at every gate that needs a human. It does not
+guess when it cannot prove the next step.
 
-> **Status:** in active development. This repository is a preview of the
-> product documentation — no code is published here.
+The first process it ships is software engineering — from a one-line ask to
+a verified, go-live-ready change. That is the flagship. It is not the whole
+product. The same engine runs takeover, knowledge extraction, calibration,
+and any process you publish into the workspace library.
 
----
+> **Status.** ironclad-ai is in active development. This repository is the
+> public documentation. Source and packages are not published here.
 
-## What it does
+<p align="center">
+  <img src="images/ink.png" alt="ironclad-ai Ink: the chat-first terminal client" width="100%">
+</p>
 
-- **Runs any defined multi‑step process autonomously.** A process is
-  declared, not hardcoded into the engine — the same machine that runs
-  software engineering end to end (Plan → Build → Run) can run any other
-  multi‑step process defined the same way. Every phase produces real,
-  checkable evidence — not a summary of what an agent claims it did.
-- **Codes discipline once, as skills.** How to plan a change, test it, review
-  it, hand it off cleanly — each is a small, versioned skill definition, not
-  something re‑explained every session. A recurring failure pattern can
-  become a new skill on its own, so the fix applies everywhere going
-  forward, not just to the run that found it.
-- **Learns from its own work.** Every run is reflected on, distilled into
-  lessons, and — only after passing a gate — folded into a growing base of
-  project and organization‑wide knowledge. Nothing gets promoted to long‑term
-  memory without going through an approval step first.
-- **Remembers what matters, safely.** A tiered memory model separates raw
-  experience from reviewed, trusted knowledge. Retrieval is relevance‑ and
-  budget‑bounded, so a flood of weak matches never drowns out the few that
-  actually matter, and one project's knowledge never leaks into another's.
-- **Never guesses at the boundary.** Every consequential action — writing a
-  file, approving a promotion, executing a tool — passes through an
-  explicit, auditable gate. Unknown input or an unreachable dependency
-  produces a structured refusal, never a silent guess.
-- **Is API‑first, all the way through.** There is exactly one versioned API
-  surface, and every caller uses it the same way — the terminal client, the
-  browser console, and the engine's own internal machinery all go through
-  the identical handlers. Nothing has a private shortcut, so nothing can
-  drift out of sync with what the API actually promises.
-- **Meets you where you work.** A terminal client for fast, keyboard‑first
-  operation; a richer TypeScript client for deeper interaction; a browser
-  console for watching a run unfold in real time — currently read‑only, on
-  its way to full interaction. All three speak that same API — nothing is
-  a special case.
-- **Runs anywhere your team does.** A single headless engine, deployable as
-  a Docker image or a native installer. The CLI runs natively on all three
-  major platforms — Windows, Linux, and macOS — no matter which one your
-  team develops on.
-- **Proves itself end to end.** A complete run through software
-  engineering's Plan → Build → Run lifecycle — start a project, take it
-  through every phase, watch it go live — runs entirely through that one
-  API, start to finish, deterministically and against real, checkable
-  evidence at every step. Not a demo path; the same route every real run
-  takes.
+<p align="center"><em>Ink — the terminal client. One conversation. The process runs behind it.</em></p>
 
 ---
 
-## How it fits together
+## Why this exists
+
+If you have tried to put an LLM on real delivery work, you already know the
+failure mode. The model sounds sure. The diff is large. The tests it mentions
+were never run. Nobody can say which decision was approved, or by whom.
+
+ironclad-ai is built for the other case: **you want the speed, and you still
+want a trail.**
+
+- **The process is visible.** Steps, gates, reviews, and reroutes are a
+  versioned definition — not a prompt you hope the model will follow.
+- **Approvals actually stop the run.** Scope, design, and go-live wait. Ink
+  is where you decide. The browser does not sneak an approve button past you.
+- **Evidence beats summaries.** A green claim is not a green suite. A
+  refused tool call is a structured refusal, not a silent retry that hopes
+  nobody notices.
+- **It learns on purpose.** Lessons and long-term knowledge only land after
+  a gate. One project's memory does not leak into another's.
+- **One API, every client.** Ink, the browser console, the process catalog,
+  and the Python automation client all speak `/api/v1`. Nothing gets a
+  private shortcut.
+
+---
+
+## What you actually get
+
+| Surface | What it is for |
+|---|---|
+| **Ink** | Chat-first terminal client. You talk, approve, and steer the run. `Ctrl+O` opens the project overlay (events, board, position, approvals, turns, incidents). |
+| **Browser console** | Live observer: event log, board, pending gates, process position, codedir, telemetry. Optional chat is a feature gate. Approvals stay in Ink. |
+| **Process catalog** | Workspace library of versioned processes. Inspect the materialized flow, publish a revision, pin a rulebook to a project. |
+| **Engine CLI** | `ironclad serve`, `ironclad run`, `ironclad update`, plus config and memory commands. `ironclad run` starts or attaches to the workspace server and opens Ink. |
+| **Python client** | Typed automation against the same versioned API. No second protocol. |
+
+<p align="center">
+  <img src="images/catalog-library.png" alt="ironclad-ai process catalog library" width="100%">
+</p>
+
+<p align="center"><em>The process catalog. Software development, takeover, extraction, calibration — versioned, grouped by use case.</em></p>
 
 ```mermaid
 flowchart LR
-    subgraph Clients["🖥️ Clients"]
-        TUI(["Terminal client"])
-        INK(["Rich terminal client"])
-        WEB(["Browser console"])
+    subgraph Clients
+        INK[Ink]
+        WEB[Browser console]
+        CAT[Process catalog]
+        PY[Python client]
     end
 
-    subgraph Engine["⚙️ Ironclad AI Engine"]
-        API(["Versioned API"])
-        LOOP(["Agent loop & tools"])
-        PROC(["Process engine"])
-        SKILL(["Skills\n(discipline, coded once)"])
-        LEARN(["Learning\nreflect → curate → gate"])
-        MEM[("Tiered memory")]
-        AUDIT[("Audit ledger")]
+    subgraph Engine["ironclad-ai engine"]
+        API["Versioned API /api/v1"]
+        LOOP[Agent loop and tools]
+        PROC[Process engine]
+        SKILL[Skills]
+        LEARN[Gated learning]
+        MEM[Tiered memory]
+        AUDIT[Audit ledger]
     end
 
-    TUI --> API
     INK --> API
     WEB --> API
+    CAT --> API
+    PY --> API
     API --> LOOP
     LOOP --> PROC
     PROC --> SKILL
@@ -101,40 +97,150 @@ flowchart LR
     MEM -.-> LOOP
     PROC --> AUDIT
     LOOP --> AUDIT
-
-    classDef client fill:#2b3a55,stroke:#7ea6ff,stroke-width:2px,color:#eaf0ff
-    classDef core fill:#4a3768,stroke:#c79bff,stroke-width:2px,color:#f3ecff
-    classDef mind fill:#1f4d3d,stroke:#5fd6a8,stroke-width:2px,color:#e6fff5
-    classDef trust fill:#5a2e2e,stroke:#ff9d9d,stroke-width:2px,color:#ffecec
-    class TUI,INK,WEB,API client
-    class LOOP,PROC,SKILL core
-    class LEARN,MEM mind
-    class AUDIT trust
 ```
-
-Every run is driven by the same process engine, guided by the same coded
-discipline, observed through the same API, and leaves the same kind of
-trail behind: an append‑only, tamper‑evident record of what was decided,
-what was approved, and what actually happened. See
-**[Architecture](docs/architecture.md)** for how skills, learning, and
-memory actually connect to each other.
 
 ---
 
-## See it in action
+## A software-engineering run, for real
 
-Curious what using it actually looks like? Read the
-**[playbook](docs/playbook.md)** — a worked example that follows a single
-feature request from a one‑line ask through to a deployed, tested change.
+The shipped default rulebook is fourteen steps, not a slogan. Plan, build,
+and go-live are how it *feels*. This is what it *does*:
+
+```mermaid
+flowchart TB
+    subgraph Plan
+        A[Intake] --> B[Spine]
+        B --> C[Scope]
+        C --> D[Scope review]
+        D --> E[Ops contract]
+        E --> F[Design]
+        F --> G[Design review and approval]
+        G --> H[Plan units]
+        H --> I[Decomposition review]
+    end
+    subgraph Build
+        I --> J[Execution]
+        J --> K[Code review]
+    end
+    subgraph GoLive
+        K --> L[Go-live]
+    end
+```
+
+Findings at a review gate do not get waved through. They reroute to the
+step that has to fix them, with a bounded retry budget. Review-of-review
+is on by default for the shipped software rulebooks. Patch and hotfix are
+the same skeleton with a different change lane.
+
+<p align="center">
+  <img src="images/catalog-sw-dev-default.png" alt="Materialized flow for sw_dev_default" width="100%">
+</p>
+
+<p align="center"><em>sw_dev_default@1 — inherited base, overridden operator gates, review forks, reroute arrows. This is the definition the engine will run.</em></p>
+
+The close-up of that flow:
+
+<p align="center">
+  <img src="images/catalog-flow-detail.png" alt="Fourteen-step software-development flow with gates and reroutes" width="72%">
+</p>
+
+While a run is live, the browser console shows where it is, what is waiting,
+and what just happened — without giving the browser the authority to approve.
+
+<p align="center">
+  <img src="images/console-operator.png" alt="ironclad-ai browser console operator view" width="100%">
+</p>
+
+<p align="center">
+  <img src="images/console-project.png" alt="ironclad-ai console on a live run waiting at scope authoring" width="100%">
+</p>
+
+<p align="center"><em>Operator overview, then a project bound to a live run. Step 3 of 14, waiting on input. Codedir path redacted.</em></p>
+
+Read the worked example in the **[playbook](docs/playbook.md)**.
+
+---
+
+## Not only software delivery
+
+The engine does not care that the flagship process is software. A process
+is a published definition: steps, variants, gates, refusal routes.
+
+Shipped today:
+
+| Process | Use case | What it is |
+|---|---|---|
+| `sw_dev_default` | Software development | Operator-gated scope and design on the fourteen-step base |
+| `sw_dev_double_reviewed` | Software development | Same sequence, second opinion named explicitly |
+| `sw_dev_unreviewed` | Software development | Primary reviews stay; review-of-review off |
+| `sw_dev_patch` / `sw_dev_hotfix` | Software development | Same sequence, different change lane |
+| `takeover` | Project adoption | Clone a repo, extract knowledge, baseline the gates, pin a rulebook |
+| `rulebook_migration` | Project adoption | Pin an existing project onto a rulebook through audited waivers |
+| `knowledge_extraction` | Knowledge extraction | Snapshot, extract, dedup, propose, gate, write project knowledge |
+| `orchestrator_calibration` | Calibration | Exercise the configured orchestrator and persist a guarded verdict |
+
+<p align="center">
+  <img src="images/catalog-takeover.png" alt="takeover process flow in the catalog" width="100%">
+</p>
+
+<p align="center"><em>takeover@1 — clone, extract, approve knowledge, then inherit the migration tail and pin the rulebook.</em></p>
+
+<p align="center">
+  <img src="images/catalog-knowledge-extraction.png" alt="knowledge extraction process flow" width="100%">
+</p>
+
+---
+
+## Discipline that does not live in the prompt
+
+**Skills** encode how the work should be done — plan, specify, slice, build,
+review, hand off — once, as versioned definitions. They are not re-explained
+every session.
+
+**Learning** reflects on runs and review findings, then waits. A pending
+lesson is not memory. Approval is.
+
+**Memory** is tiered. Raw episodes are not trusted knowledge. Promotion to
+project lessons and released knowledge takes an exact-candidate gate.
+Retrieval is project-scoped and budget-bounded.
+
+**Audit** is append-only and hash-chained. Approvals, refusals, and
+tool calls leave the same kind of record.
+
+**Fail-closed** is the default. Unknown input, a missing dependency, or a
+state the engine cannot resolve becomes a structured refusal. The run asks,
+or it stops. It does not invent a third option.
+
+---
+
+## Where it runs
+
+ironclad-ai is self-hosted.
+
+| Host | Engine | Ink and automation |
+|---|---|---|
+| Linux | Native engine, or Docker | Native |
+| Windows | Docker engine, or an operator-managed native runtime | Native Ink |
+| macOS | Docker engine | Native Ink |
+
+The engine binds loopback by default (`127.0.0.1:8484`). A wider bind
+requires an active bearer-token profile. Startup refuses rather than
+opening an unprotected socket.
+
+See **[Getting started](docs/getting-started.md)** for the honest
+install picture — this repository does not publish binaries.
 
 ---
 
 ## Learn more
 
-- **[Playbook](docs/playbook.md)** — a worked example, start to finish
-- **[Architecture](docs/architecture.md)** — how the pieces fit together in
-  more depth
+- **[Playbook](docs/playbook.md)** — one feature request, through the real steps
+- **[Architecture](docs/architecture.md)** — engine, API, skills, learning, memory
+- **[Surfaces](docs/surfaces.md)** — Ink, console, catalog, CLI, Python client
+- **[Processes](docs/processes.md)** — shipped definitions and how they compose
+- **[Getting started](docs/getting-started.md)** — how you actually run it
 
 ---
 
-*Ironclad AI is built and maintained by MJWC‑AI-LAB. Developed in the UAE.*
+*ironclad-ai is built and maintained by MJWC-AI-LAB. Developed in the UAE.*
+*https://ironclad-ai.ae/*
