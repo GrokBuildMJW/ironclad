@@ -1,0 +1,68 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1440 850" role="img" aria-labelledby="title desc"><title id="title">Codex model overlays and output boundary</title><desc id="desc">Model-specific effort and exact role templates feed native read-only CLI execution. The CLI Shim replaces the orchestrator model-server backend using a separate stdin contract.</desc>
+<defs><marker id="arrow" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9" fill="#3A95AB" /></marker></defs>
+<rect width="1440" height="850" fill="#141414" />
+<text x="50" y="65" fill="#7AA2F7" font-family="Inter,Arial,sans-serif" font-size="42" font-weight="600">Codex: model-specific steering</text>
+<text x="50" y="104" fill="#A3A3A3" font-family="Inter,Arial,sans-serif" font-size="24" font-weight="400">Native coder dispatch serves task seats; CLI Shim serves the orchestrator model backend.</text>
+<rect x="50" y="145" width="420" height="206" rx="14" fill="#2C2C2C" stroke="#363636" stroke-width="2" />
+<text x="72" y="184" fill="#7AA2F7" font-family="Inter,Arial,sans-serif" font-size="29" font-weight="600">gpt-6-astra</text>
+<text x="72" y="221" fill="#C8C8C8" font-family="Inter,Arial,sans-serif" font-size="25" font-weight="600">xhigh effort</text>
+<text x="72" y="259" fill="#A3A3A3" font-family="Inter,Arial,sans-serif" font-size="21" font-weight="400">coding · review · rereview</text>
+<text x="72" y="289" fill="#A3A3A3" font-family="Inter,Arial,sans-serif" font-size="21" font-weight="400">artifact · hunt · architecture</text>
+<text x="72" y="326" fill="#828282" font-family="Inter,Arial,sans-serif" font-size="20" font-weight="400">Goal / Context / Constraints</text>
+<rect x="510" y="145" width="420" height="206" rx="14" fill="#2C2C2C" stroke="#363636" stroke-width="2" />
+<text x="532" y="184" fill="#7AA2F7" font-family="Inter,Arial,sans-serif" font-size="29" font-weight="600">gpt-5.6-sol</text>
+<text x="532" y="221" fill="#C8C8C8" font-family="Inter,Arial,sans-serif" font-size="25" font-weight="600">high effort</text>
+<text x="532" y="259" fill="#A3A3A3" font-family="Inter,Arial,sans-serif" font-size="21" font-weight="400">coding · artifact</text>
+<text x="532" y="289" fill="#A3A3A3" font-family="Inter,Arial,sans-serif" font-size="21" font-weight="400">hunt · architecture</text>
+<text x="532" y="326" fill="#828282" font-family="Inter,Arial,sans-serif" font-size="20" font-weight="400">Ordered bounded checklist</text>
+<rect x="970" y="145" width="420" height="206" rx="14" fill="#2C2C2C" stroke="#363636" stroke-width="2" />
+<text x="992" y="184" fill="#7AA2F7" font-family="Inter,Arial,sans-serif" font-size="29" font-weight="600">gpt-5.6-terra</text>
+<text x="992" y="221" fill="#C8C8C8" font-family="Inter,Arial,sans-serif" font-size="25" font-weight="600">medium effort</text>
+<text x="992" y="259" fill="#A3A3A3" font-family="Inter,Arial,sans-serif" font-size="21" font-weight="400">No exact role templates</text>
+<text x="992" y="289" fill="#A3A3A3" font-family="Inter,Arial,sans-serif" font-size="21" font-weight="400">Base coding overlay only</text>
+<text x="992" y="326" fill="#828282" font-family="Inter,Arial,sans-serif" font-size="20" font-weight="400">Explicit task checklist</text>
+<rect x="50" y="374" width="1340" height="111" rx="14" fill="#2C2C2C" stroke="#363636" stroke-width="2" />
+<text x="72" y="407" fill="#7AA2F7" font-family="Inter,Arial,sans-serif" font-size="24" font-weight="600">Native CLI dispatch · prompt in argv</text>
+<text x="72" y="442" fill="#C8C8C8" font-family="DejaVu Sans Mono,monospace" font-size="22" font-weight="400">exec --model … --sandbox read-only --ephemeral --ignore-rules --color never</text>
+<text x="72" y="471" fill="#C8C8C8" font-family="DejaVu Sans Mono,monospace" font-size="22" font-weight="400">+ --skip-git-repo-check + -c model_reasoning_effort="…"</text>
+<rect x="50" y="512" width="242" height="88" rx="14" fill="#2C2C2C" stroke="#363636" stroke-width="2" />
+<text x="70" y="547" fill="#7AA2F7" font-family="Inter,Arial,sans-serif" font-size="23" font-weight="600">Exact overlay</text>
+<text x="70" y="577" fill="#A3A3A3" font-family="Inter,Arial,sans-serif" font-size="20" font-weight="400">model + effort</text>
+<path d="M298,556.0 L318,556.0" fill="none" stroke="#3A95AB" stroke-width="3" marker-end="url(#arrow)" />
+<rect x="324" y="512" width="242" height="88" rx="14" fill="#2C2C2C" stroke="#363636" stroke-width="2" />
+<text x="344" y="547" fill="#7AA2F7" font-family="Inter,Arial,sans-serif" font-size="23" font-weight="600">Seat template</text>
+<text x="344" y="577" fill="#A3A3A3" font-family="Inter,Arial,sans-serif" font-size="20" font-weight="400">explicit role only</text>
+<path d="M572,556.0 L592,556.0" fill="none" stroke="#3A95AB" stroke-width="3" marker-end="url(#arrow)" />
+<rect x="598" y="512" width="242" height="88" rx="14" fill="#2C2C2C" stroke="#363636" stroke-width="2" />
+<text x="618" y="547" fill="#7AA2F7" font-family="Inter,Arial,sans-serif" font-size="23" font-weight="600">Remaining layers</text>
+<text x="618" y="577" fill="#A3A3A3" font-family="Inter,Arial,sans-serif" font-size="20" font-weight="400">calibration + task</text>
+<path d="M846,556.0 L866,556.0" fill="none" stroke="#3A95AB" stroke-width="3" marker-end="url(#arrow)" />
+<rect x="872" y="512" width="242" height="88" rx="14" fill="#2C2C2C" stroke="#363636" stroke-width="2" />
+<text x="892" y="547" fill="#7AA2F7" font-family="Inter,Arial,sans-serif" font-size="23" font-weight="600">Native Codex CLI</text>
+<text x="892" y="577" fill="#A3A3A3" font-family="Inter,Arial,sans-serif" font-size="20" font-weight="400">read-only process</text>
+<path d="M1120,556.0 L1140,556.0" fill="none" stroke="#3A95AB" stroke-width="3" marker-end="url(#arrow)" />
+<rect x="1146" y="512" width="242" height="88" rx="14" fill="#2C2C2C" stroke="#363636" stroke-width="2" />
+<text x="1166" y="547" fill="#7AA2F7" font-family="Inter,Arial,sans-serif" font-size="23" font-weight="600">Diff JSON</text>
+<text x="1166" y="577" fill="#A3A3A3" font-family="Inter,Arial,sans-serif" font-size="20" font-weight="400">structured output</text>
+<rect x="50" y="632" width="242" height="88" rx="14" fill="#2C2C2C" stroke="#363636" stroke-width="2" />
+<text x="70" y="667" fill="#7AA2F7" font-family="Inter,Arial,sans-serif" font-size="23" font-weight="600">Engine validates</text>
+<text x="70" y="697" fill="#A3A3A3" font-family="Inter,Arial,sans-serif" font-size="20" font-weight="400">diff + author identity</text>
+<path d="M298,676.0 L318,676.0" fill="none" stroke="#3A95AB" stroke-width="3" marker-end="url(#arrow)" />
+<rect x="324" y="632" width="242" height="88" rx="14" fill="#2C2C2C" stroke="#363636" stroke-width="2" />
+<text x="344" y="667" fill="#7AA2F7" font-family="Inter,Arial,sans-serif" font-size="23" font-weight="600">Recovery audit</text>
+<text x="344" y="697" fill="#A3A3A3" font-family="Inter,Arial,sans-serif" font-size="20" font-weight="400">durable diff bytes</text>
+<path d="M572,676.0 L592,676.0" fill="none" stroke="#3A95AB" stroke-width="3" marker-end="url(#arrow)" />
+<rect x="598" y="632" width="242" height="88" rx="14" fill="#2C2C2C" stroke="#363636" stroke-width="2" />
+<text x="618" y="667" fill="#7AA2F7" font-family="Inter,Arial,sans-serif" font-size="23" font-weight="600">Engine applies</text>
+<text x="618" y="697" fill="#A3A3A3" font-family="Inter,Arial,sans-serif" font-size="20" font-weight="400">Git check → apply</text>
+<path d="M846,676.0 L866,676.0" fill="none" stroke="#3A95AB" stroke-width="3" marker-end="url(#arrow)" />
+<rect x="872" y="632" width="242" height="88" rx="14" fill="#2C2C2C" stroke="#363636" stroke-width="2" />
+<text x="892" y="667" fill="#7AA2F7" font-family="Inter,Arial,sans-serif" font-size="23" font-weight="600">Engine verifies</text>
+<text x="892" y="697" fill="#A3A3A3" font-family="Inter,Arial,sans-serif" font-size="20" font-weight="400">build → tests</text>
+<path d="M1120,676.0 L1140,676.0" fill="none" stroke="#3A95AB" stroke-width="3" marker-end="url(#arrow)" />
+<rect x="1146" y="632" width="242" height="88" rx="14" fill="#2C2C2C" stroke="#363636" stroke-width="2" />
+<text x="1166" y="667" fill="#7AA2F7" font-family="Inter,Arial,sans-serif" font-size="22" font-weight="600">Independent review</text>
+<text x="1166" y="697" fill="#A3A3A3" font-family="Inter,Arial,sans-serif" font-size="20" font-weight="400">approve / findings</text>
+<rect x="50" y="746" width="1340" height="63" rx="14" fill="#2C2C2C" stroke="#363636" stroke-width="2" />
+<text x="72" y="786" fill="#A3A3A3" font-family="Inter,Arial,sans-serif" font-size="23" font-weight="400">CLI Shim: orchestrator backend · stdin · JSONL · read-only scratch directory</text>
+</svg>

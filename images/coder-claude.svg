@@ -1,0 +1,55 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1440 850" role="img" aria-labelledby="title desc"><title id="title">Claude exact model overlays and templates</title><desc id="desc">Claude exact model overlays select xhigh effort and role templates. Native skill packages are separate. Coding returns a diff; the engine applies it.</desc>
+<defs><marker id="arrow" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9" fill="#3A95AB" /></marker></defs>
+<rect width="1440" height="850" fill="#141414" />
+<text x="50" y="65" fill="#7AA2F7" font-family="Inter,Arial,sans-serif" font-size="42" font-weight="600">Claude: one harness, distinct model contracts</text>
+<text x="50" y="104" fill="#A3A3A3" font-family="Inter,Arial,sans-serif" font-size="24" font-weight="400">Exact model identity selects steering; author and reviewer identities remain distinct.</text>
+<rect x="50" y="145" width="420" height="206" rx="14" fill="#2C2C2C" stroke="#363636" stroke-width="2" />
+<text x="72" y="183" fill="#7AA2F7" font-family="Inter,Arial,sans-serif" font-size="27" font-weight="600">fable</text>
+<text x="72" y="221" fill="#C8C8C8" font-family="Inter,Arial,sans-serif" font-size="25" font-weight="600">xhigh effort</text>
+<text x="72" y="259" fill="#A3A3A3" font-family="Inter,Arial,sans-serif" font-size="21" font-weight="400">coding · review · rereview</text>
+<text x="72" y="289" fill="#A3A3A3" font-family="Inter,Arial,sans-serif" font-size="21" font-weight="400">artifact · hunt · architecture</text>
+<text x="72" y="326" fill="#828282" font-family="Inter,Arial,sans-serif" font-size="20" font-weight="400">Whole TaskContract</text>
+<rect x="510" y="145" width="420" height="206" rx="14" fill="#2C2C2C" stroke="#363636" stroke-width="2" />
+<text x="532" y="183" fill="#7AA2F7" font-family="Inter,Arial,sans-serif" font-size="27" font-weight="600">claude-fable-5-1</text>
+<text x="532" y="221" fill="#C8C8C8" font-family="Inter,Arial,sans-serif" font-size="25" font-weight="600">xhigh effort</text>
+<text x="532" y="259" fill="#A3A3A3" font-family="Inter,Arial,sans-serif" font-size="21" font-weight="400">coding · review · rereview</text>
+<text x="532" y="289" fill="#A3A3A3" font-family="Inter,Arial,sans-serif" font-size="21" font-weight="400">artifact · hunt · architecture</text>
+<text x="532" y="326" fill="#828282" font-family="Inter,Arial,sans-serif" font-size="20" font-weight="400">Contract + component boundaries</text>
+<rect x="970" y="145" width="420" height="206" rx="14" fill="#2C2C2C" stroke="#363636" stroke-width="2" />
+<text x="992" y="183" fill="#7AA2F7" font-family="Inter,Arial,sans-serif" font-size="27" font-weight="600">opus</text>
+<text x="992" y="221" fill="#C8C8C8" font-family="Inter,Arial,sans-serif" font-size="25" font-weight="600">xhigh effort</text>
+<text x="992" y="259" fill="#A3A3A3" font-family="Inter,Arial,sans-serif" font-size="21" font-weight="400">coding · review · artifact</text>
+<text x="992" y="289" fill="#A3A3A3" font-family="Inter,Arial,sans-serif" font-size="21" font-weight="400">hunt · architecture</text>
+<text x="992" y="326" fill="#828282" font-family="Inter,Arial,sans-serif" font-size="20" font-weight="400">Explicit acceptance checklist</text>
+<rect x="50" y="375" width="1340" height="114" rx="14" fill="#2C2C2C" stroke="#363636" stroke-width="2" />
+<text x="72" y="411" fill="#7AA2F7" font-family="Inter,Arial,sans-serif" font-size="24" font-weight="600">Native CLI dispatch · prompt in argv</text>
+<text x="72" y="449" fill="#C8C8C8" font-family="DejaVu Sans Mono,monospace" font-size="23" font-weight="400">--print --model … --effort xhigh --permission-mode plan</text>
+<text x="72" y="479" fill="#C8C8C8" font-family="DejaVu Sans Mono,monospace" font-size="23" font-weight="400">--output-format text --no-session-persistence</text>
+<rect x="50" y="520" width="242" height="88" rx="14" fill="#2C2C2C" stroke="#363636" stroke-width="2" />
+<text x="70" y="555" fill="#7AA2F7" font-family="Inter,Arial,sans-serif" font-size="23" font-weight="600">Model overlay</text>
+<text x="70" y="585" fill="#A3A3A3" font-family="Inter,Arial,sans-serif" font-size="20" font-weight="400">steering + effort</text>
+<path d="M298,564.0 L318,564.0" fill="none" stroke="#3A95AB" stroke-width="3" marker-end="url(#arrow)" />
+<rect x="324" y="520" width="242" height="88" rx="14" fill="#2C2C2C" stroke="#363636" stroke-width="2" />
+<text x="344" y="555" fill="#7AA2F7" font-family="Inter,Arial,sans-serif" font-size="23" font-weight="600">Role template</text>
+<text x="344" y="585" fill="#A3A3A3" font-family="Inter,Arial,sans-serif" font-size="20" font-weight="400">coding / review / …</text>
+<path d="M572,564.0 L592,564.0" fill="none" stroke="#3A95AB" stroke-width="3" marker-end="url(#arrow)" />
+<rect x="598" y="520" width="242" height="88" rx="14" fill="#2C2C2C" stroke="#363636" stroke-width="2" />
+<text x="618" y="555" fill="#7AA2F7" font-family="Inter,Arial,sans-serif" font-size="23" font-weight="600">CLI prompt layers</text>
+<text x="618" y="585" fill="#A3A3A3" font-family="Inter,Arial,sans-serif" font-size="20" font-weight="400">guidance + task</text>
+<path d="M846,564.0 L866,564.0" fill="none" stroke="#3A95AB" stroke-width="3" marker-end="url(#arrow)" />
+<rect x="872" y="520" width="242" height="88" rx="14" fill="#2C2C2C" stroke="#363636" stroke-width="2" />
+<text x="892" y="555" fill="#7AA2F7" font-family="Inter,Arial,sans-serif" font-size="23" font-weight="600">Claude CLI</text>
+<text x="892" y="585" fill="#A3A3A3" font-family="Inter,Arial,sans-serif" font-size="20" font-weight="400">plan permission mode</text>
+<path d="M1120,564.0 L1140,564.0" fill="none" stroke="#3A95AB" stroke-width="3" marker-end="url(#arrow)" />
+<rect x="1146" y="520" width="242" height="88" rx="14" fill="#2C2C2C" stroke="#363636" stroke-width="2" />
+<text x="1166" y="555" fill="#7AA2F7" font-family="Inter,Arial,sans-serif" font-size="23" font-weight="600">Typed output</text>
+<text x="1166" y="585" fill="#A3A3A3" font-family="Inter,Arial,sans-serif" font-size="20" font-weight="400">diff / verdict</text>
+<rect x="50" y="639" width="645" height="162" rx="14" fill="#2C2C2C" stroke="#363636" stroke-width="2" />
+<text x="72" y="678" fill="#7AA2F7" font-family="Inter,Arial,sans-serif" font-size="26" font-weight="600">Coding output → engine-owned writes</text>
+<text x="72" y="718" fill="#A3A3A3" font-family="Inter,Arial,sans-serif" font-size="23" font-weight="400">Diff validation → recovery audit → Git apply</text>
+<text x="72" y="753" fill="#A3A3A3" font-family="Inter,Arial,sans-serif" font-size="23" font-weight="400">Build and tests → independent review</text>
+<rect x="721" y="639" width="669" height="162" rx="14" fill="#2C2C2C" stroke="#363636" stroke-width="2" />
+<text x="743" y="678" fill="#7AA2F7" font-family="Inter,Arial,sans-serif" font-size="26" font-weight="600">Review: optional advisory judgment</text>
+<text x="743" y="718" fill="#A3A3A3" font-family="Inter,Arial,sans-serif" font-size="23" font-weight="400">Only Claude declares broker-capable shell access.</text>
+<text x="743" y="753" fill="#A3A3A3" font-family="Inter,Arial,sans-serif" font-size="23" font-weight="400">Native .claude/skills/ package is separate.</text>
+</svg>

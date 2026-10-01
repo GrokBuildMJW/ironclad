@@ -1,0 +1,42 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1440 850" role="img" aria-labelledby="title desc"><title id="title">Grok verifier overlays and output codec</title><desc id="desc">Grok is a shipped review-of-review verifier. Exact model overlays and templates feed a constrained headless invocation. A JSON envelope text field carries one verdict.</desc>
+<defs><marker id="arrow" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9" fill="#3A95AB" /></marker></defs>
+<rect width="1440" height="850" fill="#141414" />
+<text x="50" y="65" fill="#7AA2F7" font-family="Inter,Arial,sans-serif" font-size="42" font-weight="600">Grok: verify the review verdict</text>
+<text x="50" y="104" fill="#A3A3A3" font-family="Inter,Arial,sans-serif" font-size="24" font-weight="400">Shipped verifier route · evidence in the prompt · no effort argv extra</text>
+<rect x="50" y="145" width="654" height="151" rx="14" fill="#2C2C2C" stroke="#363636" stroke-width="2" />
+<text x="72" y="185" fill="#7AA2F7" font-family="Inter,Arial,sans-serif" font-size="31" font-weight="600">grok-4.6</text>
+<text x="72" y="223" fill="#C8C8C8" font-family="Inter,Arial,sans-serif" font-size="24" font-weight="400">Exact role: review_of_review</text>
+<text x="72" y="264" fill="#A3A3A3" font-family="Inter,Arial,sans-serif" font-size="23" font-weight="400">Evidence-led verification</text>
+<rect x="736" y="145" width="654" height="151" rx="14" fill="#2C2C2C" stroke="#363636" stroke-width="2" />
+<text x="758" y="185" fill="#7AA2F7" font-family="Inter,Arial,sans-serif" font-size="31" font-weight="600">grok-4.5</text>
+<text x="758" y="223" fill="#C8C8C8" font-family="Inter,Arial,sans-serif" font-size="24" font-weight="400">Exact role: review_of_review</text>
+<text x="758" y="264" fill="#A3A3A3" font-family="Inter,Arial,sans-serif" font-size="23" font-weight="400">Explicit verification checklist</text>
+<rect x="50" y="321" width="1340" height="168" rx="14" fill="#2C2C2C" stroke="#363636" stroke-width="2" />
+<text x="72" y="359" fill="#7AA2F7" font-family="Inter,Arial,sans-serif" font-size="25" font-weight="600">Declared headless restrictions</text>
+<text x="72" y="399" fill="#A3A3A3" font-family="Inter,Arial,sans-serif" font-size="23" font-weight="400">--permission-mode plan · --no-memory · --no-subagents · --single</text>
+<text x="72" y="432" fill="#A3A3A3" font-family="Inter,Arial,sans-serif" font-size="23" font-weight="400">Built-in tool denylist · caller-owned Verdict JSON schema</text>
+<text x="72" y="465" fill="#A3A3A3" font-family="Inter,Arial,sans-serif" font-size="23" font-weight="400">Native prompt in argv; .grok/skills/ package installed separately.</text>
+<rect x="50" y="520" width="242" height="88" rx="14" fill="#2C2C2C" stroke="#363636" stroke-width="2" />
+<text x="70" y="555" fill="#7AA2F7" font-family="Inter,Arial,sans-serif" font-size="23" font-weight="600">Exact overlay</text>
+<text x="70" y="585" fill="#A3A3A3" font-family="Inter,Arial,sans-serif" font-size="20" font-weight="400">4.6 or 4.5</text>
+<path d="M298,564.0 L318,564.0" fill="none" stroke="#3A95AB" stroke-width="3" marker-end="url(#arrow)" />
+<rect x="324" y="520" width="242" height="88" rx="14" fill="#2C2C2C" stroke="#363636" stroke-width="2" />
+<text x="344" y="555" fill="#7AA2F7" font-family="Inter,Arial,sans-serif" font-size="23" font-weight="600">Rereview template</text>
+<text x="344" y="585" fill="#A3A3A3" font-family="Inter,Arial,sans-serif" font-size="20" font-weight="400">same task + evidence</text>
+<path d="M572,564.0 L592,564.0" fill="none" stroke="#3A95AB" stroke-width="3" marker-end="url(#arrow)" />
+<rect x="598" y="520" width="242" height="88" rx="14" fill="#2C2C2C" stroke="#363636" stroke-width="2" />
+<text x="618" y="555" fill="#7AA2F7" font-family="Inter,Arial,sans-serif" font-size="23" font-weight="600">Grok CLI</text>
+<text x="618" y="585" fill="#A3A3A3" font-family="Inter,Arial,sans-serif" font-size="20" font-weight="400">tools denied</text>
+<path d="M846,564.0 L866,564.0" fill="none" stroke="#3A95AB" stroke-width="3" marker-end="url(#arrow)" />
+<rect x="872" y="520" width="242" height="88" rx="14" fill="#2C2C2C" stroke="#363636" stroke-width="2" />
+<text x="892" y="555" fill="#7AA2F7" font-family="Inter,Arial,sans-serif" font-size="23" font-weight="600">JSON envelope</text>
+<text x="892" y="585" fill="#A3A3A3" font-family="Inter,Arial,sans-serif" font-size="20" font-weight="400">nonempty text field</text>
+<path d="M1120,564.0 L1140,564.0" fill="none" stroke="#3A95AB" stroke-width="3" marker-end="url(#arrow)" />
+<rect x="1146" y="520" width="242" height="88" rx="14" fill="#2C2C2C" stroke="#363636" stroke-width="2" />
+<text x="1166" y="548.0" fill="#7AA2F7" font-family="Inter,Arial,sans-serif" font-size="23" font-weight="600">One Verdict</text>
+<text x="1166" y="585.0" fill="#A3A3A3" font-family="Inter,Arial,sans-serif" font-size="20" font-weight="400">approve / findings</text>
+<rect x="50" y="638" width="1340" height="164" rx="14" fill="#2C2C2C" stroke="#363636" stroke-width="2" />
+<text x="72" y="676" fill="#7AA2F7" font-family="Inter,Arial,sans-serif" font-size="27" font-weight="600">Engine validates the complete verdict body</text>
+<text x="72" y="718" fill="#A3A3A3" font-family="Inter,Arial,sans-serif" font-size="24" font-weight="400">Malformed envelopes, missing text and concatenated Verdicts are refused.</text>
+<text x="72" y="754" fill="#A3A3A3" font-family="Inter,Arial,sans-serif" font-size="24" font-weight="400">The model checks supplied evidence; the engine owns artifacts and process transitions.</text>
+</svg>

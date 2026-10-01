@@ -1,0 +1,49 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1440 900" role="img" aria-labelledby="title desc">
+<title id="title">Coder dispatch: the registry selects transport</title>
+<desc id="desc">Assignment identity stays bound to the routed author. A missing declared CLI refuses; it does not fall back to HTTP.</desc>
+<defs><marker id="arrow" markerWidth="9" markerHeight="9" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" fill="#3A95AB"/></marker></defs>
+<rect width="1440" height="900" fill="#141414"/>
+<text x="60" y="68" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="34" font-weight="700" fill="#7AA2F7" text-anchor="start">Coder dispatch: the registry selects transport</text>
+<text x="60" y="110" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="20" font-weight="400" fill="#828282" text-anchor="start">Assignment identity stays bound to the routed author. A missing declared CLI refuses; it does not fall back to HTTP.</text>
+<rect x="60" y="170" width="320" height="152" rx="16" fill="#2C2C2C" stroke="#363636" stroke-width="2"/>
+<text x="84" y="208" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="24" font-weight="650" fill="#7AA2F7" text-anchor="start">Task + handover</text>
+<text x="84" y="244" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="20" font-weight="400" fill="#C8C8C8" text-anchor="start">Operation + wrapper seat</text>
+<text x="84" y="272" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="20" font-weight="400" fill="#C8C8C8" text-anchor="start">Model profile + role</text>
+<text x="84" y="300" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="20" font-weight="400" fill="#C8C8C8" text-anchor="start">Prepared assignment body</text>
+<rect x="430" y="170" width="560" height="152" rx="16" fill="#2C2C2C" stroke="#363636" stroke-width="2"/>
+<text x="454" y="208" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="24" font-weight="650" fill="#7AA2F7" text-anchor="start">Resolve registry join</text>
+<text x="454" y="244" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="20" font-weight="400" fill="#C8C8C8" text-anchor="start">Identity → profile → declared harness</text>
+<text x="454" y="272" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="20" font-weight="400" fill="#C8C8C8" text-anchor="start">Detected executable + model inventory</text>
+<text x="454" y="300" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="20" font-weight="400" fill="#C8C8C8" text-anchor="start">Exact overlay identity and seat / role</text>
+<rect x="1040" y="170" width="340" height="152" rx="16" fill="#2C2C2C" stroke="#363636" stroke-width="2"/>
+<text x="1064" y="208" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="24" font-weight="650" fill="#C8C8C8" text-anchor="start">Refuse before launch</text>
+<text x="1064" y="244" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="20" font-weight="400" fill="#C8C8C8" text-anchor="start">Unbound subscription</text>
+<text x="1064" y="272" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="20" font-weight="400" fill="#C8C8C8" text-anchor="start">Missing executable / model</text>
+<text x="1064" y="300" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="20" font-weight="400" fill="#C8C8C8" text-anchor="start">Invalid overlay / profile</text>
+<path d="M380 246 H430" fill="none" stroke="#3A95AB" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<path d="M990 246 H1040" fill="none" stroke="#3A95AB" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<rect x="60" y="398" width="620" height="230" rx="16" fill="#2C2C2C" stroke="#363636" stroke-width="2"/>
+<text x="84" y="436" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="24" font-weight="650" fill="#C8C8C8" text-anchor="start">Declared vendor CLI</text>
+<text x="84" y="472" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="20" font-weight="400" fill="#C8C8C8" text-anchor="start">Compose role resources + operation contract</text>
+<text x="84" y="500" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="20" font-weight="400" fill="#C8C8C8" text-anchor="start">Select exact-model addendum + effort arguments</text>
+<text x="84" y="528" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="20" font-weight="400" fill="#C8C8C8" text-anchor="start">Render argv from the harness template</text>
+<text x="84" y="556" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="20" font-weight="400" fill="#C8C8C8" text-anchor="start">Run detected executable directly in codedir</text>
+<text x="84" y="584" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="20" font-weight="400" fill="#C8C8C8" text-anchor="start">Use ambient or isolated keyed auth home</text>
+<text x="84" y="612" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="20" font-weight="400" fill="#C8C8C8" text-anchor="start">Provider cloud → transient stdout</text>
+<rect x="760" y="398" width="620" height="230" rx="16" fill="#2C2C2C" stroke="#363636" stroke-width="2"/>
+<text x="784" y="436" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="24" font-weight="650" fill="#C8C8C8" text-anchor="start">In-process API agent</text>
+<text x="784" y="472" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="20" font-weight="400" fill="#C8C8C8" text-anchor="start">Identity with no declared CLI harness, or</text>
+<text x="784" y="500" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="20" font-weight="400" fill="#C8C8C8" text-anchor="start">coding joined to the orchestrator profile</text>
+<text x="784" y="528" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="20" font-weight="400" fill="#C8C8C8" text-anchor="start">Build messages → generate() → model endpoint</text>
+<text x="784" y="556" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="20" font-weight="400" fill="#C8C8C8" text-anchor="start">Collect content + require one usage chunk</text>
+<text x="784" y="584" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="20" font-weight="400" fill="#C8C8C8" text-anchor="start">Assignment transport accepts content output</text>
+<text x="784" y="612" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="20" font-weight="400" fill="#C8C8C8" text-anchor="start">It does not execute returned tool-call chunks</text>
+<path d="M570 322 V366 H370 V398" fill="none" stroke="#3A95AB" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<path d="M850 322 V366 H1070 V398" fill="none" stroke="#3A95AB" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<rect x="430" y="714" width="580" height="100" rx="16" fill="#2C2C2C" stroke="#363636" stroke-width="2"/>
+<text x="454" y="752" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="24" font-weight="650" fill="#7AA2F7" text-anchor="start">Consumer validates typed result</text>
+<text x="454" y="788" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="20" font-weight="400" fill="#C8C8C8" text-anchor="start">Coding: JSON diff proposal. Review: typed verdict.</text>
+<path d="M370 628 V684 H580 V714" fill="none" stroke="#3A95AB" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<path d="M1070 628 V684 H860 V714" fill="none" stroke="#3A95AB" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<text x="60" y="861" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="20" font-weight="400" fill="#828282" text-anchor="start">Model output remains a proposal until the owning artifact or verdict consumer accepts its contract.</text>
+</svg>

@@ -1,0 +1,91 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1440 900" role="img" aria-labelledby="title desc">
+<title id="title">Default development lane · 15 steps</title>
+<desc id="desc">Operator approval is audited. Reviews use effective verdicts; FINDINGS returns to the producer.</desc>
+<defs><marker id="arrow" markerWidth="9" markerHeight="9" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" fill="#3A95AB"/></marker></defs>
+<rect width="1440" height="900" fill="#141414"/>
+<text x="60" y="68" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="34" font-weight="700" fill="#7AA2F7" text-anchor="start">Default development lane · 15 steps</text>
+<text x="60" y="110" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="20" font-weight="400" fill="#828282" text-anchor="start">Operator approval is audited. Reviews use effective verdicts; FINDINGS returns to the producer.</text>
+<rect x="60" y="190" width="240" height="135" rx="16" fill="#2C2C2C" stroke="#363636" stroke-width="2"/>
+<text x="80" y="220" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="20" font-weight="700" fill="#3A95AB" text-anchor="start">01</text>
+<text x="80" y="253" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="22" font-weight="650" fill="#C8C8C8" text-anchor="start">Intake review</text>
+<text x="80" y="286" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="20" font-weight="400" fill="#C8C8C8" text-anchor="start">Prompt readiness</text>
+<rect x="330" y="190" width="240" height="135" rx="16" fill="#2C2C2C" stroke="#363636" stroke-width="2"/>
+<text x="350" y="220" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="20" font-weight="700" fill="#3A95AB" text-anchor="start">02</text>
+<text x="350" y="253" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="22" font-weight="650" fill="#7AA2F7" text-anchor="start">Spine decision</text>
+<text x="350" y="286" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="20" font-weight="400" fill="#C8C8C8" text-anchor="start">Operator approval</text>
+<rect x="600" y="190" width="240" height="135" rx="16" fill="#2C2C2C" stroke="#363636" stroke-width="2"/>
+<text x="620" y="220" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="20" font-weight="700" fill="#3A95AB" text-anchor="start">03</text>
+<text x="620" y="253" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="22" font-weight="650" fill="#7AA2F7" text-anchor="start">Scope / contract</text>
+<text x="620" y="286" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="20" font-weight="400" fill="#C8C8C8" text-anchor="start">Operator approval</text>
+<rect x="870" y="190" width="240" height="135" rx="16" fill="#2C2C2C" stroke="#363636" stroke-width="2"/>
+<text x="890" y="220" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="20" font-weight="700" fill="#3A95AB" text-anchor="start">04</text>
+<text x="890" y="253" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="22" font-weight="650" fill="#C8C8C8" text-anchor="start">Scope review</text>
+<text x="890" y="286" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="20" font-weight="400" fill="#C8C8C8" text-anchor="start">Effective verdict</text>
+<rect x="1140" y="190" width="240" height="135" rx="16" fill="#2C2C2C" stroke="#363636" stroke-width="2"/>
+<text x="1160" y="220" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="20" font-weight="700" fill="#3A95AB" text-anchor="start">05</text>
+<text x="1160" y="253" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="22" font-weight="650" fill="#C8C8C8" text-anchor="start">Ops authoring</text>
+<text x="1160" y="286" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="20" font-weight="400" fill="#C8C8C8" text-anchor="start">Ops Contract</text>
+<rect x="60" y="420" width="240" height="135" rx="16" fill="#2C2C2C" stroke="#363636" stroke-width="2"/>
+<text x="80" y="450" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="20" font-weight="700" fill="#3A95AB" text-anchor="start">10</text>
+<text x="80" y="483" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="22" font-weight="650" fill="#C8C8C8" text-anchor="start">Plan units</text>
+<text x="80" y="516" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="20" font-weight="400" fill="#C8C8C8" text-anchor="start">Units + delivery</text>
+<rect x="330" y="420" width="240" height="135" rx="16" fill="#2C2C2C" stroke="#363636" stroke-width="2"/>
+<text x="350" y="450" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="20" font-weight="700" fill="#3A95AB" text-anchor="start">09</text>
+<text x="350" y="483" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="22" font-weight="650" fill="#7AA2F7" text-anchor="start">Design approval</text>
+<text x="350" y="516" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="20" font-weight="400" fill="#C8C8C8" text-anchor="start">Operator approval</text>
+<rect x="600" y="420" width="240" height="135" rx="16" fill="#2C2C2C" stroke="#363636" stroke-width="2"/>
+<text x="620" y="450" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="20" font-weight="700" fill="#3A95AB" text-anchor="start">08</text>
+<text x="620" y="483" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="22" font-weight="650" fill="#C8C8C8" text-anchor="start">Design review</text>
+<text x="620" y="516" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="20" font-weight="400" fill="#C8C8C8" text-anchor="start">Effective verdict</text>
+<rect x="870" y="420" width="240" height="135" rx="16" fill="#2C2C2C" stroke="#363636" stroke-width="2"/>
+<text x="890" y="450" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="20" font-weight="700" fill="#3A95AB" text-anchor="start">07</text>
+<text x="890" y="483" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="22" font-weight="650" fill="#C8C8C8" text-anchor="start">Design decision</text>
+<text x="890" y="516" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="20" font-weight="400" fill="#C8C8C8" text-anchor="start">Panel + decision</text>
+<rect x="1140" y="420" width="240" height="135" rx="16" fill="#2C2C2C" stroke="#363636" stroke-width="2"/>
+<text x="1160" y="450" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="20" font-weight="700" fill="#3A95AB" text-anchor="start">06</text>
+<text x="1160" y="483" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="22" font-weight="650" fill="#C8C8C8" text-anchor="start">Ops gate</text>
+<text x="1160" y="516" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="20" font-weight="400" fill="#C8C8C8" text-anchor="start">Required check</text>
+<rect x="60" y="650" width="240" height="135" rx="16" fill="#2C2C2C" stroke="#363636" stroke-width="2"/>
+<text x="80" y="680" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="20" font-weight="700" fill="#3A95AB" text-anchor="start">11</text>
+<text x="80" y="713" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="22" font-weight="650" fill="#C8C8C8" text-anchor="start">Units review</text>
+<text x="80" y="746" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="20" font-weight="400" fill="#C8C8C8" text-anchor="start">Effective verdict</text>
+<rect x="330" y="650" width="240" height="135" rx="16" fill="#2C2C2C" stroke="#363636" stroke-width="2"/>
+<text x="350" y="680" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="20" font-weight="700" fill="#3A95AB" text-anchor="start">12</text>
+<text x="350" y="713" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="22" font-weight="650" fill="#C8C8C8" text-anchor="start">Execution</text>
+<text x="350" y="746" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="20" font-weight="400" fill="#C8C8C8" text-anchor="start">Apply / build / test</text>
+<rect x="600" y="650" width="240" height="135" rx="16" fill="#2C2C2C" stroke="#363636" stroke-width="2"/>
+<text x="620" y="680" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="20" font-weight="700" fill="#3A95AB" text-anchor="start">13</text>
+<text x="620" y="713" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="22" font-weight="650" fill="#C8C8C8" text-anchor="start">Code review</text>
+<text x="620" y="746" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="20" font-weight="400" fill="#C8C8C8" text-anchor="start">Acceptance attacks</text>
+<rect x="870" y="650" width="240" height="135" rx="16" fill="#2C2C2C" stroke="#363636" stroke-width="2"/>
+<text x="890" y="680" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="20" font-weight="700" fill="#3A95AB" text-anchor="start">14</text>
+<text x="890" y="713" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="22" font-weight="650" fill="#C8C8C8" text-anchor="start">Go-live gate</text>
+<text x="890" y="746" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="20" font-weight="400" fill="#C8C8C8" text-anchor="start">Install + smoke</text>
+<rect x="1140" y="650" width="240" height="135" rx="16" fill="#2C2C2C" stroke="#363636" stroke-width="2"/>
+<text x="1160" y="680" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="20" font-weight="700" fill="#3A95AB" text-anchor="start">15</text>
+<text x="1160" y="713" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="22" font-weight="650" fill="#7AA2F7" text-anchor="start">Change receipt</text>
+<text x="1160" y="746" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="20" font-weight="400" fill="#C8C8C8" text-anchor="start">Terminal evidence</text>
+<path d="M300 257 H330" fill="none" stroke="#3A95AB" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<path d="M570 257 H600" fill="none" stroke="#3A95AB" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<path d="M840 257 H870" fill="none" stroke="#3A95AB" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<path d="M1110 257 H1140" fill="none" stroke="#3A95AB" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<path d="M300 717 H330" fill="none" stroke="#3A95AB" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<path d="M570 717 H600" fill="none" stroke="#3A95AB" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<path d="M840 717 H870" fill="none" stroke="#3A95AB" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<path d="M1110 717 H1140" fill="none" stroke="#3A95AB" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<path d="M330 487 H300" fill="none" stroke="#3A95AB" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<path d="M600 487 H570" fill="none" stroke="#3A95AB" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<path d="M870 487 H840" fill="none" stroke="#3A95AB" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<path d="M1140 487 H1110" fill="none" stroke="#3A95AB" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<path d="M1260 325 V420" fill="none" stroke="#3A95AB" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<path d="M180 555 V650" fill="none" stroke="#3A95AB" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<path d="M990 190 V160 H720 V190" fill="none" stroke="#3A95AB" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow)" stroke-dasharray="8 7"/>
+<text x="782" y="150" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="20" font-weight="400" fill="#828282" text-anchor="start">FINDINGS</text>
+<path d="M720 420 V389 H990 V420" fill="none" stroke="#3A95AB" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow)" stroke-dasharray="8 7"/>
+<text x="782" y="378" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="20" font-weight="400" fill="#828282" text-anchor="start">FINDINGS</text>
+<path d="M60 715 H28 V488 H60" fill="none" stroke="#3A95AB" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow)" stroke-dasharray="8 7"/>
+<text x="52" y="601" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="20" font-weight="400" fill="#828282" text-anchor="start">FINDINGS</text>
+<path d="M720 650 V618 H450 V650" fill="none" stroke="#3A95AB" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow)" stroke-dasharray="8 7"/>
+<text x="520" y="606" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="20" font-weight="400" fill="#828282" text-anchor="start">FINDINGS</text>
+<text x="60" y="846" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="20" font-weight="400" fill="#828282" text-anchor="start">Default: three reroutes per review gate. Second opinion determines the effective verdict when invoked.</text>
+</svg>

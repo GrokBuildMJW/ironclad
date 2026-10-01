@@ -1,0 +1,59 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1440 920" role="img" aria-labelledby="title desc">
+<title id="title">CLI Shim</title>
+<desc id="desc">Replace the local model server; keep Ironclad's engine local. Current backend: Codex CLI.</desc>
+<defs><marker id="arrow" markerWidth="9" markerHeight="9" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" fill="#3A95AB"/></marker></defs>
+<rect width="1440" height="920" fill="#141414"/>
+<text x="60" y="68" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="34" font-weight="700" fill="#7AA2F7" text-anchor="start">CLI Shim</text>
+<text x="60" y="110" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="20" font-weight="400" fill="#828282" text-anchor="start">Replace the local model server; keep Ironclad's engine local. Current backend: Codex CLI.</text>
+<rect x="60" y="168" width="300" height="152" rx="16" fill="#2C2C2C" stroke="#363636" stroke-width="2"/>
+<text x="84" y="206" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="24" font-weight="650" fill="#7AA2F7" text-anchor="start">Orchestrator</text>
+<text x="84" y="242" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="20" font-weight="400" fill="#C8C8C8" text-anchor="start">Same model contract</text>
+<text x="84" y="270" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="20" font-weight="400" fill="#C8C8C8" text-anchor="start">Budget + request queue</text>
+<text x="84" y="298" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="20" font-weight="400" fill="#C8C8C8" text-anchor="start">POST chat/completions</text>
+<rect x="405" y="168" width="300" height="152" rx="16" fill="#2C2C2C" stroke="#363636" stroke-width="2"/>
+<text x="429" y="206" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="24" font-weight="650" fill="#C8C8C8" text-anchor="start">Listener guards</text>
+<text x="429" y="242" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="20" font-weight="400" fill="#C8C8C8" text-anchor="start">Host and Origin checks</text>
+<text x="429" y="270" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="20" font-weight="400" fill="#C8C8C8" text-anchor="start">Existing Bearer policy</text>
+<text x="429" y="298" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="20" font-weight="400" fill="#C8C8C8" text-anchor="start">No replay cache</text>
+<rect x="750" y="168" width="300" height="152" rx="16" fill="#2C2C2C" stroke="#363636" stroke-width="2"/>
+<text x="774" y="206" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="24" font-weight="650" fill="#C8C8C8" text-anchor="start">Pin request</text>
+<text x="774" y="242" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="20" font-weight="400" fill="#C8C8C8" text-anchor="start">One exact subscription</text>
+<text x="774" y="270" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="20" font-weight="400" fill="#C8C8C8" text-anchor="start">Detected executable</text>
+<text x="774" y="298" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="20" font-weight="400" fill="#C8C8C8" text-anchor="start">Model inventory</text>
+<rect x="1095" y="168" width="285" height="152" rx="16" fill="#2C2C2C" stroke="#363636" stroke-width="2"/>
+<text x="1119" y="206" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="24" font-weight="650" fill="#C8C8C8" text-anchor="start">Shared capacity</text>
+<text x="1119" y="242" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="20" font-weight="400" fill="#C8C8C8" text-anchor="start">Process-owned counter</text>
+<text x="1119" y="270" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="20" font-weight="400" fill="#C8C8C8" text-anchor="start">Above cap: HTTP 429</text>
+<text x="1119" y="298" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="20" font-weight="400" fill="#C8C8C8" text-anchor="start">No child on refusal</text>
+<path d="M360 244 H405" fill="none" stroke="#3A95AB" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<path d="M705 244 H750" fill="none" stroke="#3A95AB" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<path d="M1050 244 H1095" fill="none" stroke="#3A95AB" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<rect x="60" y="434" width="620" height="170" rx="16" fill="#2C2C2C" stroke="#363636" stroke-width="2"/>
+<text x="84" y="472" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="24" font-weight="650" fill="#C8C8C8" text-anchor="start">Request-owned Codex child</text>
+<text x="84" y="508" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="20" font-weight="400" fill="#C8C8C8" text-anchor="start">Fresh empty scratch directory; direct argv</text>
+<text x="84" y="536" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="20" font-weight="400" fill="#C8C8C8" text-anchor="start">Messages + tool definitions rendered on stdin</text>
+<text x="84" y="564" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="20" font-weight="400" fill="#C8C8C8" text-anchor="start">JSONL / ephemeral / read-only / ignore user config</text>
+<text x="84" y="592" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="20" font-weight="400" fill="#C8C8C8" text-anchor="start">Auth remains vendor-owned; pointer selects home</text>
+<rect x="760" y="434" width="620" height="170" rx="16" fill="#2C2C2C" stroke="#363636" stroke-width="2"/>
+<text x="784" y="472" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="24" font-weight="650" fill="#C8C8C8" text-anchor="start">Subscription cloud</text>
+<text x="784" y="508" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="20" font-weight="400" fill="#C8C8C8" text-anchor="start">The vendor CLI performs the cloud call</text>
+<text x="784" y="536" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="20" font-weight="400" fill="#C8C8C8" text-anchor="start">No account rotation or session resume</text>
+<text x="784" y="564" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="20" font-weight="400" fill="#C8C8C8" text-anchor="start">No supported output token limiter in shim</text>
+<text x="784" y="592" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="20" font-weight="400" fill="#C8C8C8" text-anchor="start">Zero USD profile rates do not measure quota</text>
+<path d="M1238 320 V384 H370 V434" fill="none" stroke="#3A95AB" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<text x="624" y="370" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="20" font-weight="400" fill="#828282" text-anchor="start">New child</text>
+<path d="M680 519 H760" fill="none" stroke="#3A95AB" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<rect x="760" y="670" width="620" height="142" rx="16" fill="#2C2C2C" stroke="#363636" stroke-width="2"/>
+<text x="784" y="708" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="24" font-weight="650" fill="#C8C8C8" text-anchor="start">Parse JSONL → SSE</text>
+<text x="784" y="744" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="20" font-weight="400" fill="#C8C8C8" text-anchor="start">Agent messages → content; visible reasoning → thinking</text>
+<text x="784" y="772" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="20" font-weight="400" fill="#C8C8C8" text-anchor="start">Declared fenced call → tool_calls; shim runs no tools</text>
+<text x="784" y="800" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="20" font-weight="400" fill="#C8C8C8" text-anchor="start">Errors → error frame; normal end → [DONE]</text>
+<rect x="60" y="670" width="620" height="142" rx="16" fill="#2C2C2C" stroke="#363636" stroke-width="2"/>
+<text x="84" y="708" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="24" font-weight="650" fill="#7AA2F7" text-anchor="start">Return through generation seam</text>
+<text x="84" y="744" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="20" font-weight="400" fill="#C8C8C8" text-anchor="start">Consumer receives typed chunks + accounted usage</text>
+<text x="84" y="772" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="20" font-weight="400" fill="#C8C8C8" text-anchor="start">Product execution layer owns any tool dispatch</text>
+<text x="84" y="800" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="20" font-weight="400" fill="#C8C8C8" text-anchor="start">Thinking flag changes visibility, not vendor execution</text>
+<path d="M1070 604 V670" fill="none" stroke="#3A95AB" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<path d="M760 742 H680" fill="none" stroke="#3A95AB" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<text x="60" y="862" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="20" font-weight="400" fill="#828282" text-anchor="start">Disconnect / deadline / completion → owned child cleanup → llm.shim.completed operational receipt.</text>
+</svg>

@@ -1,0 +1,57 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1440 800" role="img" aria-labelledby="title desc">
+<title id="title">API models: reserve, dispatch, settle</title>
+<desc id="desc">A named profile becomes a concrete model identity. The same generation seam serves local and external endpoints.</desc>
+<defs><marker id="arrow" markerWidth="9" markerHeight="9" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" fill="#3A95AB"/></marker></defs>
+<rect width="1440" height="800" fill="#141414"/>
+<text x="60" y="68" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="34" font-weight="700" fill="#7AA2F7" text-anchor="start">API models: reserve, dispatch, settle</text>
+<text x="60" y="110" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="20" font-weight="400" fill="#828282" text-anchor="start">A named profile becomes a concrete model identity. The same generation seam serves local and external endpoints.</text>
+<rect x="60" y="180" width="300" height="176" rx="16" fill="#2C2C2C" stroke="#363636" stroke-width="2"/>
+<text x="84" y="218" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="24" font-weight="650" fill="#C8C8C8" text-anchor="start">Resolve profile</text>
+<text x="84" y="254" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="20" font-weight="400" fill="#C8C8C8" text-anchor="start">Endpoint + identity</text>
+<text x="84" y="282" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="20" font-weight="400" fill="#C8C8C8" text-anchor="start">Explicit egress</text>
+<text x="84" y="310" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="20" font-weight="400" fill="#C8C8C8" text-anchor="start">Price snapshot</text>
+<rect x="405" y="180" width="300" height="176" rx="16" fill="#2C2C2C" stroke="#363636" stroke-width="2"/>
+<text x="429" y="218" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="24" font-weight="650" fill="#C8C8C8" text-anchor="start">Reserve budget</text>
+<text x="429" y="254" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="20" font-weight="400" fill="#C8C8C8" text-anchor="start">Run / daily / external</text>
+<text x="429" y="282" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="20" font-weight="400" fill="#C8C8C8" text-anchor="start">Persist usage reservation</text>
+<text x="429" y="310" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="20" font-weight="400" fill="#C8C8C8" text-anchor="start">Refuse before transport</text>
+<rect x="750" y="180" width="300" height="176" rx="16" fill="#2C2C2C" stroke="#363636" stroke-width="2"/>
+<text x="774" y="218" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="24" font-weight="650" fill="#C8C8C8" text-anchor="start">Queue request</text>
+<text x="774" y="254" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="20" font-weight="400" fill="#C8C8C8" text-anchor="start">Per-profile capacity</text>
+<text x="774" y="282" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="20" font-weight="400" fill="#C8C8C8" text-anchor="start">Held for provider stream</text>
+<text x="774" y="310" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="20" font-weight="400" fill="#C8C8C8" text-anchor="start">Shared process limiter</text>
+<rect x="1095" y="180" width="285" height="176" rx="16" fill="#2C2C2C" stroke="#363636" stroke-width="2"/>
+<text x="1119" y="218" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="24" font-weight="650" fill="#C8C8C8" text-anchor="start">HTTP transport</text>
+<text x="1119" y="254" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="20" font-weight="400" fill="#C8C8C8" text-anchor="start">POST chat/completions</text>
+<text x="1119" y="282" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="20" font-weight="400" fill="#C8C8C8" text-anchor="start">Messages + tools</text>
+<text x="1119" y="310" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="20" font-weight="400" fill="#C8C8C8" text-anchor="start">Streaming requested</text>
+<path d="M360 268 H405" fill="none" stroke="#3A95AB" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<path d="M705 268 H750" fill="none" stroke="#3A95AB" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<path d="M1050 268 H1095" fill="none" stroke="#3A95AB" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<rect x="1095" y="438" width="285" height="176" rx="16" fill="#2C2C2C" stroke="#363636" stroke-width="2"/>
+<text x="1119" y="476" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="24" font-weight="650" fill="#C8C8C8" text-anchor="start">SSE response</text>
+<text x="1119" y="512" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="20" font-weight="400" fill="#C8C8C8" text-anchor="start">Content / thinking</text>
+<text x="1119" y="540" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="20" font-weight="400" fill="#C8C8C8" text-anchor="start">Tool-call fragments</text>
+<text x="1119" y="568" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="20" font-weight="400" fill="#C8C8C8" text-anchor="start">Finish + optional usage</text>
+<rect x="750" y="438" width="300" height="176" rx="16" fill="#2C2C2C" stroke="#363636" stroke-width="2"/>
+<text x="774" y="476" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="24" font-weight="650" fill="#C8C8C8" text-anchor="start">Typed chunks</text>
+<text x="774" y="512" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="20" font-weight="400" fill="#C8C8C8" text-anchor="start">Validate provider frames</text>
+<text x="774" y="540" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="20" font-weight="400" fill="#C8C8C8" text-anchor="start">Bound connect / idle time</text>
+<text x="774" y="568" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="20" font-weight="400" fill="#C8C8C8" text-anchor="start">Enforce request deadline</text>
+<rect x="405" y="438" width="300" height="176" rx="16" fill="#2C2C2C" stroke="#363636" stroke-width="2"/>
+<text x="429" y="476" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="24" font-weight="650" fill="#C8C8C8" text-anchor="start">Settle usage</text>
+<text x="429" y="512" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="20" font-weight="400" fill="#C8C8C8" text-anchor="start">Provider counts if valid</text>
+<text x="429" y="540" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="20" font-weight="400" fill="#C8C8C8" text-anchor="start">Otherwise local estimate</text>
+<text x="429" y="568" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="20" font-weight="400" fill="#C8C8C8" text-anchor="start">Same call id + rates</text>
+<rect x="60" y="438" width="300" height="176" rx="16" fill="#2C2C2C" stroke="#363636" stroke-width="2"/>
+<text x="84" y="476" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="24" font-weight="650" fill="#C8C8C8" text-anchor="start">Event log</text>
+<text x="84" y="512" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="20" font-weight="400" fill="#C8C8C8" text-anchor="start">Usage accounting</text>
+<text x="84" y="540" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="20" font-weight="400" fill="#C8C8C8" text-anchor="start">Replay budget ledger</text>
+<text x="84" y="568" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="20" font-weight="400" fill="#C8C8C8" text-anchor="start">Pending amounts count</text>
+<path d="M1238 356 V438" fill="none" stroke="#3A95AB" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<path d="M1095 526 H1050" fill="none" stroke="#3A95AB" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<path d="M750 526 H705" fill="none" stroke="#3A95AB" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<path d="M405 526 H360" fill="none" stroke="#3A95AB" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<text x="60" y="685" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="20" font-weight="400" fill="#828282" text-anchor="start">Credentials: ${env:NAME} resolves when building the Bearer header; profile configuration stores a reference.</text>
+<text x="60" y="730" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="20" font-weight="400" fill="#828282" text-anchor="start">External daily = 0 denies dispatch. Positive output pricing requires an output bound for reservation.</text>
+</svg>

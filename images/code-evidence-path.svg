@@ -1,0 +1,62 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1440 900" role="img" aria-labelledby="title desc">
+<title id="title">From a model proposal to completion evidence</title>
+<desc id="desc">The engine owns application and verification. Independent review attacks acceptance against the exact pinned contract.</desc>
+<defs><marker id="arrow" markerWidth="9" markerHeight="9" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" fill="#3A95AB"/></marker></defs>
+<rect width="1440" height="900" fill="#141414"/>
+<text x="60" y="68" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="34" font-weight="700" fill="#7AA2F7" text-anchor="start">From a model proposal to completion evidence</text>
+<text x="60" y="110" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="20" font-weight="400" fill="#828282" text-anchor="start">The engine owns application and verification. Independent review attacks acceptance against the exact pinned contract.</text>
+<rect x="60" y="178" width="300" height="178" rx="16" fill="#2C2C2C" stroke="#363636" stroke-width="2"/>
+<text x="84" y="216" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="24" font-weight="650" fill="#C8C8C8" text-anchor="start">Diff proposal</text>
+<text x="84" y="252" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="20" font-weight="400" fill="#C8C8C8" text-anchor="start">CLI stdout / API content</text>
+<text x="84" y="280" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="20" font-weight="400" fill="#C8C8C8" text-anchor="start">JSON object with diff</text>
+<text x="84" y="308" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="20" font-weight="400" fill="#C8C8C8" text-anchor="start">Routed author identity</text>
+<rect x="405" y="178" width="300" height="178" rx="16" fill="#2C2C2C" stroke="#363636" stroke-width="2"/>
+<text x="429" y="216" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="24" font-weight="650" fill="#C8C8C8" text-anchor="start">Validate proposal</text>
+<text x="429" y="252" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="20" font-weight="400" fill="#C8C8C8" text-anchor="start">Parse CodeChange</text>
+<text x="429" y="280" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="20" font-weight="400" fill="#C8C8C8" text-anchor="start">Create Code payload</text>
+<text x="429" y="308" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="20" font-weight="400" fill="#C8C8C8" text-anchor="start">Accept typed dispatch</text>
+<rect x="750" y="178" width="300" height="178" rx="16" fill="#2C2C2C" stroke="#363636" stroke-width="2"/>
+<text x="774" y="216" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="24" font-weight="650" fill="#7AA2F7" text-anchor="start">Check + apply</text>
+<text x="774" y="252" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="20" font-weight="400" fill="#C8C8C8" text-anchor="start">git apply --check</text>
+<text x="774" y="280" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="20" font-weight="400" fill="#C8C8C8" text-anchor="start">Durable recovery receipt</text>
+<text x="774" y="308" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="20" font-weight="400" fill="#C8C8C8" text-anchor="start">Apply / adopt applied diff</text>
+<rect x="1095" y="178" width="285" height="178" rx="16" fill="#2C2C2C" stroke="#363636" stroke-width="2"/>
+<text x="1119" y="216" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="24" font-weight="650" fill="#7AA2F7" text-anchor="start">Persist Code</text>
+<text x="1119" y="252" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="20" font-weight="400" fill="#C8C8C8" text-anchor="start">Immutable Code</text>
+<text x="1119" y="280" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="20" font-weight="400" fill="#C8C8C8" text-anchor="start">Content-addressed ref</text>
+<text x="1119" y="308" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="20" font-weight="400" fill="#C8C8C8" text-anchor="start">Run-visible evidence</text>
+<path d="M360 267 H405" fill="none" stroke="#3A95AB" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<path d="M705 267 H750" fill="none" stroke="#3A95AB" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<path d="M1050 267 H1095" fill="none" stroke="#3A95AB" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<rect x="1095" y="472" width="285" height="206" rx="16" fill="#2C2C2C" stroke="#363636" stroke-width="2"/>
+<text x="1119" y="510" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="24" font-weight="650" fill="#C8C8C8" text-anchor="start">Build + test</text>
+<text x="1119" y="546" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="20" font-weight="400" fill="#C8C8C8" text-anchor="start">Ops commands</text>
+<text x="1119" y="574" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="20" font-weight="400" fill="#C8C8C8" text-anchor="start">Build first, then test</text>
+<text x="1119" y="602" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="20" font-weight="400" fill="#C8C8C8" text-anchor="start">Tool runtime authority</text>
+<text x="1119" y="630" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="20" font-weight="400" fill="#C8C8C8" text-anchor="start">Evidence names Code</text>
+<rect x="750" y="472" width="300" height="206" rx="16" fill="#2C2C2C" stroke="#363636" stroke-width="2"/>
+<text x="774" y="510" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="24" font-weight="650" fill="#C8C8C8" text-anchor="start">Code review</text>
+<text x="774" y="546" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="20" font-weight="400" fill="#C8C8C8" text-anchor="start">Same Code + verification</text>
+<text x="774" y="574" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="20" font-weight="400" fill="#C8C8C8" text-anchor="start">Pinned acceptance rubric</text>
+<text x="774" y="602" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="20" font-weight="400" fill="#C8C8C8" text-anchor="start">One attack per criterion</text>
+<text x="774" y="630" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="20" font-weight="400" fill="#C8C8C8" text-anchor="start">Unsupported → FINDINGS</text>
+<rect x="405" y="472" width="300" height="206" rx="16" fill="#2C2C2C" stroke="#363636" stroke-width="2"/>
+<text x="429" y="510" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="24" font-weight="650" fill="#C8C8C8" text-anchor="start">Go-live gate</text>
+<text x="429" y="546" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="20" font-weight="400" fill="#C8C8C8" text-anchor="start">Reviewed diff in codedir</text>
+<text x="429" y="574" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="20" font-weight="400" fill="#C8C8C8" text-anchor="start">Target + command</text>
+<text x="429" y="602" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="20" font-weight="400" fill="#C8C8C8" text-anchor="start">Install fencing + smoke</text>
+<text x="429" y="630" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="20" font-weight="400" fill="#C8C8C8" text-anchor="start">Waiver stays unverified</text>
+<rect x="60" y="472" width="300" height="206" rx="16" fill="#2C2C2C" stroke="#363636" stroke-width="2"/>
+<text x="84" y="510" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="24" font-weight="650" fill="#7AA2F7" text-anchor="start">Change receipt</text>
+<text x="84" y="546" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="20" font-weight="400" fill="#C8C8C8" text-anchor="start">Committed sensors only</text>
+<text x="84" y="574" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="20" font-weight="400" fill="#C8C8C8" text-anchor="start">Current Code references</text>
+<text x="84" y="602" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="20" font-weight="400" fill="#C8C8C8" text-anchor="start">Decisions + obligations</text>
+<text x="84" y="630" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="20" font-weight="400" fill="#C8C8C8" text-anchor="start">Deterministic compilation</text>
+<path d="M1238 356 V472" fill="none" stroke="#3A95AB" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<path d="M1095 575 H1050" fill="none" stroke="#3A95AB" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<path d="M750 575 H705" fill="none" stroke="#3A95AB" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<path d="M405 575 H360" fill="none" stroke="#3A95AB" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<text x="60" y="765" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="20" font-weight="400" fill="#828282" text-anchor="start">FINDINGS reroutes to execution. The next attempt reverses the prior prepared diff before a new proposal.</text>
+<text x="60" y="810" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="20" font-weight="400" fill="#828282" text-anchor="start">Completion revalidates the receipt, completes planned tasks and commits the terminal event.</text>
+<text x="60" y="855" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="20" font-weight="400" fill="#828282" text-anchor="start">Passing tests and a receipt do not replace approval decisions or prove arbitrary acceptance claims.</text>
+</svg>

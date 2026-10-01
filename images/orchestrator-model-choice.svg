@@ -1,0 +1,38 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1440 880" role="img" aria-labelledby="title desc">
+<title id="title">Choose the orchestrator inference backend</title>
+<desc id="desc">CLI Shim replaces the local model server while preserving the generation contract. Ironclad engine stays local; the currently implemented shim backend is Codex CLI.</desc>
+<defs><marker id="arrow" markerWidth="9" markerHeight="9" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" fill="#3A95AB"/></marker></defs>
+<rect width="1440" height="880" fill="#141414"/>
+<text x="60" y="68" font-family="ui-sans-serif,system-ui,sans-serif" font-size="34" font-weight="700" fill="#7AA2F7">Choose the orchestrator inference backend</text>
+<text x="60" y="110" font-family="ui-sans-serif,system-ui,sans-serif" font-size="20" font-weight="400" fill="#828282">Replace the local model server with CLI Shim; preserve the same Ironclad generation contract.</text>
+<rect x="60" y="172" width="300" height="166" rx="16" fill="#2C2C2C" stroke="#363636" stroke-width="2"/>
+<text x="84" y="210" font-family="ui-sans-serif,system-ui,sans-serif" font-size="24" font-weight="650" fill="#7AA2F7">Local engine</text>
+<text x="84" y="246" font-family="ui-sans-serif,system-ui,sans-serif" font-size="20" font-weight="400" fill="#C8C8C8">Orchestrator decisions</text>
+<text x="84" y="274" font-family="ui-sans-serif,system-ui,sans-serif" font-size="20" font-weight="400" fill="#C8C8C8">Process + tool authority</text>
+<text x="84" y="302" font-family="ui-sans-serif,system-ui,sans-serif" font-size="20" font-weight="400" fill="#C8C8C8">Durable evidence</text>
+<rect x="405" y="172" width="975" height="166" rx="16" fill="#2C2C2C" stroke="#363636" stroke-width="2"/>
+<text x="429" y="210" font-family="ui-sans-serif,system-ui,sans-serif" font-size="24" font-weight="650" fill="#7AA2F7">Same model contract</text>
+<text x="429" y="246" font-family="ui-sans-serif,system-ui,sans-serif" font-size="20" font-weight="400" fill="#C8C8C8">Named profile → generate() → budget admission → request queue</text>
+<text x="429" y="274" font-family="ui-sans-serif,system-ui,sans-serif" font-size="20" font-weight="400" fill="#C8C8C8">OpenAI-compatible POST chat/completions → streamed chunks → usage accounting</text>
+<text x="429" y="302" font-family="ui-sans-serif,system-ui,sans-serif" font-size="20" font-weight="400" fill="#C8C8C8">The selected profile chooses the inference backend.</text>
+<path d="M360 255 H405" fill="none" stroke="#3A95AB" stroke-width="3" marker-end="url(#arrow)"/>
+<path d="M635 338 V389 H370 V434" fill="none" stroke="#3A95AB" stroke-width="3" marker-end="url(#arrow)"/>
+<path d="M1070 338 V434" fill="none" stroke="#3A95AB" stroke-width="3" marker-end="url(#arrow)"/>
+<rect x="60" y="434" width="620" height="214" rx="16" fill="#2C2C2C" stroke="#363636" stroke-width="2"/>
+<text x="84" y="472" font-family="ui-sans-serif,system-ui,sans-serif" font-size="24" font-weight="650" fill="#7AA2F7">Local model server</text>
+<text x="84" y="508" font-family="ui-sans-serif,system-ui,sans-serif" font-size="20" font-weight="400" fill="#C8C8C8">Local inference with configured weights and runtime</text>
+<text x="84" y="536" font-family="ui-sans-serif,system-ui,sans-serif" font-size="20" font-weight="400" fill="#C8C8C8">Engine calls its compatible endpoint</text>
+<text x="84" y="564" font-family="ui-sans-serif,system-ui,sans-serif" font-size="20" font-weight="400" fill="#C8C8C8">Profile declares egress: local</text>
+<text x="84" y="592" font-family="ui-sans-serif,system-ui,sans-serif" font-size="20" font-weight="400" fill="#C8C8C8">Explicit model identity for the configured runtime</text>
+<rect x="760" y="434" width="620" height="214" rx="16" fill="#2C2C2C" stroke="#363636" stroke-width="2"/>
+<text x="784" y="472" font-family="ui-sans-serif,system-ui,sans-serif" font-size="24" font-weight="650" fill="#7AA2F7">CLI Shim</text>
+<text x="784" y="508" font-family="ui-sans-serif,system-ui,sans-serif" font-size="20" font-weight="400" fill="#C8C8C8">Replaces the local model server for the orchestrator</text>
+<text x="784" y="536" font-family="ui-sans-serif,system-ui,sans-serif" font-size="20" font-weight="400" fill="#C8C8C8">Shim → configured vendor CLI → cloud inference</text>
+<text x="784" y="564" font-family="ui-sans-serif,system-ui,sans-serif" font-size="20" font-weight="400" fill="#C8C8C8">Profile declares egress: external</text>
+<text x="784" y="592" font-family="ui-sans-serif,system-ui,sans-serif" font-size="20" font-weight="400" fill="#C8C8C8">Currently implemented backend: Codex CLI</text>
+<text x="705" y="551" font-family="ui-sans-serif,system-ui,sans-serif" font-size="24" font-weight="700" fill="#828282">OR</text>
+<rect x="60" y="718" width="1320" height="112" rx="16" fill="#2C2C2C" stroke="#363636" stroke-width="2"/>
+<text x="84" y="756" font-family="ui-sans-serif,system-ui,sans-serif" font-size="24" font-weight="650" fill="#7AA2F7">Direct coder CLI: separate assignment transport</text>
+<text x="84" y="792" font-family="ui-sans-serif,system-ui,sans-serif" font-size="20" font-weight="400" fill="#C8C8C8">Registry-selected coder harnesses use their own templates, overlays and auth homes in codedir.</text>
+<text x="60" y="858" font-family="ui-sans-serif,system-ui,sans-serif" font-size="20" font-weight="400" fill="#828282">External dispatch requires a positive external daily envelope; zero denies the shim profile before HTTP.</text>
+</svg>
